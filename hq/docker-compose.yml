@@ -1,0 +1,32 @@
+# HiveMind HQ — reachable at hive.pow on the LAN/VPN.
+#
+# The in-world Bridge dials ws://hive.pow/bridge, so this must be resolvable by
+# Pi-hole and routed by Traefik like any other PowStation service. Websockets
+# need no special Traefik config on the `web` entrypoint — the Upgrade handshake
+# passes through as long as we do NOT put forward-auth in front of it (Authelia
+# breaks the upgrade, which is exactly why .pow routes stay unauthenticated).
+services:
+  hq:
+    build: .
+    container_name: hive-hq
+    environment:
+      - PORT=4400
+      - LUA_DIR=/lua
+    volumes:
+      # Source of truth for the Lua tree. Read-only: HQ publishes it, the world
+      # pulls it; nothing in-game may write back to the repo.
+      - ../lua:/lua:ro
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.hive.rule=Host(`hive.pow`)"
+      - "traefik.http.routers.hive.entrypoints=web"
+      - "traefik.http.services.hive.loadbalancer.server.port=4400"
+    networks:
+      - default
+      - traefik
+
+networks:
+  default: {}
+  traefik:
+    external: true
