@@ -517,100 +517,125 @@ end
 
 -- Dig a box. Serpentine within each layer, then drop a level -- so the drone is always adjacent
 -- to the next cell and never has to path back across ground it already cleared.
-function OnDig(p_ID, p_Message)
-    local d = p_Message.data or {}
-    local s_W = tonumber(d.w) or 8
-    local s_L = tonumber(d.l) or 8
-    local s_Depth = tonumber(d.depth) or 4
+----------------------------------------------------------------------------------------------
+-- Job framework
+----------------------------------------------------------------------------------------------
+-- Every job verb used to repeat the same twelve lines of lifecycle -- busy check, m_Job,
+-- saveResume, status, TaskStart/TaskEnd, deposit, UploadWorld -- and they had already drifted
+-- apart: some forgot to clear m_Job, some never saved resume state, and OnDig and OnLumber each
+-- had to be patched SEPARATELY to travel to the ordered site. The one that was missed dug up the
+-- base for weeks.
+--
+-- A new job type is now just a body function; the scaffolding cannot be forgotten because it is
+-- not written again.
+--
+--   opts.status   drone status while running          (default "working")
+--   opts.travel   move to data.pos first              (default true)
+--   opts.settle   descend to the ground first         (default true)
+--   opts.deposit  unload at the end if carrying       (default true)
+--   opts.upload   push observations at the end        (default true)
+function RunJob(p_Name, p_Data, p_Opts, p_Body)
+    local d = p_Data or {}
+    local o = p_Opts or {}
     if executing then return false, "busy" end
 
-    m_Job = {verb = "Dig", data = d}
+    m_Job = {verb = p_Name, data = d}
     saveResume()
-    m_Status = "mining"
+    m_Status = o.status or "working"
     TaskStart()
 
-    -- Get to the ground first.
-    --
-    -- Dig used to start wherever the drone happened to be, and a drone that has just flown
-    -- somewhere is in the air. The first real run did exactly that: a clean 3x3x2 serpentine at
-    -- y=84, seventeen fuel spent, every turtle.dig() hitting nothing, and an empty inventory at
-    -- the end. It looked like a successful mining run and moved no stone whatsoever.
-    --
-    -- GO THERE FIRST. This is not optional and its absence was destroying the base.
-    --
-    -- TaskMan has always sent pos = w.start, and this function ignored it completely: it settled
-    -- and dug wherever the drone happened to be standing, which after docking is the base itself.
-    -- An order for a site 300 blocks away excavated the module row instead -- that is how TaskMan
-    -- lost its modem, which silently took the whole fleet's ability to receive work with it.
-    --
-    -- Refuse the job rather than dig in the wrong place: a drone that cannot reach the site has
-    -- nothing useful to do there, and digging "somewhere" is worse than digging nowhere.
-    if d.pos and d.pos.x and d.pos.z then
+    local function finish(p_Ok, p_Res)
+        if o.deposit ~= false and FreeSlots() < 16 then Deposit() end
+        TaskEnd()
+        m_Status = "idle"
+        m_Job = nil
+        saveResume()
+        if o.upload ~= false then pcall(UploadWorld) end
+        return p_Ok, p_Res
+    end
+
+    -- Go to the ordered site, or refuse. Digging "somewhere" is worse than digging nowhere.
+    if o.travel ~= false and d.pos and d.pos.x and d.pos.z then
         local s_Ty = tonumber(d.pos.y)
         local s_Arrived = pgps.moveTo(tonumber(d.pos.x), s_Ty and (s_Ty + 1) or nil, tonumber(d.pos.z))
         if s_Arrived == false then
-            TaskEnd()
-            m_Status = "idle"
-            m_Job = nil saveResume()
             Distress("cannot reach site",
                 tostring(d.pos.x) .. "," .. tostring(d.pos.y) .. "," .. tostring(d.pos.z))
-            return false, "cannot reach site"
+            return finish(false, "cannot reach site")
         end
     end
 
-    -- settle() is the same descent the survey uses; the difference is only that a survey wants
-    -- to hug the surface and a dig wants to start at it.
-    local s_Dropped = settle(tonumber(d.drop) or 24)
-    if s_Dropped > 0 then print("descended " .. s_Dropped .. " to the surface") end
-    if not turtle.detectDown() then
-        -- Still nothing underneath after descending: we are over a void or a very deep drop, and
-        -- quarrying air would silently "succeed" again.
-        TaskEnd()
-        m_Status = "idle"
-        m_Job = nil saveResume()
-        Distress("nothing to dig", "no ground within " .. (tonumber(d.drop) or 24) .. " blocks")
-        return false, "no ground beneath"
-    end
+    if o.settle ~= false then settle(tonumber(d.drop) or 24) end
 
-    local s_Dug, s_Layers = 0, 0
-    for layer = 1, s_Depth do
-        if not executing then break end
-        for row = 1, s_L do
+    local s_Ok, s_Res = pcall(p_Body, d)
+    if not s_Ok then
+        -- A job that throws must report, not vanish: the drone is left somewhere unexpected and
+        -- somebody has to know why.
+        Distress(p_Name .. " failed", tostring(s_Res))
+        return finish(false, tostring(s_Res))
+    end
+    return finish(true, s_Res)
+end
+
+-- The w x l boustrophedon walk, previously written out four times with the same turn parity and
+-- the same off-by-one. p_OnCell returns false to abandon the current row; p_Advance moves to the
+-- next row and returns false to abandon the job.
+function Serpentine(p_W, p_L, p_OnCell, p_Advance)
+    p_Advance = p_Advance or function() return pgps.forward() end
+    for row = 1, p_L do
+        if not executing then return row - 1 end
+        for col = 1, p_W - 1 do
+            if not executing then return row - 1 end
+            if p_OnCell(row, col) == false then break end
+        end
+        if row < p_L then
+            local s_Turn = (row % 2 == 1) and pgps.turnRight or pgps.turnLeft
+            s_Turn()
+            if p_Advance() == false then return row end
+            s_Turn()
+        end
+    end
+    return p_L
+end
+
+function OnDig(p_ID, p_Message)
+    return RunJob("Dig", p_Message.data, {status = "mining"}, function(d)
+        local s_W     = tonumber(d.w)     or 8
+        local s_L     = tonumber(d.l)     or 8
+        local s_Depth = tonumber(d.depth) or 4
+
+        -- Refuse to quarry air. A drone that has just flown somewhere is airborne, and the first
+        -- real run dug a clean 3x3x2 of nothing at y=84: seventeen fuel spent, every dig hitting
+        -- nothing, empty inventory, and a job that reported success.
+        if not turtle.detectDown() then
+            Distress("nothing to dig", "no ground within " .. (tonumber(d.drop) or 24) .. " blocks")
+            error("no ground beneath")
+        end
+
+        local s_Dug, s_Layers = 0, 0
+        for layer = 1, s_Depth do
             if not executing then break end
-            for col = 1, s_W - 1 do
-                if not executing then break end
-                if not depositIfFull() then break end
+            Serpentine(s_W, s_L, function()
+                if not depositIfFull() then return false end
                 DigForward()
-                if not pgps.forward() then
-                    -- Something we cannot break (bedrock, a claim, a machine). Abandon the row
-                    -- rather than the job; the rest of the box is still worth having.
-                    break
-                end
+                -- Something unbreakable (bedrock, a claim, a machine). Abandon the row, not the
+                -- job: the rest of the box is still worth having.
+                if not pgps.forward() then return false end
                 s_Dug = s_Dug + 1
-            end
-            if row < s_L then
-                local s_Turn = (row % 2 == 1) and pgps.turnRight or pgps.turnLeft
-                s_Turn()
+            end, function()
                 DigForward()
-                if not pgps.forward() then break end
-                s_Turn()
+                return pgps.forward()
+            end)
+            s_Layers = s_Layers + 1
+            if layer < s_Depth then
+                if not DigDown() then break end
+                if not pgps.down() then break end
             end
         end
-        s_Layers = s_Layers + 1
-        if layer < s_Depth then
-            if not DigDown() then break end
-            if not pgps.down() then break end
-        end
-    end
 
-    -- Bring back whatever is in the hold; ore left in a parked drone is ore nobody can use.
-    if FreeSlots() < 16 then Deposit() end
-
-    TaskEnd()
-    m_Status = "idle"
-    m_Job = nil saveResume()
-    UploadWorld()
-    return true, {message = "dug " .. s_Dug .. " blocks over " .. s_Layers .. " layers"}
+        return {message = "dug " .. s_Dug .. " blocks over " .. s_Layers .. " layers",
+                dug = s_Dug, layers = s_Layers}
+    end)
 end
 
 -- Fetch from a point and take it to storage. The hauler half of the loop: miners stay at the
@@ -686,49 +711,13 @@ local function fellTree()
 end
 
 function OnLumber(p_ID, p_Message)
-    local d = p_Message.data or {}
-    local s_W = tonumber(d.w) or 8
-    local s_L = tonumber(d.l) or 8
-    if executing then return false, "busy" end
+    return RunJob("Lumber", p_Message.data, {status = "logging"}, function(d)
+        local s_W = tonumber(d.w) or 8
+        local s_L = tonumber(d.l) or 8
+        local s_Logs, s_Trees = 0, 0
 
-    m_Job = {verb = "Lumber", data = d}
-    saveResume()
-    m_Status = "logging"
-    TaskStart()
-
-    -- GO THERE FIRST. This is not optional and its absence was destroying the base.
-    --
-    -- TaskMan has always sent pos = w.start, and this function ignored it completely: it settled
-    -- and dug wherever the drone happened to be standing, which after docking is the base itself.
-    -- An order for a site 300 blocks away excavated the module row instead -- that is how TaskMan
-    -- lost its modem, which silently took the whole fleet's ability to receive work with it.
-    --
-    -- Refuse the job rather than dig in the wrong place: a drone that cannot reach the site has
-    -- nothing useful to do there, and digging "somewhere" is worse than digging nowhere.
-    if d.pos and d.pos.x and d.pos.z then
-        local s_Ty = tonumber(d.pos.y)
-        local s_Arrived = pgps.moveTo(tonumber(d.pos.x), s_Ty and (s_Ty + 1) or nil, tonumber(d.pos.z))
-        if s_Arrived == false then
-            TaskEnd()
-            m_Status = "idle"
-            m_Job = nil saveResume()
-            Distress("cannot reach site",
-                tostring(d.pos.x) .. "," .. tostring(d.pos.y) .. "," .. tostring(d.pos.z))
-            return false, "cannot reach site"
-        end
-    end
-
-    -- Same reason OnDig settles: a drone that just flew here is in the air, and every inspect()
-    -- would hit nothing while the job reported success.
-    settle(tonumber(d.drop) or 24)
-
-    local s_Logs, s_Trees = 0, 0
-    for row = 1, s_L do
-        if not executing then break end
-        for col = 1, s_W - 1 do
-            if not executing then break end
-            if not depositIfFull() then break end
-
+        Serpentine(s_W, s_L, function()
+            if not depositIfFull() then return false end
             local ok, blk = turtle.inspect()
             if ok and isLog(blk.name) then
                 local n = fellTree()
@@ -737,25 +726,13 @@ function OnLumber(p_ID, p_Message)
                 DigForward()
                 pgps.forward()
             elseif not stepForward(2) then
-                break   -- blocked by something we should not chew through
+                return false
             end
-        end
-        if row < s_L then
-            local s_Turn = (row % 2 == 1) and pgps.turnRight or pgps.turnLeft
-            s_Turn()
-            if not stepForward(2) then break end
-            s_Turn()
-        end
-    end
+        end, function() return stepForward(2) end)
 
-    if FreeSlots() < 16 then Deposit() end
-
-    TaskEnd()
-    m_Status = "idle"
-    m_Job = nil saveResume()
-    UploadWorld()
-    return true, {message = ("felled %d trees, %d logs"):format(s_Trees, s_Logs),
-                  trees = s_Trees, logs = s_Logs}
+        return {message = ("felled %d trees, %d logs"):format(s_Trees, s_Logs),
+                trees = s_Trees, logs = s_Logs}
+    end)
 end
 
 function OnHaul(p_ID, p_Message)
