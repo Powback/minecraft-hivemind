@@ -33,6 +33,9 @@ function Init()
             {x = -92, y = 95, z = -38}, {x = -85, y = 99, z = -45},
         }
     end
+    -- Called by global name on purpose: it is defined further down, after locals this function
+    -- cannot see. Globals resolve at call time, so this works and a direct reference would not.
+    BackfillBlockAt()
 end
 
 function OnSaveWorld(p_ID, p_Message)
@@ -58,6 +61,9 @@ function OnSaveWorld(p_ID, p_Message)
     -- in memory to search. Indexing incrementally keeps the answer small and costs nothing at
     -- query time; it also survives the detail map growing without bound.
     IndexNames(p_Message.data.cachedWorldDetail)
+    -- ...and index the OCCUPANCY too. A mined block reports itself only here, as a 0; it never
+    -- appears in the detail map again. Reading names alone is what made the index append-only.
+    IndexOccupancy(p_Message.data.cachedWorld)
     PowGPSServer.saveAll()
     MapRender.invalidate()
     return true, true
@@ -91,6 +97,11 @@ end
 function OnUpdatePath(p_ID, p_Message)
     PowGPSServer.UpdateCachedWorld(p_Message.data.cachedWorld, p_ID)
     PowGPSServer.UpdateCachedWorldDetail(p_Message.data.cachedWorldDetail, p_ID)
+    -- This -- not OnSaveWorld -- is the endpoint drones actually use, so it is the one that has to
+    -- keep the index honest. Indexing only in OnSaveWorld would have looked correct in the source
+    -- and done nothing whatsoever in the world.
+    IndexNames(p_Message.data.cachedWorldDetail)
+    IndexOccupancy(p_Message.data.cachedWorld)
     MapRender.invalidate()
     return true, true
 end
@@ -242,14 +253,85 @@ local function parseKey(p_Key)
     return tonumber(x), tonumber(y), tonumber(z)
 end
 
--- name -> {count, at = {up to a few sample positions}}. Small on purpose: enough to answer
--- "do we have iron, and roughly where", not a second copy of the world.
-local INDEX_SAMPLES = 12
+-- The block index: name -> { count, at = { positions } }, plus a reverse map so it can be
+-- CORRECTED rather than only appended to.
+--
+-- The first version only ever incremented. Nothing decremented it when a block was mined, so the
+-- six coal positions stayed listed after a drone had taken them and the supply loop kept
+-- dispatching miners to empty coordinates -- an index that is confidently wrong is worse than no
+-- index, because the autonomy now trusts it.
+--
+-- blockAt is what makes correction possible: knowing what USED to be at a position is the only
+-- way to decrement the right name when it changes. It costs roughly what cachedWorld already
+-- costs, since it holds one entry per known position.
+local INDEX_MAX_POSITIONS = 256   -- per name; ores are few, stone is not worth enumerating
 
+local function idxRemovePos(p_Name, p_Key)
+    local e = DATA["blockIndex"][p_Name]
+    if e == nil then return end
+    e.count = math.max(0, (e.count or 1) - 1)
+    if e.at then
+        for i = #e.at, 1, -1 do
+            local q = e.at[i]
+            if q and (q.x .. ":" .. q.y .. ":" .. q.z) == p_Key then table.remove(e.at, i) break end
+        end
+    end
+    if e.count == 0 and (e.at == nil or #e.at == 0) then DATA["blockIndex"][p_Name] = nil end
+end
+
+-- Record what is at a position NOW. p_Name nil means "air / nothing there any more".
+function ObserveBlock(p_Key, p_Name)
+    if DATA["blockIndex"] == nil then DATA["blockIndex"] = {} end
+    if DATA["blockAt"] == nil then DATA["blockAt"] = {} end
+
+    local s_Was = DATA["blockAt"][p_Key]
+    if s_Was == p_Name then return false end          -- nothing changed
+    if s_Was then idxRemovePos(s_Was, p_Key) end
+
+    if p_Name == nil then
+        DATA["blockAt"][p_Key] = nil
+        return true
+    end
+
+    local e = DATA["blockIndex"][p_Name]
+    if e == nil then e = {count = 0, at = {}} DATA["blockIndex"][p_Name] = e end
+    e.count = (e.count or 0) + 1
+    if #e.at < INDEX_MAX_POSITIONS then
+        local x, y, z = parseKey(p_Key)
+        if x then e.at[#e.at + 1] = {x = x, y = y, z = z} end
+    end
+    DATA["blockAt"][p_Key] = p_Name
+    return true
+end
+
+-- The index that already exists on disk was built by the append-only version, so it has counts and
+-- sample positions but no blockAt -- and without blockAt nothing can be decremented, which would
+-- leave exactly the stale entries this change exists to remove.
+--
+-- Rebuilding from cachedWorldDetail is not an option: that map is the 1.2MB file this computer
+-- cannot load, which is the whole reason the index exists. So seed from the samples instead. They
+-- are the positions gather actually digs at, so they are the ones that must be able to go stale.
+function BackfillBlockAt()
+    if DATA["blockAt"] ~= nil then return 0 end       -- already migrated
+    DATA["blockAt"] = {}
+    local s_N = 0
+    for name, e in pairs(DATA["blockIndex"] or {}) do
+        for _, q in ipairs(e.at or {}) do
+            if q and q.x then
+                DATA["blockAt"][q.x .. ":" .. q.y .. ":" .. q.z] = name
+                s_N = s_N + 1
+            end
+        end
+    end
+    if s_N > 0 then PowNet.MarkDirty() end
+    print(("blockAt backfilled from %d sampled positions"):format(s_N))
+    return s_N
+end
+
+-- Names arriving from a scan.
 function IndexNames(p_Detail)
     if type(p_Detail) ~= "table" then return 0 end
-    if DATA["blockIndex"] == nil then DATA["blockIndex"] = {} end
-    local s_Added = 0
+    local s_Changed = 0
     for key, info in pairs(p_Detail) do
         local s_Name
         if type(info) == "table" then
@@ -257,19 +339,24 @@ function IndexNames(p_Detail)
             if type(s_Data) == "table" and type(s_Data[2]) == "table" then s_Name = s_Data[2].name end
             s_Name = s_Name or info.name
         end
-        if s_Name then
-            local e = DATA["blockIndex"][s_Name]
-            if e == nil then e = {count = 0, at = {}} DATA["blockIndex"][s_Name] = e end
-            e.count = e.count + 1
-            if #e.at < INDEX_SAMPLES then
-                local x, y, z = parseKey(key)
-                if x then e.at[#e.at + 1] = {x = x, y = y, z = z} end
-            end
-            s_Added = s_Added + 1
+        if s_Name and ObserveBlock(key, s_Name) then s_Changed = s_Changed + 1 end
+    end
+    if s_Changed > 0 then PowNet.MarkDirty() end
+    return s_Changed
+end
+
+-- Occupancy arriving from a drone: 0 means the cell is AIR, which is how a mined block reports
+-- itself. This is the half that was missing -- scans could add, but nothing could take away.
+function IndexOccupancy(p_World)
+    if type(p_World) ~= "table" then return 0 end
+    local s_Changed = 0
+    for key, v in pairs(p_World) do
+        if v == 0 and DATA["blockAt"] and DATA["blockAt"][key] then
+            if ObserveBlock(key, nil) then s_Changed = s_Changed + 1 end
         end
     end
-    if s_Added > 0 then PowNet.MarkDirty() end
-    return s_Added
+    if s_Changed > 0 then PowNet.MarkDirty() end
+    return s_Changed
 end
 
 -- Find surveyed blocks whose name contains p_Match. Substring, so "ore" finds every ore and
@@ -298,6 +385,29 @@ function OnFindBlocks(p_ID, p_Message)
     local s_Msg = s_Total .. " matching '" .. s_Match .. "'"
     if s_Total == 0 then s_Msg = s_Msg .. " -- nothing surveyed matches; survey more first" end
     return true, {message = s_Msg, total = s_Total, counts = s_Counts, hits = s_Hits}
+end
+
+-- The whole position -> block name map, for anything that wants to DRAW the world rather than
+-- query it.
+--
+-- cachedWorld already answers "is this cell solid", which is all a pathfinder needs and all the
+-- map page could show: terrain as one undifferentiated mass of grey cubes. What it cannot say is
+-- WHAT is solid, and that is the difference between a picture of the terrain and a picture of the
+-- terrain worth mining.
+--
+-- The obvious source, cachedWorldDetail, is the 1.2MB file this computer cannot load -- the same
+-- wall OnFindBlocks hit. blockAt is the compact form that exists precisely because the index
+-- needed a reverse map, so serving it costs nothing extra.
+--
+-- IT IS NOT THE WHOLE WORLD. blockAt only holds positions a drone actually observed and reported
+-- a name for, which is a small subset of the cells cachedWorld knows the occupancy of. A caller
+-- must treat a missing key as "solid but unidentified", never as air -- cachedWorld remains the
+-- authority on what is solid.
+function OnBlockAt(p_ID, p_Message)
+    local s_At = DATA["blockAt"] or {}
+    local s_N = 0
+    for _ in pairs(s_At) do s_N = s_N + 1 end
+    return true, {blockAt = s_At, count = s_N}
 end
 
 -- Connected pockets of surveyed AIR. A cave is air that is enclosed -- so ignore anything at or
@@ -387,6 +497,7 @@ local m_ServerEvents = {
     GetBounds = { func = OnGetBounds },
     FindBlocks = { func = OnFindBlocks },
     FindCaves  = { func = OnFindCaves },
+    BlockAt    = { func = OnBlockAt },
     gpshost = {
         func = OnAddGpsHost, callable = true,
         params = { pos = { length = 3 } }

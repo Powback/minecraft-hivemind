@@ -99,10 +99,16 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
   // Checking the flag alone let a dead drone count as "busy" and stalled the whole loop.
   const dead = (d: any) => d.offline === true || d.status === 'offline' || d.status === 'lost';
   const live = drones.filter((d: any) => !dead(d));
-  const busy = live.find((d: any) => d.status && d.status !== 'idle');
-  if (busy) return { acted: false, reason: `waiting: ${busy.name} is ${busy.status}` };
-  const idleMiner = live.find((d: any) => (d.role ?? 'miner') === 'miner' && d.status === 'idle');
-  if (!idleMiner) return { acted: false, reason: 'no idle miner' };
+  // Gate per ROLE, not across the fleet.
+  //
+  // This used to bail whenever any drone was working at all, which sounded conservative and was
+  // just wrong: a scout surveying and a miner mining do not contend for anything, so one busy
+  // miner silently blocked every scan. One scout also covers many miners -- surveying is what
+  // makes the next several digs possible -- so making it wait on a free miner had it backwards.
+  const idle = (role: string) => live.find((d: any) => (d.role ?? 'miner') === role && d.status === 'idle');
+  const idleMiner = idle('miner');
+  const idleScout = idle('scout');
+  if (!idleMiner && !idleScout) return { acted: false, reason: 'no idle miner or scout' };
 
   const stock: any = await bridge.call('StorageMan', 'stock', {}, { timeoutMs: 8000 });
   const detail = stock?.detail ?? stock?.data?.detail ?? [];
@@ -111,33 +117,67 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
           .reduce((n: number, d: any) => n + (d.count ?? 0), 0);
 
   const now = Date.now();
+  // Each role can take one job per tick. A tick can therefore start a dig AND a survey, which is
+  // the point: the scan that finds the next vein should not have to wait for the current one to
+  // finish being mined.
+  let minerFree = !!idleMiner;
+  let scoutFree = !!idleScout;
+  const did: string[] = [];
+
   for (const rule of supply.rules) {
+    if (!minerFree && !scoutFree) break;
     const have = held(stockKey(rule));
     if (have >= rule.min) continue;
     if ((supply.cooldowns[rule.match] ?? 0) > now) continue;
 
-    supply.cooldowns[rule.match] = now + COOLDOWN_MS;
     try {
-      if (rule.action === 'gather') {
-        const r: any = await callTool('order.gather', { match: rule.match, limit: rule.limit ?? 64 });
-        if (r?.ok === false) {
-          // Nothing surveyed matches: the honest answer is "go and look", not "dig somewhere".
-          note(`${rule.match}: ${have}/${rule.min} but nothing surveyed — needs a scan`);
-          return { acted: false, reason: `${rule.match} not surveyed` };
-        }
-        supply.dispatched++;
-        supply.lastAction = `gather ${rule.match}`;
-        note(`${rule.match}: ${have}/${rule.min} → gather dispatched`);
-        return { acted: true, reason: `gather ${rule.match}` };
+      if (rule.action !== 'gather') {
+        supply.cooldowns[rule.match] = now + COOLDOWN_MS;
+        note(`${rule.match}: ${have}/${rule.min} → ${rule.action} not yet automatable`);
+        continue;
       }
-      note(`${rule.match}: ${have}/${rule.min} → ${rule.action} not yet automatable`);
-      return { acted: false, reason: `${rule.action} unavailable` };
+
+      // Ask for the dig first, but only if a miner could actually take it.
+      if (minerFree) {
+        const r: any = await callTool('order.gather', { match: rule.match, limit: rule.limit ?? 64 });
+        if (r?.ok !== false) {
+          supply.cooldowns[rule.match] = now + COOLDOWN_MS;
+          minerFree = false;
+          supply.dispatched++;
+          supply.lastAction = `gather ${rule.match}`;
+          note(`${rule.match}: ${have}/${rule.min} → gather dispatched`);
+          did.push(`gather ${rule.match}`);
+          continue;
+        }
+      }
+
+      // Nothing surveyed matches: the honest answer is "go and look", not "dig somewhere".
+      //
+      // This branch used to just log and stop, which was survivable only because the index was
+      // append-only -- a mined-out vein stayed listed for ever, so the loop always had somewhere to
+      // send a miner. Now that the index prunes what drones observe, exhausting a vein empties it
+      // properly and this is where the loop would otherwise come to rest permanently. So it
+      // dispatches the scan it was only describing.
+      if (!scoutFree) continue;          // no cooldown burned: retry as soon as a scout frees up
+      supply.cooldowns[rule.match] = now + COOLDOWN_MS;
+      await bridge.call('TaskMan', 'Add', {
+        name: `find-${rule.match}`,
+        priority: 3,
+        work: { survey: { w: 8, h: 8, radius: 8 } },
+      }, { timeoutMs: 8000 });
+      scoutFree = false;
+      supply.dispatched++;
+      supply.lastAction = `survey for ${rule.match}`;
+      note(`${rule.match}: ${have}/${rule.min}, none known → survey dispatched`);
+      did.push(`survey for ${rule.match}`);
     } catch (err) {
+      supply.cooldowns[rule.match] = now + COOLDOWN_MS;
       note(`${rule.match}: dispatch failed — ${(err as Error)?.message ?? err}`);
-      return { acted: false, reason: 'dispatch failed' };
     }
   }
-  return { acted: false, reason: 'all materials above target' };
+
+  if (did.length) return { acted: true, reason: did.join(', ') };
+  return { acted: false, reason: 'nothing to dispatch' };
 }
 
 export function startSupplyLoop(intervalMs = 60_000) {

@@ -127,6 +127,86 @@ end
 function GetFaults() return m_Faults end
 function ClearFaults() m_Faults = {} return true end
 
+----------------------------------------------------------------------------------------------
+-- Status: what this computer is, where it is, and what it last said
+----------------------------------------------------------------------------------------------
+
+-- Tail of this module's own log file.
+--
+-- startup's Log() already writes every line to <label>.log precisely because a CC terminal cannot
+-- be read from outside the game. Nothing could read it back, so the record existed and helped
+-- nobody. Reading is bounded by BYTES, not lines: these files are truncated at 32KB and a module
+-- that has been up for a day has thousands of lines, none of which are worth shipping over rednet.
+local LOG_TAIL_BYTES = 1200
+local function logTail(p_Lines)
+    p_Lines = p_Lines or 6
+    local s_Out = {}
+    pcall(function()
+        local s_Name = (os.getComputerLabel() or "module") .. ".log"
+        if not fs.exists(s_Name) then return end
+        local s_Size = fs.getSize(s_Name)
+        local h = fs.open(s_Name, "r")
+        if not h then return end
+        -- No seek on a CC read handle, so skip forward instead of holding the whole file: a 32KB
+        -- string built line by line on a computer with this little memory is worth avoiding.
+        local s_Skip = math.max(0, s_Size - LOG_TAIL_BYTES)
+        local s_Seen = 0
+        local s_Ring = {}
+        for line in h.readLine do
+            s_Seen = s_Seen + #line + 1
+            if s_Seen >= s_Skip then
+                s_Ring[#s_Ring + 1] = line
+                if #s_Ring > p_Lines then table.remove(s_Ring, 1) end
+            end
+        end
+        h.close()
+        s_Out = s_Ring
+    end)
+    return s_Out
+end
+
+-- Where this computer physically is.
+--
+-- A non-turtle has no pgps and no cached position, so the only answer available is the GPS
+-- constellation MapServer already hosts -- which is also why this is best-effort. A computer
+-- without a wireless modem, or one outside the constellation's range, legitimately does not know
+-- where it is, and saying nil is the correct answer. Guessing would put a marker on a map that
+-- looks exactly as authoritative as a real one.
+--
+-- The timeout is short on purpose: gps.locate blocks, and this runs inside the receive loop while
+-- a caller is counting down a rednet timeout.
+local m_Pos, m_PosAt = nil, -1000
+local function locate()
+    -- Cached hard. A computer does not move, so re-locating costs a GPS round trip to answer a
+    -- question whose answer cannot have changed.
+    if m_Pos ~= nil or (os.clock() - m_PosAt) < 60 then return m_Pos end
+    m_PosAt = os.clock()
+    local s_Ok, x, y, z = pcall(gps.locate, 1)
+    if s_Ok and x then m_Pos = {x = x, y = y, z = z} end
+    return m_Pos
+end
+
+function Status()
+    local s_Faults = GetFaults()
+    return {
+        module   = MODULENAME,
+        id       = os.getComputerID(),
+        label    = os.getComputerLabel(),
+        pos      = locate(),
+        -- Seconds since this computer booted. A module that answers with a tiny uptime is a
+        -- module that has been crash-looping, which no other field would reveal.
+        up       = os.clock(),
+        faults   = #s_Faults,
+        lastFault = s_Faults[#s_Faults],
+        -- What the monitor is showing, for the modules that drive it through Log(). NOT readable
+        -- in general: CC monitors are write-only, there is no API to read back what was painted,
+        -- so a module that draws its own dashboard (MainFrame, MapServer) cannot be mirrored --
+        -- only the modules whose display IS their last Log line.
+        monitor  = _G.LAST_LOG,
+        log      = logTail(6),
+    }
+end
+
 -- Find this computer's display. Reimplemented in six modules, each slightly differently: some
 -- wrapped a fixed side once at load and died on the first Render if nothing was there, some
 -- searched every time. "left" is the VIEWER's left, not the computer's, so a fixed side is also
@@ -157,6 +237,16 @@ function RegisterEvents( p_ServerEvents, p_DroneEvents, p_Update )
     p_ServerEvents["ClearFaults"] = {
         func = function() ClearFaults() return true, {module = MODULENAME, cleared = true} end
     }
+    -- "Where is this computer and what is it saying?" -- registered for every module for the same
+    -- reason Faults is: a diagnostic each module has to remember to implement is one most of them
+    -- will not have.
+    --
+    -- The fleet's non-turtle computers were completely invisible from outside the game. Drones
+    -- report position and status on a heartbeat; MainFrame, MapServer, TaskMan, StorageMan and
+    -- DockingMan report nothing at all, so the map could draw the machines that dig and not the
+    -- ones that decide. You could see five turtles idling and have no way to tell whether that was
+    -- because there was no work or because TaskMan had been sitting dead since the last reboot.
+    p_ServerEvents["Status"] = { func = function() return true, Status() end }
     m_ServerEvents = p_ServerEvents
     m_DroneEvents = p_DroneEvents
     m_Update = p_Update

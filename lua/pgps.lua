@@ -258,6 +258,82 @@ function detectAll()
 end
 
 
+-- POSITION CONFIRMATION
+--
+-- Everything a drone reports about the world is stamped with where the drone THINKS it is. That
+-- belief is dead reckoning: it survives only as long as every move is counted correctly, and a
+-- blocked move, a chunk unload or a reboot mid-step silently shifts it. Until now a drifted
+-- position only produced a slightly wrong map, which pathing tolerated.
+--
+-- It is no longer harmless. Air observations now DELETE entries from the server's block index, so
+-- a drone one block out of position deletes the wrong block -- and a deletion cannot be noticed
+-- the way a bad addition can, because what it leaves behind is an absence. Four coal blocks that
+-- are still in the ground were removed from the index exactly this way.
+--
+-- So: a cheap position-only fix (gps.locate does NOT move the turtle, unlike the direction-finding
+-- in setLocationFromGPS), and destructive observations are only shipped while a recent fix agrees.
+-- With no GPS the index simply stops being pruned, which is the old, stale-but-safe behaviour.
+-- Stale can be corrected by looking again. Wrong cannot.
+local m_LastFix   = nil
+local m_Drift     = 0        -- how far off the last check found us; diagnostics
+local m_Suppressed = 0       -- observations withheld for want of a fix
+local FIX_MAX_AGE = 60       -- seconds
+
+function verifyPosition()
+    if not startGPS() then return nil, "no modem for gps" end
+    local x, y, z = gps.locate(2, false)
+    if x == nil then return nil, "no gps fix" end
+    if cachedX ~= nil then
+        m_Drift = math.abs(x - cachedX) + math.abs(y - cachedY) + math.abs(z - cachedZ)
+        if m_Drift > 0 then
+            print(("position corrected by %d: %d,%d,%d -> %d,%d,%d")
+                :format(m_Drift, cachedX, cachedY, cachedZ, x, y, z))
+        end
+    end
+    cachedX, cachedY, cachedZ = x, y, z
+    m_LastFix = os.clock()
+    return true, m_Drift
+end
+
+function positionVerified()
+    return m_LastFix ~= nil and (os.clock() - m_LastFix) <= FIX_MAX_AGE
+end
+
+function fixStatus()
+    return {verified = positionVerified(), drift = m_Drift, suppressed = m_Suppressed,
+            ageSeconds = m_LastFix and (os.clock() - m_LastFix) or nil}
+end
+
+-- Record that the cell in p_Which ("forward" | "up" | "down") is now AIR.
+--
+-- Digging is the one way the world changes that the survey never learned about. detectAll only
+-- reports what a drone is standing next to, and a gather job mines a whole vein without entering
+-- most of it, so mined-out ore stayed in the server's index for ever and the supply loop kept
+-- dispatching drones to coordinates that were already air. This is the observation that makes the
+-- index self-correcting: the drone that removed the block is the one that reports it gone.
+--
+-- Must live below `deltas`, which is a local declared after noteObservation.
+function noteCleared(p_Which)
+    local d
+    if p_Which == "up"        then d = deltas[Up]
+    elseif p_Which == "down"  then d = deltas[Down]
+    else                           d = deltas[cachedDir] end
+    if d == nil then return nil end
+
+    local idx = (cachedX + d[1])..":"..(cachedY + d[2])..":"..(cachedZ + d[3])
+    -- Always update our OWN cache: pathing needs to know it just cleared a way through, and a
+    -- wrong local cache costs at most a replan.
+    cachedWorld[idx] = 0
+    cachedWorldDetail[idx] = nil
+    -- Only tell the SERVER while a recent fix agrees on where we are. See the note above.
+    if positionVerified() then
+        noteObservation(idx, 0)
+    else
+        m_Suppressed = m_Suppressed + 1
+    end
+    return idx
+end
+
 ----------------------------------------
 -- forward
 --

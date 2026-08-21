@@ -259,13 +259,28 @@ function OnAbortTask(p_ID, p_Message)
 end
 
 -- The queue, for anything that wants to show it. MainFrame draws it on the hub monitor.
+--
+-- `work` and `assignedTo` now travel with each task, and they are the whole point for anything
+-- drawing a map. Without them a task is a name and a percentage -- you can see that D3 is busy,
+-- but not that it is surveying a box thirty blocks north, which is the only form of the answer
+-- that lets an operator tell "working correctly" from "working somewhere useless". The verb and
+-- its bounds are the INTENT; everything else here is bookkeeping about the intent.
+--
+-- assignedTo is the drone id. `assigned` is a comma-joined list of NAMES, which is fine for a
+-- monitor line and useless for joining against the fleet registry.
 function OnGetTasks(p_ID, p_Message)
     local s_List = {}
     for k,v in pairs(DATA["tasks"]) do
         s_List[#s_List + 1] = {
             id = v.id, name = v.name, progress = v.progress,
             enabled = v.enabled, paused = v.paused,
-            assigned = v.assigned, role = RoleForWork(v.work),
+            assigned = v.assigned, assignedTo = v.assignedTo,
+            role = RoleForWork(v.work),
+            -- Sent whole rather than summarised. The shapes differ per verb -- dig has
+            -- start/stop, survey has min/max, gather has a target list, lumber has width and
+            -- length -- and a summariser here would have to be updated every time a verb is
+            -- added, silently omitting the new one until someone noticed.
+            work = v.work,
         }
     end
     return true, {tasks = s_List, count = #s_List}

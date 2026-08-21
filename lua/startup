@@ -18,6 +18,10 @@ local monitor
 -- and it died on a nil call — silently, because shell.run catches the error itself.
 function _G.Log(p_Message, p_Color)
     print(p_Message)
+    -- The last line painted on the monitor, kept so PowNet.Status can report it. CC monitors are
+    -- write-only -- there is no API to read back what is on one -- so remembering what we wrote is
+    -- the only way anything outside the game can know what the screen says.
+    _G.LAST_LOG = tostring(p_Message)
     -- Also to a file, because a CC terminal cannot be read from outside the game. Without this a
     -- module is completely opaque: StorageMan sat with smelting on, a furnace found, and a chest
     -- full of coal, failing to move it, and there was no way to see the reason it printed.

@@ -184,12 +184,26 @@ local function settle(p_MaxDrop)
     return s_Drops
 end
 
+-- Step forward, climbing over whatever is in the way -- and then COMING BACK DOWN.
+--
+-- The descent is the whole point. Without it every obstacle ratcheted the drone permanently
+-- upward: a survey walks hundreds of forward steps, each dune or wall added a few blocks of
+-- altitude, nothing ever gave any back, and the scout ended up at y=117 diligently scanning empty
+-- sky. It looked like the scanner was broken or the grid was wrong; it was neither. A scout that
+-- drifts above the terrain is not surveying anything, it is just burning fuel politely.
 local function stepForward(p_MaxClimb)
     local s_Climbs = 0
     while not pgps.forward() do
         if s_Climbs >= p_MaxClimb then return false end
         if not pgps.up() then return false end
         s_Climbs = s_Climbs + 1
+    end
+
+    -- Give back exactly what was taken, and only into open air -- never dig down to get there,
+    -- and never descend further than we climbed, so this cannot walk a drone into a ravine.
+    for _ = 1, s_Climbs do
+        if turtle.detectDown() then break end
+        if not pgps.down() then break end
     end
     return true
 end
@@ -381,6 +395,10 @@ function OnSurvey(p_ID, p_Message)
         for row = 1, s_H do
             for col = 1, s_W do
                 if not executing then break end
+                -- A scan is thousands of blocks recorded relative to where we think we are, so a
+                -- drifted position poisons the map wholesale rather than one cell at a time. Fix
+                -- first, scan second.
+                pgps.verifyPosition()
                 local n = absorbScan(s_Sc, s_R)
                 s_Total, s_Scans = s_Total + n, s_Scans + 1
                 UploadWorld()
@@ -499,7 +517,7 @@ function IsProtected(p_Name)
     return string.sub(p_Name, 1, 14) == "computercraft:"
 end
 
-local function digHard(p_Dig, p_Detect, p_Inspect)
+local function digHard(p_Dig, p_Detect, p_Inspect, p_Which)
     local s_Tries = 0
     while p_Detect() do
         if p_Inspect then
@@ -514,12 +532,16 @@ local function digHard(p_Dig, p_Detect, p_Inspect)
         if s_Tries > 24 then return false end
         os.sleep(0.4)
     end
+    -- Every dig in the fleet funnels through here, so this is the one place that has to tell the
+    -- map the block is gone -- and it reports the cell even when the loop never ran, because
+    -- "nothing to dig" is itself the observation that the cell is air.
+    pgps.noteCleared(p_Which)
     return true
 end
 
-function DigForward() return digHard(turtle.dig,     turtle.detect,     turtle.inspect)     end
-function DigUp()      return digHard(turtle.digUp,   turtle.detectUp,   turtle.inspectUp)   end
-function DigDown()    return digHard(turtle.digDown, turtle.detectDown, turtle.inspectDown) end
+function DigForward() return digHard(turtle.dig,     turtle.detect,     turtle.inspect,     "forward") end
+function DigUp()      return digHard(turtle.digUp,   turtle.detectUp,   turtle.inspectUp,   "up")      end
+function DigDown()    return digHard(turtle.digDown, turtle.detectDown, turtle.inspectDown, "down")    end
 
 -- Empty into storage, then come back and carry on. Asking StorageMan where to go (rather than
 -- hardcoding a chest) is what lets storage move or grow without touching drone code.
@@ -804,6 +826,9 @@ function OnGather(p_ID, p_Message)
             if not s_Seen[k] then
                 s_Seen[k] = true
                 if not depositIfFull() then break end
+                -- Re-fix before each dig. Cheap (no movement) and this is the job that edits the
+                -- map destructively, so it is the one that must know where it is.
+                pgps.verifyPosition()
                 if pgps.moveTo(t.x, t.y + 1, t.z) ~= false then
                     local s_Ok, s_Blk = turtle.inspectDown()
                     if s_Ok and s_Blk and wanted(s_Blk.name) then
