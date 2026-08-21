@@ -26,6 +26,7 @@ import { readFile, readdir, stat } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { join, relative, extname } from 'node:path';
 import { registry } from './tools/registry.js';
+import { startSupplyLoop } from './agent/supply.js';
 import './tools/core.js';                 // side-effect: registers the core tools
 import { buildBrief } from './tools/core.js';
 import { getProfile, permits } from './agent/profiles.js';
@@ -174,5 +175,6 @@ bridge.attach(server, '/bridge');
 server.listen(PORT, '0.0.0.0', () => {
   log(`HQ listening on :${PORT}`);
   log(`  tools registered: ${registry.list().length}`);
+  startSupplyLoop();
   log(`  lua tree: ${LUA_DIR}`);
 });

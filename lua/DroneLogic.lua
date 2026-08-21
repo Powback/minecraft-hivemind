@@ -472,9 +472,43 @@ end
 -- Gravel and sand fall into the space you just cleared, so a single dig is not enough. Bounded,
 -- because a dig that keeps succeeding forever means we are standing under a gravel column and
 -- should give up rather than mine the sky.
-local function digHard(p_Dig, p_Detect)
+-- Never break the fleet's own infrastructure. EVERY dig in every job funnels through digHard, so
+-- this is the one place the rule needs to exist -- and the only place it cannot be forgotten when
+-- a new job type is added.
+--
+-- D1 mined D2 out of the world: a turtle became an item in a chest while the registry went on
+-- listing it as idle. Refusing the whole SITE would be the wrong fix -- sites legitimately contain
+-- things, and a job that will not start is worse than one that digs around an obstacle. So check
+-- the block that is actually about to be broken, and leave it standing.
+local PROTECTED = {
+    ["minecraft:chest"]         = true,
+    ["minecraft:trapped_chest"] = true,
+    ["minecraft:barrel"]        = true,
+    ["minecraft:furnace"]       = true,
+    ["minecraft:blast_furnace"] = true,
+    ["minecraft:smoker"]        = true,
+    ["minecraft:hopper"]        = true,
+    ["minecraft:shulker_box"]   = true,
+}
+
+function IsProtected(p_Name)
+    if p_Name == nil then return false end
+    if PROTECTED[p_Name] then return true end
+    -- Anything from the CC mod is fleet infrastructure by definition: turtles, computers, modems,
+    -- cable, disk drives, monitors. Matching the namespace covers blocks nobody has added yet.
+    return string.sub(p_Name, 1, 14) == "computercraft:"
+end
+
+local function digHard(p_Dig, p_Detect, p_Inspect)
     local s_Tries = 0
     while p_Detect() do
+        if p_Inspect then
+            local s_Ok, s_Blk = p_Inspect()
+            if s_Ok and s_Blk and IsProtected(s_Blk.name) then
+                print("refusing to mine " .. tostring(s_Blk.name))
+                return false, s_Blk.name
+            end
+        end
         if not p_Dig() then return false end
         s_Tries = s_Tries + 1
         if s_Tries > 24 then return false end
@@ -483,9 +517,9 @@ local function digHard(p_Dig, p_Detect)
     return true
 end
 
-function DigForward() return digHard(turtle.dig,     turtle.detect)     end
-function DigUp()      return digHard(turtle.digUp,   turtle.detectUp)   end
-function DigDown()    return digHard(turtle.digDown, turtle.detectDown) end
+function DigForward() return digHard(turtle.dig,     turtle.detect,     turtle.inspect)     end
+function DigUp()      return digHard(turtle.digUp,   turtle.detectUp,   turtle.inspectUp)   end
+function DigDown()    return digHard(turtle.digDown, turtle.detectDown, turtle.inspectDown) end
 
 -- Empty into storage, then come back and carry on. Asking StorageMan where to go (rather than
 -- hardcoding a chest) is what lets storage move or grow without touching drone code.
@@ -718,6 +752,84 @@ local function fellTree()
     return s_Logs
 end
 
+-- Go and get SPECIFIC blocks, and take the WHOLE cluster.
+--
+-- Dig sweeps a volume, which is right for bulk stone and wrong for everything the survey already
+-- located: 6 coal ore at known coordinates do not need an 8x8x4 hole. The seeds come from
+-- MapServer's block index, so this is the consuming half of surveying -- without it the index is
+-- a report nobody acts on.
+--
+-- Seeds are only a starting point. Ore generates in VEINS, and the index holds at most a dozen
+-- sample positions per block type, so mining just the samples would leave most of the vein in the
+-- ground and require re-surveying to find what was always there. Each seed is therefore flood
+-- filled: mine it, then consider its neighbours, and keep going while they match. `limit` bounds
+-- the whole job so one enormous vein cannot consume a drone indefinitely.
+--
+-- Blocks are approached from ABOVE and dug downward: a turtle cannot occupy the target, and the
+-- space above it is the one position reachable for anything with air over it.
+function OnGather(p_ID, p_Message)
+    return RunJob("Gather", p_Message.data,
+        {status = "mining", travel = false, settle = false}, function(d)
+        local s_Match  = d.match
+        local s_Limit  = tonumber(d.limit) or 64
+        local s_Queue  = {}
+        local s_Seen   = {}
+        local s_Got, s_Missed = 0, 0
+
+        local function key(x, y, z) return x .. ":" .. y .. ":" .. z end
+        local function push(x, y, z)
+            if x and y and z and not s_Seen[key(x, y, z)] then
+                s_Queue[#s_Queue + 1] = {x = x, y = y, z = z}
+            end
+        end
+        local function wanted(p_Name)
+            if p_Name == nil then return false end
+            if IsProtected(p_Name) then return false end
+            if s_Match == nil then return true end
+            return string.find(p_Name, s_Match, 1, true) ~= nil
+        end
+
+        for _, t in ipairs(d.targets or {}) do
+            push(tonumber(t.x), tonumber(t.y), tonumber(t.z))
+        end
+
+        -- Cap CANDIDATES as well as blocks taken. The limit above bounds what we mine, but a
+        -- vein sitting in solid rock has a boundary of non-matching neighbours, each costing a
+        -- flight to inspect -- so an exhausted vein could cost dozens of trips for nothing.
+        local s_Checked, s_MaxChecks = 0, math.max(24, s_Limit * 3)
+        while #s_Queue > 0 and s_Got < s_Limit and s_Checked < s_MaxChecks and executing do
+            s_Checked = s_Checked + 1
+            local t = table.remove(s_Queue)
+            local k = key(t.x, t.y, t.z)
+            if not s_Seen[k] then
+                s_Seen[k] = true
+                if not depositIfFull() then break end
+                if pgps.moveTo(t.x, t.y + 1, t.z) ~= false then
+                    local s_Ok, s_Blk = turtle.inspectDown()
+                    if s_Ok and s_Blk and wanted(s_Blk.name) then
+                        if DigDown() then
+                            s_Got = s_Got + 1
+                            -- The vein continues through the faces of what we just took.
+                            push(t.x + 1, t.y, t.z)
+                            push(t.x - 1, t.y, t.z)
+                            push(t.x, t.y, t.z + 1)
+                            push(t.x, t.y, t.z - 1)
+                            push(t.x, t.y - 1, t.z)
+                            push(t.x, t.y + 1, t.z)
+                        end
+                    end
+                else
+                    s_Missed = s_Missed + 1
+                end
+            end
+        end
+
+        return {message = ("gathered %d (limit %d, %d unreachable)")
+                    :format(s_Got, s_Limit, s_Missed),
+                got = s_Got, missed = s_Missed}
+    end)
+end
+
 function OnLumber(p_ID, p_Message)
     return RunJob("Lumber", p_Message.data, {status = "logging"}, function(d)
         local s_W = tonumber(d.w) or 8
@@ -818,6 +930,9 @@ local m_DroneEvents = {
     },
     Lumber = {
         func = OnLumber,
+    },
+    Gather = {
+        func = OnGather,
     }
 }
 

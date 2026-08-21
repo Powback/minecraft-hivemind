@@ -100,6 +100,7 @@ end
 function RoleForWork(p_Work)
     if p_Work == nil then return "miner" end
     if p_Work["survey"] or p_Work["scan"] then return "scout" end
+    if p_Work["gather"] then return "miner" end
     -- Lumber goes to a miner: roles are derived from HARDWARE (geoscanner -> scout, chunky ->
     -- loader, otherwise miner) and there is no wood-specific upgrade. A turtle digs wood with
     -- whatever tool it has.
@@ -166,6 +167,11 @@ function OnStartTask(p_ID, p_Message)
             return false, "every miner is busy (" .. tostring(s_Busy2 and s_Busy2.name) .. ")"
         end
         local w = s_Task.work.dig
+
+        -- NOT refused for containing a drone. That check lived here and was the wrong level:
+        -- sites legitimately contain things, and a job that will not start is worse than one that
+        -- digs around an obstacle. The rule belongs at the block being broken -- see IsProtected
+        -- in DroneLogic, which every dig funnels through.
         local s_Depth = tonumber(w.depth) or (math.abs((w.stop.y or 0) - (w.start.y or 0)) + 1)
         local s_Slabs = dig.SplitRegion(w.start, w.stop, #s_Free, s_Depth)
 
@@ -202,6 +208,10 @@ function OnStartTask(p_ID, p_Message)
     if s_Role == "scout" then
         local w = s_Task.work.survey or {}
         s_Verb, s_Payload = "Survey", {w = w.w, h = w.h, radius = w.radius}
+    elseif s_Task.work.gather then
+        -- Targeted collection: the survey already knows where these blocks are.
+        local w = s_Task.work.gather
+        s_Verb, s_Payload = "Gather", {targets = w.targets, match = w.match, limit = w.limit}
     elseif s_Task.work.lumber then
         -- Wood gates chests, planks and sticks, and therefore every factory the fleet might
         -- build. Nothing else produces it.

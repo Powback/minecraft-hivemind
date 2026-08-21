@@ -51,6 +51,13 @@ function OnSaveWorld(p_ID, p_Message)
     if(p_Message.data.cachedWorldDetail) then
         PowGPSServer.UpdateCachedWorldDetail(p_Message.data.cachedWorldDetail, p_ID)
     end
+    -- Index the names as they ARRIVE, rather than scanning the detail map on demand.
+    --
+    -- That map is now 1.2MB and 1000+ entries. blockData (96KB) still loads, which is why
+    -- world.caves works and world.find returned zero for everything -- the detail table was never
+    -- in memory to search. Indexing incrementally keeps the answer small and costs nothing at
+    -- query time; it also survives the detail map growing without bound.
+    IndexNames(p_Message.data.cachedWorldDetail)
     PowGPSServer.saveAll()
     MapRender.invalidate()
     return true, true
@@ -235,6 +242,36 @@ local function parseKey(p_Key)
     return tonumber(x), tonumber(y), tonumber(z)
 end
 
+-- name -> {count, at = {up to a few sample positions}}. Small on purpose: enough to answer
+-- "do we have iron, and roughly where", not a second copy of the world.
+local INDEX_SAMPLES = 12
+
+function IndexNames(p_Detail)
+    if type(p_Detail) ~= "table" then return 0 end
+    if DATA["blockIndex"] == nil then DATA["blockIndex"] = {} end
+    local s_Added = 0
+    for key, info in pairs(p_Detail) do
+        local s_Name
+        if type(info) == "table" then
+            local s_Data = info.data
+            if type(s_Data) == "table" and type(s_Data[2]) == "table" then s_Name = s_Data[2].name end
+            s_Name = s_Name or info.name
+        end
+        if s_Name then
+            local e = DATA["blockIndex"][s_Name]
+            if e == nil then e = {count = 0, at = {}} DATA["blockIndex"][s_Name] = e end
+            e.count = e.count + 1
+            if #e.at < INDEX_SAMPLES then
+                local x, y, z = parseKey(key)
+                if x then e.at[#e.at + 1] = {x = x, y = y, z = z} end
+            end
+            s_Added = s_Added + 1
+        end
+    end
+    if s_Added > 0 then PowNet.MarkDirty() end
+    return s_Added
+end
+
 -- Find surveyed blocks whose name contains p_Match. Substring, so "ore" finds every ore and
 -- "dirt" finds dirt/coarse_dirt/rooted_dirt.
 function OnFindBlocks(p_ID, p_Message)
@@ -243,22 +280,17 @@ function OnFindBlocks(p_ID, p_Message)
     if s_Match == nil then return false, "Missing match" end
     local s_Limit = tonumber(d.limit) or 40
 
-    local s_Detail = PowGPSServer.cachedWorldDetail or {}
+    -- Served from the incremental index, NOT by walking the detail map: that map is over 1.2MB
+    -- and does not load on an in-world computer, so scanning it returned zero for every query.
+    local s_Index = DATA["blockIndex"] or {}
     local s_Hits, s_Counts, s_Total = {}, {}, 0
-    for key, info in pairs(s_Detail) do
-        local s_Name
-        if type(info) == "table" then
-            -- detail is {discovered=..., discoverer=..., data={true, {state=..., name=...}}}
-            local s_Data = info.data
-            if type(s_Data) == "table" and type(s_Data[2]) == "table" then s_Name = s_Data[2].name end
-            s_Name = s_Name or info.name
-        end
-        if s_Name and string.find(s_Name, s_Match, 1, true) then
-            s_Total = s_Total + 1
-            s_Counts[s_Name] = (s_Counts[s_Name] or 0) + 1
-            if #s_Hits < s_Limit then
-                local x, y, z = parseKey(key)
-                if x then s_Hits[#s_Hits + 1] = {name = s_Name, x = x, y = y, z = z} end
+    for s_Name, e in pairs(s_Index) do
+        if string.find(s_Name, s_Match, 1, true) then
+            s_Total = s_Total + e.count
+            s_Counts[s_Name] = e.count
+            for _, p in ipairs(e.at or {}) do
+                if #s_Hits >= s_Limit then break end
+                s_Hits[#s_Hits + 1] = {name = s_Name, x = p.x, y = p.y, z = p.z}
             end
         end
     end

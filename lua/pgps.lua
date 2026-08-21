@@ -283,7 +283,19 @@ function forward()
         detectAll()
         return true
     else
-        cachedWorld[idx_pos] = (turtle.detect() and 1 or 0.5)
+        -- Something stopped us: record it and put it in the DELTA, not just the local cache.
+        --
+        -- A blocked move is a real observation -- often a better one than a scan, because it is
+        -- ground truth from a drone that tried. Writing straight to cachedWorld kept it local
+        -- until the next full SavePath, so other drones re-planned into the same wall.
+        --
+        -- 0.5 was used for "blocked but detect() says nothing" (a mob, another turtle). That reads
+        -- back as neither 1 nor 0, i.e. UNKNOWN, throwing away the one thing we just learned. It
+        -- is recorded as solid instead: transiently wrong if a mob wanders off, and a scan will
+        -- correct it, which is much cheaper than pathing into it repeatedly.
+        local s_Solid = 1
+        cachedWorld[idx_pos] = s_Solid
+        noteObservation(idx_pos, s_Solid, cachedWorldDetail[idx_pos])
         return false
     end
 end
@@ -445,9 +457,40 @@ function SavePath()
     cachedWorld = {}
 end
 
+-- BOUNDED. This loop used to be `while not there do replan; walk; end` with no way out, so a
+-- target that cannot be reached -- one buried in solid rock, behind a claim, past the edge of the
+-- map -- hung the drone permanently. It looked alive the whole time: heartbeats kept arriving from
+-- their own coroutine, so DroneMan showed it "mining" at a fixed position with fuel that never
+-- moved. D1 hung exactly this way on a Gather boundary candidate embedded in stone.
+--
+-- Give up on two conditions: too many replans, or several replans in a row that did not get us
+-- closer. Distance is the honest progress signal -- a path can legitimately go sideways for a few
+-- steps, so it takes repeated non-improvement to count as stuck.
+local MOVE_MAX_REPLANS = 40
+local MOVE_MAX_STALLS  = 4
+
 function moveTo(_targetX, _targetY, _targetZ, _targetDir, changeDir, discover)
     changeDir = changeDir or false
+    local s_Replans, s_Stalls, s_LastDist = 0, 0, nil
     while cachedX ~= _targetX or cachedY ~= _targetY or cachedZ ~= _targetZ do
+        s_Replans = s_Replans + 1
+        if s_Replans > MOVE_MAX_REPLANS then
+            print("moveTo: giving up after " .. s_Replans .. " replans")
+            return false, "unreachable"
+        end
+        local s_Dist = math.abs(cachedX - _targetX)
+                     + math.abs(cachedY - _targetY)
+                     + math.abs(cachedZ - _targetZ)
+        if s_LastDist ~= nil and s_Dist >= s_LastDist then
+            s_Stalls = s_Stalls + 1
+            if s_Stalls >= MOVE_MAX_STALLS then
+                print("moveTo: no progress toward " .. _targetX .. "," .. _targetY .. "," .. _targetZ)
+                return false, "no progress"
+            end
+        else
+            s_Stalls = 0
+        end
+        s_LastDist = s_Dist
         --TODO: NETWORK
         local s_Request = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "GetPath", {cachedX, cachedY, cachedZ, _targetX, _targetY, _targetZ, discover})
         local s_Response = PowNet.sendAndWaitForResponse("MapServer", s_Request)

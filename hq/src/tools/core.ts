@@ -15,6 +15,7 @@ import { z } from 'zod';
 import { registry, ToolError } from './registry.js';
 import { state, STALE_MS, type Vec3 } from '../world/state.js';
 import { bridge } from '../bridge/ws.js';
+import { supply, runSupplyTick, stockKey, type SupplyRule } from '../agent/supply.js';
 
 /**
  * Pull the fleet from DroneMan, which owns the registry.
@@ -44,10 +45,13 @@ async function refreshFleet(): Promise<void> {
         id,
         name: d.name ?? `drone-${id}`,
         role: d.role ?? 'miner',
-        status: d.status ?? 'idle',
+        status: d.offline ? 'lost' : (d.status ?? 'idle'),
         fuel: typeof d.fuel === 'number' ? d.fuel : 0,
         pos: d.pos && typeof d.pos.x === 'number' ? d.pos : undefined,
-        lastSeen: now,
+        // DroneMan's timestamp, NOT now. Stamping `now` here measures when HQ last polled, so
+        // every drone reported silent=0s -- including one that had been mined out of the world.
+        // A liveness field that is always zero is worse than none: it looks like proof of life.
+        lastSeen: typeof d.lastSeen === 'number' ? d.lastSeen : (d.offline ? 0 : now),
       });
     }
   } catch (err) {
@@ -315,6 +319,120 @@ registry.register({
       }
     }
     return { total, modules: out };
+  },
+});
+
+// ── supply.status / supply.set ─────────────────────────────────────────────
+// The autonomous half: stock is compared against targets on a timer and each shortfall becomes
+// the job that fixes it, so drones stop idling while a human decides what is needed.
+registry.register({
+  name: 'supply.status',
+  summary: 'The standing supply policy, and what the loop has been doing.',
+  description: 'Shows each material target, current holdings, whether the loop is on, and its recent actions.',
+  params: z.object({}).strict(),
+  returns: 'enabled flag, rules with current stock, recent decisions.',
+  danger: 'read',
+  handler: async () => {
+    let held: Record<string, number> = {};
+    if (bridge.connected) {
+      try {
+        const stock: any = await bridge.call('StorageMan', 'stock', {}, { timeoutMs: 8000 });
+        const detail = stock?.detail ?? stock?.data?.detail ?? [];
+        for (const r of supply.rules) {
+          held[r.match] = detail
+            .filter((d: any) => typeof d.name === 'string' && d.name.includes(stockKey(r)))
+            .reduce((n: number, d: any) => n + (d.count ?? 0), 0);
+        }
+      } catch { /* reported as unknown below */ }
+    }
+    return {
+      enabled: supply.enabled,
+      dispatched: supply.dispatched,
+      lastAction: supply.lastAction ?? null,
+      rules: supply.rules.map((r) => ({ ...r, have: held[r.match] ?? null,
+                                        short: (held[r.match] ?? 0) < r.min })),
+      recent: supply.log.slice(0, 10),
+    };
+  },
+});
+
+registry.register({
+  name: 'supply.set',
+  summary: 'Turn the supply loop on or off, or change a material target.',
+  description:
+    'The loop dispatches at most ONE job at a time and only when a drone of the right role is ' +
+    'idle, so it never competes with work you ordered. Off by default: an autonomous fleet should ' +
+    'not start itself.',
+  params: z.object({
+    enabled: z.boolean().optional(),
+    match: z.string().min(2).optional().describe('Material to add or adjust.'),
+    min: z.number().int().min(0).max(10000).optional(),
+    action: z.enum(['gather', 'lumber']).optional(),
+    limit: z.number().int().min(1).max(512).optional(),
+    runNow: z.boolean().optional().describe('Run one tick immediately rather than waiting.'),
+  }).strict(),
+  returns: 'The updated policy, and the result of the immediate tick if requested.',
+  danger: 'mutate',
+  handler: async (a, ctx) => {
+    if (typeof a.enabled === 'boolean') supply.enabled = a.enabled;
+    if (a.match) {
+      const existing = supply.rules.find((r) => r.match === a.match);
+      if (existing) {
+        if (a.min !== undefined) existing.min = a.min;
+        if (a.action) existing.action = a.action;
+        if (a.limit !== undefined) existing.limit = a.limit;
+      } else {
+        supply.rules.push({ match: a.match, min: a.min ?? 32,
+                            action: a.action ?? 'gather', limit: a.limit } as SupplyRule);
+      }
+    }
+    let tick;
+    if (a.runNow) tick = await runSupplyTick();
+    ctx.log('supply.set', { enabled: supply.enabled, rules: supply.rules.length });
+    return { enabled: supply.enabled, rules: supply.rules, tick: tick ?? null };
+  },
+});
+
+// ── order.gather ───────────────────────────────────────────────────────────
+// The consuming half of surveying. world.find already knows where things are; without this the
+// index is a report nobody acts on, and the only way to get a material was to quarry a box and
+// hope. Seeds come from the index; the drone flood-fills each one, so a vein is taken whole.
+registry.register({
+  name: 'order.gather',
+  summary: 'Send a miner to collect a specific material the survey has already located.',
+  description:
+    'Looks the material up in the block index and dispatches a miner to each cluster, following ' +
+    'the vein outward from every seed. Use for ore, dirt, clay -- anything known and scattered. ' +
+    'Use order.issue{kind:dig} instead for bulk excavation of a volume.',
+  params: z.object({
+    match: z.string().min(2).describe('Block name substring, e.g. "coal_ore" or "dirt".'),
+    limit: z.number().int().min(1).max(512).default(64)
+      .describe('Maximum blocks to take, so one huge vein cannot occupy a drone forever.'),
+  }).strict(),
+  returns: 'Whether it dispatched, how many seed positions were found, and the material.',
+  danger: 'destructive',
+  handler: async (a, ctx) => {
+    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+
+    const found: any = await bridge.call('MapServer', 'FindBlocks',
+      { match: a.match, limit: 40 }, { timeoutMs: 10000 });
+    const hits = found?.hits ?? found?.data?.hits ?? [];
+    const seeds = Array.isArray(hits) ? hits : Object.values(hits ?? {});
+    if (!seeds.length) {
+      throw new ToolError(
+        `Nothing matching "${a.match}" has been surveyed.`,
+        'Survey the area first, or check world.find for what is actually known.');
+    }
+
+    const res: any = await bridge.call('TaskMan', 'Add', {
+      name: `gather:${a.match}`,
+      priority: 2,
+      work: { gather: { targets: seeds, match: a.match, limit: a.limit } },
+    }, { timeoutMs: 8000 });
+
+    ctx.log(`gather ${a.match}`, { seeds: seeds.length, limit: a.limit });
+    return { dispatched: true, material: a.match, seeds: seeds.length,
+             limit: a.limit, task: res?.id ?? res?.data?.id };
   },
 });
 

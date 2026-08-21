@@ -44,6 +44,7 @@ function RegisterDrone(p_ID, p_Pos, p_Heading, p_Role)
     local s_Existing = GetDroneIDByCCID(p_ID)
     if(s_Existing ~= nil and DATA["drones"][s_Existing] ~= nil) then
         local s_Drone = DATA["drones"][s_Existing]
+        s_Drone.lastSeen = os.epoch("utc")   -- seen right now, by definition
         print("Drone " .. tostring(p_ID) .. " is already " .. tostring(s_Drone.name) .. ", replaying")
         local s_Dock = s_Drone.dock or {}
         return true, {name = s_Drone.name, go = s_Dock.pos, heading = s_Dock.heading}
@@ -486,7 +487,13 @@ local function Tick()
         local s_Now = os.epoch("utc")
         local s_Changed = false
         for _, d in pairs(DATA["drones"] or {}) do
-            if d.lastSeen and not d.offline and (s_Now - d.lastSeen) > OFFLINE_AFTER_MS then
+            -- A MISSING lastSeen means offline too. Guarding on `d.lastSeen and ...` skipped
+            -- exactly the drones most likely to be dead: anything that stopped answering before
+            -- this sweep existed has no timestamp at all, so D2 -- mined out of the world by D1 --
+            -- stayed "idle" forever precisely because it had never checked in.
+            -- Registration stamps lastSeen, so nil now means "has not been heard from since".
+            local s_Silent = (d.lastSeen == nil) or ((s_Now - d.lastSeen) > OFFLINE_AFTER_MS)
+            if s_Silent and not d.offline then
                 d.offline = true
                 d.status  = "offline"
                 s_Changed = true
