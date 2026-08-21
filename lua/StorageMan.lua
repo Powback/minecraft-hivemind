@@ -11,9 +11,7 @@
 -- 2 fuel, 3 output, so ore in and ingots out is pushItems/pullItems -- no drone ever touches it.
 
 local function monitor()
-    local m = peripheral.wrap("top")
-    if m and m.write then return m end
-    return peripheral.find("monitor")
+    return PowNet.Monitor("top")
 end
 
 Log("Starting...")

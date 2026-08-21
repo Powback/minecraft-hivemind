@@ -12,7 +12,7 @@
 local function monitor()
     local m = peripheral.wrap("left")
     if m and m.write then return m end
-    return peripheral.find("monitor")
+    return PowNet.Monitor()
 end
 print(os.loadAPI("ServerTasks/dig"))
 Log("Starting...")

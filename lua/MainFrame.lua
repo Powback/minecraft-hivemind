@@ -172,7 +172,7 @@ local function ask(p_Module, p_Key)
 end
 
 local function dashboard()
-    local mon = peripheral.find("monitor")
+    local mon = PowNet.Monitor()
     if not mon then return end
     pcall(mon.setTextScale, 0.5)
     mon.setBackgroundColour(colors.black)

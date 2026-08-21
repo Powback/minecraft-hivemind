@@ -127,6 +127,26 @@ end
 function GetFaults() return m_Faults end
 function ClearFaults() m_Faults = {} return true end
 
+-- Find this computer's display. Reimplemented in six modules, each slightly differently: some
+-- wrapped a fixed side once at load and died on the first Render if nothing was there, some
+-- searched every time. "left" is the VIEWER's left, not the computer's, so a fixed side is also
+-- wrong as soon as a computer is placed facing another way.
+--
+-- Searches, tolerates having no monitor, and falls back to the terminal so a module without a
+-- screen still runs instead of crashing.
+function Monitor(p_PreferredSide)
+    if p_PreferredSide then
+        local ok, s_Type = pcall(peripheral.getType, p_PreferredSide)
+        if ok and s_Type == "monitor" then
+            local ok2, m = pcall(peripheral.wrap, p_PreferredSide)
+            if ok2 and m then return m end
+        end
+    end
+    local ok, m = pcall(peripheral.find, "monitor")
+    if ok and m then return m end
+    return term
+end
+
 function RegisterEvents( p_ServerEvents, p_DroneEvents, p_Update )
     p_ServerEvents = p_ServerEvents or {}
     -- Every module answers "what has gone wrong here" without each one remembering to implement

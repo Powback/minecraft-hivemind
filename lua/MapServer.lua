@@ -404,7 +404,7 @@ function Render()
     -- Whatever display exists: a monitor of any size if one is attached, otherwise this computer's
     -- own screen. MapRender fits the surveyed bounds to it, so nothing here needs to know the
     -- dimensions and the same code works before and after a monitor wall gets built.
-    local s_Dev = peripheral.find("monitor") or term
+    local s_Dev = PowNet.Monitor()
     local s_Fleet = nil
     pcall(function() s_Fleet = fleet() end)
     local s_Ok, s_Err = pcall(MapRender.draw, s_Dev,
