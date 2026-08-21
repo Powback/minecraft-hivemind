@@ -180,3 +180,64 @@ end
 -- file unloadable as an API -- os.loadAPI executes the chunk, so TaskMan died on
 -- `attempt to index local 'max' (a nil value)` before it ever ran, and left an "out"
 -- file on the computer as the only clue. Removed; the module is a library.
+
+----------------------------------------------------------------------------------------------
+-- Splitting a site across several miners
+----------------------------------------------------------------------------------------------
+-- A turn costs a full step, exactly like a move. So a w x l sweep is not w*l steps, it is
+--
+--     w*l  moves  +  2*(l-1)  turns
+--
+-- because every row transition is turn, advance, turn. That single fact decides the geometry:
+--
+--   * Rows must run along the LONG axis. A 32x4 box swept in 4 long rows costs 128+6 = 134
+--     steps; the same box swept in 32 short rows costs 128+62 = 190. Same blocks, 42% more work.
+--   * Workers must be split across the SHORT axis, so each one keeps WHOLE rows. Splitting along
+--     the row axis would cut every row in half and double the turn count.
+--   * Slabs are disjoint by construction, so miners cannot dig each other. That is not a nicety:
+--     D1 mined D2 out of existence because its dig box contained D2's parking spot, and nothing
+--     noticed -- the registry still listed D2 as idle.
+--
+-- Returns one payload per worker, each a plain Dig job over its own slab.
+function SplitRegion(p_Min, p_Max, p_Workers, p_Depth)
+    local s_MinX, s_MaxX = math.min(p_Min.x, p_Max.x), math.max(p_Min.x, p_Max.x)
+    local s_MinZ, s_MaxZ = math.min(p_Min.z, p_Max.z), math.max(p_Min.z, p_Max.z)
+    local s_MinY        = math.min(p_Min.y, p_Max.y)
+
+    local s_DX = s_MaxX - s_MinX + 1
+    local s_DZ = s_MaxZ - s_MinZ + 1
+
+    -- Long axis carries the rows; the short axis is what we cut into slabs.
+    local s_RowAlongX = s_DX >= s_DZ
+    local s_RowLen    = s_RowAlongX and s_DX or s_DZ     -- cells per row
+    local s_Rows      = s_RowAlongX and s_DZ or s_DX     -- number of rows to share out
+
+    -- Never more workers than rows: a worker with no rows has nothing to do, and two workers in
+    -- one row is the collision we are trying to prevent.
+    local s_N = math.max(1, math.min(p_Workers or 1, s_Rows))
+
+    local s_Base, s_Extra = math.floor(s_Rows / s_N), s_Rows % s_N
+    local s_Out, s_Cursor = {}, 0
+
+    for i = 1, s_N do
+        local s_Slab = s_Base + ((i <= s_Extra) and 1 or 0)   -- spread the remainder, not all on one
+        local s_Start
+        if s_RowAlongX then
+            s_Start = {x = s_MinX, y = s_MinY, z = s_MinZ + s_Cursor}
+        else
+            s_Start = {x = s_MinX + s_Cursor, y = s_MinY, z = s_MinZ}
+        end
+        s_Out[#s_Out + 1] = {
+            pos   = s_Start,
+            w     = s_RowLen,
+            l     = s_Slab,
+            depth = p_Depth or 1,
+            -- Reported so a human can sanity-check the plan without re-deriving it.
+            cost  = (s_RowLen * s_Slab) + 2 * math.max(0, s_Slab - 1),
+            slab  = i,
+            of    = s_N,
+        }
+        s_Cursor = s_Cursor + s_Slab
+    end
+    return s_Out
+end

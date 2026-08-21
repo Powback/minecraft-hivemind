@@ -123,6 +123,14 @@ function SendHeartBeat()
     print("Sent heartbeat")
 end
 
+-- Cheap liveness. The registry cannot tell a docked drone from one that no longer exists:
+-- heartbeats only fire at boot and shutdown, so a drone that is mined out of the world stays
+-- "idle" forever and keeps being handed work. D2 was dug up by D1 and was still being offered
+-- jobs afterwards.
+function OnPing(p_ID, p_Message)
+    return true, {alive = true, status = m_Status, fuel = turtle.getFuelLevel()}
+end
+
 function OnReboot(p_ID, p_Message)
     os.reboot()
 end
@@ -786,6 +794,9 @@ end
 local m_DroneEvents = {
     Reboot = {
         func = OnReboot,
+    },
+    Ping = {
+        func = OnPing,
     },
     GoTo = {
         func = OnGoTo,

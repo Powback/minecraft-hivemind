@@ -61,10 +61,27 @@ end
 -- Connection
 --=====================================================================
 
+-- Set while a dial is in flight. Without it socketLoop dials on EVERY event while disconnected --
+-- and events arrive constantly from rednet and timers -- so dozens of websockets open at once and
+-- CC:T eventually refuses with "Too many websockets already open", after which the Bridge can
+-- never reconnect. That is what took the fleet off HQ.
+local m_Dialing = false
+
+local function closeSocket()
+  if m_Socket then
+    pcall(function() m_Socket.close() end)   -- dropping the reference does NOT free the socket
+    m_Socket = nil
+  end
+end
+
 local function connect()
+  if m_Dialing then return true end          -- one dial at a time
+  closeSocket()
+  m_Dialing = true
   log("connecting to " .. HQ_URL)
   local ok, err = http.websocketAsync(HQ_URL)
   if not ok then
+    m_Dialing = false
     log("dial failed: " .. tostring(err))
     return false
   end
@@ -76,7 +93,7 @@ local function send(tbl)
   local ok, err = pcall(function() m_Socket.send(textutils.serialiseJSON(tbl)) end)
   if not ok then
     log("send failed: " .. tostring(err))
-    m_Socket = nil          -- force the reconnect path
+    closeSocket()           -- close it, do not merely forget it, or the handle leaks
     return false
   end
   return true
@@ -204,12 +221,14 @@ local function socketLoop()
 
     if event == "websocket_success" and url == HQ_URL then
       m_Socket = param
+      m_Dialing = false
       m_Backoff = RECONNECT_MIN                 -- reset only on real success
       log("connected")
       send({ v = PROTOCOL, type = "HELLO", bridge = os.getComputerLabel() or "bridge",
              computerId = os.getComputerID() })
 
     elseif event == "websocket_failure" and url == HQ_URL then
+      m_Dialing = false
       log(("connect failed (%s) — retrying in %ds"):format(tostring(param), m_Backoff))
       sleep(m_Backoff)
       -- Exponential backoff, capped. Hammering a downed HQ helps nobody and
@@ -221,7 +240,8 @@ local function socketLoop()
 
     elseif event == "websocket_closed" and url == HQ_URL then
       log("closed — will reconnect")
-      m_Socket = nil
+      m_Dialing = false
+      closeSocket()
       sleep(m_Backoff)
       m_Backoff = math.min(m_Backoff * 2, RECONNECT_MAX)
     end

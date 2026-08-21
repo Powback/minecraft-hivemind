@@ -117,6 +117,36 @@ local function pickDrone(p_Role)
     return nil, s_Busy
 end
 
+-- Every idle drone of a role that ACTUALLY ANSWERS, so a site can be worked by the whole shift
+-- instead of one drone while the rest sit on their docks.
+--
+-- The liveness check is not optional. The registry cannot distinguish a docked drone from one
+-- that no longer exists -- heartbeats fire only at boot and shutdown -- so a drone that is mined
+-- out of the world stays "idle" forever. D1 dug up D2, and D2 was still being offered work
+-- afterwards: a slab of the site would simply never be dug and the task would never complete.
+local function pickDrones(p_Role)
+    local s_Free, s_Busy = {}, nil
+    for _, d in ipairs(fleet()) do
+        if (d.role or "miner") == p_Role then
+            -- offline is set by DroneMan when a drone misses three heartbeats; the ping is the
+            -- belt to that braces, catching a drone that died since the last sweep.
+            if d.status == "idle" and not d.offline then
+                local s_Msg = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Ping", {})
+                local s_Ok, s_Res = pcall(PowNet.sendAndWaitForResponse, d.id, s_Msg,
+                                          PowNet.DRONE_PROTOCOL)
+                if s_Ok and s_Res then
+                    s_Free[#s_Free + 1] = d
+                else
+                    print("skipping " .. tostring(d.name) .. ": no answer")
+                end
+            else
+                s_Busy = s_Busy or d
+            end
+        end
+    end
+    return s_Free, s_Busy
+end
+
 function OnStartTask(p_ID, p_Message)
     local s_Id = p_Message.data and p_Message.data.id
     if s_Id == nil then return false, "Missing id" end
@@ -124,6 +154,37 @@ function OnStartTask(p_ID, p_Message)
     if s_Task == nil then return false, "No task " .. tostring(s_Id) end
 
     local s_Role = RoleForWork(s_Task.work)
+
+    -- A dig is the one job that splits cleanly across workers, so give it everyone who is free.
+    -- dig.SplitRegion cuts the box into disjoint slabs oriented to minimise TURNS (a turn costs a
+    -- full step), and disjoint is what stops miners digging each other -- D1 mined D2 out of the
+    -- world because its box contained D2's parking spot.
+    if s_Role == "miner" and s_Task.work and s_Task.work.dig
+       and s_Task.work.dig.start and s_Task.work.dig.stop then
+        local s_Free, s_Busy2 = pickDrones(s_Role)
+        if #s_Free == 0 then
+            return false, "every miner is busy (" .. tostring(s_Busy2 and s_Busy2.name) .. ")"
+        end
+        local w = s_Task.work.dig
+        local s_Depth = tonumber(w.depth) or (math.abs((w.stop.y or 0) - (w.start.y or 0)) + 1)
+        local s_Slabs = dig.SplitRegion(w.start, w.stop, #s_Free, s_Depth)
+
+        local s_Names = {}
+        for i, slab in ipairs(s_Slabs) do
+            local d = s_Free[i]
+            PowNet.SendToDrone(d.id, PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Dig",
+                {w = slab.w, l = slab.l, depth = slab.depth, pos = slab.pos}))
+            s_Names[#s_Names + 1] = tostring(d.name) .. "(" .. slab.cost .. ")"
+        end
+
+        s_Task.assigned   = table.concat(s_Names, ",")
+        s_Task.assignedTo = s_Free[1].id
+        s_Task.paused     = false
+        PowNet.MarkDirty()
+        return true, {message = ("task %s -> %d miner(s): %s"):format(
+            tostring(s_Id), #s_Slabs, table.concat(s_Names, " ")), workers = #s_Slabs}
+    end
+
     local s_Drone, s_Busy = pickDrone(s_Role)
     if s_Drone == nil then
         if s_Busy then

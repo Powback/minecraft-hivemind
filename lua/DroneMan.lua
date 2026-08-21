@@ -98,6 +98,15 @@ function OnHeartbeat(p_ID, p_Message)
     for k,v in pairs(p_Message.data) do
         DATA["drones"][s_ID][k] = v
     end
+    -- WHEN we last heard from it, which is the only way to tell a docked drone from one that no
+    -- longer exists. Drones heartbeat every 30s; nothing was recording the arrival, so a drone
+    -- that stopped answering stayed "idle" forever. D1 mined D2 out of the world and the registry
+    -- kept offering D2 work afterwards.
+    DATA["drones"][s_ID].lastSeen = os.epoch("utc")
+    if DATA["drones"][s_ID].offline then
+        DATA["drones"][s_ID].offline = nil
+        print(tostring(DATA["drones"][s_ID].name) .. " is back")
+    end
     -- A heartbeat reporting no stuck reason means it recovered; drop the stale flag rather than
     -- leaving a drone marked in trouble forever because it once was.
     if p_Message.data.stuck == nil then
@@ -464,7 +473,31 @@ PowNet.RegisterEvents(m_ServerEvents, m_DroneEvents, Render)
 SetStatus("Connected!", colors.green)
 
 Render()
-parallel.waitForAny(PowNet.main, PowNet.droneMain, PowNet.control)
+-- Mark drones offline when they go quiet.
+--
+-- Three missed heartbeats, not one: a drone mid-job can be slow, and flapping a drone in and out
+-- of the fleet is worse than noticing a little late. Offline drones keep their last known
+-- position and fuel so a rescue has somewhere to start looking -- the record is stale, not wrong.
+local OFFLINE_AFTER_MS = 3 * 30 * 1000
+
+local function Tick()
+    while true do
+        os.sleep(20)
+        local s_Now = os.epoch("utc")
+        local s_Changed = false
+        for _, d in pairs(DATA["drones"] or {}) do
+            if d.lastSeen and not d.offline and (s_Now - d.lastSeen) > OFFLINE_AFTER_MS then
+                d.offline = true
+                d.status  = "offline"
+                s_Changed = true
+                print(tostring(d.name) .. " went silent -- marked offline")
+            end
+        end
+        if s_Changed then PowNet.MarkDirty() end
+    end
+end
+
+parallel.waitForAny(PowNet.main, PowNet.droneMain, PowNet.control, Tick)
 
 print("Unhosting")
 rednet.unhost(PowNet.SERVER_PROTOCOL)
