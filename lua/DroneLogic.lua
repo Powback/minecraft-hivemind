@@ -536,6 +536,28 @@ function OnDig(p_ID, p_Message)
     -- y=84, seventeen fuel spent, every turtle.dig() hitting nothing, and an empty inventory at
     -- the end. It looked like a successful mining run and moved no stone whatsoever.
     --
+    -- GO THERE FIRST. This is not optional and its absence was destroying the base.
+    --
+    -- TaskMan has always sent pos = w.start, and this function ignored it completely: it settled
+    -- and dug wherever the drone happened to be standing, which after docking is the base itself.
+    -- An order for a site 300 blocks away excavated the module row instead -- that is how TaskMan
+    -- lost its modem, which silently took the whole fleet's ability to receive work with it.
+    --
+    -- Refuse the job rather than dig in the wrong place: a drone that cannot reach the site has
+    -- nothing useful to do there, and digging "somewhere" is worse than digging nowhere.
+    if d.pos and d.pos.x and d.pos.z then
+        local s_Ty = tonumber(d.pos.y)
+        local s_Arrived = pgps.moveTo(tonumber(d.pos.x), s_Ty and (s_Ty + 1) or nil, tonumber(d.pos.z))
+        if s_Arrived == false then
+            TaskEnd()
+            m_Status = "idle"
+            m_Job = nil saveResume()
+            Distress("cannot reach site",
+                tostring(d.pos.x) .. "," .. tostring(d.pos.y) .. "," .. tostring(d.pos.z))
+            return false, "cannot reach site"
+        end
+    end
+
     -- settle() is the same descent the survey uses; the difference is only that a survey wants
     -- to hug the surface and a dig wants to start at it.
     local s_Dropped = settle(tonumber(d.drop) or 24)
@@ -673,6 +695,28 @@ function OnLumber(p_ID, p_Message)
     saveResume()
     m_Status = "logging"
     TaskStart()
+
+    -- GO THERE FIRST. This is not optional and its absence was destroying the base.
+    --
+    -- TaskMan has always sent pos = w.start, and this function ignored it completely: it settled
+    -- and dug wherever the drone happened to be standing, which after docking is the base itself.
+    -- An order for a site 300 blocks away excavated the module row instead -- that is how TaskMan
+    -- lost its modem, which silently took the whole fleet's ability to receive work with it.
+    --
+    -- Refuse the job rather than dig in the wrong place: a drone that cannot reach the site has
+    -- nothing useful to do there, and digging "somewhere" is worse than digging nowhere.
+    if d.pos and d.pos.x and d.pos.z then
+        local s_Ty = tonumber(d.pos.y)
+        local s_Arrived = pgps.moveTo(tonumber(d.pos.x), s_Ty and (s_Ty + 1) or nil, tonumber(d.pos.z))
+        if s_Arrived == false then
+            TaskEnd()
+            m_Status = "idle"
+            m_Job = nil saveResume()
+            Distress("cannot reach site",
+                tostring(d.pos.x) .. "," .. tostring(d.pos.y) .. "," .. tostring(d.pos.z))
+            return false, "cannot reach site"
+        end
+    end
 
     -- Same reason OnDig settles: a drone that just flew here is in the air, and every inspect()
     -- would hit nothing while the job reported success.

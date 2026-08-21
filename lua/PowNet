@@ -23,9 +23,32 @@ for _, side in ipairs(redstone.getSides()) do
     end
 end
 
+-- A missing modem is a hard fault and must SAY SO. It used to `return` here, which is the worst
+-- possible response: an early return leaves every function below this line undefined, so the
+-- caller dies on "attempt to call field 'InitServer' (a nil value)" -- an error that names the
+-- wrong thing, three layers from the cause. TaskMan sat dead for hours like that, powered on with
+-- every file present, while the whole fleet could not be given work.
+--
+-- So: record it, make it visible from OUTSIDE the game (a CC terminal cannot be read from the
+-- host), and carry on defining the API so callers get a description instead of a nil.
+NO_REDNET = nil
 if not rednet.isOpen() then
-    printError("could not open rednet")
-    return
+    NO_REDNET = "no modem attached to " .. tostring(os.getComputerLabel() or os.getComputerID())
+                .. " -- rednet cannot open, so this computer can neither host nor be called"
+    printError(NO_REDNET)
+    local h = fs.open("/FATAL.txt", "w")
+    if h then
+        h.write(NO_REDNET .. "\nAttach a modem to this computer and reboot it.\n")
+        h.close()
+    end
+    local m = peripheral.find("monitor")
+    if m then
+        pcall(function()
+            m.setBackgroundColour(colors.red) m.clear()
+            m.setCursorPos(1, 1) m.setTextColour(colors.white)
+            m.write("NO MODEM")
+        end)
+    end
 end
 
 function Lookup(p_Name)
@@ -426,10 +449,24 @@ function control()
 end
 
 function InitServer()
+    -- Report the real reason rather than letting a rednet call throw somewhere further down.
+    if NO_REDNET then return false, NO_REDNET end
     print(MODULENAME)
-    local host = rednet.lookup(SERVER_PROTOCOL, MODULENAME)
-    if host and host ~= os.computerID() then
-        return false, (tostring(os.getComputerLabel()) .. " server already running?")
+    -- ALWAYS host. rednet.host is idempotent and simply replaces the entry, so a stale
+    -- registration is not a reason to refuse to start.
+    --
+    -- This used to `return false` whenever the lookup found any other host, and the bootloader
+    -- responds to that by printing and RETURNING -- which leaves the computer powered on, hosting
+    -- nothing, answering nothing, and never writing last-run.txt. It looks completely healthy
+    -- from outside: "On | Y", files present, no error anywhere. TaskMan sat like that with the
+    -- whole fleet unable to receive work, and every check said it was fine.
+    --
+    -- A module refusing its own name because something answered a lookup is strictly worse than
+    -- taking the name back: at worst two hosts briefly disagree, at best the fleet keeps working.
+    local s_Host = rednet.lookup(SERVER_PROTOCOL, MODULENAME)
+    local s_Me = (os.computerID and os.computerID()) or os.getComputerID()
+    if s_Host and s_Host ~= s_Me then
+        print("taking over " .. tostring(MODULENAME) .. " from #" .. tostring(s_Host))
     end
     rednet.host(SERVER_PROTOCOL, MODULENAME)
     return true

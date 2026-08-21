@@ -83,8 +83,14 @@ end
 os.loadAPI("PowNet")
 local s_Started, s_Message = PowNet.InitServer()
 if not s_Started then
+    -- Persist it. A bootloader that prints and returns leaves a computer that looks perfectly
+    -- healthy from outside -- On=Y, every file present, no error anywhere -- while it hosts
+    -- nothing and answers nothing.
     print("Failed to initialize:")
     print(s_Message)
+    local h = fs.open("/FATAL.txt", "w")
+    if h then h.write("init failed: " .. tostring(s_Message) .. "\n") h.close() end
+    SetStatus("INIT FAILED", colors.red)
     return
 end
 
