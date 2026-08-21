@@ -284,6 +284,40 @@ registry.register({
   },
 });
 
+// ── fleet.faults ───────────────────────────────────────────────────────────
+// Ask every module what has gone wrong. Almost every hour lost building this fleet went to a
+// failure that was detected, described, and then thrown away.
+registry.register({
+  name: 'fleet.faults',
+  summary: 'Recent errors recorded by each in-world module.',
+  description:
+    'Check this FIRST when something "works" but produces nothing. A module can be up, answering ' +
+    'calls, and still failing every tick -- that is what these record.',
+  params: z.object({ module: z.string().optional() }).strict(),
+  returns: 'Per-module fault lists: where it happened and the error text.',
+  danger: 'read',
+  handler: async (a) => {
+    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    const mods = a.module ? [a.module]
+      : ['DroneMan', 'TaskMan', 'DockingMan', 'MapServer', 'StorageMan'];
+    const out: Record<string, unknown> = {};
+    let total = 0;
+    for (const m of mods) {
+      try {
+        const r: any = await bridge.call(m, 'Faults', {}, { timeoutMs: 5000 });
+        const list = r?.faults ?? r?.data?.faults ?? [];
+        out[m] = list;
+        total += Array.isArray(list) ? list.length : 0;
+      } catch (err) {
+        // A module that cannot even be asked is itself the most important fault.
+        out[m] = [{ where: 'unreachable', err: (err as Error)?.message ?? String(err) }];
+        total += 1;
+      }
+    }
+    return { total, modules: out };
+  },
+});
+
 // ── world.find ─────────────────────────────────────────────────────────────
 // Ask the surveyed map where something is, instead of digging to find out. The base sits in a
 // desert, so guessing cost a whole dig job that returned nothing but sand.

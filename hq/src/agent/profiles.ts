@@ -73,6 +73,7 @@ export const PROFILES: Record<string, AgentProfile> = {
       'storage.smelt',
       'world.find',
       'world.caves',
+      'fleet.faults',
     ],
     maxDanger: 'destructive',
     maxSteps: 12,

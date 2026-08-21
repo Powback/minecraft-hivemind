@@ -61,7 +61,59 @@ function newMessage(messageType, dataKey, data)
     }
 end
 
+----------------------------------------------------------------------------------------------
+-- Faults: make friction visible instead of losing it
+----------------------------------------------------------------------------------------------
+-- Nearly every hour lost building this fleet went to something failing silently: a fuel transfer
+-- that moved zero items, a module lookup returning nil, a module overwritten with 0 bytes, an
+-- order that reported "queued" and never left HQ. In every case the code HAD the reason and threw
+-- it away -- usually a bare pcall whose result was discarded.
+--
+-- Failures are therefore RECORDED, not merely printed: a CC terminal cannot be read from outside
+-- the game, so a print nobody sees is the same as no error at all.
+--
+-- DEPLOYMENT RULE, learned the hard way: ship this file FIRST and reboot everything twice, THEN
+-- ship module code that calls Try/Fault. The bootloader does os.loadAPI("PowNet") BEFORE
+-- UpdateModule("PowNet"), so on the boot where a module first pulls new code it is still running
+-- the OLD PowNet -- and a module calling a brand-new PowNet function dies with
+-- "attempt to call field 'Try' (a nil value)" while that function is plainly in the file on disk.
+local m_Faults = {}
+local FAULT_KEEP = 40
+
+function Fault(p_Where, p_Err)
+    local s_Entry = {
+        module = MODULENAME,
+        where  = tostring(p_Where),
+        err    = tostring(p_Err),
+        clock  = os.clock(),
+    }
+    m_Faults[#m_Faults + 1] = s_Entry
+    while #m_Faults > FAULT_KEEP do table.remove(m_Faults, 1) end
+    if _G.Log then _G.Log("FAULT " .. s_Entry.where .. ": " .. s_Entry.err)
+    else print("FAULT " .. s_Entry.where .. ": " .. s_Entry.err) end
+    return false, s_Entry.err
+end
+
+-- pcall that does not swallow. Use instead of a bare pcall wherever the failure matters.
+function Try(p_Where, p_Fn, ...)
+    local s_Ok, s_Res = pcall(p_Fn, ...)
+    if not s_Ok then Fault(p_Where, s_Res) end
+    return s_Ok, s_Res
+end
+
+function GetFaults() return m_Faults end
+function ClearFaults() m_Faults = {} return true end
+
 function RegisterEvents( p_ServerEvents, p_DroneEvents, p_Update )
+    p_ServerEvents = p_ServerEvents or {}
+    -- Every module answers "what has gone wrong here" without each one remembering to implement
+    -- it. Friction nobody can query is friction nobody fixes.
+    p_ServerEvents["Faults"] = {
+        func = function() return true, {module = MODULENAME, faults = GetFaults()} end
+    }
+    p_ServerEvents["ClearFaults"] = {
+        func = function() ClearFaults() return true, {module = MODULENAME, cleared = true} end
+    }
     m_ServerEvents = p_ServerEvents
     m_DroneEvents = p_DroneEvents
     m_Update = p_Update
