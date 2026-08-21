@@ -28,16 +28,25 @@ end
 ----------------------------------------------------------------------------------------------
 -- Anything on the wired network that can list its contents is storage. Furnaces answer the same
 -- interface, so they are found the same way and told apart by their peripheral type.
+-- The six direct-adjacency side names. Everything reachable this way is ALSO reachable by its
+-- network name once it has a wired modem, so counting both double-counts every chest -- and worse,
+-- a side name is meaningless to any other peripheral: pushItems/pullItems require BOTH inventories
+-- to be on wired modems joined by cable, so passing "front" fails with
+-- "Source 'front' does not exist". Network names only.
+local SIDE_NAMES = {top = true, bottom = true, left = true, right = true, front = true, back = true}
+
 local function inventories()
     local s_Chests, s_Furnaces = {}, {}
     for _, name in ipairs(peripheral.getNames()) do
-        local s_Type = peripheral.getType(name)
-        if s_Type and string.find(s_Type, "furnace") then
-            s_Furnaces[#s_Furnaces + 1] = name
-        else
-            local ok, m = pcall(peripheral.wrap, name)
-            if ok and m and m.list and m.size then
-                s_Chests[#s_Chests + 1] = name
+        if not SIDE_NAMES[name] then
+            local s_Type = peripheral.getType(name)
+            if s_Type and string.find(s_Type, "furnace") then
+                s_Furnaces[#s_Furnaces + 1] = name
+            else
+                local ok, m = pcall(peripheral.wrap, name)
+                if ok and m and m.list and m.size then
+                    s_Chests[#s_Chests + 1] = name
+                end
             end
         end
     end
@@ -71,6 +80,7 @@ function BuildIndex()
 end
 
 m_Index, m_Free, m_Chests, m_Furnaces = {}, {}, {}, {}
+m_WarnedSided = {}   -- furnace name -> already warned about sided access
 
 function Rescan()
     local ok, a, b, c, d = pcall(BuildIndex)
@@ -106,11 +116,20 @@ end
 function OnStock(p_ID, p_Message)
     Rescan()
     local s_Kinds, s_Items, s_Slots = 0, 0, 0
-    for _, e in pairs(m_Index) do s_Kinds = s_Kinds + 1 s_Items = s_Items + e.total end
+    -- Report WHAT is held, not just how much. "4 kinds, 168 items" cannot answer "do we have fuel",
+    -- which is the question that actually blocks work -- and it hid a furnace sitting idle next to
+    -- a chest full of coal.
+    local s_Detail = {}
+    for name, e in pairs(m_Index) do
+        s_Kinds = s_Kinds + 1
+        s_Items = s_Items + e.total
+        s_Detail[#s_Detail + 1] = {name = name, count = e.total}
+    end
+    table.sort(s_Detail, function(a, b) return a.count > b.count end)
     for _, f in pairs(m_Free) do s_Slots = s_Slots + f end
     return true, {message = string.format("%d kinds, %d items, %d chests, %d free slots, %d furnaces",
         s_Kinds, s_Items, #m_Chests, s_Slots, #m_Furnaces),
-        kinds = s_Kinds, items = s_Items, free = s_Slots}
+        kinds = s_Kinds, items = s_Items, free = s_Slots, detail = s_Detail}
 end
 
 -- Where a full drone should fly to unload. Deposit points are physical positions a drone can
@@ -167,6 +186,44 @@ local function isSmeltable(p_Name)
     return string.match(p_Name, "_ore$") ~= nil
 end
 
+-- A vanilla furnace is a SIDED container. CC:T exposes only the slots belonging to the face a
+-- modem is attached to, so ONE furnace appears as several small peripherals and never as a single
+-- 3-slot inventory: top = input (1 slot), side = fuel (1 slot), bottom = output AND fuel (2 slots).
+-- The original code assumed slots 1/2/3 on one peripheral, so toSlot 2 and 3 were out of range and
+-- every transfer silently moved zero while appearing to succeed.
+--
+-- Do NOT try to label each face "input"/"fuel"/"output". That was tried and is wrong: the bottom
+-- face accepts fuel as well as holding output, so a probe that offers it coal labels it "fuel" and
+-- nothing ever drains the finished goods sitting in its other slot.
+--
+-- Instead, act on slot CONTENTS, which needs no geometry:
+--   * a slot holding something neither smeltable nor fuel is finished product -> push it to storage
+--   * an empty slot gets offered smeltable first, then fuel; the face itself rejects what it
+--     cannot take, so the right thing lands in the right place with no knowledge of which face
+--     this is.
+local function isFuel(p_Name)
+    for _, f in ipairs(FUEL) do if f == p_Name then return true end end
+    return false
+end
+
+local function firstInStorage(p_Pred)
+    for name, e in pairs(m_Index) do
+        if e.at[1] and p_Pred(name) then return e end
+    end
+end
+
+local function isSmeltableInput(p_Name) return isSmeltable(p_Name) and not isFuel(p_Name) end
+
+local function drainTo(p_Fur, p_Slot)
+    for _, cname in ipairs(m_Chests) do
+        if (m_Free[cname] or 0) > 0 then
+            local ok, moved = pcall(p_Fur.pushItems, cname, p_Slot)
+            return ok and (moved or 0) or 0
+        end
+    end
+    return 0
+end
+
 function ServiceFurnaces()
     if not DATA["smelting"] then return 0 end
     Rescan()
@@ -174,50 +231,41 @@ function ServiceFurnaces()
     for _, fname in ipairs(m_Furnaces) do
         local ok, fur = pcall(peripheral.wrap, fname)
         if ok and fur then
+            local okS, s_Size = pcall(fur.size)
             local ok2, items = pcall(fur.list)
-            if ok2 then
-                -- Pull finished output first, so a full output slot never stalls the furnace.
-                if items[3] then
-                    for _, cname in ipairs(m_Chests) do
-                        if (m_Free[cname] or 0) > 0 then
-                            local okp = pcall(fur.pushItems, cname, 3)
-                            if okp then s_Moved = s_Moved + 1 end
-                            break
-                        end
-                    end
-                end
-                -- Then top up fuel and input from storage.
-                if items[2] == nil or items[2].count < 8 then
-                    for _, fuel in ipairs(FUEL) do
-                        local e = m_Index[fuel]
-                        if e and e.at[1] then
-                            pcall(fur.pullItems, e.at[1].where, e.at[1].slot, 16, 2)
-                            break
-                        end
-                    end
-                end
-                -- Un-jam: anything in the input slot that cannot smelt would sit there forever,
-                -- because the refill below only fires when slot 1 is empty. Push it back to
-                -- storage instead of leaving the furnace dead.
-                if items[1] and not isSmeltable(items[1].name) then
-                    for _, cname in ipairs(m_Chests) do
-                        if (m_Free[cname] or 0) > 0 then
-                            local okj = pcall(fur.pushItems, cname, 1)
-                            if okj then
-                                print("unjammed " .. fname .. ": " .. tostring(items[1].name))
-                                items[1] = nil
-                                s_Moved = s_Moved + 1
-                            end
-                            break
-                        end
-                    end
-                end
-                if items[1] == nil then
-                    for name, e in pairs(m_Index) do
-                        if isSmeltable(name) and e.at[1] then
-                            pcall(fur.pullItems, e.at[1].where, e.at[1].slot, 32, 1)
+            if okS and ok2 and s_Size then
+                -- 1. Take finished product out first: a full output slot stalls the furnace.
+                for slot = 1, s_Size do
+                    local it = items[slot]
+                    if it and not isSmeltable(it.name) and not isFuel(it.name) then
+                        local moved = drainTo(fur, slot)
+                        if moved > 0 then
                             s_Moved = s_Moved + 1
-                            break
+                            Log(("drained %s x%d from %s"):format(it.name, moved, fname))
+                        end
+                    end
+                end
+
+                -- 2. Fill whatever is empty. The face rejects what it cannot hold, so offering
+                --    input then fuel is enough -- no need to know which face this is.
+                local ok3, fresh = pcall(fur.list)
+                if ok3 then
+                    for slot = 1, s_Size do
+                        if fresh[slot] == nil then
+                            local moved = 0
+                            local e = firstInStorage(isSmeltableInput)
+                            if e then
+                                local okp, r = pcall(fur.pullItems, e.at[1].where, e.at[1].slot, 32, slot)
+                                moved = (okp and (r or 0)) or 0
+                            end
+                            if moved == 0 then
+                                local f = firstInStorage(isFuel)
+                                if f then
+                                    local okp, r = pcall(fur.pullItems, f.at[1].where, f.at[1].slot, 16, slot)
+                                    moved = (okp and (r or 0)) or 0
+                                end
+                            end
+                            if moved > 0 then s_Moved = s_Moved + 1 end
                         end
                     end
                 end

@@ -279,6 +279,39 @@ registry.register({
   },
 });
 
+// ── storage.stock ──────────────────────────────────────────────────────────
+// StorageMan indexes every inventory on the wired network. These are the first tools that let a
+// commander see and act on materials rather than only on drones.
+registry.register({
+  name: 'storage.stock',
+  summary: 'What the base has: item kinds, totals, chests, free slots, furnaces.',
+  description: 'Ask before ordering work that needs materials, and to confirm a haul actually landed.',
+  params: z.object({}).strict(),
+  returns: 'Summary line plus per-item totals from StorageMan.',
+  danger: 'read',
+  handler: async () => {
+    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    return await bridge.call('StorageMan', 'stock', {}, { timeoutMs: 8000 });
+  },
+});
+
+// ── storage.smelt ──────────────────────────────────────────────────────────
+registry.register({
+  name: 'storage.smelt',
+  summary: 'Turn automatic smelting on or off.',
+  description:
+    'StorageMan services every furnace on the wired network on a 10s tick: pulls finished output ' +
+    'to a chest, tops up fuel, and loads smeltable input. Needs at least one furnace on the ' +
+    'network and fuel (coal/charcoal) in storage, or it has nothing to do.',
+  params: z.object({ off: z.boolean().default(false).describe('true to stop smelting.') }).strict(),
+  returns: 'Whether smelting is now on, and how many furnaces are on the network.',
+  danger: 'mutate',
+  handler: async (a) => {
+    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    return await bridge.call('StorageMan', 'smelt', a.off ? { off: true } : {}, { timeoutMs: 8000 });
+  },
+});
+
 // ── order.abort ────────────────────────────────────────────────────────────
 registry.register({
   name: 'order.abort',

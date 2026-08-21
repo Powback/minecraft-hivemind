@@ -18,6 +18,19 @@ local monitor
 -- and it died on a nil call — silently, because shell.run catches the error itself.
 function _G.Log(p_Message, p_Color)
     print(p_Message)
+    -- Also to a file, because a CC terminal cannot be read from outside the game. Without this a
+    -- module is completely opaque: StorageMan sat with smelting on, a furnace found, and a chest
+    -- full of coal, failing to move it, and there was no way to see the reason it printed.
+    -- Truncates rather than growing without bound -- these are diagnostics, not an audit trail.
+    pcall(function()
+        local s_Name = (os.getComputerLabel() or "module") .. ".log"
+        if fs.exists(s_Name) and fs.getSize(s_Name) > 32768 then fs.delete(s_Name) end
+        local h = fs.open(s_Name, "a")
+        if h then
+            h.writeLine(("%s %s"):format(tostring(os.clock()), tostring(p_Message)))
+            h.close()
+        end
+    end)
     if(peripheral.getType("left") == "monitor" ) then
         monitor = peripheral.wrap("left")
     end

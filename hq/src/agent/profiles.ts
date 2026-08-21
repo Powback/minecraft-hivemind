@@ -69,6 +69,8 @@ export const PROFILES: Record<string, AgentProfile> = {
       'order.issue',
       'order.abort',
       'recover.dispatch',
+      'storage.stock',
+      'storage.smelt',
     ],
     maxDanger: 'destructive',
     maxSteps: 12,
