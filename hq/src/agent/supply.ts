@@ -95,7 +95,10 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
   // Never stack speculative work: if anything is already mining, this loop waits.
   const fleet: any = await bridge.call('DroneMan', 'GetDrones', {}, { timeoutMs: 5000 });
   const drones = fleet?.drones ?? fleet?.data?.drones ?? [];
-  const live = drones.filter((d: any) => !d.offline);
+  // A drone is live only if it is neither flagged offline nor REPORTING an offline-ish status.
+  // Checking the flag alone let a dead drone count as "busy" and stalled the whole loop.
+  const dead = (d: any) => d.offline === true || d.status === 'offline' || d.status === 'lost';
+  const live = drones.filter((d: any) => !dead(d));
   const busy = live.find((d: any) => d.status && d.status !== 'idle');
   if (busy) return { acted: false, reason: `waiting: ${busy.name} is ${busy.status}` };
   const idleMiner = live.find((d: any) => (d.role ?? 'miner') === 'miner' && d.status === 'idle');

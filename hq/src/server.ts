@@ -12,6 +12,11 @@
  *   GET  /lua/manifest        hash manifest of the Lua tree  ── file sync
  *   GET  /lua/file/:path      raw source of one module       ──
  *
+ *   GET  /map                 live 3D view of the surveyed world  ── operator's eyes
+ *   GET  /map/state           one poll: fleet, caves, materials   ──
+ *   GET  /map/voxels          the occupancy grid                  ──
+ *   GET  /map/vendor/:file    vendored Three.js                   ──
+ *
  * FILE SYNC, and why it exists: CC computers have no shell we can reach and no
  * shared filesystem. Without a pull path, shipping a Lua change means retyping it
  * into an in-game terminal. So HQ publishes the repo's `lua/` tree with content
@@ -35,6 +40,12 @@ import { bridge } from './bridge/ws.js';
 
 const PORT = Number(process.env.PORT ?? 4400);
 const LUA_DIR = process.env.LUA_DIR ?? join(process.cwd(), '..', 'lua');
+/**
+ * Static assets for /map. Baked into the image rather than bind-mounted like lua/: the Lua tree is
+ * edited and re-synced at runtime by design, whereas the page and its vendored Three.js are build
+ * output and must not be able to drift from the server that serves them.
+ */
+const PUBLIC_DIR = process.env.PUBLIC_DIR ?? join(process.cwd(), 'public');
 
 let callSeq = 0;
 const log = (msg: string, data?: unknown) =>
@@ -69,6 +80,15 @@ const server = createServer(async (req, res) => {
     const payload = type === 'application/json' ? JSON.stringify(body, null, 2) : String(body);
     res.writeHead(code, { 'content-type': type });
     res.end(payload);
+  };
+  /**
+   * JSON without the pretty-printing. `send` indents because its readers are humans and language
+   * models; the map page's readers are a poll loop and a voxel grid, where indentation is most of
+   * the payload. Same envelope, different audience.
+   */
+  const sendCompact = (code: number, body: unknown, headers: Record<string, string> = {}) => {
+    res.writeHead(code, { 'content-type': 'application/json', ...headers });
+    res.end(JSON.stringify(body));
   };
 
   try {

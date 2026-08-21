@@ -73,6 +73,10 @@ export const PROFILES: Record<string, AgentProfile> = {
       'storage.smelt',
       'world.find',
       'world.caves',
+      // Summary-only for an agent unless it explicitly asks for raw, which nothing but the /map
+      // renderer should. Allowed here so that "why does the map show nothing there?" is a question
+      // the commander can answer for itself instead of one only a human with curl can.
+      'world.voxels',
       'order.gather',
       'supply.status',
       'supply.set',

@@ -458,6 +458,93 @@ registry.register({
   },
 });
 
+// ── world.voxels ───────────────────────────────────────────────────────────
+// The occupancy grid itself, for RENDERERS rather than for reasoning.
+//
+// Every other world tool here deliberately summarises, because a small model handed thousands of
+// cells spends its budget parsing instead of deciding. A 3D viewer has the opposite need: it wants
+// the cells and nothing else. Rather than bolt a second, untyped data path onto the bridge for the
+// map page, this stays a tool -- same validation, same error envelope, same audit line -- and pays
+// for the size difference with a `raw` flag that is off by default. An agent that calls it without
+// asking for raw gets a one-paragraph answer; the page asks for raw and gets the grid.
+//
+// MapServer's LoadWorld returns PowGPSServer's `cachedWorld`, keyed "x:y:z":
+//   1 = solid, 0 = surveyed air, 2 = a cell a drone was parked in, absent = never surveyed.
+// The distinction between 0 and absent is the whole value of the map, so we never collapse them.
+
+/** How long a fetched grid stays good. */
+const VOXEL_CACHE_MS = 10_000;
+let voxelCache: { at: number; grid: Record<string, number> } | null = null;
+/**
+ * A single in-flight fetch shared by every concurrent caller. The cache alone is not enough: the
+ * map page polls, and rednet round-trips take seconds, so two pollers arriving inside one fetch
+ * would each start their own. The grid is ~100KB over a link that also carries drone orders --
+ * exactly the traffic the Bridge's backpressure exists to avoid generating in the first place.
+ */
+let voxelInflight: Promise<Record<string, number>> | null = null;
+
+async function loadVoxels(): Promise<Record<string, number>> {
+  if (voxelCache && Date.now() - voxelCache.at < VOXEL_CACHE_MS) return voxelCache.grid;
+  if (voxelInflight) return voxelInflight;
+  voxelInflight = (async () => {
+    const res: any = await bridge.call('MapServer', 'LoadWorld', {}, { timeoutMs: 20_000 });
+    // PowNet replies are unwrapped by the Bridge, but SaveWorld-era callers saw a nested `data`,
+    // so accept both shapes rather than returning an empty world on a wrapper change.
+    const grid = res?.cachedWorld ?? res?.data?.cachedWorld ?? {};
+    voxelCache = { at: Date.now(), grid };
+    return grid;
+  })().finally(() => { voxelInflight = null; });
+  return voxelInflight;
+}
+
+/** Bounds and composition, derived once so neither the agent nor the page has to scan twice. */
+function voxelStats(grid: Record<string, number>) {
+  let solid = 0, air = 0, other = 0;
+  let minx = Infinity, miny = Infinity, minz = Infinity;
+  let maxx = -Infinity, maxy = -Infinity, maxz = -Infinity;
+  for (const k in grid) {
+    const p = k.split(':');
+    const x = Number(p[0]), y = Number(p[1]), z = Number(p[2]);
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+    if (x < minx) minx = x; if (x > maxx) maxx = x;
+    if (y < miny) miny = y; if (y > maxy) maxy = y;
+    if (z < minz) minz = z; if (z > maxz) maxz = z;
+    const v = grid[k];
+    if (v === 1) solid++; else if (v === 0) air++; else other++;
+  }
+  const known = solid + air + other;
+  return {
+    known, solid, air, other,
+    // Null rather than an inverted infinity box: a caller centring a camera on this must be able
+    // to tell "no survey yet" from "a box at the origin", and Infinity would silently become NaN.
+    bounds: known
+      ? { min: { x: minx, y: miny, z: minz }, max: { x: maxx, y: maxy, z: maxz } }
+      : null,
+    cachedAgeMs: voxelCache ? Date.now() - voxelCache.at : 0,
+  };
+}
+
+registry.register({
+  name: 'world.voxels',
+  summary: 'The raw surveyed occupancy grid — solid/air/unknown per cell. For rendering, not reading.',
+  description:
+    'Returns coverage and bounds by default. Pass raw:true only if you are DRAWING the map: that ' +
+    'sends every surveyed cell (tens of thousands of numbers) and there is nothing in it a plan ' +
+    'can use that world.query, world.find or world.caves do not already answer in one line.',
+  params: z.object({
+    raw: z.boolean().default(false).describe('Include the full cell map. Renderers only.'),
+  }).strict(),
+  returns: 'Counts of solid/air/unknown cells, the surveyed bounding box, and with raw:true a `cells` map keyed "x:y:z" (1 solid, 0 air, 2 drone-occupied).',
+  danger: 'read',
+  bounds: `Served from a ${VOXEL_CACHE_MS / 1000}s cache, so polling it is cheap but it can be that stale.`,
+  handler: async (a) => {
+    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    const grid = await loadVoxels();
+    const stats = voxelStats(grid);
+    return a.raw ? { ...stats, cells: grid } : stats;
+  },
+});
+
 // ── world.caves ────────────────────────────────────────────────────────────
 registry.register({
   name: 'world.caves',

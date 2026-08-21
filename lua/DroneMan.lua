@@ -293,6 +293,10 @@ function OnGetDrones(p_ID, p_Message)
             droneID = v.droneID, name = v.name, id = v.id,
             pos = v.pos, status = v.status, fuel = v.fuel, role = v.role,
             stuck = v.stuck, detail = v.detail,
+            -- offline and lastSeen travel with the drone. Without them a caller can only infer
+            -- liveness from `status`, and "offline" then reads as "busy doing something", which
+            -- stalled the supply loop on a drone that no longer exists.
+            offline = v.offline, lastSeen = v.lastSeen,
         }
     end
     return true, {drones = s_List, count = #s_List}
