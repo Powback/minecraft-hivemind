@@ -174,12 +174,78 @@ const server = createServer(async (req, res) => {
       return send(200, await readFile(full, 'utf8'), 'text/plain');
     }
 
+    // ── /map — the operator's eyes ─────────────────────────────────────────
+    //
+    // Deliberately NOT routed through /invoke. That endpoint enforces the profile allowlist and
+    // danger ceiling, which exist to constrain a language model deciding what to do; a browser
+    // rendering read-only state is not that actor, and making the page carry a profile name would
+    // imply it is one. It calls the registry directly, which still gives it schema validation and
+    // the ok/error envelope -- just without pretending a renderer needs an agent identity.
+    if (url.pathname === '/map' || url.pathname === '/map/') {
+      return send(200, await readFile(join(PUBLIC_DIR, 'map.html'), 'utf8'), 'text/html; charset=utf-8');
+    }
+
+    if (url.pathname.startsWith('/map/vendor/')) {
+      const rel = decodeURIComponent(url.pathname.slice('/map/vendor/'.length));
+      const full = join(PUBLIC_DIR, 'vendor', rel);
+      // Same containment rule as /lua/file, for the same reason: a path from a request is input.
+      if (!full.startsWith(join(PUBLIC_DIR, 'vendor'))) return send(400, 'bad path', 'text/plain');
+      const body = await readFile(full);
+      // Three.js is 670KB and never changes without an image rebuild, so let the browser keep it.
+      // Without this every 3s poll of the page's own tab reload would re-ship the whole library.
+      res.writeHead(200, {
+        'content-type': 'text/javascript; charset=utf-8',
+        'cache-control': 'public, max-age=604800, immutable',
+      });
+      return res.end(body);
+    }
+
+    if (url.pathname === '/map/voxels') {
+      return sendCompact(200, await mapCall('world.voxels', { raw: true }));
+    }
+
+    /**
+     * Everything that changes, in ONE request. The page polls this every few seconds; issuing five
+     * separate fetches would put five independent rednet round-trips on the bridge per tick and
+     * give the page five chances to render a half-updated world. Each source is settled
+     * independently so that one failing tool (a cave scan timing out, say) costs its own panel and
+     * not the whole view -- the alternative is a blank page whenever the slowest call blinks.
+     */
+    if (url.pathname === '/map/state') {
+      const [fleet, caves, ore, dirt, stock] = await Promise.all([
+        mapCall('fleet.status', {}),
+        mapCall('world.caves', { min: 4 }),
+        mapCall('world.find', { match: 'ore', limit: 200 }),
+        mapCall('world.find', { match: 'dirt', limit: 200 }),
+        mapCall('storage.stock', {}),
+      ]);
+      return sendCompact(200, {
+        at: Date.now(),
+        bridge: bridge.status(),
+        fleet, caves, ore, dirt, stock,
+      });
+    }
+
     send(404, { error: 'not found' });
   } catch (err) {
     log('request failed', (err as Error).message);
     send(500, { error: (err as Error).message });
   }
 });
+
+/**
+ * One tool call on behalf of the map page.
+ *
+ * Returns the registry envelope untouched, failures included, so the page can draw what it has and
+ * label what it could not get. A 500 here would tell the operator only that "the map broke", when
+ * the useful fact is which of five things broke.
+ *
+ * The log is deliberately swallowed: the page polls every few seconds forever, and letting that
+ * into the same stream as `invoke` lines would bury the agent's actual decisions under a metronome.
+ */
+function mapCall(tool: string, args: unknown) {
+  return registry.invoke(tool, args, { agent: 'map', callId: `m${++callSeq}`, log: () => {} });
+}
 
 function readBody(req: import('node:http').IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
