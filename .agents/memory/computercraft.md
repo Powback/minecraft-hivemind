@@ -375,3 +375,39 @@ exact-match rednet string, so its Bridge could never have reached MainFrame and 
 silently. Nothing was ever deployed, so the fleet was never damaged. Stubs deleted.
 
 Orientation for that side lives in `HiveMind/.agents/memory/the-live-pownet-system.md`.
+
+## Reading world state over rcon: `say` does not come back
+
+`execute if block <pos> <id> run say HIT` looks like a block predicate and is not one. rcon does
+NOT return chat output, so a TRUE match returns an empty string -- exactly like a false one. Worse,
+a *malformed* command echoes the command text back with a `<--[HERE]` marker, and that echo
+contains the marker word, so `grep -q HIT` matches on FAILURE. The predicate is inverted precisely
+when the command is broken.
+
+This produced a false bug report: four coal blocks were declared "still in the ground, wrongly
+pruned from the index" when they had in fact been mined and the index was correct. The mitigation
+built on top of that finding was therefore aimed at a problem that did not exist.
+
+Use a scoreboard, which rcon does return:
+
+    scoreboard objectives add ccchk dummy
+    scoreboard players set probe ccchk 0
+    execute store success score probe ccchk if block <x> <y> <z> <id>
+    scoreboard players get probe ccchk        # -> "probe has 1 [ccchk]" / "... 0 ..."
+
+ALWAYS validate the probe against two controls before trusting a sweep of results -- one that must
+be 1 and one that must be 0. Both controls returning the same value means the method is broken, not
+that the world is uniform.
+
+Related, and the reason the command was malformed in the first place: **zsh does not word-split
+unquoted variables**, so `set -- $coords` leaves `$1` holding "x y z" and `$2`/`$3` empty. Use
+`${=coords}` or pass arguments to a function. This cost three separate wrong conclusions in one
+session.
+
+## Finding a computer that has gone quiet
+
+`computercraft dump` lists every LOADED computer with its real position, and is reliable. If a
+computer is missing from it, the chunk is not loaded -- `forceload add` the area and dump again
+rather than assuming the machine was destroyed. D3 was found this way at -25,117,-129 while
+reporting -25,117,-105: 24 blocks of dead-reckoning drift had walked it out of the force-loaded
+region, where it froze and became invisible.
