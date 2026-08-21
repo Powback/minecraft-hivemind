@@ -13,9 +13,17 @@ services:
       - PORT=4400
       - LUA_DIR=/lua
     volumes:
-      # Source of truth for the Lua tree. Read-only: HQ publishes it, the world
-      # pulls it; nothing in-game may write back to the repo.
-      - ../lua:/lua:ro
+      # The Lua tree HQ publishes at /lua/manifest and /lua/file/:path, which Sync.lua
+      # pulls onto MainFrame's disk. Read-only: nothing in-game may write back.
+      #
+      # This points at minecraft-create121/pownet -- the SINGLE source of truth for all
+      # in-world Lua -- not at a copy inside this repo. HiveMind used to keep its own
+      # lua/ tree here, which is how it ended up shipping a hand-written 92-line PowNet
+      # stub whose protocol string ("pownet-server" vs the live "PowNet:Server") meant its
+      # Bridge could never reach MainFrame. One tree, one truth.
+      #
+      # Override with HIVE_LUA_DIR if the checkout lives somewhere else.
+      - ${HIVE_LUA_DIR:-../../minecraft-create121/pownet}:/lua:ro
     restart: unless-stopped
     labels:
       - "traefik.enable=true"

@@ -126,6 +126,24 @@ survived this intact and only the Lua stub had to go.
 `RegisterDrone` returns `false, "Failed to get docking"` if DockingMan does not answer, so **no
 drone can register until DockingMan is up**. That alone kept the registry empty once.
 
+## Two deployment paths, one source
+
+`minecraft-create121/pownet/` is the source. It reaches the world two ways, and both are valid:
+
+1. **`bin/pownet-sync.sh`** — rsyncs `pownet/` to `data/world/computercraft/disk/0`. Fast, but only
+   works with host filesystem access to the world directory.
+2. **HQ publishes it over HTTP** — `hq/docker-compose.yml` mounts that same directory read-only at
+   `/lua`, and serves `/lua/manifest` (hash-diffed) and `/lua/file/:path`. `Sync.lua`, running
+   in-world, pulls changed files onto MainFrame's disk, which then serves them to drones via
+   `PowNet UPDATE`. This works with no host access at all, which is the point.
+
+HQ's mount deliberately points OUTSIDE this repo, at `../../minecraft-create121/pownet`. HiveMind
+used to publish its own `lua/` copy, which is exactly how the stub happened. Override with
+`HIVE_LUA_DIR` if the checkout moves.
+
+Verified 2026-08-21: `GET /lua/manifest` returns 30 files and `/lua/file/PowNet` serves the real
+385-line API with `SERVER_PROTOCOL = "PowNet:Server"`.
+
 ## What HiveMind still needs to do
 
 1. Label `#78` `Bridge` so the module bootloader turns it into the Bridge. It will fetch
