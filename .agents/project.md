@@ -16,6 +16,10 @@ MCP API. Claude talks to HQ via typed tools mirrored from PowNet's callable regi
     rednet ↔ websocket↔HQ. Handles reconnect/backoff, idempotency, correlation, PING.
   - `Sync.lua` (137 LOC) — pulls the Lua tree from HQ onto MainFrame's disk via
     `/lua/manifest` + `/lua/file/:path`; hash-diffed so no-change sync is one small request.
+  - `PowNet` (92 LOC) — PowNet V2 module. 8 symbols on the `PowNet` global:
+    `Connect()`, `newMessage(type,key,data)`, `sendAndWaitForResponse(module,message,protocol)`,
+    `control`, `MESSAGE_TYPE.CALL`, `MESSAGE_TYPE.INIT`, `DRONE_PROTOCOL`, `SERVER_PROTOCOL`.
+    Loaded via `os.loadAPI("disk/PowNet")` by Bridge.lua and Sync.lua.
 - `hq/` — out-of-world service (TypeScript, Node 22, ~1620 LOC total):
   - `src/server.ts` (178) — HTTP server: `/health`, `/tools`, `/brief`, `/prime`,
     `/invoke`, `/lua/manifest`, `/lua/file/:path`; WS on `/bridge`.
@@ -34,12 +38,35 @@ MCP API. Claude talks to HQ via typed tools mirrored from PowNet's callable regi
 
 ## Current state
 
-Phase 0 (run §9 Sable carrier probes) — pre-integration. All source files exist and
-type-check cleanly (strict mode, no dist yet). No test suite exists (no `"test"` script in
-package.json, no `*.test.ts` / `*.spec.ts` files). No git repo.
+Phase 1 (HQ + Bridge integration) — in flight.
+
+**Live service**: HQ running on `:4400`, 6 tools registered, 3 profiles
+(commander/scout/quartermaster). All endpoints verified working:
+- `/health` — `ok:true`, `bridge.connected:false` (no bridge yet), `tools:6`
+- `/tools?profile=commander` — 6 tools
+- `/tools?profile=scout` — 3 tools (hive.brief, fleet.status, world.query)
+- `/tools?profile=quartermaster` — 4 tools (hive.brief, fleet.status, order.abort, recover.dispatch)
+- `/brief` — fleet (0 drones), orders, world coverage, problems
+- `/lua/manifest` — lists Bridge.lua, Sync.lua, PowNet with sha1 + bytes
+- `/lua/file/:path` — serves raw source
+- `/prime?profile=commander` — full boot transcript
+
+**In-world**: Bridge computer #78 `hivemind--1` at -85 81 -44, running, persistent.
+Wireless modem on its right (rednet works). Disk drive on its left with a floppy,
+mounted as /disk, WRITABLE.
+
+**lua/ tree** (3 files):
+- `Bridge.lua` (212 LOC) — websocket ↔ rednet relay
+- `Sync.lua` (137 LOC) — file sync from HQ
+- `PowNet` (92 LOC) — PowNet V2 module with 8 symbols
+
+**Next steps**:
+1. Verify Sync.lua works on Bridge computer #78
+2. Verify Bridge.lua connects to HQ (ws://hive.pow/bridge)
+3. Verify HQ /health shows bridge.connected:true
+4. Verify drones can register
 
 ## Open questions
 
 - Are the Sable carrier probes (Phase 0, §9 of SPEC.md) run yet?
-- Is there a live HQ instance to smoke-test against, or is this all source-only?
 - What is the target small model for the commander profile? (profiles.ts says 'small' as a hint)
