@@ -136,7 +136,10 @@ local function handleCall(msg)
     end
   end
 
-  rememberIdem(msg.idem, reply)
+  -- Cache SUCCESSES only. Caching a failure makes the failure permanent for that key: a retry
+  -- replays the cached error instead of trying again, so a transient timeout becomes a wall.
+  -- Idempotency exists to stop work happening twice, not to stop it happening at all.
+  if reply.ok then rememberIdem(msg.idem, reply) end
   send({ v = PROTOCOL, type = "REPLY", id = msg.id, ok = reply.ok, data = reply.data, error = reply.error })
 end
 

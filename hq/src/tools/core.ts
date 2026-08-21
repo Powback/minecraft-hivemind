@@ -241,8 +241,41 @@ registry.register({
     const order = state.createOrder({
       kind: a.kind, bounds: a.bounds, priority: a.priority, issuedBy: ctx.agent,
     });
-    ctx.log(`order ${order.id} issued`, { kind: a.kind, volume, note: a.note });
-    return { id: order.id, kind: order.kind, status: order.status, priority: order.priority, volume };
+
+    // Actually hand the work to TaskMan. Without this the order existed only in HQ's memory:
+    // order.issue returned a plausible id and status:'queued', nothing reached the fleet, and the
+    // drones sat idle -- the single most misleading failure this API could have.
+    //
+    // TaskMan.AddTask takes { name, priority, work }, where `work` selects the job type and the
+    // role: work.dig -> dig.PrepareTask (miner), work.survey / work.scan -> scout.
+    let dispatched = false;
+    let dispatchError: string | undefined;
+    if (bridge.connected) {
+      const work: Record<string, unknown> =
+        a.kind === 'explore'
+          ? { survey: { min: a.bounds!.min, max: a.bounds!.max } }
+          : { dig: { start: a.bounds!.min, stop: a.bounds!.max } };
+      try {
+        // 'Add', not 'AddTask'. The wire key is the KEY in the module's m_ServerEvents table,
+        // which is not the same as the On<Name> handler function. TaskMan registers OnAddTask
+        // under 'Add'; calling 'AddTask' reaches TaskMan, finds no handler, and gets no reply at
+        // all -- which surfaces as a timeout, not as "unknown method".
+        await bridge.call('TaskMan', 'Add', {
+          name: `${order.id}:${a.kind}`, priority: a.priority, work,
+        }, { timeoutMs: 8000, idem: order.id });
+        dispatched = true;
+      } catch (err) {
+        dispatchError = (err as Error)?.message ?? String(err);
+      }
+    } else {
+      dispatchError = 'bridge offline';
+    }
+
+    ctx.log(`order ${order.id} issued`, { kind: a.kind, volume, note: a.note, dispatched });
+    return {
+      id: order.id, kind: order.kind, status: dispatched ? order.status : 'not-dispatched',
+      priority: order.priority, volume, dispatched, dispatchError,
+    };
   },
 });
 

@@ -93,6 +93,28 @@ one reboot.
 Roles are derived from hardware, not configured: `geoscanner_turtle` → `scout`, a peripheral of
 type `chunky` → `loader`, otherwise `miner`.
 
+## Issuing work — verified end to end 2026-08-21
+
+`order.issue` now reaches the fleet. It was previously a no-op that returned a plausible
+`status: "queued"` while nothing left HQ's memory — the most misleading failure this API could
+have. It calls `TaskMan.Add` (see the key warning below) and reports `dispatched: true/false` plus
+`dispatchError`, so a failure to reach the world can never again look like success.
+
+Proven: `order.issue {kind:'dig', bounds:{min:{-72,68,-62}, max:{-70,70,-60}}}` → `dispatched:true`
+→ TaskMan assigned it → **D1 went `idle` → `mining` and physically moved**
+(`-95,80,-46` → `-99,80,-46` → `-99,79,-46` → `-96,79,-47`).
+
+`order.issue` maps `kind:'explore'` to `work.survey` (scout) and everything else to `work.dig`
+(miner). TaskMan's `RoleForWork` picks the role from the work type, so the right drone gets the job.
+
+## The drone job verbs that actually exist
+
+`GoTo` `Rescue` `Scan` `Survey` `Dig` `Haul` `Abort` `StartTask` `AbortTask` `Reboot`.
+
+**There is no forestry.** No tree felling, no log gathering, no sapling planting — nothing produces
+wood. Roles are `miner`, `scout`, `loader` only. Any plan that assumes lumber is available is
+assuming a capability that has never existed.
+
 ## What does not work yet
 
 - **Smelting has still never actually run** — no furnace has ever been placed. The code is real and
@@ -106,19 +128,36 @@ type `chunky` → `loader`, otherwise `miner`.
 - Nothing else known broken. HQ ↔ fleet is live: `hive.brief` and `fleet.status` return all four
   drones with `silentMs: 0`.
 
-## The callable surface HQ tools must mirror
+## The callable surface — use the REGISTERED KEYS, not the handler names
 
-| module | callables |
+**The wire key is the key in each module's `m_ServerEvents` table, which is often NOT the
+`On<Name>` handler it points at.** TaskMan registers `OnAddTask` under `Add`; calling `AddTask`
+reaches TaskMan, matches no handler, and gets **no reply at all** — so it surfaces as a timeout
+rather than "unknown method", which is maximally confusing. Read the table, do not infer from
+function names.
+
+| module | registered keys |
 |---|---|
-| DroneMan | `Heartbeat` `RegisterDrone` `RestartDrones` `DockDrones` `Distress` `ListStuck` `RescueDrones` `Escort` `GetDrones` `SurveyDrones` `GoTo` |
-| MapServer | `SaveWorld` `LoadWorld` `GetPath` `UpdatePath` `SetDronePos` `MapMode` `GetBounds` `AddGpsHost` `SetBounds` `MapFollow` `MapInfo` |
-| TaskMan | `Abort` `AddTask` `StartTask` `PauseTask` `AbortTask` `GetTasks` `ListFleet` |
-| DockingMan | `AllocateDocking` `ListDockingTowers` `DelDockingTower` `AddDockingTower` `EditDockingTower` `GetDroneInfo` |
-| StorageMan | `Find` `Stock` `DepositPoint` `AddDeposit` `Smelt` |
+| DroneMan | `RestartDrone` `DockDrones` `GetDrones` `Distress` `escort` `stuck` `rescue` `drones` `survey` `GoTo` |
+| TaskMan | `start` `pause` `stop` `fleet` `GetTasks` `StartTask` `PauseTask` `AbortTask` `Abort` `Add` `Start` `Pause` |
+| DockingMan | `add` `rm` `ls` `edit` `AllocateDocking` `GetDroneInfo` |
+| MapServer | `UpdatePath` `SaveWorld` `LoadWorld` `GetPath` `SetDronePos` `GetBounds` `gpshost` `bounds` `map` `follow` `mapinfo` |
+| StorageMan | `FindItem` `DepositPoint` `GetStock` `find` `stock` `deposit` `smelt` |
 
-In Lua these are `On<Name>`; over the wire the `key` is the name without `On`. HQ's own tools
-(`hive.brief`, `fleet.status`, `world.query`, `order.issue`, `order.abort`, `recover.dispatch`)
-hardcode none of these, which is why all ~1,350 lines of `hq/` survived the reconciliation intact.
+Casing is inconsistent and deliberate-looking but is not: some keys are CLI-style lowercase verbs
+for the in-game console, others are PascalCase for programmatic use, and several are aliases for the
+same handler. Extract them fresh rather than trusting this table after edits:
+
+```bash
+python3 - TaskMan <<'EOF'
+import sys,re; s=open(sys.argv[1]+'.lua').read()
+b=re.search(r'local m_ServerEvents\s*=\s*\{(.*?)\n\}', s, re.S).group(1)
+print(re.findall(r'^\s{4}([A-Za-z_]\w*)\s*=\s*\{', b, re.M))
+EOF
+```
+
+HQ's own tool names (`hive.brief`, `fleet.status`, `world.query`, `order.issue`, `order.abort`,
+`recover.dispatch`) are a separate, stable surface that maps onto these.
 
 ## Traps that cost real hours
 
