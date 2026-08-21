@@ -29,15 +29,32 @@ local RECONNECT_MIN   = 2
 local RECONNECT_MAX   = 60
 local IDEM_KEEP       = 200     -- remembered idempotency keys
 
-os.loadAPI("disk/PowNet")
+-- PowNet is ALREADY loaded by the module bootloader (`startup` does os.loadAPI("PowNet")
+-- before running us), exactly as it is for DroneMan, TaskMan and the rest -- none of which
+-- load it themselves.
+--
+-- This used to be os.loadAPI("disk/PowNet"), from when Bridge ran standalone on the computer
+-- sitting next to the disk drive. As a module fetched from MainFrame there is no /disk mount,
+-- so that call died with "Failed to load API PowNet due to File not found" -- while PowNet was
+-- plainly present in the computer's own root.
 
 local m_Socket
+local m_Tasks    = {}           -- in-flight handleCall coroutines, resumed by pumpTasks
 local m_Backoff  = RECONNECT_MIN
 local m_Idem     = {}           -- idem key -> cached reply
 local m_IdemAge  = {}           -- insertion order, for trimming
 
+-- Also to a file. A CC terminal cannot be read from outside the game, so a Bridge that is
+-- misbehaving is otherwise completely opaque -- which cost real time when DroneMan calls were
+-- timing out and there was no way to see whether the call had even arrived.
+local LOG_FILE = "bridge.log"
 local function log(msg)
   print(("[bridge] %s"):format(msg))
+  local ok, h = pcall(fs.open, LOG_FILE, "a")
+  if ok and h then
+    h.writeLine(("%s %s"):format(tostring(os.clock()), msg))
+    h.close()
+  end
 end
 
 --=====================================================================
@@ -108,7 +125,10 @@ local function handleCall(msg)
   else
     -- Everything else is a PowNet call to a module (TaskMan, DroneMan, ...).
     local message = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, msg.key, msg.data)
+    local target = PowNet.Lookup(msg.module)
+    log(("call %s.%s -> lookup=%s"):format(tostring(msg.module), tostring(msg.key), tostring(target)))
     local response = PowNet.sendAndWaitForResponse(msg.module, message, PowNet.SERVER_PROTOCOL)
+    log(("call %s.%s -> response=%s"):format(tostring(msg.module), tostring(msg.key), tostring(response)))
     if response == false or response == nil then
       reply = { ok = false, error = ("no response from %s.%s"):format(msg.module, msg.key) }
     else
@@ -132,9 +152,16 @@ local function onFrame(raw)
   end
 
   if msg.type == "CALL" then
-    -- Run in its own coroutine so a slow rednet round-trip cannot stall the
-    -- socket loop; otherwise one unresponsive module deafens the whole bridge.
+    -- Run in its own coroutine so a slow rednet round-trip cannot stall the socket loop;
+    -- otherwise one unresponsive module deafens the whole bridge.
+    --
+    -- It must then be RESUMED on every subsequent event, which is the entire job of
+    -- m_Tasks + pumpTasks below. Creating the coroutine and resuming it once -- which is
+    -- what this did originally -- abandons it at its first yield. handleCall yields almost
+    -- immediately (PowNet.Lookup -> rednet.lookup), so every single call was dropped before
+    -- it reached even its first log line, and HQ saw nothing but timeouts.
     local co = coroutine.create(handleCall)
+    m_Tasks[#m_Tasks + 1] = co
     coroutine.resume(co, msg)
   elseif msg.type == "PONG" then
     -- liveness confirmed; nothing to do
@@ -153,7 +180,24 @@ local function socketLoop()
     if not m_Socket then
       connect()
     end
-    local event, url, param = os.pullEvent()
+    -- table.pack, NOT three named locals. Events carry different arities: a websocket event is
+    -- (event, url, param) but a rednet_message is (event, senderId, message, protocol). Forwarding
+    -- only the first three silently truncates every rednet event, so rednet.receive/lookup inside
+    -- an in-flight call never matches and every module lookup returns nil.
+    local s_Ev = table.pack(os.pullEvent())
+    local event, url, param = s_Ev[1], s_Ev[2], s_Ev[3]
+
+    -- Feed every event to in-flight calls before handling it ourselves. A coroutine blocked
+    -- in rednet.receive is waiting for exactly these events; without this it waits forever.
+    local s_Live = {}
+    for _, co in ipairs(m_Tasks) do
+      if coroutine.status(co) == "suspended" then
+        local ok, err = coroutine.resume(co, table.unpack(s_Ev, 1, s_Ev.n))
+        if not ok then log("call coroutine died: " .. tostring(err)) end
+      end
+      if coroutine.status(co) ~= "dead" then s_Live[#s_Live + 1] = co end
+    end
+    m_Tasks = s_Live
 
     if event == "websocket_success" and url == HQ_URL then
       m_Socket = param

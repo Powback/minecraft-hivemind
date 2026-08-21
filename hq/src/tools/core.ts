@@ -14,6 +14,49 @@
 import { z } from 'zod';
 import { registry, ToolError } from './registry.js';
 import { state, STALE_MS, type Vec3 } from '../world/state.js';
+import { bridge } from '../bridge/ws.js';
+
+/**
+ * Pull the fleet from DroneMan, which owns the registry.
+ *
+ * HQ was designed to learn about drones passively, from `drone.heartbeat` EVENTs the Bridge would
+ * relay. Those can never arrive: DroneLogic sends heartbeats with
+ * `PowNet.SendToServer("DroneMan", ...)` -- directed, on SERVER_PROTOCOL -- while the Bridge
+ * listens with `rednet.receive(DRONE_PROTOCOL)`, which only sees broadcasts or traffic addressed
+ * to itself. Wrong protocol AND wrong addressing, so every tool read an empty world and answered
+ * "0 drones" with ok:true -- indistinguishable from a healthy fleet that happens to be empty.
+ *
+ * Asking is also better than sniffing: DroneMan owns the registry, it survives a Bridge restart,
+ * and heartbeats only fire at boot and shutdown anyway (there is no timer), so a passive listener
+ * would go stale the moment a drone settled.
+ */
+async function refreshFleet(): Promise<void> {
+  if (!bridge.connected) return;        // offline: serve last-known state rather than erroring
+  try {
+    const res: any = await bridge.call('DroneMan', 'GetDrones', {}, { timeoutMs: 5000 });
+    const list = res?.drones ?? res?.data?.drones;
+    if (!Array.isArray(list)) return;
+    const now = Date.now();
+    for (const d of list) {
+      const id = typeof d?.droneID === 'number' ? d.droneID : d?.id;
+      if (typeof id !== 'number') continue;
+      state.upsertDrone({
+        id,
+        name: d.name ?? `drone-${id}`,
+        role: d.role ?? 'miner',
+        status: d.status ?? 'idle',
+        fuel: typeof d.fuel === 'number' ? d.fuel : 0,
+        pos: d.pos && typeof d.pos.x === 'number' ? d.pos : undefined,
+        lastSeen: now,
+      });
+    }
+  } catch (err) {
+    // A refresh failure must not take down a read tool; stale data beats no answer. But it must
+    // not be silent either -- a swallowed error here reads as "the fleet is empty", which is the
+    // most misleading possible answer.
+    console.log(`[fleet] refresh failed: ${(err as Error)?.message ?? err}`);
+  }
+}
 
 const vec3 = z.object({ x: z.number().int(), y: z.number().int(), z: z.number().int() });
 
@@ -45,7 +88,7 @@ registry.register({
   returns: 'Fleet summary, active orders, world model coverage, and a problems list.',
   danger: 'read',
   preload: true,
-  handler: async () => buildBrief(),
+  handler: async () => { await refreshFleet(); return buildBrief(); },
 });
 
 export function buildBrief() {
@@ -105,6 +148,7 @@ registry.register({
     takeaway: 'Two idle. drone-3 has the fuel for distant work; drone-5 should stay close to dock.',
   }],
   handler: async (a) => {
+    await refreshFleet();
     const drones = state.listDrones().filter(
       (d) => (a.id === undefined || d.id === a.id) &&
              (!a.status || d.status === a.status) &&

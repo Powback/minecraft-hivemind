@@ -105,6 +105,7 @@ if not s_Connected then
     os.sleep(10)
     os.reboot()
 end
+
 SetStatus("Updating")
 
 --MapServer only

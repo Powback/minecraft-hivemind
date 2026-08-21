@@ -377,7 +377,7 @@ function InitServer()
     print(MODULENAME)
     local host = rednet.lookup(SERVER_PROTOCOL, MODULENAME)
     if host and host ~= os.computerID() then
-        return false, (os.getComputerLabel() " server already running?")
+        return false, (tostring(os.getComputerLabel()) .. " server already running?")
     end
     rednet.host(SERVER_PROTOCOL, MODULENAME)
     return true

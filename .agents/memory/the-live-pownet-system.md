@@ -46,7 +46,8 @@ Verified with `computercraft dump`. All 16 computers powered on, all five module
 | `#112` | `TaskMan` | task queue and dispatch |
 | `#113` | `StorageMan` | network inventory index, deposit, smelting |
 | `#100`–`#103` | `gps-100`…`gps-103` | GPS constellation |
-| `#120`–`#123` | `D4`, `D1`, `D2`, `D3` | drones |
+| `#120`–`#123` | `D4`, `D1`, `D2`, `D3` | drones — `loader`, `miner`, `miner`, `scout` |
+| `#124` | `Bridge` | the link to HQ (placed 2026-08-21) |
 
 ### `#78` is MainFrame. Do NOT label it `Bridge`.
 
@@ -54,9 +55,8 @@ Verified with `computercraft dump`. All 16 computers powered on, all five module
 dangerous**. `#78` was repurposed as MainFrame. Labelling it `Bridge` would destroy the module that
 serves source to the entire fleet and take everything down.
 
-**There is currently no Bridge computer.** One has to be placed. Use `bin/cc-computer.sh`, give it a
-wireless modem, and label it `Bridge` — the label IS the module, so it will fetch `Bridge.lua` and
-the real PowNet from MainFrame on boot.
+The Bridge is **`#124`** at `-99 81 -44`, placed 2026-08-21 with a wireless modem above it. HQ
+reports `"bridge": {"connected": true}` and tool calls reach the fleet.
 
 ## Deploying — two paths, one source, both verified working
 
@@ -103,8 +103,8 @@ type `chunky` → `loader`, otherwise `miner`.
   pushed back to storage. **All of that is still untested against a real furnace.**
 - **Crafting and factories are design-only.**
 - **`Haul` as a separate role is untested** — hauling happens inside the dig job.
-- **No Bridge exists**, so HQ has never talked to the world. `hive.pow/health` reports
-  `"bridge": {"connected": false}` and has since it was first started.
+- Nothing else known broken. HQ ↔ fleet is live: `hive.brief` and `fleet.status` return all four
+  drones with `silentMs: 0`.
 
 ## The callable surface HQ tools must mirror
 
@@ -148,10 +148,38 @@ The full list is in `.agents/memory/computercraft.md`. The ones that bite hardes
 `RegisterDrone` returns `false, "Failed to get docking"` if DockingMan does not answer, so **no
 drone can register until DockingMan is up**. That alone kept the registry empty once.
 
+## Four bugs that stood between HQ and the fleet — fixed 2026-08-21
+
+All four failed *silently*, which is why they survived so long. Read these before debugging the
+Bridge again.
+
+1. **`Bridge.lua` did `os.loadAPI("disk/PowNet")`** — from when it ran standalone beside the disk
+   drive. As a module fetched from MainFrame there is no `/disk` mount, so it died with
+   "Failed to load API PowNet due to File not found" while PowNet sat plainly in its own root.
+   The bootloader already loads PowNet; real modules never load it themselves.
+
+2. **`onFrame` created a coroutine for each CALL and resumed it exactly once.** `handleCall` yields
+   almost immediately (`PowNet.Lookup` → `rednet.lookup`), so every call was abandoned at its first
+   yield — it never even reached its first log line. There is now a task list pumped from the
+   socket loop.
+
+3. **The pump truncated event arity.** A websocket event is `(event, url, param)` but a
+   `rednet_message` is `(event, senderId, message, protocol)`. Forwarding only three values meant
+   `rednet.receive`/`lookup` inside a call never matched, so every module lookup returned nil.
+   Use `table.pack`/`table.unpack`, never named locals, when relaying events to coroutines.
+
+4. **HQ's tools never talked to the world at all.** `core.ts` imported only `registry` and `state`;
+   all six tools read HQ-local state fed by `drone.heartbeat` EVENTs that can never arrive —
+   DroneLogic sends heartbeats *directed to DroneMan on SERVER_PROTOCOL*, while the Bridge listens
+   for broadcasts on DRONE_PROTOCOL. Wrong protocol and wrong addressing. `fleet.status` and
+   `hive.brief` now call `DroneMan.GetDrones` through the Bridge, which is authoritative anyway.
+
+Note also that **`last-run.txt` is written when a module EXITS**, not while it runs. A running
+module shows a stale `last-run.txt` from its previous exit — do not read it as current health.
+
 ## Next steps
 
-1. **Place a Bridge computer** (not `#78`) and label it `Bridge`. Then `hive.pow/health` should flip
-   to `"bridge": {"connected": true}` and the tool surface goes live for the first time.
-2. Point HQ's 6 tools at the real callables above.
-3. Run the SPEC §9 Sable carrier probes — Phase 0, which everything else is gated behind.
-4. Place a furnace on the wired network and finally test smelting.
+1. Point the remaining HQ tools (`world.query`, `order.issue`, `order.abort`, `recover.dispatch`)
+   at real callables the way `fleet.status` now is.
+2. Run the SPEC §9 Sable carrier probes — Phase 0, which everything else is gated behind.
+3. Place a furnace on the wired network and finally test smelting.
