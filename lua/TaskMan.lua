@@ -100,6 +100,9 @@ end
 function RoleForWork(p_Work)
     if p_Work == nil then return "miner" end
     if p_Work["survey"] or p_Work["scan"] then return "scout" end
+    -- Lumber goes to a miner: roles are derived from HARDWARE (geoscanner -> scout, chunky ->
+    -- loader, otherwise miner) and there is no wood-specific upgrade. A turtle digs wood with
+    -- whatever tool it has.
     return "miner"
 end
 
@@ -138,6 +141,11 @@ function OnStartTask(p_ID, p_Message)
     if s_Role == "scout" then
         local w = s_Task.work.survey or {}
         s_Verb, s_Payload = "Survey", {w = w.w, h = w.h, radius = w.radius}
+    elseif s_Task.work.lumber then
+        -- Wood gates chests, planks and sticks, and therefore every factory the fleet might
+        -- build. Nothing else produces it.
+        local w = s_Task.work.lumber
+        s_Verb, s_Payload = "Lumber", {w = w.w, l = w.l, drop = w.drop, pos = w.start}
     else
         local w = s_Task.work.dig or {}
         s_Verb, s_Payload = "Dig", {w = w.w, l = w.l, depth = w.depth, pos = w.start}

@@ -41,7 +41,7 @@ export interface Drone {
 
 export interface Order {
   id: string;
-  kind: 'dig' | 'build' | 'quarry' | 'explore' | 'recover' | 'follow';
+  kind: 'dig' | 'build' | 'quarry' | 'explore' | 'recover' | 'follow' | 'lumber';
   issuedBy: string;
   issuedAt: number;
   bounds?: { min: Vec3; max: Vec3 };

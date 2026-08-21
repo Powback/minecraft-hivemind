@@ -215,6 +215,127 @@ local m_DroneEvents = {
 
 }
 
+----------------------------------------------------------------------------------------------
+-- Asking the map questions
+----------------------------------------------------------------------------------------------
+-- The survey is already a 3D occupancy grid -- cachedWorld[x:y:z] is 1 solid / 0 air / nil unknown,
+-- with block names in cachedWorldDetail. Everything below is reading data the scouts already
+-- gathered, so it needs no drone, no fuel and no expedition: "where is dirt", "where is iron",
+-- "where are the caves" are all answerable from the base.
+--
+-- This matters because the base sits in a desert. Guessing where to dig wasted a whole dig job on
+-- sand; asking the map first is free.
+
+local function parseKey(p_Key)
+    -- Anchored, and the sign is matched explicitly. A bare "-" inside a character class is Lua's
+    -- lazy quantifier, which silently fails on negative coordinates -- and every coordinate here
+    -- is negative.
+    local x, y, z = string.match(p_Key, "^(%-?%d+):(%-?%d+):(%-?%d+)$")
+    if x == nil then return nil end
+    return tonumber(x), tonumber(y), tonumber(z)
+end
+
+-- Find surveyed blocks whose name contains p_Match. Substring, so "ore" finds every ore and
+-- "dirt" finds dirt/coarse_dirt/rooted_dirt.
+function OnFindBlocks(p_ID, p_Message)
+    local d = p_Message.data or {}
+    local s_Match = d.match or d.item
+    if s_Match == nil then return false, "Missing match" end
+    local s_Limit = tonumber(d.limit) or 40
+
+    local s_Detail = PowGPSServer.cachedWorldDetail or {}
+    local s_Hits, s_Counts, s_Total = {}, {}, 0
+    for key, info in pairs(s_Detail) do
+        local s_Name
+        if type(info) == "table" then
+            -- detail is {discovered=..., discoverer=..., data={true, {state=..., name=...}}}
+            local s_Data = info.data
+            if type(s_Data) == "table" and type(s_Data[2]) == "table" then s_Name = s_Data[2].name end
+            s_Name = s_Name or info.name
+        end
+        if s_Name and string.find(s_Name, s_Match, 1, true) then
+            s_Total = s_Total + 1
+            s_Counts[s_Name] = (s_Counts[s_Name] or 0) + 1
+            if #s_Hits < s_Limit then
+                local x, y, z = parseKey(key)
+                if x then s_Hits[#s_Hits + 1] = {name = s_Name, x = x, y = y, z = z} end
+            end
+        end
+    end
+
+    local s_Msg = s_Total .. " matching '" .. s_Match .. "'"
+    if s_Total == 0 then s_Msg = s_Msg .. " -- nothing surveyed matches; survey more first" end
+    return true, {message = s_Msg, total = s_Total, counts = s_Counts, hits = s_Hits}
+end
+
+-- Connected pockets of surveyed AIR. A cave is air that is enclosed -- so ignore anything at or
+-- above the highest solid block in its column, which is open sky rather than a cave.
+function OnFindCaves(p_ID, p_Message)
+    local d = p_Message.data or {}
+    local s_MinSize = tonumber(d.min) or 8
+    local s_World = PowGPSServer.getCachedWorld() or {}
+
+    -- Surface height per column, so open air can be told from enclosed air.
+    local s_Top = {}
+    for key, v in pairs(s_World) do
+        if v == 1 then
+            local x, y, z = parseKey(key)
+            if x then
+                local col = x .. ":" .. z
+                if s_Top[col] == nil or y > s_Top[col] then s_Top[col] = y end
+            end
+        end
+    end
+
+    local s_Seen, s_Caves = {}, {}
+    for key, v in pairs(s_World) do
+        if v == 0 and not s_Seen[key] then
+            local x0, y0, z0 = parseKey(key)
+            local col = x0 and (x0 .. ":" .. z0)
+            if x0 and s_Top[col] and y0 < s_Top[col] then
+                -- flood fill this pocket
+                local s_Stack, s_Cells = {{x0, y0, z0}}, {}
+                s_Seen[key] = true
+                while #s_Stack > 0 do
+                    local c = table.remove(s_Stack)
+                    s_Cells[#s_Cells + 1] = c
+                    local s_Adj = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}}
+                    for _, o in ipairs(s_Adj) do
+                        local nx, ny, nz = c[1]+o[1], c[2]+o[2], c[3]+o[3]
+                        local nk = nx .. ":" .. ny .. ":" .. nz
+                        if s_World[nk] == 0 and not s_Seen[nk] then
+                            local ncol = nx .. ":" .. nz
+                            if s_Top[ncol] and ny < s_Top[ncol] then
+                                s_Seen[nk] = true
+                                s_Stack[#s_Stack + 1] = {nx, ny, nz}
+                            end
+                        end
+                    end
+                end
+                if #s_Cells >= s_MinSize then
+                    local minx, miny, minz = math.huge, math.huge, math.huge
+                    local maxx, maxy, maxz = -math.huge, -math.huge, -math.huge
+                    for _, c in ipairs(s_Cells) do
+                        if c[1] < minx then minx = c[1] end
+                        if c[2] < miny then miny = c[2] end
+                        if c[3] < minz then minz = c[3] end
+                        if c[1] > maxx then maxx = c[1] end
+                        if c[2] > maxy then maxy = c[2] end
+                        if c[3] > maxz then maxz = c[3] end
+                    end
+                    s_Caves[#s_Caves + 1] = {size = #s_Cells,
+                        min = {x = minx, y = miny, z = minz},
+                        max = {x = maxx, y = maxy, z = maxz},
+                        entrance = {x = x0, y = y0, z = z0}}
+                end
+            end
+        end
+    end
+    table.sort(s_Caves, function(a, b) return a.size > b.size end)
+    return true, {message = #s_Caves .. " cave pocket(s) of >= " .. s_MinSize .. " cells",
+                  count = #s_Caves, caves = s_Caves}
+end
+
 local m_ServerEvents = {
     UpdatePath = {
         func = OnUpdatePath
@@ -232,6 +353,8 @@ local m_ServerEvents = {
         func = OnSetDronePos
     },
     GetBounds = { func = OnGetBounds },
+    FindBlocks = { func = OnFindBlocks },
+    FindCaves  = { func = OnFindCaves },
     gpshost = {
         func = OnAddGpsHost, callable = true,
         params = { pos = { length = 3 } }

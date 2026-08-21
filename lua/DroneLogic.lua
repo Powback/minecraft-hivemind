@@ -593,6 +593,127 @@ end
 
 -- Fetch from a point and take it to storage. The hauler half of the loop: miners stay at the
 -- face, haulers commute. Later this is what item conduits replace on fixed routes.
+----------------------------------------------------------------------------------------------
+-- Lumber
+----------------------------------------------------------------------------------------------
+-- Wood is the gate in front of everything else the fleet wants to build: chests for field caches,
+-- planks and sticks for crafting, and therefore any factory at all. Nothing else in the fleet
+-- produces it, so until this exists the swarm cannot build its own infrastructure.
+--
+-- Leaves are cleared as the trunk is climbed, on purpose. Felling only the trunk leaves the canopy
+-- to decay on Minecraft's own schedule, which may be minutes -- and saplings come from leaf decay,
+-- so a drone that only takes logs walks away with no way to replant and the forest shrinks every
+-- pass. Breaking leaves makes the sapling drop now, while we are standing there to pick it up.
+local function isLog(p_Name)
+    return p_Name ~= nil and (string.find(p_Name, "_log", 1, true)
+                           or string.find(p_Name, "_stem", 1, true))
+end
+local function isLeaf(p_Name)     return p_Name ~= nil and string.find(p_Name, "_leaves", 1, true) end
+local function isSapling(p_Name)  return p_Name ~= nil and string.find(p_Name, "_sapling", 1, true) end
+
+local function selectMatching(p_Pred)
+    for i = 1, 16 do
+        local it = turtle.getItemDetail(i)
+        if it and p_Pred(it.name) then turtle.select(i) return true end
+    end
+    return false
+end
+
+-- Drops land on the ground and in the air around a felled trunk; sweep all three planes.
+local function suckAround()
+    pcall(turtle.suck)
+    pcall(turtle.suckUp)
+    pcall(turtle.suckDown)
+end
+
+-- Fell the tree whose trunk is directly in FRONT. Returns how many log blocks were taken.
+local function fellTree()
+    if not DigForward() then return 0 end
+    if not pgps.forward() then return 0 end
+
+    local s_Logs, s_Climbed = 1, 0
+    while true do
+        local ok, blk = turtle.inspectUp()
+        if not (ok and isLog(blk.name)) then break end
+        if not DigUp() then break end
+        if not pgps.up() then break end
+        s_Climbed = s_Climbed + 1
+        s_Logs = s_Logs + 1
+
+        -- Clear the canopy at this level so saplings drop while we are here to collect them.
+        for _ = 1, 4 do
+            local okf, b = turtle.inspect()
+            if okf and isLeaf(b.name) then DigForward() end
+            pgps.turnRight()
+        end
+        suckAround()
+    end
+
+    for _ = 1, s_Climbed do pgps.down() end
+    suckAround()
+
+    -- Replant. The turtle is standing IN the old trunk base, so it has to step back before the
+    -- sapling has somewhere to go: placeDown would target the dirt block it is standing on.
+    if pgps.back() then
+        if selectMatching(isSapling) then
+            pcall(turtle.place)
+        end
+    end
+    turtle.select(1)
+    return s_Logs
+end
+
+function OnLumber(p_ID, p_Message)
+    local d = p_Message.data or {}
+    local s_W = tonumber(d.w) or 8
+    local s_L = tonumber(d.l) or 8
+    if executing then return false, "busy" end
+
+    m_Job = {verb = "Lumber", data = d}
+    saveResume()
+    m_Status = "logging"
+    TaskStart()
+
+    -- Same reason OnDig settles: a drone that just flew here is in the air, and every inspect()
+    -- would hit nothing while the job reported success.
+    settle(tonumber(d.drop) or 24)
+
+    local s_Logs, s_Trees = 0, 0
+    for row = 1, s_L do
+        if not executing then break end
+        for col = 1, s_W - 1 do
+            if not executing then break end
+            if not depositIfFull() then break end
+
+            local ok, blk = turtle.inspect()
+            if ok and isLog(blk.name) then
+                local n = fellTree()
+                if n > 0 then s_Trees = s_Trees + 1 s_Logs = s_Logs + n end
+            elseif ok and isLeaf(blk.name) then
+                DigForward()
+                pgps.forward()
+            elseif not stepForward(2) then
+                break   -- blocked by something we should not chew through
+            end
+        end
+        if row < s_L then
+            local s_Turn = (row % 2 == 1) and pgps.turnRight or pgps.turnLeft
+            s_Turn()
+            if not stepForward(2) then break end
+            s_Turn()
+        end
+    end
+
+    if FreeSlots() < 16 then Deposit() end
+
+    TaskEnd()
+    m_Status = "idle"
+    m_Job = nil saveResume()
+    UploadWorld()
+    return true, {message = ("felled %d trees, %d logs"):format(s_Trees, s_Logs),
+                  trees = s_Trees, logs = s_Logs}
+end
+
 function OnHaul(p_ID, p_Message)
     local d = p_Message.data or {}
     if d.pos == nil then return false, "Missing pos" end
@@ -662,6 +783,9 @@ local m_DroneEvents = {
     },
     Haul = {
         func = OnHaul,
+    },
+    Lumber = {
+        func = OnLumber,
     }
 }
 

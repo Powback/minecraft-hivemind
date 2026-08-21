@@ -193,7 +193,7 @@ registry.register({
     'are rejected if the region is too large — split large jobs deliberately rather than ' +
     'hoping. Check world.query coverage first if you are not sure what is there.',
   params: z.object({
-    kind: z.enum(['dig', 'build', 'quarry', 'explore', 'follow']),
+    kind: z.enum(['dig', 'build', 'quarry', 'explore', 'follow', 'lumber']),
     bounds: z.object({ min: vec3, max: vec3 }).optional()
       .describe('Required for dig, quarry, explore and build.'),
     priority: z.number().int().min(1).max(5).default(3)
@@ -251,10 +251,15 @@ registry.register({
     let dispatched = false;
     let dispatchError: string | undefined;
     if (bridge.connected) {
+      const b = a.bounds!;
       const work: Record<string, unknown> =
-        a.kind === 'explore'
-          ? { survey: { min: a.bounds!.min, max: a.bounds!.max } }
-          : { dig: { start: a.bounds!.min, stop: a.bounds!.max } };
+        a.kind === 'explore' ? { survey: { min: b.min, max: b.max } }
+        : a.kind === 'lumber'
+          // Lumber walks a surface area rather than excavating a volume, so it takes width/length
+          // and settles to the ground itself -- a height is meaningless for felling trees.
+          ? { lumber: { start: b.min, w: Math.abs(b.max.x - b.min.x) + 1,
+                        l: Math.abs(b.max.z - b.min.z) + 1 } }
+        : { dig: { start: b.min, stop: b.max } };
       try {
         // 'Add', not 'AddTask'. The wire key is the KEY in the module's m_ServerEvents table,
         // which is not the same as the On<Name> handler function. TaskMan registers OnAddTask
@@ -276,6 +281,46 @@ registry.register({
       id: order.id, kind: order.kind, status: dispatched ? order.status : 'not-dispatched',
       priority: order.priority, volume, dispatched, dispatchError,
     };
+  },
+});
+
+// ── world.find ─────────────────────────────────────────────────────────────
+// Ask the surveyed map where something is, instead of digging to find out. The base sits in a
+// desert, so guessing cost a whole dig job that returned nothing but sand.
+registry.register({
+  name: 'world.find',
+  summary: 'Locate surveyed blocks by name, e.g. "ore", "dirt", "log".',
+  description:
+    'Reads the scouts\' occupancy map -- no drone, no fuel, no travel. Substring match, so "ore" ' +
+    'finds every ore type. Returns nothing if that block has not been surveyed yet, which means ' +
+    'survey first rather than that it is absent.',
+  params: z.object({
+    match: z.string().min(2).describe('Substring of the block name, e.g. "iron_ore".'),
+    limit: z.number().int().min(1).max(200).default(40),
+  }).strict(),
+  returns: 'Total found, counts per block name, and up to `limit` coordinates.',
+  danger: 'read',
+  handler: async (a) => {
+    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    return await bridge.call('MapServer', 'FindBlocks', a, { timeoutMs: 10000 });
+  },
+});
+
+// ── world.caves ────────────────────────────────────────────────────────────
+registry.register({
+  name: 'world.caves',
+  summary: 'Enclosed air pockets in the surveyed map — candidate caves worth exploring.',
+  description:
+    'A cave is connected surveyed air that sits below the highest solid block in its column, so ' +
+    'open sky is excluded. Gives size, bounding box and an entry cell for each pocket.',
+  params: z.object({
+    min: z.number().int().min(1).max(1000).default(8).describe('Ignore pockets smaller than this.'),
+  }).strict(),
+  returns: 'Cave pockets, largest first, with size, bounds and an entry coordinate.',
+  danger: 'read',
+  handler: async (a) => {
+    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    return await bridge.call('MapServer', 'FindCaves', a, { timeoutMs: 15000 });
   },
 });
 

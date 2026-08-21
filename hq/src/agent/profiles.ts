@@ -71,6 +71,8 @@ export const PROFILES: Record<string, AgentProfile> = {
       'recover.dispatch',
       'storage.stock',
       'storage.smelt',
+      'world.find',
+      'world.caves',
     ],
     maxDanger: 'destructive',
     maxSteps: 12,
