@@ -15,6 +15,9 @@ import { z } from 'zod';
 import { registry, ToolError } from './registry.js';
 import { state, STALE_MS, type Vec3, type DroneStatus } from '../world/state.js';
 import { bridge } from '../bridge/ws.js';
+import { expand, craftable } from '../world/recipes.js';
+import { allocate, checkOrder, SPEC, type Purpose } from '../world/plots.js';
+import { city, saveCity } from '../world/city.js';
 import { supply, runSupplyTick, stockKey, type SupplyRule } from '../agent/supply.js';
 
 /**
@@ -929,6 +932,165 @@ registry.register({
     o.workers = [];
     ctx.log(`order ${o.id} aborted`, { reason: a.reason });
     return { id: o.id, status: o.status, released };
+  },
+});
+
+// ── fleet.goto ─────────────────────────────────────────────────────────────
+//
+// Moving ONE named drone to ONE position was, until now, the only thing the fleet could not be
+// asked to do from here. Every tool issued work over a region and let the planner choose who went.
+// That is the right default and the wrong only option: when a drone is somewhere it should not be
+// -- stranded on a ledge, parked at the bounds, stopped mid-job -- the fix is not an order, it is
+// a destination.
+//
+// The gap had a real cost. D3 ended up 64 blocks above the terrain at the edge of the world and
+// the only ways to move it were to invent a fake mining job near where you wanted it, or to reach
+// past the system entirely and edit the save. Both are worse than the fleet simply being able to
+// take the instruction.
+registry.register({
+  name: 'fleet.goto',
+  summary: 'Send one drone to one position. The direct control the region tools deliberately lack.',
+  description:
+    'Use for recovery and repositioning: a drone stranded high, parked outside its dock, or ' +
+    'left somewhere awkward by an aborted job. NOT for work -- digging, gathering and surveying ' +
+    'are region orders so the planner can split and assign them. This aborts whatever the drone ' +
+    'is currently doing, so check fleet.status first if that matters.',
+  params: z.object({
+    id: z.number().int().describe('Drone computer id, as shown by fleet.status.'),
+    pos: vec3.describe('Where it should end up. Must be inside the operating bounds.'),
+  }).strict(),
+  returns: 'Whether the drone accepted the move, and the destination it was given.',
+  danger: 'mutate',
+  teach: [{
+    situation: 'D3 (#123) finished a survey stranded at y=150 on the map edge and needs to come home.',
+    args: { id: 123, pos: { x: -88, y: 86, z: -51 } },
+    result: { sent: true, id: 123, to: { x: -88, y: 86, z: -51 } },
+    takeaway: 'Recovery is a destination, not a job. The drone aborts and travels.',
+  }],
+  handler: async (a, ctx) => {
+    const drone = state.listDrones().find((d) => d.id === a.id);
+    if (!drone) throw new ToolError(`No drone #${a.id}.`, 'Check fleet.status for drone ids.');
+    // A drone that is not reporting cannot be steered -- it will not hear this. Say so plainly
+    // rather than returning a hopeful success; recover.dispatch is the tool for that case.
+    if (drone.status === 'lost')
+      return { sent: false, id: a.id, reason: 'drone is lost and not reporting; use recover.dispatch' };
+
+    const res: any = await bridge.call('DroneMan', 'GoTo', { id: a.id, pos: a.pos }, { timeoutMs: 15000 });
+    ctx.log(`goto #${a.id}`, { to: a.pos });
+    if (res === false || res == null)
+      return { sent: false, id: a.id, to: a.pos, reason: 'DroneMan did not answer' };
+    return { sent: true, id: a.id, to: a.pos };
+  },
+});
+
+
+// ── plan.make ──────────────────────────────────────────────────────────────
+//
+// The tool that turns a GOAL into WORK. Everything else here acts on a region or a drone; this is
+// the only one that answers "what would it take?".
+registry.register({
+  name: 'plan.make',
+  summary: 'Expand a goal into the ordered jobs that would achieve it, minus what storage already holds.',
+  description:
+    'Ask before ordering anything compound. "Four chests" is not a job -- it is logs, planks and ' +
+    'crafting, in that order, less whatever is already in the chest. Steps come back in ' +
+    'dependency order, so they can be executed front to back. If something cannot be made or ' +
+    'obtained it is listed in `missing` rather than quietly omitted, so an impossible goal says ' +
+    'so instead of producing a plan that stalls halfway.',
+  params: z.object({
+    item: z.string().describe('Namespaced item, e.g. "minecraft:chest".'),
+    quantity: z.number().int().min(1).max(512).default(1),
+  }).strict(),
+  returns: 'Ordered steps, what stock was drawn on, and anything unobtainable.',
+  danger: 'read',
+  teach: [{
+    situation: 'We want four chests for field caches and have 8 planks in storage.',
+    args: { item: 'minecraft:chest', quantity: 4 },
+    result: {
+      steps: [
+        { item: 'minecraft:oak_log', action: 'lumber', runs: 6 },
+        { item: 'minecraft:oak_planks', action: 'craft', need: 24, runs: 6 },
+        { item: 'minecraft:chest', action: 'craft', need: 4, runs: 4 },
+      ],
+      satisfied: { 'minecraft:oak_planks': 8 },
+      missing: [],
+    },
+    takeaway: 'The 8 planks already held are subtracted once, not once per chest.',
+  }],
+  handler: async (a) => {
+    let stock: Record<string, number> = {};
+    try {
+      const res: any = await bridge.call('StorageMan', 'stock', {}, { timeoutMs: 8000 });
+      for (const d of res?.detail ?? res?.data?.detail ?? []) {
+        if (typeof d?.name === 'string') stock[d.name] = (stock[d.name] ?? 0) + (d.count ?? 0);
+      }
+    } catch {
+      // Plan against nothing rather than refusing. A plan that over-orders is recoverable; no
+      // plan at all when the bridge blips is not. The response says which happened.
+      stock = {};
+    }
+    const plan = expand(a.item, a.quantity, (i) => stock[i] ?? 0);
+    return { ...plan, stockKnown: Object.keys(stock).length > 0, craftable: craftable().length };
+  },
+});
+
+// ── plot.alloc ─────────────────────────────────────────────────────────────
+registry.register({
+  name: 'plot.alloc',
+  summary: 'Reserve ground for a purpose. Every build must sit inside a plot.',
+  description:
+    'Allocation walks outward from the base and returns the first free footprint that fits, ' +
+    'sized for the purpose and separated from its neighbours by a street. Do this BEFORE ' +
+    'ordering any build: an order that names no plot is an order nothing can check, and that is ' +
+    'how a monitor wall was built on top of a drone.',
+  params: z.object({
+    purpose: z.enum(['docks','storage','smelting','crafting','farm','forestry','mine_head','power','reserved']),
+    name: z.string().max(40).optional().describe('Override the generated name.'),
+  }).strict(),
+  returns: 'The allocated plot, or why no ground was free.',
+  danger: 'mutate',
+  teach: [{
+    situation: 'We have saplings and dirt and need somewhere to put a tree farm.',
+    args: { purpose: 'forestry' },
+    result: { name: 'forestry-01', min: { x: -85, y: 81, z: -44 }, max: { x: -75, y: 96, z: -34 }, status: 'planned' },
+    takeaway: 'Site first, build second. The plot is what makes the build order checkable.',
+  }],
+  handler: async (a, ctx) => {
+    const r = allocate(city, a.purpose as Purpose, a.name);
+    if ('error' in r) throw new ToolError(r.error, 'Free ground by removing a planned plot, or widen the operating bounds.');
+    saveCity();
+    ctx.log(`plot ${r.name} allocated`, { purpose: r.purpose });
+    return { ...r, footprint: SPEC[r.purpose] };
+  },
+});
+
+// ── plot.list ──────────────────────────────────────────────────────────────
+registry.register({
+  name: 'plot.list',
+  summary: 'What the settlement is made of, and whether a region is safe to work.',
+  description:
+    'With `check`, answers the only question that matters before a destructive order: may this ' +
+    'region be dug or built in? A null reason means yes.',
+  params: z.object({
+    check: z.object({
+      plot: z.string(),
+      min: vec3, max: vec3,
+    }).optional().describe('Validate a region against a named plot.'),
+  }).strict(),
+  returns: 'Every plot, and the verdict for a checked region.',
+  danger: 'read',
+  handler: async (a) => {
+    const out: any = {
+      origin: city.origin,
+      bounds: city.bounds,
+      count: city.plots.length,
+      plots: city.plots,
+    };
+    if (a.check) {
+      const reason = checkOrder(city, a.check.plot, { min: a.check.min, max: a.check.max });
+      out.check = { allowed: reason === null, reason };
+    }
+    return out;
   },
 });
 

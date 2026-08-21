@@ -79,7 +79,17 @@ local function connect()
   closeSocket()
   m_Dialing = true
   log("connecting to " .. HQ_URL)
-  local ok, err = http.websocketAsync(HQ_URL)
+  -- pcall, because this THROWS rather than returning on "Too many websockets already open".
+  -- Unguarded it propagated out of socketLoop, ended parallel.waitForAny, and stopped the bridge
+  -- dead -- turning a recoverable resource problem into the fleet losing HQ entirely.
+  local s_Called, ok, err = pcall(http.websocketAsync, HQ_URL)
+  if not s_Called then
+    m_Dialing = false
+    log("dial threw: " .. tostring(ok) .. " -- backing off")
+    sleep(m_Backoff)
+    m_Backoff = math.min(m_Backoff * 2, RECONNECT_MAX)
+    return false
+  end
   if not ok then
     m_Dialing = false
     log("dial failed: " .. tostring(err))
@@ -220,6 +230,19 @@ local function socketLoop()
     m_Tasks = s_Live
 
     if event == "websocket_success" and url == HQ_URL then
+      -- Close whatever we were already holding BEFORE overwriting the reference.
+      --
+      -- This is the leak that kept killing the bridge with "Too many websockets already open".
+      -- m_Dialing stops us starting two dials at once, but it cannot stop two dials COMPLETING:
+      -- a websocket_closed for the old socket clears m_Dialing while a new dial is still in
+      -- flight, both then succeed, and this line used to drop the first handle on the floor
+      -- without closing it. CC:T counts handles, not variables. Every HQ restart leaked one, and
+      -- HQ was restarting repeatedly while the map work was being rebuilt -- so the bridge died
+      -- and took the fleet's whole view of itself with it.
+      if m_Socket and m_Socket ~= param then
+        pcall(function() m_Socket.close() end)
+        log("closed a leaked socket on reconnect")
+      end
       m_Socket = param
       m_Dialing = false
       m_Backoff = RECONNECT_MIN                 -- reset only on real success

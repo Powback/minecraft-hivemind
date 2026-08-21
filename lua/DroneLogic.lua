@@ -251,6 +251,10 @@ function Role()
     -- "chunky". That makes it the fleet's freedom of movement -- drones outside a forceloaded
     -- chunk simply stop, silently, wherever they happened to be.
     if peripheral.find("chunky") then return "loader" end
+    -- A crafting table is an upgrade like any other, and it is what makes a drone able to PRODUCE
+    -- rather than only extract. Reported so TaskMan can route craft work to a drone that can
+    -- actually do it, instead of discovering the hard way that turtle.craft is nil.
+    if IsCrafter() then return "crafter" end
     return "miner"
 end
 
@@ -855,6 +859,164 @@ function OnGather(p_ID, p_Message)
     end)
 end
 
+-- CRAFTING
+--
+-- The gate everything else was behind. The fleet could dig, carry and smelt, so it could obtain
+-- raw material and it could not turn any of it into a single useful object -- no planks, so no
+-- chests, so no field caches; no crafting table, so no second crafty turtle; no sticks, so no
+-- tools. A settlement that cannot make anything is a quarry with extra steps.
+--
+-- Needs a turtle with a crafting-table upgrade. turtle.craft simply does not exist otherwise, so
+-- this refuses loudly on the wrong drone rather than failing in some subtler way further in.
+
+-- The 3x3 grid maps onto a 4x4 inventory, so it is NOT slots 1-9: the fourth column is outside the
+-- grid and anything left there makes the craft fail with no explanation.
+local CRAFT_SLOTS = {1, 2, 3, 5, 6, 7, 9, 10, 11}
+
+function IsCrafter()
+    return type(turtle.craft) == "function"
+end
+
+-- Staging slots, outside the crafting grid.
+--
+-- turtle.suck takes whatever the chest offers next -- there is no "suck the planks". So items are
+-- pulled in bulk, consolidated by kind into these slots, and only then dealt into the grid. Four
+-- is enough for every recipe in the graph (none has more than two distinct inputs) and the code
+-- says so rather than silently mis-crafting if that ever stops being true.
+local STAGE_SLOTS = {13, 14, 15, 16}
+
+local function emptyInventory()
+    for i = 1, 16 do
+        if turtle.getItemCount(i) > 0 then
+            turtle.select(i)
+            turtle.dropDown()
+        end
+    end
+end
+
+--- Pull everything from the chest below and consolidate by item name.
+--- Returns name -> staging slot.
+local function stageFromChest()
+    local s_Where = {}
+    -- Suck in bulk first; sorting afterwards is far cheaper than one round trip per item.
+    for _ = 1, 32 do
+        turtle.select(1)
+        if not turtle.suckDown() then break end
+    end
+
+    for i = 1, 12 do
+        local d = turtle.getItemDetail(i)
+        if d then
+            local s_Slot = s_Where[d.name]
+            if s_Slot == nil then
+                -- Claim a staging slot for this kind.
+                for _, cand in ipairs(STAGE_SLOTS) do
+                    local cd = turtle.getItemDetail(cand)
+                    if cd == nil or cd.name == d.name then s_Slot = cand break end
+                end
+                if s_Slot == nil then return nil, "more ingredient kinds than staging slots" end
+                s_Where[d.name] = s_Slot
+            end
+            if i ~= s_Slot then
+                turtle.select(i)
+                turtle.transferTo(s_Slot)
+            end
+        end
+    end
+    return s_Where
+end
+
+--- Deal p_Count of the item staged at p_From into grid slot p_To.
+local function dealInto(p_From, p_To, p_Count)
+    if p_From == nil then return 0 end
+    local s_Before = turtle.getItemCount(p_To)
+    turtle.select(p_From)
+    turtle.transferTo(p_To, p_Count)
+    return turtle.getItemCount(p_To) - s_Before
+end
+
+function OnCraft(p_ID, p_Message)
+    return RunJob("Craft", p_Message.data, {status = "crafting", travel = false}, function(d)
+        if not IsCrafter() then
+            -- Named, not generic: "cannot craft" sends someone looking for a software bug, when
+            -- the actual fix is to put a crafting table on a turtle.
+            error("this drone has no crafting table upgrade -- it physically cannot craft", 0)
+        end
+
+        local s_Item  = d.item
+        local s_Runs  = math.max(1, tonumber(d.runs) or 1)
+        local s_Grid  = d.grid                       -- may be nil for shapeless recipes
+        local s_Inputs= d.inputs or {}
+        if s_Item == nil then error("no item to craft", 0) end
+
+        -- 1. Ask storage to put the ingredients somewhere we can reach.
+        local s_Req = {}
+        for name, per in pairs(s_Inputs) do
+            s_Req[#s_Req + 1] = {name = name, count = per * s_Runs}
+        end
+        if #s_Req == 0 then error("recipe has no inputs", 0) end
+
+        local s_Hand = PowNet.sendAndWaitForResponse("StorageMan",
+            PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Provide", {items = s_Req}),
+            PowNet.SERVER_PROTOCOL)
+        if type(s_Hand) ~= "table" or s_Hand.pos == nil then
+            error("storage would not hand over ingredients", 0)
+        end
+        if s_Hand.complete == false then
+            -- Stop rather than craft a partial batch. A short craft silently produces fewer items
+            -- than the plan counted on, and the shortfall surfaces much later as a mystery.
+            local s_Miss = ""
+            for _, m in ipairs(s_Hand.short or {}) do s_Miss = s_Miss .. m.name .. " x" .. m.count .. " " end
+            error("short of " .. s_Miss, 0)
+        end
+
+        -- 2. Go to the pickup chest and face it.
+        if pgps.moveTo(s_Hand.pos.x, s_Hand.pos.y + 1, s_Hand.pos.z) == false then
+            error("could not reach the pickup chest", 0)
+        end
+
+        -- 3. Load the grid. Layout IS the recipe: turtle.craft reads the slots and infers the
+        --    result, so a misplaced ingredient yields the wrong item or nothing at all.
+        emptyInventory()                   -- leftovers change what the grid means
+        local s_Stage, s_StageErr = stageFromChest()
+        if s_Stage == nil then error(s_StageErr, 0) end
+
+        if s_Grid then
+            for i = 1, 9 do
+                local want = s_Grid[i]
+                -- textutils/JSON turns a nil hole into false or a sentinel depending on transport,
+                -- so an empty cell is anything that is not a string.
+                if type(want) == "string" then
+                    local n = dealInto(s_Stage[want], CRAFT_SLOTS[i], s_Runs)
+                    if n < s_Runs then
+                        error(("only %d/%d of %s reached slot %d"):format(n, s_Runs, want, i), 0)
+                    end
+                end
+            end
+        else
+            local s_At = 1
+            for name, per in pairs(s_Inputs) do
+                local n = dealInto(s_Stage[name], CRAFT_SLOTS[s_At], per * s_Runs)
+                if n < per * s_Runs then error("short of " .. name, 0) end
+                s_At = s_At + 1
+            end
+        end
+
+        -- 4. Craft, then put the result away.
+        local s_Ok, s_Err = turtle.craft()
+        if not s_Ok then
+            error("craft refused: " .. tostring(s_Err) ..
+                  " (layout wrong, or this is not a valid recipe)", 0)
+        end
+
+        local s_Made = 0
+        for i = 1, 16 do s_Made = s_Made + turtle.getItemCount(i) end
+        Deposit()
+        return {message = ("crafted %s x%d"):format(s_Item, s_Runs), item = s_Item, runs = s_Runs,
+                held = s_Made}
+    end)
+end
+
 function OnLumber(p_ID, p_Message)
     return RunJob("Lumber", p_Message.data, {status = "logging"}, function(d)
         local s_W = tonumber(d.w) or 8
@@ -931,6 +1093,11 @@ end
 local m_DroneEvents = {
     Reboot = {
         func = OnReboot,
+    },
+    -- The verb the whole recipe graph is for. Only a turtle with a crafting-table upgrade can
+    -- serve it; OnCraft says so plainly rather than failing somewhere less obvious.
+    Craft = {
+        func = OnCraft,
     },
     Ping = {
         func = OnPing,

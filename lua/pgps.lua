@@ -279,6 +279,19 @@ local m_Drift     = 0        -- how far off the last check found us; diagnostics
 local m_Suppressed = 0       -- observations withheld for want of a fix
 local FIX_MAX_AGE = 60       -- seconds
 
+-- How far a drone may travel on belief alone before it has to prove where it is.
+--
+-- Not zero: gps.locate costs a round trip and calling it every single step would halve the fleet's
+-- speed for no benefit over short hops. Not unbounded either, which is what cost us D3. 24 blocks
+-- of undetected drift is what walking a long survey leg without a single confirmation buys.
+--
+-- These MUST be declared before any function that reads them. A Lua local is only visible to
+-- closures created after its declaration; putting them lower down would silently bind fixStatus to
+-- nil globals and report nothing while looking correct.
+local MOVES_PER_FIX   = 16
+local m_MovesSinceFix = 0
+local m_NoFixStops    = 0
+
 function verifyPosition()
     if not startGPS() then return nil, "no modem for gps" end
     local x, y, z = gps.locate(2, false)
@@ -301,7 +314,24 @@ end
 
 function fixStatus()
     return {verified = positionVerified(), drift = m_Drift, suppressed = m_Suppressed,
+            movesSinceFix = m_MovesSinceFix, stalled = m_NoFixStops,
             ageSeconds = m_LastFix and (os.clock() - m_LastFix) or nil}
+end
+
+-- True if it is safe to take another step. Re-fixes when the budget runs out, and REFUSES when no
+-- fix can be had -- a drone that stops inside the world is recoverable, one that wanders out of it
+-- is not. That is the whole trade, and it is not close.
+function requireFix()
+    if m_MovesSinceFix < MOVES_PER_FIX and positionVerified() then
+        m_MovesSinceFix = m_MovesSinceFix + 1
+        return true
+    end
+    if verifyPosition() then
+        m_MovesSinceFix = 1
+        return true
+    end
+    m_NoFixStops = m_NoFixStops + 1
+    return false
 end
 
 -- Record that the cell in p_Which ("forward" | "up" | "down") is now AIR.
@@ -342,6 +372,17 @@ end
 --
 
 function forward()
+    -- A bounds check is only as good as the position it is checking.
+    --
+    -- D3 was found 24 blocks OUTSIDE the force-loaded region, frozen and invisible to the server,
+    -- while reporting a position exactly on the boundary. Nothing was wrong with inBounds: it was
+    -- asked about coordinates the drone had drifted away from, answered honestly, and waved the
+    -- drone across a line it had already crossed. Dead reckoning cannot be allowed to run
+    -- indefinitely between confirmations -- the whole safety system is downstream of the position.
+    if not requireFix() then
+        return false, "position unverified"
+    end
+
     -- Refuse rather than step out of the world we can operate in.
     if cachedDir and cachedX then
         local F = deltas[cachedDir]

@@ -25,6 +25,10 @@ services:
       # hand-written 92-line PowNet stub whose protocol string ("pownet-server" vs the live
       # "PowNet:Server") meant its Bridge could never reach MainFrame, silently.
       - ../lua:/lua:ro
+      # The plot registry. Losing it means losing the map of what the settlement IS, which would
+      # let the next build order sit on top of something already there -- exactly the failure the
+      # registry exists to prevent. So it outlives the container.
+      - hive-state:/state
     restart: unless-stopped
     labels:
       - "traefik.enable=true"
@@ -39,3 +43,6 @@ networks:
   default: {}
   traefik:
     external: true
+
+volumes:
+  hive-state:

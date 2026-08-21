@@ -111,6 +111,68 @@ function OnFind(p_ID, p_Message)
     return true, {message = s_Msg, count = s_Total, hits = s_Hits}
 end
 
+-- Gather requested items into the pickup chest so a drone can collect them.
+--
+-- Storage has been one-way since it was built: drones could deposit, nothing could take. That was
+-- survivable while every job CONSUMED the world and produced items, and it becomes the blocker the
+-- moment anything needs INPUTS -- crafting, refuelling, building. A recipe plan is worthless if
+-- the planks cannot get from the chest into the turtle.
+--
+-- Items are pushed to a physical chest rather than handed over directly, because a turtle is not a
+-- network inventory unless it is wired to the modem network, and these drones are mobile. The
+-- deposit chest is somewhere a drone can already fly to and reach, so this reuses infrastructure
+-- that is known to work rather than inventing a second delivery mechanism.
+function OnProvide(p_ID, p_Message)
+    Rescan()
+    local s_Want = p_Message.data and p_Message.data.items
+    if type(s_Want) ~= "table" or #s_Want == 0 then return false, "Missing items" end
+
+    -- The pickup chest. Deliberately the SAME chest drones already unload into: one physical
+    -- rendezvous point, one thing to keep clear, one place to look when something goes missing.
+    local s_Point
+    for _, d in ipairs(DATA["deposits"] or {}) do s_Point = d break end
+    if s_Point == nil then
+        return false, "no deposit point to hand over at -- add one with: p StorageMan deposit -pos x y z"
+    end
+
+    local s_Given, s_Short = {}, {}
+    for _, req in ipairs(s_Want) do
+        local s_Name  = req.name
+        local s_Need  = tonumber(req.count) or 0
+        local s_Moved = 0
+
+        for name, e in pairs(m_Index) do
+            if s_Moved >= s_Need then break end
+            -- Exact match here, NOT the substring matching Find uses. "iron" finding iron_ingot is
+            -- helpful when a human is looking; a crafting grid filled with raw_iron because the
+            -- recipe asked for iron_ingot produces nothing and wastes the trip.
+            if name == s_Name then
+                for _, at in ipairs(e.at or {}) do
+                    if s_Moved >= s_Need then break end
+                    local src = peripheral.wrap(at.where)
+                    if src and src.pushItems then
+                        local ok, n = pcall(src.pushItems, s_Point.peripheral, at.slot, s_Need - s_Moved)
+                        if ok and type(n) == "number" then s_Moved = s_Moved + n end
+                    end
+                end
+            end
+        end
+
+        if s_Moved > 0 then s_Given[#s_Given + 1] = {name = s_Name, count = s_Moved} end
+        if s_Moved < s_Need then
+            s_Short[#s_Short + 1] = {name = s_Name, count = s_Need - s_Moved}
+        end
+    end
+
+    Rescan()
+    return true, {
+        pos = s_Point.pos, peripheral = s_Point.peripheral,
+        provided = s_Given, short = s_Short,
+        complete = (#s_Short == 0),
+        message = ("handed over %d kinds at %d,%d,%d"):format(#s_Given, s_Point.pos.x, s_Point.pos.y, s_Point.pos.z),
+    }
+end
+
 function OnStock(p_ID, p_Message)
     Rescan()
     local s_Kinds, s_Items, s_Slots = 0, 0, 0
@@ -288,6 +350,8 @@ local m_ServerEvents = {
     FindItem     = { func = OnFind },
     DepositPoint = { func = OnDepositPoint },
     GetStock     = { func = OnStock },
+    -- The other direction. Storage was deposit-only, which blocked every job that needs inputs.
+    Provide      = { func = OnProvide },
 
     find = {
         func = OnFind, callable = true,
