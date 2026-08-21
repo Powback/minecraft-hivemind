@@ -201,7 +201,13 @@ const server = createServer(async (req, res) => {
     }
 
     if (url.pathname === '/map/voxels') {
-      return sendCompact(200, await mapCall('world.voxels', { raw: true }));
+      // Occupancy and identity in one response, because the renderer cannot colour a cell without
+      // both and fetching them separately would let it draw a frame with one and not the other.
+      const [voxels, blocks] = await Promise.all([
+        mapCall('world.voxels', { raw: true }),
+        mapCall('world.blocks', { raw: true }),
+      ]);
+      return sendCompact(200, { voxels, blocks });
     }
 
     /**
@@ -212,8 +218,10 @@ const server = createServer(async (req, res) => {
      * not the whole view -- the alternative is a blank page whenever the slowest call blinks.
      */
     if (url.pathname === '/map/state') {
-      const [fleet, caves, ore, dirt, stock] = await Promise.all([
+      const [fleet, tasks, nodes, caves, ore, dirt, stock] = await Promise.all([
         mapCall('fleet.status', {}),
+        mapCall('fleet.tasks', {}),
+        mapCall('hive.nodes', {}),
         mapCall('world.caves', { min: 4 }),
         mapCall('world.find', { match: 'ore', limit: 200 }),
         mapCall('world.find', { match: 'dirt', limit: 200 }),
@@ -222,7 +230,7 @@ const server = createServer(async (req, res) => {
       return sendCompact(200, {
         at: Date.now(),
         bridge: bridge.status(),
-        fleet, caves, ore, dirt, stock,
+        fleet, tasks, nodes, caves, ore, dirt, stock,
       });
     }
 

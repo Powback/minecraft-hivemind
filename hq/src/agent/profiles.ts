@@ -77,6 +77,11 @@ export const PROFILES: Record<string, AgentProfile> = {
       // renderer should. Allowed here so that "why does the map show nothing there?" is a question
       // the commander can answer for itself instead of one only a human with curl can.
       'world.voxels',
+      'world.blocks',
+      // What the fleet was told to do, and whether the machines that tell it are alive. Both are
+      // things the commander was previously unable to check about its own orders.
+      'fleet.tasks',
+      'hive.nodes',
       'order.gather',
       'supply.status',
       'supply.set',

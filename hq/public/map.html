@@ -7,34 +7,40 @@
   useless for the question a human actually asks, which is "why did the drone stop THERE?" —
   a question about shape, and shape does not survive being turned into a number.
 
-  Design rules this page follows:
+  What it shows, in the order it earns its keep:
 
-    - ONE poll for everything that moves (/map/state), separate and slower for the terrain
-      (/map/voxels). The occupancy grid is ~100KB and changes only when a scout surveys; drone
-      positions change constantly and are a few hundred bytes. Polling them at the same rate would
-      mean either stale drones or a saturated bridge.
-    - The page never fails as a whole. Each data source is drawn if present and named in the HUD if
-      absent, because "caves unavailable" is information and a blank canvas is not.
-    - Absent is not air. The grid distinguishes surveyed-air (0) from never-surveyed (missing), and
-      so does this: unsurveyed space is drawn as nothing at all, so the holes in the map are
-      visible AS holes rather than as open cavern.
+    - INTENT, not just position. A drone marker tells you where something is; a task box tells you
+      what it was told to do and where. The second is the one that catches a scout surveying a
+      region it is nowhere near — which is exactly the class of bug that hid in this fleet for
+      days, because every individual component reported itself healthy.
+    - THE CONTROL PLANE. Drones heartbeat; the computers that command them did not report at all,
+      so five idle turtles looked identical whether there was no work or TaskMan had been dead
+      since the last chunk unload.
+    - WHAT the terrain is, not merely that it is solid.
+
+  Design rules:
+
+    - ONE poll for everything that moves, separate and slower for terrain. The occupancy grid is
+      ~100KB and changes only when a scout surveys; drone positions change constantly.
+    - The page never fails as a whole. Each source is drawn if present and named if absent,
+      because "tasks unavailable" is information and a blank canvas is not.
+    - Absent is not air, and unidentified is not absent. The grid distinguishes surveyed-air (0)
+      from never-surveyed (missing); the block index identifies only a subset of the solid cells.
+      Three states, drawn as three states.
 
   Three.js is vendored under /map/vendor. Not a CDN: this runs on a LAN behind Pi-hole with no
   guarantee of internet, and a visualiser that goes blank when WAN drops is worse than no
   visualiser, because it looks like the fleet died.
 -->
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>HiveMind — world map</title>
-<!-- Inline empty icon. Without it every load spends a request on /favicon.ico and takes a 404 back,
-     which is harmless but puts a permanent red line in the console of a page whose whole job is to
-     make real problems visible. -->
 <link rel="icon" href="data:,">
 
 <style>
   :root {
     --bg: #0a0d12;
-    --panel: rgba(14, 19, 27, 0.86);
+    --panel: rgba(14, 19, 27, 0.88);
     --edge: rgba(120, 160, 200, 0.18);
     --ink: #d7e2ee;
     --dim: #7d8ea2;
@@ -44,73 +50,126 @@
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink);
-               font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; }
-  canvas { display: block; }
+               font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+               overflow: hidden; -webkit-text-size-adjust: 100%; }
+  canvas { display: block; touch-action: none; }
 
   .panel {
     position: fixed; background: var(--panel); border: 1px solid var(--edge);
     border-radius: 8px; padding: 10px 12px; backdrop-filter: blur(8px);
     box-shadow: 0 8px 28px rgba(0,0,0,.45);
   }
-  #hud { top: 12px; left: 12px; min-width: 230px; }
-  #fleet { top: 12px; right: 12px; width: 268px; max-height: calc(100vh - 24px); overflow: auto; }
+  #hud    { top: 12px; left: 12px; width: 250px; max-height: calc(100vh - 24px); overflow: auto; }
+  #side   { top: 12px; right: 12px; width: 286px; max-height: calc(100vh - 24px); overflow: auto; }
   #legend { bottom: 12px; left: 12px; }
 
   h1 { font-size: 13px; margin: 0 0 8px; letter-spacing: .09em; text-transform: uppercase; color: #9fb6cd; }
-  h2 { font-size: 11px; margin: 12px 0 6px; letter-spacing: .09em; text-transform: uppercase; color: var(--dim); }
+  h2 { font-size: 11px; margin: 13px 0 6px; letter-spacing: .09em; text-transform: uppercase; color: var(--dim);
+       border-top: 1px solid var(--edge); padding-top: 9px; }
+  h2:first-of-type { border-top: 0; }
 
-  .row { display: flex; justify-content: space-between; gap: 14px; padding: 1px 0; }
+  .row { display: flex; justify-content: space-between; gap: 12px; padding: 1px 0; }
   .row .k { color: var(--dim); }
-  .row .v { color: var(--ink); }
+  .row .v { color: var(--ink); text-align: right; }
 
-  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px;
-         vertical-align: 1px; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: 1px; }
 
-  /* One drone. The whole card is the hover target so the pointer does not have to find 8px of text. */
-  .drone { border-left: 3px solid var(--role); padding: 5px 8px; margin: 4px 0; border-radius: 0 5px 5px 0;
-           background: rgba(255,255,255,.028); cursor: default; transition: background .12s; }
-  .drone:hover, .drone.hot { background: rgba(255,255,255,.1); }
-  .drone .name { font-weight: 700; }
-  .drone .meta { color: var(--dim); font-size: 11px; }
-  .drone .pos { color: #8fa9c4; font-size: 11px; }
+  /* One entity — drone, task or computer. Whole card is the hover target so the pointer does not
+     have to find 8px of text. */
+  .card { border-left: 3px solid var(--accent, #666); padding: 5px 8px; margin: 4px 0;
+          border-radius: 0 5px 5px 0; background: rgba(255,255,255,.028); transition: background .12s; }
+  .card:hover, .card.hot { background: rgba(255,255,255,.1); }
+  .card .name { font-weight: 700; }
+  .card .meta { color: var(--dim); font-size: 11px; }
+  .card .pos  { color: #8fa9c4; font-size: 11px; }
+  .card .warn { color: var(--warn); font-size: 11px; }
+  .card .log  { color: #6f8298; font-size: 10.5px; white-space: nowrap; overflow: hidden;
+                text-overflow: ellipsis; font-style: italic; }
+  .drone { cursor: pointer; }
 
   .bar { height: 3px; border-radius: 2px; background: rgba(255,255,255,.12); margin-top: 4px; overflow: hidden; }
-  .bar > i { display: block; height: 100%; background: var(--ok); }
+  .bar > i { display: block; height: 100%; }
 
-  label.toggle { display: flex; align-items: center; gap: 7px; padding: 1px 0; color: var(--dim); cursor: pointer; }
+  label.toggle { display: flex; align-items: center; gap: 7px; padding: 2px 0; color: var(--dim); cursor: pointer; }
   label.toggle:hover { color: var(--ink); }
-  input[type=checkbox] { accent-color: #5aa9e6; margin: 0; }
+  input[type=checkbox] { accent-color: #5aa9e6; margin: 0; width: 15px; height: 15px; }
 
   .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  .muted { color: var(--dim); }
+  .note { color: var(--warn); font-size: 11px; line-height: 1.35; margin: 4px 0 0; }
 
   #err { position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%);
          background: rgba(70, 16, 22, .93); border: 1px solid #7d2b33; color: #ffd9dc;
-         padding: 7px 14px; border-radius: 7px; display: none; max-width: 70vw; }
-  #tip { position: fixed; pointer-events: none; display: none; z-index: 10; }
-  .muted { color: var(--dim); }
+         padding: 7px 14px; border-radius: 7px; display: none; max-width: 70vw; z-index: 20; }
+  #tip { position: fixed; pointer-events: none; display: none; z-index: 30; max-width: 260px; }
+
+  /* ── mobile ──────────────────────────────────────────────────────────────
+     Phones get a tab bar and one panel at a time. The panels are the same DOM — collapsing rather
+     than duplicating means there is no second layout to keep in sync, and the 3D view keeps the
+     whole screen by default, which is the thing you came to look at. */
+  /* The inset goes on the TOP only — a notch is above the bar, not below it. Folding it into the
+     shorthand's bottom value padded the wrong edge on exactly the devices that have one. */
+  #tabs { position: fixed; top: 0; left: 0; right: 0; display: none; z-index: 25;
+          background: rgba(10,13,18,.92); border-bottom: 1px solid var(--edge);
+          padding: calc(6px + env(safe-area-inset-top, 0px)) 8px 6px; gap: 6px; }
+  #tabs button { flex: 1; background: rgba(255,255,255,.05); color: var(--dim);
+                 border: 1px solid var(--edge); border-radius: 6px; padding: 8px 4px;
+                 font: inherit; font-size: 11px; letter-spacing: .06em; text-transform: uppercase; }
+  #tabs button.on { background: rgba(90,169,230,.18); color: var(--ink); border-color: #5aa9e6; }
+
+  @media (max-width: 760px), (pointer: coarse) and (max-width: 1024px) {
+    #tabs { display: flex; }
+    #hud, #side, #legend {
+      top: auto; left: 8px; right: 8px; bottom: 8px; width: auto;
+      max-height: 52vh; overflow: auto; display: none;
+    }
+    body.show-hud    #hud    { display: block; }
+    body.show-side   #side   { display: block; }
+    body.show-legend #legend { display: block; }
+    #err { bottom: auto; top: calc(58px + env(safe-area-inset-top, 0px)); max-width: 92vw; }
+    /* Touch targets. A 15px checkbox is a miss on a phone. */
+    label.toggle { padding: 7px 0; }
+    input[type=checkbox] { width: 20px; height: 20px; }
+    #tip { display: none !important; }   /* no hover on touch; the panel is the readout */
+  }
 </style>
+
+<div id="tabs">
+  <button data-panel="hud">status</button>
+  <button data-panel="side">fleet</button>
+  <button data-panel="legend">legend</button>
+</div>
 
 <div id="hud" class="panel">
   <h1>HiveMind</h1>
   <div class="row"><span class="k">bridge</span><span class="v" id="h-bridge">…</span></div>
+  <div class="row"><span class="k">control plane</span><span class="v" id="h-nodes">…</span></div>
   <div class="row"><span class="k">drones</span><span class="v" id="h-drones">…</span></div>
+  <div class="row"><span class="k">tasks</span><span class="v" id="h-tasks">…</span></div>
   <div class="row"><span class="k">surveyed</span><span class="v" id="h-cells">…</span></div>
+  <div class="row"><span class="k">identified</span><span class="v" id="h-ident">…</span></div>
   <div class="row"><span class="k">caves</span><span class="v" id="h-caves">…</span></div>
-  <div class="row"><span class="k">ore / dirt</span><span class="v" id="h-mats">…</span></div>
   <div class="row"><span class="k">storage</span><span class="v" id="h-stock">…</span></div>
   <div class="row"><span class="k">updated</span><span class="v" id="h-age">…</span></div>
+  <div id="h-alerts"></div>
 
   <h2>layers</h2>
   <label class="toggle"><input type="checkbox" id="t-solid" checked> terrain</label>
   <label class="toggle"><input type="checkbox" id="t-air"> surveyed air</label>
   <label class="toggle"><input type="checkbox" id="t-caves" checked> caves</label>
-  <label class="toggle"><input type="checkbox" id="t-mats" checked> ore &amp; dirt</label>
-  <label class="toggle"><input type="checkbox" id="t-labels" checked> drone labels</label>
+  <label class="toggle"><input type="checkbox" id="t-mats" checked> ore &amp; dirt (advisory)</label>
+  <label class="toggle"><input type="checkbox" id="t-tasks" checked> task regions</label>
+  <label class="toggle"><input type="checkbox" id="t-nodes" checked> computers</label>
+  <label class="toggle"><input type="checkbox" id="t-labels" checked> labels</label>
 </div>
 
-<div id="fleet" class="panel">
+<div id="side" class="panel">
   <h1>fleet</h1>
   <div id="fleet-list" class="muted">loading…</div>
+  <h2>tasks</h2>
+  <div id="task-list" class="muted">loading…</div>
+  <h2>computers</h2>
+  <div id="node-list" class="muted">loading…</div>
   <h2>storage</h2>
   <div id="stock-list" class="muted">loading…</div>
 </div>
@@ -120,10 +179,12 @@
                    <span class="k"><i class="swatch" style="background:#4fc3e8"></i> scout</span></div>
   <div class="row"><span class="k"><i class="swatch" style="background:#7de08a"></i> loader</span>
                    <span class="k"><i class="swatch" style="background:#8a94a3"></i> offline</span></div>
-  <div class="row"><span class="k"><i class="swatch" style="background:#ffe14d"></i> ore</span>
-                   <span class="k"><i class="swatch" style="background:#9a6b3f"></i> dirt</span></div>
-  <div class="row"><span class="k"><i class="swatch" style="background:#a06bd8"></i> cave</span>
-                   <span class="k muted">drag rotate · scroll zoom</span></div>
+  <div class="row"><span class="k"><i class="swatch" style="background:#ff8a4c"></i> dig</span>
+                   <span class="k"><i class="swatch" style="background:#4fc3e8"></i> survey</span></div>
+  <div class="row"><span class="k"><i class="swatch" style="background:#ffe14d"></i> gather</span>
+                   <span class="k"><i class="swatch" style="background:#a06bd8"></i> cave</span></div>
+  <div class="row"><span class="k"><i class="swatch" style="background:#dfe6ee"></i> computer</span>
+                   <span class="k muted">drag · pinch · scroll</span></div>
 </div>
 
 <div id="tip" class="panel"></div>
@@ -137,21 +198,34 @@
 import * as THREE from 'three';
 import { OrbitControls } from '/map/vendor/OrbitControls.js';
 
-// How often each source is re-read. The terrain interval is longer than the server's 10s voxel
-// cache on purpose: polling faster than the cache only burns bandwidth to re-receive bytes we were
-// just told are still current.
-const STATE_MS  = 3_000;
-const VOXEL_MS  = 15_000;
+// How often each source is re-read. The terrain interval is longer than the server's cache on
+// purpose: polling faster only burns bandwidth to re-receive bytes we were just told are current.
+const STATE_MS = 3_000;
+const VOXEL_MS = 15_000;
 
 const ROLE_COLOR = { miner: 0xe0a33c, scout: 0x4fc3e8, loader: 0x7de08a };
 const OFFLINE_COLOR = 0x8a94a3;
+const VERB_COLOR = {
+  dig: 0xff8a4c, quarry: 0xff8a4c,
+  survey: 0x4fc3e8, scan: 0x4fc3e8,
+  gather: 0xffe14d, lumber: 0x7de08a, build: 0x6f9bff,
+};
+const DEAD = new Set(['offline', 'lost', 'stranded', 'stuck']);
+
+/**
+ * How far above the surveyed ground a drone has to be before the map says so.
+ *
+ * Not an arbitrary threshold: a scout that climbs over an obstacle and never comes back down
+ * ratchets upward a block at a time, and by the time anyone notices it is scanning empty sky
+ * a hundred blocks up while reporting itself perfectly healthy. Position alone does not show that
+ * — only position RELATIVE to the terrain it was sent to survey does.
+ */
+const HIGH_ABOVE_GROUND = 12;
 
 // ── scene ──────────────────────────────────────────────────────────────────
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0a0d12);
-// Fog does real work here rather than being decoration: the survey is a shell of cells with big
-// unsurveyed gaps, and without depth cueing the far side of the terrain reads as the near side.
 scene.fog = new THREE.Fog(0x0a0d12, 70, 320);
 
 const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 4000);
@@ -165,10 +239,8 @@ controls.enableDamping = true;
 controls.dampingFactor = 0.08;
 controls.maxPolarAngle = Math.PI * 0.92;
 
-// Lit brighter than a normal scene would need. Three's colour management treats the values we set
-// as sRGB and works in linear space, so a mid-grey block ends up much darker on screen than its
-// number suggests — the first version of this page rendered legible-on-paper terrain as a black
-// silhouette. The fix is to light for what is actually displayed, not for what the constants read.
+// Lit brighter than a normal scene would need. Three treats the values we set as sRGB and works in
+// linear space, so a mid-grey block ends up much darker on screen than its number suggests.
 scene.add(new THREE.AmbientLight(0xbcd3ea, 0.9));
 const key = new THREE.DirectionalLight(0xffffff, 1.9);
 key.position.set(1, 2, 0.8);
@@ -177,14 +249,14 @@ const rim = new THREE.DirectionalLight(0x6fa8ff, 0.65);
 rim.position.set(-1, 0.4, -1);
 scene.add(rim);
 
-// Groups rather than loose meshes, so a layer toggle is one `.visible` write and a refresh can
-// throw away exactly one subtree without hunting for its members.
 const gTerrain = new THREE.Group();
 const gAir     = new THREE.Group();
 const gCaves   = new THREE.Group();
 const gMats    = new THREE.Group();
+const gTasks   = new THREE.Group();
+const gNodes   = new THREE.Group();
 const gDrones  = new THREE.Group();
-scene.add(gTerrain, gAir, gCaves, gMats, gDrones);
+scene.add(gTerrain, gAir, gCaves, gMats, gTasks, gNodes, gDrones);
 gAir.visible = false;
 
 const CUBE = new THREE.BoxGeometry(1, 1, 1);
@@ -194,10 +266,65 @@ function clearGroup(g) {
   for (const child of g.children.slice()) {
     g.remove(child);
     child.geometry?.dispose?.();
-    if (child.material) {
-      for (const m of [].concat(child.material)) { m.map?.dispose?.(); m.dispose?.(); }
-    }
+    if (child.material) for (const m of [].concat(child.material)) { m.map?.dispose?.(); m.dispose?.(); }
   }
+}
+
+// ── block colours ──────────────────────────────────────────────────────────
+
+/**
+ * Block name -> colour, by substring, most specific first.
+ *
+ * Substring rather than exact match because the index carries fully-qualified names
+ * ("minecraft:coarse_dirt") and mod blocks will arrive with prefixes nobody has enumerated. A
+ * table of exact names would silently grey out every block added to the pack.
+ *
+ * Ores come first so that "deepslate_iron_ore" is iron and not deepslate — the ore is the reason
+ * anyone is looking at that cell.
+ */
+const PALETTE = [
+  [/diamond_ore/,   0x4fe0d4, true],
+  [/emerald_ore/,   0x35d06a, true],
+  [/gold_ore/,      0xf5cf3e, true],
+  [/redstone_ore/,  0xd63b3b, true],
+  [/lapis_ore/,     0x3a6fe0, true],
+  [/copper_ore/,    0xd07a4a, true],
+  [/iron_ore/,      0xe0b48a, true],
+  [/coal_ore/,      0x3c4048, true],
+  [/quartz|debris/, 0xe8e2d8, true],
+  [/_ore\b|_ore$/,  0xff7fd0, true],          // an ore type nobody listed is still an ore
+  [/bedrock/,       0x2a2a2e],
+  [/deepslate/,     0x4c4c54],
+  [/cobblestone/,   0x7d8085],
+  [/stone|andesite|diorite|granite|tuff/, 0x8d9096],
+  [/grass_block|moss/, 0x6ba03a],
+  [/coarse_dirt|rooted_dirt|dirt|podzol|mud/, 0x8a5f3d],
+  [/sandstone/,     0xd6c79b],
+  [/red_sand/,      0xc2703c],
+  [/sand/,          0xe3dbb0],
+  [/gravel/,        0x8d8681],
+  [/clay/,          0x9aa3b0],
+  [/water/,         0x3b6fd4],
+  [/lava|magma/,    0xe06a1c, true],
+  [/leaves/,        0x4a7a35],
+  [/log|wood|stem/, 0x7a5a30],
+  [/planks/,        0xc8a165],
+  [/glass/,         0xbfe3ec],
+  [/ice|snow/,      0xe8f2fb],
+  [/obsidian/,      0x2a2140],
+  [/netherrack/,    0x7a3535],
+  [/terracotta/,    0xa2593c],
+  [/wool|concrete/, 0xc9ced6],
+];
+
+const paletteCache = new Map();
+function blockStyle(name) {
+  let hit = paletteCache.get(name);
+  if (hit !== undefined) return hit;
+  hit = null;
+  for (const [re, color, glow] of PALETTE) if (re.test(name)) { hit = { color, glow: !!glow }; break; }
+  paletteCache.set(name, hit);
+  return hit;
 }
 
 // ── terrain ────────────────────────────────────────────────────────────────
@@ -206,25 +333,97 @@ const dummy = new THREE.Object3D();
 const tmpColor = new THREE.Color();
 
 /**
- * Build the voxel field from the occupancy grid.
+ * Highest solid cell per column, keyed "x,z".
  *
- * Two things matter for legibility:
- *
- *  - Fully buried cells are skipped. A cell whose six neighbours are all solid can never be seen,
- *    and drawing it costs an instance for nothing. This is a real saving here because the scouts
- *    survey volumes, not surfaces.
- *  - Colour tracks height, not block type. The grid carries no block names — only solid/air — so
- *    a flat colour would render the terrain as one unreadable mass. Height banding is the only
- *    signal available and it happens to be the one that makes a cliff look like a cliff.
+ * Kept because a drone's altitude is only meaningful against the ground under it. This is what
+ * turns "D3 is at y=117" — a number nobody can judge — into "D3 is 40 blocks above the terrain it
+ * was sent to survey", which is a diagnosis.
  */
+let surfaceAt = new Map();
+
+function buildTerrain(cells, bounds, blockAt) {
+  clearGroup(gTerrain);
+  clearGroup(gAir);
+  surfaceAt = new Map();
+  if (!bounds) return null;
+
+  const solid = [];
+  const air = [];
+  for (const k in cells) {
+    const v = cells[k];
+    const p = k.split(':');
+    const x = +p[0], y = +p[1], z = +p[2];
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+    if (v === 1) {
+      const col = x + ',' + z;
+      const prev = surfaceAt.get(col);
+      if (prev === undefined || y > prev) surfaceAt.set(col, y);
+      // A cell whose six neighbours are all solid can never be seen. 2 (drone-occupied) and
+      // absent both count as open, so anything not known-solid can expose a face.
+      const buried =
+        cells[(x + 1) + ':' + y + ':' + z] === 1 && cells[(x - 1) + ':' + y + ':' + z] === 1 &&
+        cells[x + ':' + (y + 1) + ':' + z] === 1 && cells[x + ':' + (y - 1) + ':' + z] === 1 &&
+        cells[x + ':' + y + ':' + (z + 1)] === 1 && cells[x + ':' + y + ':' + (z - 1)] === 1;
+      if (!buried) solid.push([x, y, z, k]);
+    } else {
+      air.push([x, y, z]);
+    }
+  }
+
+  const span = Math.max(1, bounds.max.y - bounds.min.y);
+  if (solid.length) {
+    // NOT `vertexColors: true`. That define makes the shader multiply by a per-VERTEX `color`
+    // attribute, which BoxGeometry does not have, so every instance came out multiplied by zero —
+    // a terrain of black cubes on a black background, indistinguishable from a failed load.
+    // Per-INSTANCE colour is a different define and setColorAt turns it on by itself.
+    const mesh = new THREE.InstancedMesh(CUBE, new THREE.MeshLambertMaterial(), solid.length);
+    let identified = 0;
+    solid.forEach(([x, y, z, k], i) => {
+      dummy.position.set(x, y, z);
+      dummy.updateMatrix();
+      mesh.setMatrixAt(i, dummy.matrix);
+
+      const name = blockAt?.[k];
+      const style = name ? blockStyle(name) : null;
+      if (style) {
+        identified++;
+        tmpColor.setHex(style.color);
+      } else {
+        // Unidentified is drawn as unidentified: a desaturated height band, deliberately duller
+        // than any real block colour so that "we do not know what this is" is visually distinct
+        // from "this is stone". The index covers only a fraction of the surveyed cells and
+        // pretending otherwise would make the map look far more complete than it is.
+        const t = (y - bounds.min.y) / span;
+        tmpColor.setHSL(0.58 - 0.14 * t, 0.10 + 0.08 * t, 0.30 + 0.34 * t);
+      }
+      mesh.setColorAt(i, tmpColor);
+    });
+    mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+    gTerrain.add(mesh);
+    gTerrain.userData.identified = identified;
+    gTerrain.userData.drawn = solid.length;
+  }
+
+  if (air.length) {
+    const geo = new THREE.BufferGeometry();
+    const pos = new Float32Array(air.length * 3);
+    air.forEach(([x, y, z], i) => { pos[i * 3] = x; pos[i * 3 + 1] = y; pos[i * 3 + 2] = z; });
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    gAir.add(new THREE.Points(geo, new THREE.PointsMaterial({
+      color: 0x4b6fa0, size: 0.16, transparent: true, opacity: 0.55, sizeAttenuation: true,
+    })));
+  }
+
+  return percentileBox(solid.length ? solid : air) ?? bounds;
+}
+
 /**
- * The box worth pointing a camera at.
+ * The box worth pointing a camera at — NOT the full bounding box.
  *
- * NOT the full bounding box. The survey has a long tail — one scout that wandered to z -114 while
- * every other cell sits between -38 and -60 — and framing on the extremes makes the part anyone
- * cares about a smudge in the middle of the screen. Clipping to the 3rd..97th percentile per axis
- * throws away the strays and keeps the base. Three sorts of a few thousand numbers, once per
- * terrain refresh, is not worth optimising.
+ * The survey has a long tail: one scout wandered to z -114 while every other cell sits between
+ * -38 and -60, and framing on the extremes makes the part anyone cares about a smudge. Clipping
+ * to the 3rd..97th percentile per axis throws away the strays and keeps the base.
  */
 function percentileBox(points, lo = 0.03, hi = 0.97) {
   if (!points.length) return null;
@@ -236,124 +435,148 @@ function percentileBox(points, lo = 0.03, hi = 0.97) {
   return { min: { x: x0, y: y0, z: z0 }, max: { x: x1, y: y1, z: z1 } };
 }
 
-function buildTerrain(cells, bounds) {
-  clearGroup(gTerrain);
-  clearGroup(gAir);
-  if (!bounds) return null;
-
-  const solid = [];
-  const air = [];
-  for (const k in cells) {
-    const v = cells[k];
-    const p = k.split(':');
-    const x = +p[0], y = +p[1], z = +p[2];
-    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
-    if (v === 1) {
-      // 2 (a cell a drone occupied) counts as open for this test, as does absent — anything not
-      // known-solid can expose a face.
-      const buried =
-        cells[(x + 1) + ':' + y + ':' + z] === 1 && cells[(x - 1) + ':' + y + ':' + z] === 1 &&
-        cells[x + ':' + (y + 1) + ':' + z] === 1 && cells[x + ':' + (y - 1) + ':' + z] === 1 &&
-        cells[x + ':' + y + ':' + (z + 1)] === 1 && cells[x + ':' + y + ':' + (z - 1)] === 1;
-      if (!buried) solid.push([x, y, z]);
-    } else {
-      air.push([x, y, z]);
-    }
+/** Ground level under a position, searching outward a little so a drone over a gap still gets one. */
+function groundUnder(x, z) {
+  const exact = surfaceAt.get(Math.round(x) + ',' + Math.round(z));
+  if (exact !== undefined) return exact;
+  let best;
+  for (let dx = -2; dx <= 2; dx++) for (let dz = -2; dz <= 2; dz++) {
+    const v = surfaceAt.get((Math.round(x) + dx) + ',' + (Math.round(z) + dz));
+    if (v !== undefined && (best === undefined || v > best)) best = v;
   }
-
-  const span = Math.max(1, bounds.max.y - bounds.min.y);
-  if (solid.length) {
-    // NOT `vertexColors: true`. That define makes the shader multiply by a per-VERTEX `color`
-    // attribute, which a plain BoxGeometry does not have, so every instance came out multiplied by
-    // zero — a terrain of perfectly black cubes on a black background, indistinguishable from the
-    // grid having failed to load. Per-INSTANCE colour is a different define, and setColorAt turns
-    // it on by itself.
-    const mesh = new THREE.InstancedMesh(CUBE, new THREE.MeshLambertMaterial(), solid.length);
-    solid.forEach(([x, y, z], i) => {
-      dummy.position.set(x, y, z);
-      dummy.updateMatrix();
-      mesh.setMatrixAt(i, dummy.matrix);
-      const t = (y - bounds.min.y) / span;
-      // Cold slate at depth to warm stone at the surface. Deliberately low saturation: the ore and
-      // drone markers are the things meant to catch the eye, and terrain that competes for
-      // attention makes the six coal ore cells impossible to spot.
-      tmpColor.setHSL(0.58 - 0.14 * t, 0.18 + 0.14 * t, 0.34 + 0.38 * t);
-      mesh.setColorAt(i, tmpColor);
-    });
-    mesh.instanceMatrix.needsUpdate = true;
-    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-    gTerrain.add(mesh);
-  }
-
-  // Surveyed air, off by default. This is the shape of the tunnels and the sky the scouts have
-  // actually looked at — invaluable for "did anyone survey this?", noise the rest of the time.
-  if (air.length) {
-    const geo = new THREE.BufferGeometry();
-    const pos = new Float32Array(air.length * 3);
-    air.forEach(([x, y, z], i) => { pos[i * 3] = x; pos[i * 3 + 1] = y; pos[i * 3 + 2] = z; });
-    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-    gAir.add(new THREE.Points(geo, new THREE.PointsMaterial({
-      color: 0x4b6fa0, size: 0.16, transparent: true, opacity: 0.55, sizeAttenuation: true,
-    })));
-  }
-
-  // Frame on solid ground where there is any: air cells include open sky, which would push the
-  // camera up into nothing.
-  return percentileBox(solid.length ? solid : air) ?? bounds;
+  return best;
 }
 
-// ── caves ──────────────────────────────────────────────────────────────────
+// ── boxes: caves and task regions ──────────────────────────────────────────
+
+/**
+ * A translucent box over an inclusive block range.
+ *
+ * min..max covers max-min+1 cells and each cell is drawn centred on its own coordinate, so the
+ * box centre sits at the midpoint of the two extremes, not half a block past it. The wireframe is
+ * what actually reads at distance; the fill only gives it volume.
+ */
+function addBox(group, min, max, color, opacity = 0.1, dashed = false) {
+  const w = max.x - min.x + 1, h = max.y - min.y + 1, d = max.z - min.z + 1;
+  const geo = new THREE.BoxGeometry(w, h, d);
+  const cx = (min.x + max.x) / 2, cy = (min.y + max.y) / 2, cz = (min.z + max.z) / 2;
+
+  const fill = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
+    color, transparent: true, opacity, depthWrite: false, side: THREE.BackSide,
+  }));
+  fill.position.set(cx, cy, cz);
+  group.add(fill);
+
+  const edges = new THREE.LineSegments(
+    new THREE.EdgesGeometry(geo),
+    new THREE.LineBasicMaterial({ color, transparent: true, opacity: dashed ? 0.3 : 0.7 }),
+  );
+  edges.position.set(cx, cy, cz);
+  group.add(edges);
+  return { x: cx, y: cy, z: cz };
+}
 
 function buildCaves(caves) {
   clearGroup(gCaves);
-  for (const c of caves) {
-    const w = c.max.x - c.min.x + 1, h = c.max.y - c.min.y + 1, d = c.max.z - c.min.z + 1;
-    const geo = new THREE.BoxGeometry(w, h, d);
-    // Centre of the inclusive block range: min..max covers max-min+1 cells, and each cell is drawn
-    // centred on its own coordinate, so the box centre sits half a block past the midpoint.
-    const cx = (c.min.x + c.max.x) / 2, cy = (c.min.y + c.max.y) / 2, cz = (c.min.z + c.max.z) / 2;
+  for (const c of caves) addBox(gCaves, c.min, c.max, 0xa06bd8, 0.09);
+}
 
-    const box = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
-      color: 0xa06bd8, transparent: true, opacity: 0.1, depthWrite: false, side: THREE.BackSide,
-    }));
-    box.position.set(cx, cy, cz);
-    gCaves.add(box);
+// ── task regions: what the fleet was TOLD to do ────────────────────────────
 
-    // The wireframe is what actually reads at distance; the translucent fill only gives it volume.
-    const edges = new THREE.LineSegments(
-      new THREE.EdgesGeometry(geo),
-      new THREE.LineBasicMaterial({ color: 0xb98ae8, transparent: true, opacity: 0.55 }),
-    );
-    edges.position.set(cx, cy, cz);
-    gCaves.add(edges);
+let taskAnchors = new Map();   // drone name -> region centre, for the assignment lines
+
+function buildTasks(tasks, dronesByName) {
+  clearGroup(gTasks);
+  taskAnchors = new Map();
+  const showLabels = $('t-labels').checked;
+
+  for (const t of tasks) {
+    if (!t.region) continue;         // queued work whose geometry TaskMan does not yet report
+    const color = VERB_COLOR[t.verb] ?? 0x9aa6b4;
+    const active = !!t.assigned && !t.paused;
+    // Queued work is drawn faintly and unfilled. An operator needs to tell at a glance which boxes
+    // are being worked from which are merely waiting, or the map implies a fleet five times busier
+    // than it is.
+    const centre = addBox(gTasks, t.region.min, t.region.max, color,
+                          active ? 0.11 : 0.03, !active);
+
+    if (showLabels) {
+      const pct = t.progress ? ` ${Math.round(t.progress * (t.progress <= 1 ? 100 : 1))}%` : '';
+      const label = makeLabel(`${t.verb ?? 'task'} ${t.name}${pct}`, '#' + color.toString(16).padStart(6, '0'));
+      label.position.set(centre.x, t.region.max.y + 2.2, centre.z);
+      label.userData.isLabel = true;
+      gTasks.add(label);
+    }
+
+    // The link between a drone and its work. TaskMan does not publish the route a drone is
+    // actually taking — pgps computes and holds that on the turtle itself — so this is drawn as a
+    // straight assignment line and not as a path. Pretending to know the route would be inventing
+    // data, and a wrong path on a map is worse than none.
+    for (const name of String(t.assigned ?? '').split(',').map((s) => s.trim()).filter(Boolean)) {
+      taskAnchors.set(name, { centre, color, task: t });
+      const d = dronesByName.get(name);
+      if (!d?.pos) continue;
+      gTasks.add(new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints([
+          new THREE.Vector3(d.pos.x, d.pos.y, d.pos.z),
+          new THREE.Vector3(centre.x, centre.y, centre.z),
+        ]),
+        new THREE.LineDashedMaterial({ color, transparent: true, opacity: 0.55,
+                                       dashSize: 1.6, gapSize: 1.2 }),
+      ).computeLineDistances());
+    }
   }
 }
 
-// ── ore and dirt ───────────────────────────────────────────────────────────
+// ── computers ──────────────────────────────────────────────────────────────
+
+function buildNodes(nodes) {
+  clearGroup(gNodes);
+  const showLabels = $('t-labels').checked;
+  for (const n of nodes) {
+    if (!n.pos) continue;            // unknown position: listed in the panel, not guessed onto the map
+    const color = n.reachable ? (n.faults ? 0xf0b45e : 0xdfe6ee) : 0xf2616b;
+    // A tall thin pillar, deliberately unlike anything else in the scene: computers are fixed
+    // infrastructure and should not be mistakable for a drone or a block at a glance.
+    const body = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.45, 0.45, 2.2, 6),
+      new THREE.MeshLambertMaterial({ color, emissive: color, emissiveIntensity: n.reachable ? 0.45 : 0.2 }),
+    );
+    body.position.set(n.pos.x, n.pos.y + 0.6, n.pos.z);
+    gNodes.add(body);
+
+    if (showLabels) {
+      const label = makeLabel(`${n.module}${n.faults ? ' !' + n.faults : ''}`,
+                              '#' + color.toString(16).padStart(6, '0'));
+      label.position.set(n.pos.x, n.pos.y + 3.4, n.pos.z);
+      label.userData.isLabel = true;
+      gNodes.add(label);
+    }
+  }
+}
+
+// ── materials ──────────────────────────────────────────────────────────────
 
 /**
- * Material markers sit slightly proud of the terrain (scale 1.06) rather than replacing the voxel
- * they share a cell with. Same size would z-fight with the terrain cube; noticeably bigger would
- * misrepresent a single block as a vein.
+ * Ore and dirt markers, drawn as hollow cages rather than solid cubes.
+ *
+ * That is a deliberate statement about trust. These come from the block index, which is known to
+ * prune positions that are still physically in the world — four coal blocks that exist were
+ * removed from it. A solid block on a map reads as fact; a cage reads as an annotation, which is
+ * what an advisory index entry actually is.
  */
 function buildMaterials(groups) {
   clearGroup(gMats);
-  for (const { hits, color, emissive } of groups) {
+  for (const { hits, color } of groups) {
     if (!hits.length) continue;
-    const mesh = new THREE.InstancedMesh(
-      CUBE,
-      new THREE.MeshLambertMaterial({ color, emissive, emissiveIntensity: 0.85 }),
-      hits.length,
-    );
-    hits.forEach((h, i) => {
-      dummy.position.set(h.x, h.y, h.z);
-      dummy.scale.setScalar(1.06);
-      dummy.updateMatrix();
-      mesh.setMatrixAt(i, dummy.matrix);
-    });
-    dummy.scale.setScalar(1);
-    mesh.instanceMatrix.needsUpdate = true;
-    gMats.add(mesh);
+    const geo = new THREE.EdgesGeometry(new THREE.BoxGeometry(1.12, 1.12, 1.12));
+    for (const h of hits) {
+      const cage = new THREE.LineSegments(geo.clone(),
+        new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.9 }));
+      cage.position.set(h.x, h.y, h.z);
+      gMats.add(cage);
+    }
+    geo.dispose();
   }
 }
 
@@ -386,17 +609,16 @@ const droneMeshes = [];              // raycast targets, rebuilt with the group
 function buildDrones(drones) {
   clearGroup(gDrones);
   droneMeshes.length = 0;
+  const showLabels = $('t-labels').checked;
   // Where labels have already been put, so parked drones do not stack their names into one
-  // unreadable blur. D4 and D5 sit one block apart at the dock; that is the normal case, not an
-  // edge case, so the view has to survive it.
+  // unreadable blur. D4 and D5 sit one block apart at the dock; that is the normal case.
   const placed = [];
+
   for (const d of drones) {
     if (!d.pos) continue;            // a drone with no fix cannot be placed, and guessing is worse
-    const offline = d.status === 'offline' || d.status === 'lost' || d.status === 'stranded';
+    const offline = DEAD.has(d.status) || DEAD.has(doingOf(d) ?? '');
     const color = offline ? OFFLINE_COLOR : (ROLE_COLOR[d.role] ?? 0xffffff);
 
-    // Octahedron, not a cube: at this scale everything else in the scene is a cube, and a marker
-    // that shares the terrain's silhouette is a marker you have to hunt for.
     const body = new THREE.Mesh(
       new THREE.OctahedronGeometry(0.85),
       new THREE.MeshLambertMaterial({ color, emissive: color, emissiveIntensity: offline ? 0.15 : 0.6 }),
@@ -406,26 +628,39 @@ function buildDrones(drones) {
     gDrones.add(body);
     droneMeshes.push(body);
 
-    // A vertical stalk down to y=min keeps the drone locatable when it is inside the terrain,
-    // which — being a mining fleet — is most of the time.
-    const stalk = new THREE.Line(
+    // A stalk down to the ground under it. Two jobs: it keeps a drone inside the terrain findable,
+    // and its LENGTH is the altitude cue — a scout that has ratcheted itself into the sky trails a
+    // stalk the height of the screen, which is not a thing you can fail to notice.
+    const ground = groundUnder(d.pos.x, d.pos.z);
+    const above = ground === undefined ? null : d.pos.y - ground;
+    d.aboveGround = above;
+    const high = above !== null && above > HIGH_ABOVE_GROUND;
+    const foot = ground === undefined ? d.pos.y - 14 : ground;
+    gDrones.add(new THREE.Line(
       new THREE.BufferGeometry().setFromPoints([
         new THREE.Vector3(d.pos.x, d.pos.y - 0.9, d.pos.z),
-        new THREE.Vector3(d.pos.x, d.pos.y - 14, d.pos.z),
+        new THREE.Vector3(d.pos.x, foot, d.pos.z),
       ]),
-      new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.28 }),
-    );
-    gDrones.add(stalk);
+      new THREE.LineBasicMaterial({ color: high ? 0xf2616b : color,
+                                    transparent: true, opacity: high ? 0.85 : 0.28 }),
+    ));
 
-    const label = makeLabel(`${d.name} ${d.status}`, '#' + color.toString(16).padStart(6, '0'));
-    let ly = d.pos.y + 2.4;
-    while (placed.some((p) => Math.abs(p.x - d.pos.x) < 7 && Math.abs(p.z - d.pos.z) < 7 &&
-                              Math.abs(p.y - ly) < 2.5)) ly += 2.6;
-    placed.push({ x: d.pos.x, y: ly, z: d.pos.z });
-    label.position.set(d.pos.x, ly, d.pos.z);
-    label.userData.isLabel = true;
-    label.visible = document.getElementById('t-labels').checked;
-    gDrones.add(label);
+    if (showLabels) {
+      const rep = doingOf(d);
+      const doing = rep && rep !== d.status ? rep : d.status;
+      const anchor = taskAnchors.get(d.name);
+      const job = anchor ? ` → ${anchor.task.verb ?? anchor.task.name}` : '';
+      const alt = high ? ` +${above}↑` : '';
+      const label = makeLabel(`${d.name} ${doing}${job}${alt}`,
+                              '#' + (high ? 0xf2616b : color).toString(16).padStart(6, '0'));
+      let ly = d.pos.y + 2.4;
+      while (placed.some((p) => Math.abs(p.x - d.pos.x) < 7 && Math.abs(p.z - d.pos.z) < 7 &&
+                                Math.abs(p.y - ly) < 2.5)) ly += 2.6;
+      placed.push({ x: d.pos.x, y: ly, z: d.pos.z });
+      label.position.set(d.pos.x, ly, d.pos.z);
+      label.userData.isLabel = true;
+      gDrones.add(label);
+    }
   }
 }
 
@@ -437,9 +672,8 @@ let framed = false;
  * Point the camera at the DATA, once.
  *
  * The base sits around x -60..-100, z -40..-60. A camera left at the origin looks at empty desert
- * a hundred blocks away and the page appears broken — which is exactly what it looked like the
- * first time. Framing happens once and never again: re-framing on every poll would yank the view
- * out from under anyone who had just lined up a shot of a tunnel.
+ * a hundred blocks away and the page appears broken. Framing happens once and never again:
+ * re-framing on every poll would yank the view out from under anyone mid-inspection.
  */
 function frameOnce(bounds) {
   if (framed || !bounds) return;
@@ -447,27 +681,24 @@ function frameOnce(bounds) {
   const cx = (bounds.min.x + bounds.max.x) / 2;
   const cy = (bounds.min.y + bounds.max.y) / 2;
   const cz = (bounds.min.z + bounds.max.z) / 2;
-  const span = Math.max(
-    bounds.max.x - bounds.min.x,
-    bounds.max.y - bounds.min.y,
-    bounds.max.z - bounds.min.z,
-    16,
-  );
+  const span = Math.max(bounds.max.x - bounds.min.x, bounds.max.y - bounds.min.y,
+                        bounds.max.z - bounds.min.z, 16);
   // Solve for the distance that actually fits `span` in the frustum rather than guessing a
-  // multiple of it. Guessing put the camera roughly twice as far out as needed, which is why the
-  // first render looked like a distant speck: correct data, wrong vantage point.
+  // multiple of it. Guessing put the camera about twice as far out as needed.
   const dist = (span / 2) / Math.tan((camera.fov * Math.PI) / 360) * 1.3;
 
   controls.target.set(cx, cy, cz);
-  const dir = new THREE.Vector3(0.62, 0.52, 0.86).normalize();
-  camera.position.set(cx, cy, cz).addScaledVector(dir, dist);
-  camera.near = 0.1;
+  camera.position.set(cx, cy, cz)
+        .addScaledVector(new THREE.Vector3(0.62, 0.52, 0.86).normalize(), dist);
   camera.far = dist * 30;
   camera.updateProjectionMatrix();
-  // Fog starts beyond the framed box so nothing in the initial view is dimmed by it; its only job
-  // is to separate near from far once the operator flies in.
   scene.fog.near = dist * 0.85;
   scene.fog.far = dist * 3.2;
+  controls.update();
+}
+
+function flyTo(pos) {
+  controls.target.set(pos.x, pos.y, pos.z);
   controls.update();
 }
 
@@ -475,24 +706,36 @@ function frameOnce(bounds) {
 
 const $ = (id) => document.getElementById(id);
 const errBox = $('err');
-function problem(msg) {
-  errBox.textContent = msg;
-  errBox.style.display = msg ? 'block' : 'none';
-}
+const problem = (msg) => { errBox.textContent = msg; errBox.style.display = msg ? 'block' : 'none'; };
 
 /** Unwrap the registry envelope. ok:false is data too — it says which panel to mark unavailable. */
 const dataOf = (env) => (env && env.ok ? env.data : null);
-
-let lastStateAt = 0;
+const esc = (s) => String(s ?? '').replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
+const hexOf = (n) => '#' + n.toString(16).padStart(6, '0');
 
 /**
- * Skip a tick rather than stack one.
+ * Silence, in words.
  *
- * Each /map/state poll fans out to five in-world calls, and rednet round-trips can take seconds —
- * longer than the poll interval, especially right after a restart when nothing is cached. Without
- * this guard a slow bridge accumulates overlapping polls, each adding five more calls to a link
- * that is already the reason they are slow. A dropped tick costs three seconds of freshness; a
- * pile-up costs the fleet its command channel.
+ * fleet.status returns `silentMs`; hive.brief returns the same fact as `silentSec`. This page
+ * reads the former, and asking for the latter is how the first version of this panel reported
+ * every healthy drone as "never reported" — undefined is not null, but `== null` catches both, so
+ * the wrong field name failed as a plausible-looking sentence rather than as an error.
+ */
+const silentText = (d) =>
+  d.silentMs == null ? 'never reported' : `silent ${Math.round(d.silentMs / 1000)}s`;
+/** The drone's own word for what it is doing, which fleet.status calls `reported`. */
+const doingOf = (d) => d.reported ?? d.doing ?? null;
+
+let lastStateAt = 0;
+let lastDrones = [];
+let lastTasks = [];
+/** Last known bridge state, so the terrain poll can tell 'down' from 'genuinely broken'. */
+let bridgeUp = null;
+
+/**
+ * Skip a tick rather than stack one. Each /map/state poll fans out to several in-world calls, and
+ * rednet round-trips can take seconds — longer than the poll interval. A dropped tick costs three
+ * seconds of freshness; a pile-up costs the fleet its command channel.
  */
 function guarded(fn) {
   let running = false;
@@ -504,16 +747,30 @@ function guarded(fn) {
 }
 
 async function pollVoxels() {
+  // Say "loading" while the first fetch is in flight. A cold LoadWorld is a rednet round-trip over
+  // a grid of several thousand cells and can take fifteen seconds; leaving the field as an ellipsis
+  // that whole time is indistinguishable from the page having quietly given up.
+  if (!framed) $('h-cells').textContent = 'loading…';
   try {
-    const env = await (await fetch('/map/voxels', { cache: 'no-store' })).json();
-    const d = dataOf(env);
-    if (!d) throw new Error(env?.error ?? 'world.voxels returned nothing');
-    const focus = buildTerrain(d.cells ?? {}, d.bounds);
-    frameOnce(focus ?? d.bounds);
-    $('h-cells').textContent = `${d.solid} solid / ${d.known} known`;
+    const r = await (await fetch('/map/voxels', { cache: 'no-store' })).json();
+    const v = dataOf(r.voxels);
+    if (!v) throw new Error(r.voxels?.error ?? 'world.voxels returned nothing');
+    // Identity is optional. world.blocks needs a MapServer that has been synced with the BlockAt
+    // endpoint; until then the terrain renders unidentified rather than not at all.
+    const b = dataOf(r.blocks);
+    const focus = buildTerrain(v.cells ?? {}, v.bounds, b?.blockAt);
+    frameOnce(focus ?? v.bounds);
+    $('h-cells').textContent = `${v.solid} solid / ${v.known} known`;
+    $('h-ident').textContent = b
+      ? `${gTerrain.userData.identified ?? 0} of ${gTerrain.userData.drawn ?? 0} drawn`
+      : 'not available';
+    $('h-ident').style.color = b ? '' : 'var(--warn)';
   } catch (err) {
     $('h-cells').textContent = 'unavailable';
-    problem(`terrain: ${err.message}`);
+    // A bridge that is down is already reported once, in the HUD, by the state poll. Repeating it
+    // as a red banner would train the operator to ignore the banner during every fleet reload —
+    // which is exactly when a genuinely different error most needs to be readable.
+    if (bridgeUp !== false) problem(`terrain: ${err.message}`);
   }
 }
 
@@ -530,6 +787,7 @@ async function pollState() {
   lastStateAt = Date.now();
 
   const up = s.bridge?.connected;
+  bridgeUp = !!up;
   $('h-bridge').innerHTML =
     `<span class="dot" style="background:${up ? 'var(--ok)' : 'var(--bad)'}"></span>` +
     (up ? `connected · ${s.bridge.inFlight} in flight` : 'disconnected');
@@ -537,11 +795,31 @@ async function pollState() {
   // Fleet ------------------------------------------------------------------
   const fleet = dataOf(s.fleet);
   const drones = fleet?.drones ?? [];
+  lastDrones = drones;
+  const byName = new Map(drones.map((d) => [d.name, d]));
   $('h-drones').textContent = fleet
     ? `${drones.length} · ${drones.filter((d) => d.status === 'idle').length} idle`
     : 'unavailable';
+
+  // Tasks ------------------------------------------------------------------
+  const tasks = dataOf(s.tasks)?.tasks ?? [];
+  lastTasks = tasks;
+  const staffed = tasks.filter((t) => t.assigned).length;
+  $('h-tasks').textContent = dataOf(s.tasks) ? `${tasks.length} · ${staffed} staffed` : 'unavailable';
+  buildTasks(tasks, byName);
+  // Drones after tasks: their labels name the job, which comes from the anchors tasks just built.
   buildDrones(drones);
-  renderFleetList(drones, s.fleet);
+  renderFleet(drones, s.fleet);
+  renderTasks(tasks, s.tasks);
+
+  // Computers --------------------------------------------------------------
+  const nodesEnv = dataOf(s.nodes);
+  const nodes = nodesEnv?.nodes ?? [];
+  $('h-nodes').textContent = !nodesEnv ? 'unavailable'
+    : nodesEnv.probing ? 'probing…' : `${nodesEnv.up} of ${nodesEnv.count} up`;
+  $('h-nodes').style.color = nodesEnv && nodesEnv.up < nodesEnv.count ? 'var(--warn)' : '';
+  buildNodes(nodes);
+  renderNodes(nodes, nodesEnv?.note);
 
   // Caves ------------------------------------------------------------------
   const caves = dataOf(s.caves)?.caves ?? [];
@@ -549,52 +827,145 @@ async function pollState() {
   buildCaves(caves);
 
   // Materials --------------------------------------------------------------
-  const ore  = dataOf(s.ore)?.hits ?? [];
+  const ore = dataOf(s.ore)?.hits ?? [];
   const dirt = dataOf(s.dirt)?.hits ?? [];
-  $('h-mats').textContent = `${ore.length} / ${dirt.length}`;
-  buildMaterials([
-    { hits: ore,  color: 0xffe14d, emissive: 0x6a5400 },
-    { hits: dirt, color: 0x9a6b3f, emissive: 0x2a1a0c },
-  ]);
+  buildMaterials([{ hits: ore, color: 0xffe14d }, { hits: dirt, color: 0xb07a4a }]);
 
   // Storage ----------------------------------------------------------------
   const stock = dataOf(s.stock);
   $('h-stock').textContent = stock ? `${stock.kinds} kinds · ${stock.items}` : 'unavailable';
   renderStock(stock);
+
+  renderAlerts(drones, nodes);
 }
 
-function renderFleetList(drones, env) {
+// ── panels ─────────────────────────────────────────────────────────────────
+
+/**
+ * The things that are wrong, stated at the top.
+ *
+ * Everything else on this page is a view you have to read; this is the part that reads it for you.
+ * A drone forty blocks above the ground it is surveying is visible in the 3D view only if you
+ * happen to be looking that way.
+ */
+function renderAlerts(drones, nodes) {
+  const out = [];
+  for (const d of drones) {
+    if (d.aboveGround != null && d.aboveGround > HIGH_ABOVE_GROUND)
+      out.push(`${d.name} is ${d.aboveGround} blocks above the surveyed ground — climbing, not surveying?`);
+    if (DEAD.has(d.status)) out.push(`${d.name} is ${d.status} (${silentText(d)})`);
+    else if (d.fuel < 200) out.push(`${d.name} is low on fuel (${d.fuel})`);
+  }
+  for (const n of nodes) if (n.reachable && n.faults) out.push(`${n.module}: ${n.faults} fault(s)`);
+  $('h-alerts').innerHTML = out.length
+    ? `<h2>attention</h2>` + out.map((t) => `<div class="note">${esc(t)}</div>`).join('')
+    : '';
+}
+
+function renderFleet(drones, env) {
   const el = $('fleet-list');
   if (!drones.length) {
     el.className = 'muted';
-    el.textContent = env?.ok ? 'no drones registered' : (env?.error ?? 'fleet unavailable');
+    // Name the real reason. "No drones registered" during a fleet reload is technically what HQ
+    // knows and entirely the wrong thing to tell an operator, who will go looking for a lost fleet
+    // rather than waiting ninety seconds for the bridge to dial back in.
+    el.textContent = bridgeUp === false ? 'bridge down — the fleet is unreachable, not gone'
+      : env?.ok ? 'no drones registered' : (env?.error ?? 'fleet unavailable');
     return;
   }
   el.className = '';
   el.innerHTML = drones.map((d) => {
-    const offline = d.status === 'offline' || d.status === 'lost' || d.status === 'stranded';
-    const hex = '#' + (offline ? OFFLINE_COLOR : (ROLE_COLOR[d.role] ?? 0xffffff))
-      .toString(16).padStart(6, '0');
-    // Turtles cap around 20k fuel, so that is the scale the bar is drawn against; an unbounded bar
-    // would make a nearly-empty drone look full.
+    const offline = DEAD.has(d.status);
+    const hex = hexOf(offline ? OFFLINE_COLOR : (ROLE_COLOR[d.role] ?? 0xffffff));
+    // Turtles cap around 20k fuel, so that is the scale the bar is drawn against.
     const pct = Math.max(2, Math.min(100, Math.round((d.fuel / 20000) * 100)));
     const p = d.pos ? `${d.pos.x}, ${d.pos.y}, ${d.pos.z}` : 'position unknown';
-    return `<div class="drone" data-id="${d.id}" style="--role:${hex}">
-      <div class="name" style="color:${hex}">${d.name} <span class="meta">#${d.id} · ${d.role}</span></div>
-      <div class="meta">${d.status} · fuel ${d.fuel.toLocaleString()}</div>
-      <div class="pos">${p}</div>
+    const anchor = taskAnchors.get(d.name);
+    const job = anchor ? `<div class="meta">→ ${esc(anchor.task.verb ?? 'task')} ${esc(anchor.task.name)}</div>` : '';
+    const rep = doingOf(d);
+    const doing = rep && rep !== d.status ? `${esc(d.status)} · ${esc(rep)}` : esc(d.status);
+    const silent = silentText(d);
+    const alt = d.aboveGround != null && d.aboveGround > HIGH_ABOVE_GROUND
+      ? `<div class="warn">${d.aboveGround} blocks above ground</div>` : '';
+    return `<div class="card drone" data-id="${d.id}" style="--accent:${hex}">
+      <div class="name" style="color:${hex}">${esc(d.name)} <span class="meta">#${d.id} · ${esc(d.role)}</span></div>
+      <div class="meta">${doing} · fuel ${d.fuel.toLocaleString()} · ${silent}</div>
+      <div class="pos">${p}</div>${alt}${job}
       <div class="bar"><i style="width:${pct}%;background:${pct < 10 ? 'var(--bad)' : hex}"></i></div>
     </div>`;
   }).join('');
 
-  // Hovering a card flies the camera's attention to that drone, which is the fastest way to answer
-  // "where is D2?" without hunting the scene for a 1.7-block octahedron.
   for (const card of el.querySelectorAll('.drone')) {
     card.addEventListener('click', () => {
       const d = drones.find((x) => String(x.id) === card.dataset.id);
-      if (d?.pos) { controls.target.set(d.pos.x, d.pos.y, d.pos.z); controls.update(); }
+      if (d?.pos) flyTo(d.pos);
     });
   }
+}
+
+function renderTasks(tasks, env) {
+  const el = $('task-list');
+  if (!tasks.length) {
+    el.className = 'muted';
+    el.textContent = bridgeUp === false ? 'bridge down — queue unreadable'
+      : env?.ok ? 'queue empty' : (env?.error ?? 'tasks unavailable');
+    return;
+  }
+  el.className = '';
+  const noGeometry = tasks.every((t) => !t.region);
+  el.innerHTML = tasks.map((t) => {
+    const hex = hexOf(VERB_COLOR[t.verb] ?? 0x9aa6b4);
+    const where = t.region
+      ? `${t.region.min.x},${t.region.min.y},${t.region.min.z} → ${t.region.max.x},${t.region.max.y},${t.region.max.z}`
+      : 'region not reported';
+    const who = t.assigned ? esc(t.assigned) : 'unassigned';
+    const state = t.paused ? 'paused' : (t.enabled === false ? 'disabled' : (t.assigned ? 'running' : 'queued'));
+    return `<div class="card task" data-id="${t.id}" style="--accent:${hex}">
+      <div class="name" style="color:${hex}">${esc(t.verb ?? 'task')} <span class="meta">${esc(t.name)}</span></div>
+      <div class="meta">${state} · ${who}${t.role ? ' · ' + esc(t.role) : ''}</div>
+      <div class="pos">${esc(where)}</div>
+    </div>`;
+  }).join('')
+  // Said once, at the bottom, rather than repeated on every card: the reason the boxes are missing
+  // is a deploy state, not a per-task fact.
+  + (noGeometry ? `<div class="note">No task reports a region. TaskMan.GetTasks only sends
+      geometry once the Lua tree is synced and the fleet reloaded; until then this list is
+      accurate and the map cannot draw the boxes.</div>` : '');
+
+  for (const card of el.querySelectorAll('.task')) {
+    card.addEventListener('click', () => {
+      const t = tasks.find((x) => String(x.id) === card.dataset.id);
+      if (t?.region) flyTo({ x: (t.region.min.x + t.region.max.x) / 2,
+                             y: (t.region.min.y + t.region.max.y) / 2,
+                             z: (t.region.min.z + t.region.max.z) / 2 });
+    });
+  }
+}
+
+function renderNodes(nodes, note) {
+  const el = $('node-list');
+  if (!nodes.length) {
+    el.className = 'muted';
+    el.textContent = note ?? 'computers unavailable';
+    return;
+  }
+  el.className = '';
+  el.innerHTML = nodes.map((n) => {
+    const hex = n.reachable ? (n.faults ? '#f0b45e' : '#dfe6ee') : '#f2616b';
+    const meta = n.reachable
+      ? `up ${n.upSec ?? '?'}s · ${n.faults} fault(s)${n.id != null ? ' · #' + n.id : ''}`
+      : 'not answering';
+    const where = n.pos ? `${n.pos.x}, ${n.pos.y}, ${n.pos.z}`
+                        : (n.reachable ? 'position unknown (no GPS fix)' : '');
+    const last = n.monitor || n.log?.[n.log.length - 1];
+    return `<div class="card" style="--accent:${hex}">
+      <div class="name" style="color:${hex}">${esc(n.module)}</div>
+      <div class="meta">${esc(meta)}</div>
+      ${where ? `<div class="pos">${esc(where)}</div>` : ''}
+      ${last ? `<div class="log">${esc(last)}</div>` : ''}
+      ${n.lastFault ? `<div class="warn">${esc(n.lastFault.where)}: ${esc(n.lastFault.err)}</div>` : ''}
+    </div>`;
+  }).join('') + (note ? `<div class="note">${esc(note)}</div>` : '');
 }
 
 function renderStock(stock) {
@@ -602,9 +973,8 @@ function renderStock(stock) {
   if (!stock) { el.className = 'muted'; el.textContent = 'storage unavailable'; return; }
   el.className = '';
   el.innerHTML = (stock.detail ?? []).slice(0, 10).map((it) =>
-    `<div class="row"><span class="k">${it.name.replace(/^[a-z]+:/, '')}</span>` +
-    `<span class="v">${it.count}</span></div>`).join('')
-    || '<span class="muted">empty</span>';
+    `<div class="row"><span class="k">${esc(it.name.replace(/^[a-z]+:/, ''))}</span>` +
+    `<span class="v">${it.count}</span></div>`).join('') || '<span class="muted">empty</span>';
 }
 
 // ── hover tooltip ──────────────────────────────────────────────────────────
@@ -615,23 +985,26 @@ const tip = $('tip');
 let hovered = null;
 
 addEventListener('pointermove', (e) => {
+  if (e.pointerType === 'touch') return;      // the panel is the readout on touch devices
   pointer.x = (e.clientX / innerWidth) * 2 - 1;
   pointer.y = -(e.clientY / innerHeight) * 2 + 1;
   raycaster.setFromCamera(pointer, camera);
-  const hit = raycaster.intersectObjects(droneMeshes, false)[0];
-  const d = hit?.object.userData.drone;
+  const d = raycaster.intersectObjects(droneMeshes, false)[0]?.object.userData.drone;
 
   if (d) {
+    const anchor = taskAnchors.get(d.name);
     tip.style.display = 'block';
-    tip.style.left = Math.min(e.clientX + 14, innerWidth - 240) + 'px';
+    tip.style.left = Math.min(e.clientX + 14, innerWidth - 270) + 'px';
     tip.style.top = (e.clientY + 14) + 'px';
     tip.innerHTML =
-      `<div class="row"><span class="v"><b>${d.name}</b></span><span class="k">#${d.id}</span></div>` +
-      `<div class="row"><span class="k">role</span><span class="v">${d.role}</span></div>` +
-      `<div class="row"><span class="k">status</span><span class="v">${d.status}</span></div>` +
+      `<div class="row"><span class="v"><b>${esc(d.name)}</b></span><span class="k">#${d.id}</span></div>` +
+      `<div class="row"><span class="k">role</span><span class="v">${esc(d.role)}</span></div>` +
+      `<div class="row"><span class="k">status</span><span class="v">${esc(d.status)}${doingOf(d) && doingOf(d) !== d.status ? ' · ' + esc(doingOf(d)) : ''}</span></div>` +
       `<div class="row"><span class="k">fuel</span><span class="v">${d.fuel.toLocaleString()}</span></div>` +
       `<div class="row"><span class="k">at</span><span class="v">${d.pos.x}, ${d.pos.y}, ${d.pos.z}</span></div>` +
-      `<div class="row"><span class="k">silent</span><span class="v">${Math.round((d.silentMs ?? 0) / 1000)}s</span></div>`;
+      (d.aboveGround != null ? `<div class="row"><span class="k">above ground</span><span class="v">${d.aboveGround}</span></div>` : '') +
+      `<div class="row"><span class="k">silent</span><span class="v">${silentText(d)}</span></div>` +
+      (anchor ? `<div class="row"><span class="k">job</span><span class="v">${esc(anchor.task.verb ?? anchor.task.name)}</span></div>` : '');
   } else {
     tip.style.display = 'none';
   }
@@ -650,9 +1023,28 @@ $('t-solid').onchange = (e) => { gTerrain.visible = e.target.checked; };
 $('t-air').onchange   = (e) => { gAir.visible = e.target.checked; };
 $('t-caves').onchange = (e) => { gCaves.visible = e.target.checked; };
 $('t-mats').onchange  = (e) => { gMats.visible = e.target.checked; };
-$('t-labels').onchange = (e) => {
-  for (const c of gDrones.children) if (c.userData.isLabel) c.visible = e.target.checked;
+$('t-tasks').onchange = (e) => { gTasks.visible = e.target.checked; };
+$('t-nodes').onchange = (e) => { gNodes.visible = e.target.checked; };
+$('t-labels').onchange = () => {
+  // Labels are built during a refresh rather than toggled, because the text depends on live state.
+  // Rebuild from what we already have instead of waiting up to three seconds for the next poll.
+  buildTasks(lastTasks, new Map(lastDrones.map((d) => [d.name, d])));
+  buildDrones(lastDrones);
 };
+
+// ── mobile panel tabs ──────────────────────────────────────────────────────
+
+for (const btn of document.querySelectorAll('#tabs button')) {
+  btn.addEventListener('click', () => {
+    const cls = 'show-' + btn.dataset.panel;
+    const on = document.body.classList.contains(cls);
+    // One panel at a time. On a phone two overlapping sheets leave no map visible, which defeats
+    // the point of opening the map.
+    document.body.classList.remove('show-hud', 'show-side', 'show-legend');
+    for (const b of document.querySelectorAll('#tabs button')) b.classList.remove('on');
+    if (!on) { document.body.classList.add(cls); btn.classList.add('on'); }
+  });
+}
 
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
@@ -666,7 +1058,7 @@ function tick() {
   requestAnimationFrame(tick);
   controls.update();
   // A slow spin on the drone markers. Not decoration: it is the only cue that the page is live
-  // rather than a frozen screenshot, in a world where four of five drones are usually idle.
+  // rather than a frozen screenshot, in a world where most drones are usually idle.
   const t = performance.now() * 0.001;
   for (const c of gDrones.children) if (c.userData.drone) c.rotation.y = t * 0.6;
   renderer.render(scene, camera);

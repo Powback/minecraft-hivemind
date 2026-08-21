@@ -34,8 +34,25 @@ export interface Drone {
   heading?: 'north' | 'south' | 'east' | 'west';
   fuel: number;
   status: DroneStatus;
-  /** epoch ms of last heartbeat. Silence is the primary loss signal. */
-  lastSeen: number;
+  /**
+   * The word the drone actually used, kept alongside the normalised status.
+   *
+   * DroneLogic's vocabulary is finer than HQ's — mining, scanning, surveying, hauling, moving,
+   * rotation, updating, stuck — and collapsing all of those to 'working' is right for deciding
+   * whether a drone is available but wrong for telling an operator what it is doing. Both
+   * questions are legitimate, so both answers are kept rather than one being reconstructed from
+   * the other.
+   */
+  reported?: string;
+  /**
+   * epoch ms of last heartbeat. Silence is the primary loss signal.
+   *
+   * OPTIONAL, and that is the point: a drone DroneMan has never heard from has no timestamp at
+   * all, which is different from one last seen long ago. Encoding "never" as 0 made silence
+   * arithmetic return the entire Unix epoch — /brief reported a drone "silent 1787342964s",
+   * roughly 56,000 years, which reads as a broken clock rather than as a dead drone.
+   */
+  lastSeen?: number;
   order?: string;
 }
 
@@ -120,9 +137,11 @@ export class HiveState {
   // ── fleet ────────────────────────────────────────────────────────────────
   upsertDrone(d: Partial<Drone> & { id: number }): Drone {
     const prev = this.drones.get(d.id);
+    // No lastSeen default. Defaulting it to now() invents proof of life for a drone nobody has
+    // ever heard from, which is the one thing this field exists to disprove.
     const next: Drone = {
       name: `drone-${d.id}`, role: 'worker', fuel: 0, status: 'idle',
-      lastSeen: Date.now(), ...prev, ...d,
+      ...prev, ...d,
     };
     this.drones.set(d.id, next);
     return next;
@@ -133,12 +152,17 @@ export class HiveState {
    * background job so that state is always self-consistent when read — a drone
    * cannot appear 'working' while having been silent for ten minutes.
    */
-  listDrones(): Array<Drone & { silentMs: number }> {
+  listDrones(): Array<Drone & { silentMs: number | null }> {
     const now = Date.now();
     return [...this.drones.values()].map((d) => {
-      const silentMs = now - d.lastSeen;
+      // null, not a number, when there is no timestamp: callers must be forced to decide how to
+      // say "never heard from" rather than being handed a duration that happens to be enormous.
+      const silentMs = d.lastSeen ? now - d.lastSeen : null;
       const status: DroneStatus =
         d.status === 'lost' ? 'lost'
+        // Never reported at all is the strongest loss signal there is, not the weakest. DroneMan
+        // stamps lastSeen on registration, so its absence means the drone has not spoken since.
+        : silentMs === null ? 'lost'
         : silentMs > STALE_MS.drone * 5 ? 'lost'
         : silentMs > STALE_MS.drone ? 'stranded'
         : d.status;

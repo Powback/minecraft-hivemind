@@ -13,7 +13,7 @@
  */
 import { z } from 'zod';
 import { registry, ToolError } from './registry.js';
-import { state, STALE_MS, type Vec3 } from '../world/state.js';
+import { state, STALE_MS, type Vec3, type DroneStatus } from '../world/state.js';
 import { bridge } from '../bridge/ws.js';
 import { supply, runSupplyTick, stockKey, type SupplyRule } from '../agent/supply.js';
 
@@ -31,28 +31,66 @@ import { supply, runSupplyTick, stockKey, type SupplyRule } from '../agent/suppl
  * and heartbeats only fire at boot and shutdown anyway (there is no timer), so a passive listener
  * would go stale the moment a drone settled.
  */
+/**
+ * DroneLogic's status words, mapped onto the five HQ reasons about.
+ *
+ * These two vocabularies were never reconciled and the mismatch was invisible: `d.status` arrives
+ * off an `any`, so TypeScript accepted "mining" as a DroneStatus and the wrong value flowed all
+ * the way to the agent. The damage was silent and total --
+ *
+ *   - buildBrief tests `status === 'lost' | 'stranded'`, so a drone DroneMan had explicitly marked
+ *     "offline" raised NO problem at all. /brief said `problems: ["none"]` while a drone was dead.
+ *   - fleet.status's filter enum has no "mining", so `{status:'working'}` matched zero drones
+ *     while two were actively mining, and `{status:'mining'}` was rejected as invalid. There was
+ *     no accepted value that could find a working drone.
+ *
+ * Anything unrecognised maps to 'working' rather than 'idle': a drone reporting a word we do not
+ * know is doing SOMETHING, and guessing "idle" would offer it more work on top.
+ */
+const REPORTED_STATUS: Record<string, DroneStatus> = {
+  idle: 'idle',
+  mining: 'working', scanning: 'working', surveying: 'working',
+  moving: 'working', rotation: 'working', updating: 'working',
+  // Hauling is the return leg to storage, which is what 'docking' means here.
+  hauling: 'docking',
+  // Stuck is a drone that has given up and said so. It needs a rescue, not a re-queue.
+  stuck: 'stranded',
+  offline: 'lost',
+};
+
+function normaliseStatus(reported: unknown, offline: unknown): DroneStatus {
+  if (offline) return 'lost';
+  if (typeof reported !== 'string') return 'idle';
+  return REPORTED_STATUS[reported] ?? 'working';
+}
+
 async function refreshFleet(): Promise<void> {
   if (!bridge.connected) return;        // offline: serve last-known state rather than erroring
   try {
     const res: any = await bridge.call('DroneMan', 'GetDrones', {}, { timeoutMs: 5000 });
     const list = res?.drones ?? res?.data?.drones;
     if (!Array.isArray(list)) return;
-    const now = Date.now();
     for (const d of list) {
       const id = typeof d?.droneID === 'number' ? d.droneID : d?.id;
       if (typeof id !== 'number') continue;
-      state.upsertDrone({
+      const patch: Parameters<typeof state.upsertDrone>[0] = {
         id,
         name: d.name ?? `drone-${id}`,
         role: d.role ?? 'miner',
-        status: d.offline ? 'lost' : (d.status ?? 'idle'),
+        status: normaliseStatus(d.status, d.offline),
+        reported: typeof d.status === 'string' ? d.status : undefined,
         fuel: typeof d.fuel === 'number' ? d.fuel : 0,
         pos: d.pos && typeof d.pos.x === 'number' ? d.pos : undefined,
-        // DroneMan's timestamp, NOT now. Stamping `now` here measures when HQ last polled, so
-        // every drone reported silent=0s -- including one that had been mined out of the world.
-        // A liveness field that is always zero is worse than none: it looks like proof of life.
-        lastSeen: typeof d.lastSeen === 'number' ? d.lastSeen : (d.offline ? 0 : now),
-      });
+      };
+      // DroneMan's timestamp, NOT now. Stamping `now` here measures when HQ last polled, so every
+      // drone reported silent=0s -- including one that had been mined out of the world. A liveness
+      // field that is always zero is worse than none: it looks like proof of life.
+      //
+      // Absent stays absent. It is only set when DroneMan actually has one, so that a drone it has
+      // never heard from keeps `lastSeen: undefined` and is reported as never-seen rather than as
+      // silent-since-1970.
+      if (typeof d.lastSeen === 'number' && d.lastSeen > 0) patch.lastSeen = d.lastSeen;
+      state.upsertDrone(patch);
     }
   } catch (err) {
     // A refresh failure must not take down a read tool; stale data beats no answer. But it must
@@ -101,8 +139,8 @@ export function buildBrief() {
   const problems: string[] = [];
 
   for (const d of drones) {
-    if (d.status === 'lost') problems.push(`${d.name} (#${d.id}) is LOST — silent ${Math.round(d.silentMs / 1000)}s.`);
-    else if (d.status === 'stranded') problems.push(`${d.name} (#${d.id}) has gone quiet (${Math.round(d.silentMs / 1000)}s).`);
+    if (d.status === 'lost') problems.push(`${d.name} (#${d.id}) is LOST — ${describeSilence(d.silentMs)}.`);
+    else if (d.status === 'stranded') problems.push(`${d.name} (#${d.id}) has gone quiet (${describeSilence(d.silentMs)}).`);
     else if (d.fuel < 200) problems.push(`${d.name} (#${d.id}) is low on fuel (${d.fuel}).`);
   }
   for (const o of orders) if (o.failure) problems.push(`Order ${o.id} (${o.kind}) failed: ${o.failure}`);
@@ -112,9 +150,9 @@ export function buildBrief() {
       total: drones.length,
       byStatus: tally(drones.map((d) => d.status)),
       drones: drones.map((d) => ({
-        id: d.id, name: d.name, status: d.status, fuel: d.fuel,
+        id: d.id, name: d.name, status: d.status, doing: d.reported ?? null, fuel: d.fuel,
         pos: d.pos ?? null, order: d.order ?? null,
-        silentSec: Math.round(d.silentMs / 1000),
+        silentSec: silentSec(d.silentMs),
       })),
     },
     orders: orders.map((o) => ({
@@ -130,6 +168,17 @@ export function buildBrief() {
 const tally = (xs: string[]) =>
   xs.reduce<Record<string, number>>((a, x) => ((a[x] = (a[x] ?? 0) + 1), a), {});
 
+/** Seconds of silence, or null for a drone that has never reported. Never a fake number. */
+const silentSec = (ms: number | null) => (ms === null ? null : Math.round(ms / 1000));
+
+/**
+ * Silence in words. "Never reported" is a different diagnosis from "silent for four minutes" —
+ * the first means the drone may not exist, the second means it stopped — and the agent replans
+ * differently on each, so the distinction has to survive into the prose it actually reads.
+ */
+const describeSilence = (ms: number | null) =>
+  ms === null ? 'never reported to DroneMan' : `silent ${Math.round(ms / 1000)}s`;
+
 // ── fleet.status ───────────────────────────────────────────────────────────
 registry.register({
   name: 'fleet.status',
@@ -137,10 +186,21 @@ registry.register({
   description: 'Use when the brief is not specific enough — e.g. to check one drone before assigning it work.',
   params: z.object({
     id: z.number().int().optional().describe('A specific drone id.'),
-    status: z.enum(['idle', 'working', 'docking', 'stranded', 'lost']).optional(),
+    /**
+     * Both vocabularies are accepted, because a caller cannot be expected to know which one a
+     * given drone happens to be speaking. Asking for 'working' finds the drone that reported
+     * 'mining'; asking for 'mining' finds it too. Previously neither did: 'mining' was rejected
+     * by the enum and 'working' matched nothing, so a mining drone was unreachable by any
+     * accepted value of the one filter meant to find it.
+     */
+    status: z.enum([
+      'idle', 'working', 'docking', 'stranded', 'lost',
+      'mining', 'scanning', 'surveying', 'moving', 'rotation', 'updating', 'hauling',
+      'stuck', 'offline',
+    ]).optional().describe('HQ status (idle/working/docking/stranded/lost) or the drone\'s own word (mining, scanning, hauling…).'),
     role: z.string().optional(),
   }).strict(),
-  returns: 'Matching drones with position, fuel, status, current order and silence duration.',
+  returns: 'Matching drones with position, fuel, status, what they reported doing, current order and silence duration (null if never heard from).',
   danger: 'read',
   teach: [{
     situation: 'Which drones are free to take work right now?',
@@ -153,9 +213,16 @@ registry.register({
   }],
   handler: async (a) => {
     await refreshFleet();
+    // Match on either the normalised status or the drone's own word, so both spellings of the
+    // same question return the same drones.
+    const wanted = a.status;
+    const matches = (d: { status: DroneStatus; reported?: string }) =>
+      !wanted || d.status === wanted || d.reported === wanted ||
+      (REPORTED_STATUS[wanted] !== undefined && d.status === REPORTED_STATUS[wanted]);
+
     const drones = state.listDrones().filter(
       (d) => (a.id === undefined || d.id === a.id) &&
-             (!a.status || d.status === a.status) &&
+             matches(d) &&
              (!a.role || d.role === a.role),
     );
     return { matched: drones.length, drones };
@@ -545,6 +612,254 @@ registry.register({
   },
 });
 
+// ── world.blocks ───────────────────────────────────────────────────────────
+// Position -> block name, for colouring a map by what is actually there.
+//
+// world.voxels answers "is this cell solid", which is what a pathfinder needs and all a renderer
+// could previously show: terrain as one grey mass. This says WHAT is solid. It is a strict subset
+// of the occupancy grid -- only positions a drone reported a name for -- so a missing key means
+// "solid but unidentified", never "air". Collapsing those two would draw holes in the ground.
+
+const BLOCKS_CACHE_MS = 15_000;
+let blocksCache: { at: number; map: Record<string, string> } | null = null;
+let blocksInflight: Promise<Record<string, string>> | null = null;
+
+async function loadBlocks(): Promise<Record<string, string>> {
+  if (blocksCache && Date.now() - blocksCache.at < BLOCKS_CACHE_MS) return blocksCache.map;
+  if (blocksInflight) return blocksInflight;
+  blocksInflight = (async () => {
+    // Shorter than the voxel fetch it rides alongside. Identity is an enrichment: if MapServer
+    // does not have this endpoint yet, the map must fall back to unidentified terrain quickly
+    // rather than hold the whole terrain refresh open waiting for a call that will never answer.
+    const res: any = await bridge.call('MapServer', 'BlockAt', {}, { timeoutMs: 8000 });
+    const map = res?.blockAt ?? res?.data?.blockAt ?? {};
+    blocksCache = { at: Date.now(), map };
+    return map;
+  })().finally(() => { blocksInflight = null; });
+  return blocksInflight;
+}
+
+registry.register({
+  name: 'world.blocks',
+  summary: 'Every surveyed position and the block name at it. For rendering, not reading.',
+  description:
+    'Like world.voxels, this is renderer input: raw:true returns thousands of entries. The ' +
+    'summary form tells you how many positions are identified and what they are, which is the ' +
+    'part a plan can use. To FIND something use world.find instead -- it answers the same ' +
+    'question in one line.',
+  params: z.object({
+    raw: z.boolean().default(false).describe('Include the full position->name map. Renderers only.'),
+  }).strict(),
+  returns: 'Count of identified positions, a tally by block name, and with raw:true a `blockAt` map keyed "x:y:z".',
+  danger: 'read',
+  bounds: `Served from a ${BLOCKS_CACHE_MS / 1000}s cache. Covers only observed positions, not the whole world.`,
+  handler: async (a) => {
+    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    const map = await loadBlocks();
+    const counts: Record<string, number> = {};
+    let n = 0;
+    for (const k in map) { counts[map[k]] = (counts[map[k]] ?? 0) + 1; n++; }
+    const stats = {
+      identified: n,
+      counts: Object.fromEntries(Object.entries(counts).sort((x, y) => y[1] - x[1])),
+      cachedAgeMs: blocksCache ? Date.now() - blocksCache.at : 0,
+    };
+    return a.raw ? { ...stats, blockAt: map } : stats;
+  },
+});
+
+// ── fleet.tasks ────────────────────────────────────────────────────────────
+// What the fleet has been TOLD to do, as opposed to where it happens to be.
+//
+// fleet.status answers "where is D3"; this answers "and why". Those are different questions with
+// different failure modes, and only the second one can tell you that a scout has been assigned a
+// survey it is nowhere near. The work payload travels whole because its shape differs per verb.
+registry.register({
+  name: 'fleet.tasks',
+  summary: 'The task queue: what each job is, its region, who it is assigned to, and progress.',
+  description:
+    'Use to answer "what is the fleet actually doing" and to check that an order you issued was ' +
+    'picked up. A task with no `assignedTo` is queued but unstaffed -- usually because every ' +
+    'drone of the required role is busy or dead.',
+  params: z.object({}).strict(),
+  returns: 'Tasks with id, name, verb, region, assigned drone id and name, role, progress, paused/enabled flags.',
+  danger: 'read',
+  handler: async () => {
+    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    const res: any = await bridge.call('TaskMan', 'GetTasks', {}, { timeoutMs: 8000 });
+    const raw = res?.tasks ?? res?.data?.tasks ?? [];
+    return { count: raw.length, tasks: raw.map(describeTask) };
+  },
+});
+
+/**
+ * Turn a task's `work` table into a verb and a region.
+ *
+ * Every job type spells its geometry differently -- dig uses start/stop, survey min/max, lumber a
+ * corner plus width and length, gather a list of target positions -- because each was added when
+ * it was needed. Normalising here rather than in the renderer means the map, the agent and any
+ * future consumer all read the same shape, and a new verb degrades to "unknown region" instead of
+ * silently drawing nothing.
+ */
+function describeTask(t: any) {
+  const work = t?.work ?? {};
+  const verb = Object.keys(work)[0];
+  const w: any = verb ? work[verb] : undefined;
+  let region: { min: Vec3; max: Vec3 } | null = null;
+  let targets: Vec3[] | null = null;
+
+  const box = (a: any, b: any) => ({
+    min: { x: Math.min(a.x, b.x), y: Math.min(a.y, b.y), z: Math.min(a.z, b.z) },
+    max: { x: Math.max(a.x, b.x), y: Math.max(a.y, b.y), z: Math.max(a.z, b.z) },
+  });
+
+  if (w?.start && w?.stop) region = box(w.start, w.stop);
+  else if (w?.min && w?.max) region = box(w.min, w.max);
+  else if (w?.start && typeof w.w === 'number') {
+    // Lumber walks a surface: a corner plus width and length, with no meaningful height. Give it
+    // a thin slab so it can be drawn, rather than a degenerate box that renders as nothing.
+    region = box(w.start, { x: w.start.x + w.w - 1, y: w.start.y, z: w.start.z + (w.l ?? w.w) - 1 });
+  }
+  if (Array.isArray(w?.targets)) {
+    targets = w.targets.filter((p: any) => typeof p?.x === 'number');
+    if (!region && targets && targets.length) {
+      // A gather job has no box of its own, so derive one from the seeds. It is the region the
+      // drone will actually be working in, which is the thing an operator wants to see.
+      const xs = targets.map((p) => p.x), ys = targets.map((p) => p.y), zs = targets.map((p) => p.z);
+      region = {
+        min: { x: Math.min(...xs), y: Math.min(...ys), z: Math.min(...zs) },
+        max: { x: Math.max(...xs), y: Math.max(...ys), z: Math.max(...zs) },
+      };
+    }
+  }
+
+  return {
+    id: t.id, name: t.name, verb: verb ?? null,
+    role: t.role ?? null,
+    assignedTo: typeof t.assignedTo === 'number' ? t.assignedTo : null,
+    assigned: t.assigned ?? null,
+    progress: t.progress ?? null,
+    paused: t.paused === true,
+    enabled: t.enabled !== false,
+    region, targets,
+    match: w?.match ?? null,
+    limit: w?.limit ?? null,
+  };
+}
+
+// ── hive.nodes ─────────────────────────────────────────────────────────────
+// The computers, as opposed to the turtles.
+//
+// Drones report themselves on a heartbeat; the machines that command them reported nothing, so
+// the entire control plane was invisible from outside the game. Five idle drones look identical
+// whether there is no work to do or TaskMan has been dead since the last chunk unload.
+const NODE_MODULES = ['MainFrame', 'DroneMan', 'TaskMan', 'MapServer', 'StorageMan', 'DockingMan'];
+
+/**
+ * Cached hard, and backed off harder when nothing answers.
+ *
+ * This is the most expensive read in the system: seven modules, each a rednet round-trip, and an
+ * unreachable one costs the full timeout rather than failing fast. Left uncached behind a page
+ * that polls every three seconds it would keep six timed-out calls permanently in flight on the
+ * link the fleet uses to receive orders — a monitoring tool degrading the thing it monitors.
+ *
+ * The long backoff exists because "no module answers Status" is the expected state until the Lua
+ * side is synced and rebooted, and retrying that every 20s for hours is pure noise on the bridge.
+ * A computer's position and uptime are not fast-moving data in any case.
+ */
+const NODES_CACHE_MS = 20_000;
+const NODES_BACKOFF_MS = 90_000;
+let nodesCache: { at: number; value: any; anyUp: boolean } | null = null;
+let nodesInflight: Promise<any> | null = null;
+
+registry.register({
+  name: 'hive.nodes',
+  summary: 'The in-world computers: up/down, position, fault count, and their last log lines.',
+  description:
+    'Check this when the fleet is idle for no reason, or when a tool times out. A module that ' +
+    'does not answer here is down, and that is a different problem from a drone being stuck. ' +
+    'Positions come from the GPS constellation and are absent for a computer without a wireless ' +
+    'modem -- absent means unknown, not origin.',
+  params: z.object({}).strict(),
+  returns: 'Per-module: reachable flag, computer id, position, uptime, fault count, last fault, last monitor line, recent log lines.',
+  danger: 'read',
+  handler: async () => {
+    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    const ttl = nodesCache?.anyUp === false ? NODES_BACKOFF_MS : NODES_CACHE_MS;
+    const stale = !nodesCache || Date.now() - nodesCache.at >= ttl;
+
+    // Refresh in the BACKGROUND and answer from cache. A probe takes up to five seconds when a
+    // module is down, and the map polls every three: awaiting it here would make the whole page's
+    // update rate hostage to its slowest, least urgent panel, and starve the terrain fetch behind
+    // it. Whoever asks next gets the fresh answer.
+    if (stale && !nodesInflight) {
+      nodesInflight = probeNodes()
+        .catch(() => undefined)     // a failed probe must not become an unhandled rejection
+        .finally(() => { nodesInflight = null; });
+    }
+    if (!nodesCache) {
+      // First call ever: there is nothing to serve yet, and saying so beats blocking.
+      return { count: NODE_MODULES.length + 1, up: 0, nodes: [], probing: true,
+               note: 'Probing the in-world computers; results appear on the next poll.' };
+    }
+    return { ...nodesCache.value, cachedAgeMs: Date.now() - nodesCache.at };
+  },
+});
+
+async function probeNodes() {
+    // Asked in parallel: six sequential rednet round-trips at up to 5s each is long enough that
+    // the page polling this would never see a complete answer.
+    const nodes = await Promise.all(NODE_MODULES.map(async (m) => {
+      try {
+        const r: any = await bridge.call(m, 'Status', {}, { timeoutMs: 5000 });
+        const s = r?.data ?? r ?? {};
+        return {
+          module: m, reachable: true,
+          id: s.id ?? null, label: s.label ?? null,
+          pos: s.pos && typeof s.pos.x === 'number' ? s.pos : null,
+          upSec: typeof s.up === 'number' ? Math.round(s.up) : null,
+          faults: s.faults ?? 0,
+          lastFault: s.lastFault ?? null,
+          monitor: s.monitor ?? null,
+          log: Array.isArray(s.log) ? s.log : [],
+        };
+      } catch (err) {
+        // Unreachable is the answer, not an error. A module that cannot be asked is the most
+        // important thing on this list, and throwing would hide the five that did reply.
+        return {
+          module: m, reachable: false,
+          id: null, label: null, pos: null, upSec: null, faults: 0, lastFault: null,
+          monitor: null, log: [],
+          error: (err as Error)?.message ?? String(err),
+        };
+      }
+    }));
+
+    // The Bridge answers on its own path, which works even when PowNet does not -- so it is the
+    // one node whose silence would mean something entirely different.
+    let bridgeNode: any = { module: 'Bridge', reachable: false };
+    try {
+      const b: any = await bridge.call('BRIDGE', 'ping', {}, { timeoutMs: 4000 });
+      bridgeNode = { module: 'Bridge', reachable: true, id: b?.id ?? null, pos: null,
+                     upSec: typeof b?.up === 'number' ? Math.round(b.up) : null,
+                     faults: 0, lastFault: null, monitor: null, log: [] };
+    } catch { /* left unreachable */ }
+
+  const all = [...nodes, bridgeNode];
+  // "Any PowNet module answered" — the Bridge is excluded deliberately, because it answers on its
+  // own path and would mask the case this backoff exists for: Status not deployed anywhere.
+  const anyUp = nodes.some((n) => n.reachable);
+  const value = {
+    count: all.length, up: all.filter((n) => n.reachable).length, nodes: all,
+    // Said plainly rather than left to be inferred from six identical timeouts.
+    note: anyUp ? undefined
+      : 'No module answered Status. That endpoint ships with PowNet; until the Lua tree is synced ' +
+        'and the fleet reloaded, every module will report unreachable here while working normally.',
+  };
+  nodesCache = { at: Date.now(), value, anyUp };
+  return { ...value, cachedAgeMs: 0 };
+}
+
 // ── world.caves ────────────────────────────────────────────────────────────
 registry.register({
   name: 'world.caves',
@@ -653,7 +968,7 @@ registry.register({
     return {
       order: order.id, rescuer,
       searching: target.pos ?? null,
-      lastSeenSecAgo: Math.round(target.silentMs / 1000),
+      lastSeenSecAgo: silentSec(target.silentMs),
     };
   },
 });
