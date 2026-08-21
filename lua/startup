@@ -1,0 +1,170 @@
+local s_Label = os.getComputerLabel()
+if(s_Label == nil and fs.exists("disk/startup")) then
+    print("Copying Startup Data.")
+    fs.delete("/startup")
+    fs.delete("/PowNet")
+    fs.copy("disk/startup", "/startup")
+    fs.copy("disk/PowNet", "/PowNet")
+
+    if (s_Label == nil) then
+        print("Please set the label to the module you want")
+    end
+    return
+end
+
+local monitor
+-- _G on purpose: CC:T gives every program its own environment, so a plain global here is
+-- invisible to the module we shell.run below. MainFrame.lua's first statement is Log("Loading...")
+-- and it died on a nil call — silently, because shell.run catches the error itself.
+function _G.Log(p_Message, p_Color)
+    print(p_Message)
+    if(peripheral.getType("left") == "monitor" ) then
+        monitor = peripheral.wrap("left")
+    end
+    if(monitor ~= nil) then
+
+        monitor.clear()
+        monitor.setCursorPos(1,1)
+        monitor.setTextScale(1.5)
+        if(p_Color == nil) then
+            p_Color = colors.white
+        end
+        monitor.setTextColor(p_Color)
+        monitor.write(p_Message)
+        monitor.setTextColor(colors.white)
+
+    end
+end
+
+function _G.SetStatus(p_Message, p_Color)
+    print(p_Message)
+    if(peripheral.getType("left") == "monitor" ) then
+        monitor = peripheral.wrap("left")
+    end
+    if(monitor ~= nil) then
+
+        monitor.clear()
+        monitor.setCursorPos(1,1)
+        monitor.setTextScale(1.5)
+        if(p_Color == nil) then
+            p_Color = colors.white
+        end
+        monitor.setTextColor(p_Color)
+        monitor.write(p_Message)
+        monitor.setTextColor(colors.white)
+
+    end
+end
+
+SetStatus("Booting...")
+
+--MainFrame only
+if(s_Label == "MainFrame") then
+    shell.setDir("disk")
+    shell.run("MainFrame.lua")
+    Log("Offline", colors.red)
+    return
+end
+
+
+os.loadAPI("PowNet")
+local s_Started, s_Message = PowNet.InitServer()
+if not s_Started then
+    print("Failed to initialize:")
+    print(s_Message)
+    return
+end
+
+
+
+SetStatus("Connecting...")
+-- _G, for the same reason as Log above: every module reads DATA as a global, and a plain
+-- assignment here lands in startup's own environment where shell.run cannot see it. DroneMan's
+-- Init() indexes DATA["lastDrone"] and dies on nil before it ever hosts.
+_G.DATA = nil
+-- Wait for MainFrame instead of rebooting on the first failure.
+--
+-- A fleet reload drops everything at once, so on the way back up a module reliably beat MainFrame
+-- to the punch, failed to connect, and rebooted -- over and over, at full speed, looking "on" the
+-- whole time. StorageMan sat in exactly this loop and never pulled its own module.
+PowNet.WaitForService("MAINFRAME", 120)
+s_Connected, _G.DATA = PowNet.Connect()
+
+local s_Tries = 0
+while not s_Connected and s_Tries < 10 do
+    SetStatus("Waiting for MainFrame...", colors.orange)
+    os.sleep(3)
+    s_Tries = s_Tries + 1
+    s_Connected, _G.DATA = PowNet.Connect()
+end
+
+if not s_Connected then
+    -- Reboot only after genuinely giving up, so the loop is slow and legible rather than a
+    -- spin that hides the problem.
+    SetStatus("Offline!", colors.red)
+    os.sleep(10)
+    os.reboot()
+end
+SetStatus("Updating")
+
+--MapServer only
+if(s_Label == "MapServer") then
+    PowNet.UpdateModule("PowGPSServer.lua", "PowGPSServer")
+    -- MapRender too, and for the same reason: MapServer does os.loadAPI on both at its very first
+    -- line, so anything it fetches itself arrives one boot too late to be loadable.
+    PowNet.UpdateModule("MapRender.lua", "MapRender")
+    print("Updated GPS server")
+end
+
+
+PowNet.UpdateModule("startup")
+PowNet.UpdateModule("PowNet")
+PowNet.UpdateModule(s_Label .. ".lua")
+SetStatus("Launching!", colors.green)
+-- Record WHY a module stopped. shell.run swallows the error and prints it to a terminal nobody
+-- is looking at, so a module that dies on its first line is indistinguishable from one that ran
+-- and exited — both just reboot. Writing it down is the difference between debugging this in
+-- minutes and guessing at it.
+-- loadfile + pcall, NOT shell.run. shell.run catches a program's error itself and returns false,
+-- so wrapping it in pcall always reports success and tells you nothing — which is exactly how I
+-- spent an hour believing DroneMan "ran and exited cleanly" when it may have been erroring on its
+-- first line. This surfaces the real message.
+local s_Fn, s_LoadErr = loadfile(s_Label .. ".lua", nil, _ENV)
+local s_Ok, s_Err
+if s_Fn then
+  s_Ok, s_Err = pcall(s_Fn)
+else
+  s_Ok, s_Err = false, "loadfile: " .. tostring(s_LoadErr)
+end
+do
+  local h = fs.open("/last-run.txt", "w")
+  h.write(("module=%s ok=%s err=%s at=%s\n"):format(
+    tostring(s_Label), tostring(s_Ok), tostring(s_Err), tostring(os.time())))
+  h.close()
+end
+SetStatus("Disconnected!", colors.red)
+
+-- THE REBOOT MUST HAPPEN, WHATEVER ELSE FAILS.
+--
+-- This write-back used to run unguarded, and the single most common reason a module stands down
+-- is a fleet update -- which is precisely when MainFrame is also restarting. So MAINFRAME is nil,
+-- sendAndWaitForResponse throws, and the bootloader dies HERE, before os.reboot(). The computer
+-- stays powered on, sitting at a shell prompt, hosting nothing.
+--
+-- That is the worst possible failure shape: `computercraft dump` shows it as on, it answers no
+-- rednet, and every "did my update deploy?" check reports a module that is simply absent. Hours
+-- went into chasing this as a deploy race when it was a missing pcall.
+--
+-- Losing the write-back costs telemetry that is re-derived within 30s. Not rebooting costs the
+-- module entirely, until someone notices and power-cycles it by hand.
+local s_Saved
+local s_Ok, s_Err = pcall(function()
+    local s_Message = PowNet.newMessage(PowNet.MESSAGE_TYPE.SET, s_Label, _G.DATA)
+    s_Saved = PowNet.sendAndWaitForResponse(-1, s_Message, PowNet.SERVER_PROTOCOL)
+end)
+if not s_Ok then
+    print("write-back failed (" .. tostring(s_Err) .. ") -- rebooting anyway")
+end
+print("EXITED saved=" .. tostring(s_Saved))
+os.sleep(3)
+os.reboot()

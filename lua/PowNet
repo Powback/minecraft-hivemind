@@ -1,0 +1,385 @@
+REDNET_TIMEOUT = 1
+--===== SET REDNET PROTOCOL =====--
+SERVER_PROTOCOL = "PowNet:Server"
+DRONE_PROTOCOL = "PowNet:Drone"
+
+MODULENAME = os.getComputerLabel()
+MESSAGE_TYPE = {
+    GET = 0,
+    SET = 1,
+    INIT = 2,
+    REGISTER = 3,
+    UPDATE = 4,
+    CALL = 5
+}
+local m_ServerEvents = {}
+local m_DroneEvents = {}
+local m_Update
+
+--===== OPEN REDNET =====--
+for _, side in ipairs(redstone.getSides()) do
+    if peripheral.getType(side) == "modem" then
+        rednet.open(side)
+    end
+end
+
+if not rednet.isOpen() then
+    printError("could not open rednet")
+    return
+end
+
+function Lookup(p_Name)
+    return rednet.lookup(SERVER_PROTOCOL, p_Name)
+end
+
+function Connect(p_Module)
+    MAINFRAME = rednet.lookup(SERVER_PROTOCOL, "MAINFRAME")
+    if not MAINFRAME then
+        print("Failed to connect to MainFrame")
+        return false
+    end
+        -- Initialize our data for faster lookup
+    if(p_Module == nil) then
+        p_Module = MODULENAME
+    end
+    local s_Message = PowNet.newMessage(MESSAGE_TYPE.INIT, p_Module)
+    local s_Response = PowNet.sendAndWaitForResponse(MAINFRAME, s_Message, PowNet.SERVER_PROTOCOL)
+    if s_Response then
+        return true, s_Response
+    else
+        print("Failed to fetch data")
+        return false
+    end
+end
+
+function newMessage(messageType, dataKey, data)
+    return {
+        type = messageType,
+        ID = math.random(0, 2^30),
+        dataKey = dataKey,
+        data = data,
+    }
+end
+
+function RegisterEvents( p_ServerEvents, p_DroneEvents, p_Update )
+    m_ServerEvents = p_ServerEvents
+    m_DroneEvents = p_DroneEvents
+    m_Update = p_Update
+
+    for k,v in pairs(p_ServerEvents) do
+        if(type(v) == "table" and v.callable) then
+            local s_Message = newMessage(PowNet.MESSAGE_TYPE.REGISTER, "RegisterCallable", {module = MODULENAME, name = k, params = v.params, installer = v.installer or false})
+            PowNet.Send(MAINFRAME, s_Message, SERVER_PROTOCOL)
+        end
+    end
+end
+function UpdateModule(p_Module, p_Path)
+    local s_Message = {
+        type = MESSAGE_TYPE.UPDATE,
+        ID = math.random(0, 2^30),
+        dataKey = p_Module,
+        data = false
+    }
+
+    local s_Response = sendAndWaitForResponse(MAINFRAME, s_Message, SERVER_PROTOCOL)
+    if not s_Response then
+        print("Failed to receive program: " .. p_Module)
+        return
+    end
+    if(s_Response == "InvalidName") then
+        print("No module by this name: " .. p_Module)
+    end
+    if(p_Path == nil) then
+        p_Path = "/" .. p_Module
+    end
+    local file = fs.open(p_Path, "w")
+    file.write(s_Response)
+    file.close()
+end
+
+-- Write-back of a module's DATA to MainFrame's VFS.
+--
+-- Before this, the ONLY persistence was the bootloader's write-back after a module exits. That
+-- covers a clean shutdown and nothing else: a server stop, a chunk unload, or MainFrame
+-- rebooting (which returns every module through the INIT id=0 path) dropped every drone
+-- registration and every docking allocation. That is worse than losing state, because
+-- registration is not idempotent -- DroneMan's lastDrone keeps counting and DockingMan's
+-- freeSlot keeps advancing -- so a drone that survives a restart still holds a name and a slot
+-- that the servers no longer believe they handed out.
+local m_Dirty = false
+
+-- Cheap and non-blocking on purpose. Handlers run inside main()'s receive loop while whoever
+-- called them is counting down a 1s rednet timeout (3 tries, then it gives up). Saving
+-- synchronously there spends a whole extra round-trip BEFORE the reply is sent, which is enough
+-- to time the caller out -- and a drone that times out mid-registration is the exact failure
+-- this is meant to prevent. So handlers only raise the flag; Update() does the writing.
+function MarkDirty()
+    m_Dirty = true
+end
+
+function Save()
+    if(_G.DATA == nil or MODULENAME == nil or MAINFRAME == nil) then
+        return false
+    end
+    local s_Saved = sendAndWaitForResponse(
+        MAINFRAME, newMessage(MESSAGE_TYPE.SET, MODULENAME, _G.DATA), SERVER_PROTOCOL)
+    if(s_Saved) then
+        m_Dirty = false
+        return true
+    end
+    -- Left dirty on purpose: the next message this module handles retries the write.
+    print("Save failed, will retry")
+    return false
+end
+
+function Update()
+    -- After the reply, never before -- main() calls this once the handler's response is already
+    -- on the wire, which is what makes the extra round-trip free as far as the caller is
+    -- concerned.
+    if(m_Dirty) then
+        Save()
+    end
+    if(m_Update == nil) then
+        return
+    end
+    m_Update()
+end
+-- Something to run before this module stands down for an update.
+--
+-- The INIT id=0 broadcast is how a fleet-wide update propagates: every module drops out of main,
+-- the bootloader writes its DATA back and reboots, and the reboot pulls new code. That covers a
+-- module's DATA and nothing else -- a drone halfway through a survey lost its task, and any scan
+-- data it had not yet uploaded went with it.
+--
+-- The hook is the module's chance to flush and record where it got to.
+local m_ShutdownHook
+
+function SetShutdownHook(p_Fn)
+    m_ShutdownHook = p_Fn
+end
+
+function RunShutdownHook(p_Reason)
+    if m_ShutdownHook == nil then return end
+    -- pcall: a failing hook must not stop the update, or one bad module wedges the whole fleet
+    -- on the old version.
+    local ok, err = pcall(m_ShutdownHook, p_Reason)
+    if not ok then print("shutdown hook failed: " .. tostring(err)) end
+end
+
+-- Wait for a named service to actually be hosting before talking to it.
+--
+-- Boot order is not controllable: a fleet reload drops every machine at once and they come back
+-- in whatever order the server happens to tick them. A module that assumes its dependency is
+-- already up does not fail loudly -- it fails silently and then reports healthy. That is how
+-- drones ended up holding names DroneMan had never issued, and how StorageMan sat in a reboot
+-- loop looking fine.
+--
+-- Returns the id, or nil if it never appeared. nil means "genuinely absent" and callers should
+-- treat it as a fault worth reporting, NOT as permission to carry on.
+function WaitForService(p_Name, p_Seconds)
+    local s_Waited, s_Limit = 0, (p_Seconds or 60)
+    while s_Waited < s_Limit do
+        local id = rednet.lookup(SERVER_PROTOCOL, p_Name)
+        if id then
+            if s_Waited > 0 then print("waited " .. s_Waited .. "s for " .. p_Name) end
+            return id
+        end
+        os.sleep(2)
+        s_Waited = s_Waited + 2
+    end
+    print("gave up waiting for " .. p_Name .. " after " .. s_Limit .. "s")
+    return nil
+end
+
+-- Ask, and keep asking while the answer is "no reply".
+--
+-- sendAndWaitForResponse returns false both for "the service said no" and for "nothing answered".
+-- Those mean opposite things and conflating them is what turned a boot race into a fleet that
+-- silently disagreed with itself about who existed.
+function AskInsisting(p_Service, p_Message, p_Tries)
+    for attempt = 1, (p_Tries or 3) do
+        local s_Res = sendAndWaitForResponse(p_Service, p_Message, SERVER_PROTOCOL)
+        if s_Res ~= false then return s_Res, true end
+        os.sleep(3)
+    end
+    return false, false      -- second return: false means "never got an answer at all"
+end
+
+function main()
+    while true do
+        print("Waiting for Server signal...")
+        local serverID, serverMessage = rednet.receive(PowNet.SERVER_PROTOCOL)
+        if type(serverMessage) == "table" then
+            if(serverMessage.type == PowNet.MESSAGE_TYPE.INIT and serverMessage.ID == 0) then
+                print("Server has been re-initialized. Ending execution.")
+                do
+                  -- Say WHO knocked us down and when. A module exiting here is by design, but it
+                  -- is indistinguishable from a crash without this, and the whole fleet does it
+                  -- at once whenever MainFrame reboots.
+                  local h = fs.open("/exit-reason.txt", "w")
+                  h.write(("INIT id=0 from %s at %s\n"):format(tostring(serverID), tostring(os.time())))
+                  h.close()
+                end
+                RunShutdownHook("update")
+                return
+            end
+            if(m_ServerEvents[serverMessage.dataKey] ~= nil) then
+                print("Received: " .. serverMessage.dataKey)
+
+                local s_Result, s_Response
+                if(type(m_ServerEvents[serverMessage.dataKey]) == "function") then
+                   s_Result, s_Response = m_ServerEvents[serverMessage.dataKey](serverID, serverMessage)
+                elseif(type(m_ServerEvents[serverMessage.dataKey]) == "table") then
+                    if(m_ServerEvents[serverMessage.dataKey].func == nil) then
+                        print("Event registered, but pointing to nothing")
+                    else
+                        s_Result, s_Response = m_ServerEvents[serverMessage.dataKey].func(serverID, serverMessage)
+                    end
+                else
+                    print("Unknown drone message handle")
+                end
+                if(s_Result ~= nil) then
+                    serverMessage.status = s_Result
+                    serverMessage.data = s_Response
+                    rednet.send(serverID, serverMessage, SERVER_PROTOCOL)
+                end
+            else
+                print("No server event with the name: " .. serverMessage.dataKey .. serverMessage.type)
+            end
+        end
+        Update()
+    end
+end
+
+function droneMain()
+    while true do
+        print("Waiting for Drone signal...")
+        local droneID, droneMessage = rednet.receive(PowNet.DRONE_PROTOCOL)
+        if type(droneMessage) == "table" then
+           --if(droneMessage.type == PowNet.MESSAGE_TYPE.INIT and droneID.ID == 0) then
+           --    print("Server has been initialized. Rebooting and performing updates.")
+           --    Save()
+           --    os.reboot()
+           --end
+            if(m_DroneEvents[droneMessage.dataKey] ~= nil) then
+                print("Received: " .. droneMessage.dataKey)
+                if(type(m_DroneEvents[droneMessage.dataKey]) == "function") then
+                    local s_Result, s_Response = m_DroneEvents[droneMessage.dataKey](droneID, droneMessage)
+                elseif(type(m_DroneEvents[droneMessage.dataKey]) == "table") then
+                    print(m_DroneEvents[droneMessage.dataKey].func)
+                    if(m_DroneEvents[droneMessage.dataKey].func == nil) then
+                        print("Event registered, but pointing to nothing")
+                    else
+                        local s_Result, s_Response = m_DroneEvents[droneMessage.dataKey].func(droneID, droneMessage)
+                    end
+                else
+                    print("Unknown drone message handle")
+                end
+                if(s_Result ~= nil) then
+                    droneMessage.status = s_Result
+                    droneMessage.data = s_Response
+                    rednet.send(droneID, droneMessage, DRONE_PROTOCOL)
+                end
+            else
+                print("No drone event with the name: " .. droneMessage.dataKey)
+            end
+        end
+        Update()
+    end
+end
+
+function Send(p_Recipient, p_Message, p_Protocol)
+    local s_RecipientID = p_Recipient
+    if(type(p_Recipient) == "string") then
+        s_RecipientID = PowNet.Lookup(p_Recipient)
+        if(s_RecipientID == nil or s_RecipientID == os.getComputerID()) then
+            print("Could not find server: " .. p_Recipient)
+            return false
+        end
+    end
+    rednet.send(s_RecipientID, p_Message, p_Protocol)
+    return true, s_RecipientID
+end
+
+function SendToServer(p_ServerName, p_Message, p_Protocol)
+    if(p_Protocol == nil) then
+        p_Protocol = SERVER_PROTOCOL
+    end
+    return Send(p_ServerName, p_Message, p_Protocol)
+end
+
+function SendToDrone(p_DroneID, p_Message, p_Protocol)
+    if(p_Protocol == nil) then
+        p_Protocol = DRONE_PROTOCOL
+    end
+    return Send(p_DroneID, p_Message, p_Protocol)
+end
+function SendToAllDrones(p_Message)
+    rednet.broadcast(p_Message, DRONE_PROTOCOL)
+    return true
+end
+
+function sendAndWaitForResponse(p_Recipient, message, protocol)
+    if(p_Recipient == -1) then
+        p_Recipient = MAINFRAME
+    end
+    if(protocol == nil) then
+        protocol = SERVER_PROTOCOL
+    end
+
+    local s_Status, s_RecipientID = Send(p_Recipient, message, protocol)
+    if(s_Status == false) then
+        return false, "Failed to send message"
+    end
+    local attemptNumber = 1
+    while true do
+        local senderID, reply = rednet.receive(protocol, REDNET_TIMEOUT)
+        if senderID == s_RecipientID and reply.ID == message.ID then
+            return reply.data
+        elseif not senderID then
+            if attemptNumber < 3 then
+                rednet.send(s_RecipientID, message, protocol)
+                attemptNumber = attemptNumber + 1
+            else
+                return false
+            end
+        end
+    end
+end
+
+function dump(o)
+    if(o == nil) then
+        print("tried to load jack shit")
+    end
+    if type(o) == 'table' then
+        local s = '{ '
+        for k,v in pairs(o) do
+            if type(k) ~= 'number' then k = '"'..k..'"' end
+            s = s .. '['..k..'] = ' .. dump(v) .. ','
+        end
+        return s .. '} '
+    else
+        return tostring(o)
+    end
+end
+
+--===== USER INTERFACE =====--
+function control()
+    while true do
+        local event, key = os.pullEvent("key")
+        if key == keys.backspace then
+            break
+        end
+    end
+end
+
+function InitServer()
+    print(MODULENAME)
+    local host = rednet.lookup(SERVER_PROTOCOL, MODULENAME)
+    if host and host ~= os.computerID() then
+        return false, (os.getComputerLabel() " server already running?")
+    end
+    rednet.host(SERVER_PROTOCOL, MODULENAME)
+    return true
+end
+

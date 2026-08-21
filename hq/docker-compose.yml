@@ -16,14 +16,15 @@ services:
       # The Lua tree HQ publishes at /lua/manifest and /lua/file/:path, which Sync.lua
       # pulls onto MainFrame's disk. Read-only: nothing in-game may write back.
       #
-      # This points at minecraft-create121/pownet -- the SINGLE source of truth for all
-      # in-world Lua -- not at a copy inside this repo. HiveMind used to keep its own
-      # lua/ tree here, which is how it ended up shipping a hand-written 92-line PowNet
-      # stub whose protocol string ("pownet-server" vs the live "PowNet:Server") meant its
-      # Bridge could never reach MainFrame. One tree, one truth.
+      # lua/ in THIS repo is the single source of truth for all in-world Lua. It moved here
+      # from the server repo (minecraft-create121) because that repo is the Minecraft server
+      # -- modpack, world, mods -- and the drone fleet is an application that merely runs
+      # inside it. The server can be rebuilt or replaced without touching the fleet.
       #
-      # Override with HIVE_LUA_DIR if the checkout lives somewhere else.
-      - ${HIVE_LUA_DIR:-../../minecraft-create121/pownet}:/lua:ro
+      # There must be exactly one copy. HiveMind previously kept a second lua/ tree with a
+      # hand-written 92-line PowNet stub whose protocol string ("pownet-server" vs the live
+      # "PowNet:Server") meant its Bridge could never reach MainFrame, silently.
+      - ../lua:/lua:ro
     restart: unless-stopped
     labels:
       - "traefik.enable=true"
