@@ -187,7 +187,18 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
   const queued = new Set<string>();
   try {
     const res: any = await bridge.call('TaskMan', 'GetTasks', {}, { timeoutMs: 15000 });
-    for (const t of res?.tasks ?? res?.data?.tasks ?? []) {
+    const list = res?.tasks ?? res?.data?.tasks;
+    // A REFUSAL COMES BACK AS A VALUE, NOT AN EXCEPTION.
+    //
+    // PowNet puts an error in the same field a success uses, so a failed GetTasks arrives as a
+    // plain string -- and `undefined?.tasks ?? []` then iterates nothing, leaving the dedup set
+    // empty with no error raised anywhere. Dedup silently switched itself off and the queue filled
+    // with nine copies of the same two surveys. An empty result and an unreadable one look
+    // identical and mean opposite things, so they must be told apart explicitly.
+    if (!Array.isArray(list)) {
+      return { acted: false, reason: `cannot read the task queue (${typeof res === 'string' ? res : typeof res}); not dispatching blind` };
+    }
+    for (const t of list) {
       if ((t?.progress ?? 0) < 100 && typeof t?.name === 'string') queued.add(t.name);
     }
   } catch {

@@ -369,10 +369,16 @@ end
 local TICK_SECONDS = 15
 local RECLAIM_AFTER_MS = 90 * 1000
 
+-- How many tasks to start in one pass. Small on purpose: assigning is expensive (a liveness ping
+-- per candidate) and the tick comes round every 15 seconds anyway, so there is no need to place the
+-- whole queue at once -- only to place SOMETHING, reliably, every pass.
+local START_PER_TICK = 3
+
 function Tick()
     while true do
         os.sleep(TICK_SECONDS)
         local s_Ok, s_Err = pcall(function()
+            local s_NoDrone, s_Started = {}, 0
             for k,v in pairs(DATA["tasks"]) do
                 -- Unassigned, enabled, not paused, not finished: try to place it. pickDrone
                 -- returns nothing when every drone of that role is busy, so this quietly
@@ -428,7 +434,26 @@ function Tick()
 
                 if v.enabled ~= false and not v.paused and v.assigned == nil
                    and not s_Blocked and (v.progress or 0) < 100 then
-                    OnStartTask(0, {data = {id = v.id}})
+                    -- ONE ROLE, ONCE. Do not re-ask for a role that has already said "nobody free"
+                    -- this pass.
+                    --
+                    -- This tried EVERY unassigned task on every tick, and picking a drone for a dig
+                    -- or gather pings each candidate with a four-second timeout to prove it is
+                    -- alive. With forty-six queued tasks that is minutes of pinging per pass, so the
+                    -- tick never reached the end of the list and nothing was ever assigned -- while
+                    -- three miners and a crafter sat idle in front of a full queue.
+                    local s_Role = RoleForWork(v.work)
+                    if not s_NoDrone[s_Role] then
+                        local s_Ok = OnStartTask(0, {data = {id = v.id}})
+                        if s_Ok then
+                            s_Started = s_Started + 1
+                            -- That drone is now busy; give the next tick a chance rather than
+                            -- burning this one discovering the same thing for every other task.
+                            if s_Started >= START_PER_TICK then break end
+                        else
+                            s_NoDrone[s_Role] = true
+                        end
+                    end
                 end
             end
         end)
