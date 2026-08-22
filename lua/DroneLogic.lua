@@ -124,7 +124,21 @@ function SendHeartBeat()
     end
     local s_Fuel = turtle.getFuelLevel()
 
-    local s_Data = {pos = s_Pos, status = m_Status, fuel = s_Fuel, role = Role(), stuck = m_Stuck, hosting = m_Hosting}
+    -- IDLE MEANS AVAILABLE. Say "blocked" when it is not.
+    --
+    -- A drone missing its position or its heading cannot move, so it cannot do any job it is given
+    -- -- but it reported "idle", which is the word the scheduler reads as "ready for work". It was
+    -- then offered jobs it could only fail, and an operator looking at the fleet saw a healthy
+    -- drone standing around. Availability and health are different, and this field is about
+    -- availability.
+    local s_Report = m_Status
+    if s_Report == "idle" then
+        local px, _, _, pd = pgps.getCachedPosition()
+        if px == nil then s_Report = "blocked"          -- does not know where it is
+        elseif pd == nil then s_Report = "blocked" end  -- does not know which way it faces
+    end
+
+    local s_Data = {pos = s_Pos, status = s_Report, fuel = s_Fuel, role = Role(), stuck = m_Stuck, hosting = m_Hosting}
     local s_Message = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Heartbeat", s_Data)
     -- WAIT FOR THE ANSWER.
     --

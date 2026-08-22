@@ -60,6 +60,9 @@ const REPORTED_STATUS: Record<string, DroneStatus> = {
   hauling: 'docking',
   // Stuck is a drone that has given up and said so. It needs a rescue, not a re-queue.
   stuck: 'stranded',
+  // Physically fine, cannot act -- missing a position or a heading. Deliberately NOT idle: the
+  // scheduler reads idle as "ready for work" and would keep handing it jobs it can only fail.
+  blocked: 'stranded',
   offline: 'lost',
 };
 
