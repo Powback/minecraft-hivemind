@@ -1891,12 +1891,34 @@ local function gpsRelay()
                     print("GPS relay re-anchored (moved " .. s_Drift .. ")")
                 end
             else
+                -- A RELAY MUST BE ABLE TO CHECK ITS OWN FIX.
+                --
+                -- Anchoring on a real gps.locate is not enough. The fix itself is computed from
+                -- whatever hosts answered, and if any of those were relays publishing a bad
+                -- position, the result is wrong -- confidently. A drone that then hosts it turns
+                -- one bad position into a spreading one.
+                --
+                -- D4 did exactly this: with no position of its own it accepted a fix of
+                -- -138,75,-51 while sitting at -80,85,12, and began broadcasting it. Eighty-five
+                -- blocks of error, offered to every drone in range as fact.
+                --
+                -- So a relay must have a position it already believed, and the fix must agree with
+                -- it. A drone that does not know where it is has nothing to check against and is
+                -- therefore exactly the wrong machine to be a reference for anyone else.
+                local cx, cy, cz = pgps.getCachedPosition()
+                if cx == nil then
+                    trace("relay: refusing to host -- no position of my own to check the fix against")
+                elseif (math.abs(fx - cx) + math.abs(fy - cy) + math.abs(fz - cz)) > 8 then
+                    trace(("relay: refusing to host -- fix %d,%d,%d disagrees with my position %d,%d,%d")
+                        :format(fx, fy, fz, cx, cy, cz))
+                else
                 s_Modem.open(gps.CHANNEL_GPS)
                 m_Hosting = true
                 m_HostPos = {x = fx, y = fy, z = fz}
                 trace(("relay: hosting at %d,%d,%d"):format(fx, fy, fz))
                 print("GPS relay hosting at " .. fx .. "," .. fy .. "," .. fz)
                 SendHeartBeat()
+                end
             end
 
         elseif not s_Eligible then
