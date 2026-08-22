@@ -56,11 +56,32 @@ export const SOURCES: Record<string, { action: 'gather' | 'lumber' | 'smelt'; bl
   'minecraft:sand':      { action: 'gather', block: 'sand' },
   'minecraft:coal':      { action: 'gather', block: 'coal_ore' },
   'minecraft:raw_iron':  { action: 'gather', block: 'iron_ore' },
+  'minecraft:redstone':  { action: 'gather', block: 'redstone_ore' },
 };
 
 const P = 'minecraft:oak_planks';
 const S = 'minecraft:stick';
+const ST = 'minecraft:stone';
+const IR = 'minecraft:iron_ingot';
+const RD = 'minecraft:redstone';
+const GP = 'minecraft:glass_pane';
+const GL = 'minecraft:glass';
+const EP = 'minecraft:ender_pearl';
+const COMP = 'computercraft:computer_normal';
 
+/**
+ * THE DRONE ITSELF.
+ *
+ * Taken from the mod's own recipe files rather than memory, because the grid layout IS the
+ * instruction -- turtle.craft reads the inventory and infers the result, so a misremembered pattern
+ * produces silently nothing.
+ *
+ * This is the loop closing: iron, stone, sand and wood go in; a machine that can mine iron, stone,
+ * sand and wood comes out. Everything in the chain has a source the fleet can reach EXCEPT the
+ * ender pearl in the modem, which is a mob drop. There is deliberately no recipe and no source for
+ * it, so a plan needing one says so plainly instead of quietly stalling -- stock satisfies it, and
+ * seeding that stock is the acknowledged cheat rather than a hidden one.
+ */
 export const RECIPES: Recipe[] = [
   // Wood chain. Everything the fleet can build starts here, which is why a desert base with no
   // trees could not build anything at all.
@@ -78,6 +99,37 @@ export const RECIPES: Recipe[] = [
     grid: ['minecraft:coal', null, null, S, null, null, null, null, null] },
   { output: 'minecraft:hopper', yields: 1, inputs: { 'minecraft:iron_ingot': 5, 'minecraft:chest': 1 },
     station: 'inventory' },
+
+  // ── The drone factory ────────────────────────────────────────────────────
+  { output: GP, yields: 16, inputs: { [GL]: 6 }, station: 'inventory',
+    grid: [GL, GL, GL, GL, GL, GL, null, null, null] },
+
+  { output: COMP, yields: 1, inputs: { [ST]: 7, [RD]: 1, [GP]: 1 }, station: 'inventory',
+    grid: [ST, ST, ST, ST, RD, ST, ST, GP, ST] },
+
+  { output: 'computercraft:wireless_modem_normal', yields: 1, inputs: { [ST]: 8, [EP]: 1 },
+    station: 'inventory', grid: [ST, ST, ST, ST, EP, ST, ST, ST, ST] },
+
+  { output: 'computercraft:turtle_normal', yields: 1,
+    inputs: { [IR]: 7, [COMP]: 1, 'minecraft:chest': 1 }, station: 'inventory',
+    grid: [IR, IR, IR, IR, COMP, IR, IR, 'minecraft:chest', IR] },
+
+  // THE PIPING. A wired modem joins any inventory to the network, and cable carries it there --
+  // after which StorageMan can move items between them directly. That is the conveyor: it runs at
+  // server speed, costs no fuel, and needs no drone. Turtles hauling between factories is what you
+  // do BEFORE you can afford this, not the goal.
+  { output: 'computercraft:wired_modem', yields: 1, inputs: { [ST]: 8, [RD]: 1 },
+    station: 'inventory', grid: [ST, ST, ST, ST, RD, ST, ST, ST, ST] },
+  { output: 'computercraft:cable', yields: 6, inputs: { [ST]: 5, [RD]: 1 },
+    station: 'inventory', grid: [null, ST, null, ST, RD, ST, null, ST, null] },
+
+  { output: 'computercraft:disk_drive', yields: 1, inputs: { [ST]: 7, [RD]: 2 },
+    station: 'inventory', grid: [ST, ST, ST, ST, RD, ST, ST, RD, ST] },
+
+  // A drone is useless without a tool. Iron rather than diamond: reachable from ore the fleet can
+  // actually prospect for, and a turtle digs stone just as well with it.
+  { output: 'minecraft:iron_pickaxe', yields: 1, inputs: { [IR]: 3, [S]: 2 }, station: 'inventory',
+    grid: [IR, IR, IR, null, S, null, null, S, null] },
 
   // Smelting. StorageMan already drives furnaces, so these are plannable today.
   { output: 'minecraft:glass', yields: 1, inputs: { 'minecraft:sand': 1 }, station: 'furnace' },

@@ -1622,6 +1622,58 @@ registry.register({
   }),
 });
 
+
+// ── factory.route ──────────────────────────────────────────────────────────
+//
+// PIPING, WITHOUT PIPES.
+//
+// A wired modem joins any inventory to the network, and any two things on that network can hand
+// items straight to each other. So connecting factories does not need belts, chutes, or a drone
+// ferrying crates between buildings -- it needs to know which items should flow where. StorageMan
+// then does it on a tick, at server speed, for no fuel.
+//
+// A drone hauling a stack across the base is minutes of flying and a drone that can do nothing else
+// meanwhile. The same move here is one call. Hauling is what you do BEFORE you can afford this.
+registry.register({
+  name: 'factory.route',
+  summary: 'Make items flow between networked inventories automatically, with no drone involved.',
+  description:
+    'Rules are read as sentences: "everything matching _ore in the mine chest goes to the smelter ' +
+    'feed". `item` is a substring, so one rule can carry a whole family. `keep` leaves a working ' +
+    'stock behind, which is what stops a route draining the chest a machine is feeding from. Both ' +
+    'inventories must be on the wired network -- see storage.stock for their names.',
+  params: z.object({
+    from: z.string().optional().describe('Source peripheral name.'),
+    to: z.string().optional().describe('Destination peripheral name.'),
+    item: z.string().optional().describe('Substring match; omit to move everything.'),
+    keep: z.number().int().min(0).max(64).optional().describe('Leave this many behind.'),
+    clear: z.boolean().optional().describe('Remove all routes instead of adding one.'),
+  }).strict(),
+  returns: 'The configured routes.',
+  danger: 'mutate',
+  teach: [{
+    situation: 'Ore piling up in the mine chest should feed the smelter without a drone carrying it.',
+    args: { from: 'minecraft:chest_2', to: 'minecraft:chest_0', item: '_ore' },
+    result: { route: { from: 'minecraft:chest_2', to: 'minecraft:chest_0', item: '_ore' }, count: 1 },
+    takeaway: 'The network is the conveyor; this is just the routing policy on top of it.',
+  }],
+  handler: async (a, ctx) => {
+    if (a.clear) {
+      const r: any = await bridge.call('StorageMan', 'ClearRoutes', {}, { timeoutMs: 8000 });
+      return { cleared: true, result: r ?? null };
+    }
+    if (!a.from || !a.to) {
+      const r: any = await bridge.call('StorageMan', 'GetRoutes', {}, { timeoutMs: 8000 });
+      return { routes: r?.routes ?? r?.data?.routes ?? [] };
+    }
+    const r: any = await bridge.call('StorageMan', 'AddRoute',
+      { from: a.from, to: a.to, item: a.item, keep: a.keep }, { timeoutMs: 8000 });
+    if (typeof r === 'string') throw new ToolError(r, 'Check storage.stock for valid peripheral names.');
+    ctx.log('factory.route', { from: a.from, to: a.to });
+    return r;
+  },
+});
+
 // ── recover.dispatch ───────────────────────────────────────────────────────
 registry.register({
   name: 'recover.dispatch',

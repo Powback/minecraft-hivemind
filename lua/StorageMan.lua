@@ -216,6 +216,114 @@ function OnSetPickup(p_ID, p_Message)
                   pickup = DATA["pickup"]}
 end
 
+
+----------------------------------------------------------------------------------------------
+-- Routes: the conveyor, in software
+----------------------------------------------------------------------------------------------
+-- A wired modem joins any inventory to the network, and any two things on that network can hand
+-- items to each other directly. So the fleet does not need belts, chutes or turtles ferrying
+-- crates between buildings -- it needs to know WHICH items should flow WHERE, and to do it on a
+-- tick. That is all a conveyor is.
+--
+-- This runs at server speed and costs no fuel. A drone hauling a stack across the base is minutes
+-- of flying and a drone that cannot do anything else meanwhile; the same move here is one call.
+--
+-- Deliberately rule-based rather than a graph: "everything called _ore in the mine chest goes to
+-- the smelter feed" is a sentence someone can read and check. A routing graph nobody can read is
+-- how items end up circulating forever between two chests that each think the other wants them.
+
+function ServiceRoutes()
+    local s_Routes = DATA["routes"]
+    if type(s_Routes) ~= "table" or #s_Routes == 0 then return 0 end
+    Rescan()
+
+    local s_Moved, s_Tried = 0, 0
+    for _, r in ipairs(s_Routes) do
+        if r.enabled ~= false and r.from and r.to and r.from ~= r.to then
+            local src = peripheral.wrap(r.from)
+            if src == nil then
+                Log("route source not on the network: " .. tostring(r.from))
+            elseif src.list == nil or src.pushItems == nil then
+                Log("route source is not an inventory: " .. tostring(r.from))
+            else
+                local ok, items = pcall(src.list)
+                if ok and items then
+                    -- `keep` is a TOTAL reserve, not a per-slot one.
+                    --
+                    -- Applied per slot it silently does nothing in the common case: a chest holds
+                    -- full 64-stacks, so `keep = 64` computes 64 - 64 = 0 for every slot and the
+                    -- route never moves an item while looking perfectly configured. What an
+                    -- operator means by "leave 64 behind" is 64 in total.
+                    local s_Have = 0
+                    for _, it in pairs(items) do
+                        if (r.item == nil) or string.find(it.name, r.item, 1, true) ~= nil then
+                            s_Have = s_Have + it.count
+                        end
+                    end
+                    local s_Budget = s_Have - (tonumber(r.keep) or 0)
+
+                    for slot, it in pairs(items) do
+                        -- Substring match so one rule can carry a family: "_ore" moves every ore
+                        -- without needing a line per ore type.
+                        local s_Match = (r.item == nil) or string.find(it.name, r.item, 1, true) ~= nil
+                        if s_Match and s_Budget > 0 then
+                            local s_Take = math.min(it.count, s_Budget)
+                            if s_Take > 0 then
+                                s_Tried = s_Tried + 1
+                                local ok2, n = pcall(src.pushItems, r.to, slot, s_Take)
+                                if ok2 and type(n) == "number" then
+                                    s_Moved = s_Moved + n
+                                    s_Budget = s_Budget - n
+                                else
+                                    -- Say WHY. A route that silently moves nothing is
+                                    -- indistinguishable from one that was never configured.
+                                    Log("route " .. tostring(r.from) .. "->" .. tostring(r.to) ..
+                                        " failed: " .. tostring(n))
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if s_Tried > 0 then
+        Log(("routes: %d attempt(s), %d item(s) moved"):format(s_Tried, s_Moved))
+    end
+    return s_Moved
+end
+
+function OnAddRoute(p_ID, p_Message)
+    local d = p_Message.data or {}
+    if d.from == nil or d.to == nil then return false, "need from and to peripheral names" end
+    if d.from == d.to then return false, "a route to itself would loop forever" end
+    if DATA["routes"] == nil then DATA["routes"] = {} end
+
+    for i, r in ipairs(DATA["routes"]) do
+        if r.from == d.from and r.to == d.to and r.item == d.item then
+            DATA["routes"][i] = {from = d.from, to = d.to, item = d.item,
+                                 keep = d.keep, enabled = d.enabled ~= false}
+            PowNet.MarkDirty()
+            return true, {updated = true, route = DATA["routes"][i], count = #DATA["routes"]}
+        end
+    end
+
+    DATA["routes"][#DATA["routes"] + 1] = {from = d.from, to = d.to, item = d.item,
+                                           keep = d.keep, enabled = d.enabled ~= false}
+    PowNet.MarkDirty()
+    return true, {route = DATA["routes"][#DATA["routes"]], count = #DATA["routes"]}
+end
+
+function OnGetRoutes(p_ID, p_Message)
+    return true, {routes = DATA["routes"] or {}, count = #(DATA["routes"] or {})}
+end
+
+function OnClearRoutes(p_ID, p_Message)
+    DATA["routes"] = {}
+    PowNet.MarkDirty()
+    return true, {cleared = true}
+end
+
 function OnStock(p_ID, p_Message)
     Rescan()
     local s_Kinds, s_Items, s_Slots = 0, 0, 0
@@ -401,6 +509,9 @@ local m_ServerEvents = {
     GetStock     = { func = OnStock },
     -- The other direction. Storage was deposit-only, which blocked every job that needs inputs.
     Provide      = { func = OnProvide },
+    AddRoute     = { func = OnAddRoute },
+    GetRoutes    = { func = OnGetRoutes },
+    ClearRoutes  = { func = OnClearRoutes },
     SetPickup    = { func = OnSetPickup },
     GetPickup    = { func = function() return true, {pickup = DATA["pickup"]} end },
 
@@ -453,6 +564,9 @@ local function Tick()
         os.sleep(10)
         pcall(Rescan)
         pcall(ServiceFurnaces)
+        -- Routes ride the same tick as smelting: both are just moving items between things on the
+        -- wired network, and neither needs a drone to do it.
+        pcall(ServiceRoutes)
         pcall(Render)
     end
 end
