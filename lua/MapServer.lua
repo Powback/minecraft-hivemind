@@ -208,6 +208,14 @@ function OnLoadWorld(p_ID, p_Message)
         for key in pairs(s_World) do m_PageKeys[#m_PageKeys + 1] = key end
     end
 
+    -- Report what the SERVING path sees. The load logs 230,629 cells and the caller gets zero, so
+    -- one of those two views of cachedWorld is wrong and only the server can say which.
+    if s_Offset == 0 and _G.Log then
+        local s_Live = 0
+        for _ in pairs(s_World) do s_Live = s_Live + 1 end
+        _G.Log(("LoadWorld: live=%d keys=%d"):format(s_Live, #m_PageKeys))
+    end
+
     local s_N = #m_PageKeys
     local s_Page, s_Sent = {}, 0
     for i = s_Offset + 1, math.min(s_Offset + s_Limit, s_N) do
@@ -826,13 +834,26 @@ PowNet.RegisterEvents(m_ServerEvents, m_DroneEvents, Render)
 
 SetStatus("Connected!", colors.green)
 
-Render()
--- Follow mode eases the view a step per redraw, so it needs a heartbeat of its own -- Render is
--- otherwise only called when a message arrives, and a quiet minute would freeze the pan halfway.
+-- DO NOT RENDER BEFORE THE SERVER IS SERVING.
+--
+-- Render() was called right here, unconditionally, and MapRender.draw walks every cell in the map.
+-- At 230,000 cells that takes longer than anything else in the boot -- and it happens BEFORE
+-- parallel.waitForAny, so PowNet.main had not started yet. MapServer therefore hosted its name
+-- (InitServer does that earlier, in the bootloader), resolved correctly for every caller, and
+-- answered nothing at all: the Bridge logged "call MapServer.LoadWorld FAILED (lookup=111)" -- a
+-- module found and then silent. It looked like a busy server or a network fault and was neither.
+--
+-- The map is a display. It can wait two seconds for the loop below to draw it; the fleet cannot
+-- wait for pathfinding.
 local function RenderLoop()
+    local s_First = true
     while true do
+        -- First pass immediately after the serving loop is up, then only when following.
+        if s_First or MapRender.following() then
+            s_First = false
+            pcall(Render)
+        end
         os.sleep(2)
-        if MapRender.following() then pcall(Render) end
     end
 end
 

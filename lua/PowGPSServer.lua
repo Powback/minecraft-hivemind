@@ -426,8 +426,15 @@ function load()
     cachedWorld, cachedWorldDetail = {}, {}
     local s_Cells = 0
 
+    -- Report what the load actually SEES. It returned an empty map in-world while parsing 229,895
+    -- rows correctly off-world, and print() goes to a terminal nobody reads -- so there was no way
+    -- to tell whether the directory was missing, the listing was empty, or the parse was failing.
+    local function say(m) if _G.Log then _G.Log(m) else print(m) end end
+
+    say("load: isDir(" .. CHUNK_DIR .. ")=" .. tostring(fs.isDir(CHUNK_DIR)))
     if fs.isDir(CHUNK_DIR) then
         loadNames()
+        say("load: " .. #fs.list(CHUNK_DIR) .. " entries, " .. #m_Names .. " names")
         -- Counted ACROSS files, not within one.
         --
         -- This was declared inside the per-file loop, so it reset on every chunk -- and with 70
@@ -472,6 +479,7 @@ function load()
             os.sleep(0)
           end
         end
+        say("load: parsed " .. s_Cells .. " cells")
         print("loaded " .. s_Cells .. " cells from " .. #fs.list(CHUNK_DIR) .. " chunks")
         return true
     end
