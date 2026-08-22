@@ -90,9 +90,21 @@ local function fleet(p_Force)
     local s_Now = os.clock()
     if not p_Force and m_Fleet and (s_Now - m_FleetAt) < 5 then return m_Fleet end
     local s_Msg = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "GetDrones", {})
-    local s_Res = PowNet.sendAndWaitForResponse("DroneMan", s_Msg, PowNet.SERVER_PROTOCOL)
+    -- FIVE seconds, not the default one.
+    --
+    -- DroneMan answers the whole fleet's heartbeats from a single receive loop, and HQ polls it
+    -- constantly for the map and the status page. A one-second budget therefore fails often -- and
+    -- when it does, this keeps its previous list, so TaskMan plans against a stale or empty view of
+    -- who exists. It then assigns nothing, reclaims nothing, and the queue fills with work while
+    -- idle drones sit in front of it. That is exactly what "lots of tasks and nothing executing"
+    -- looked like from outside.
+    local s_Res = PowNet.sendAndWaitForResponse("DroneMan", s_Msg, PowNet.SERVER_PROTOCOL, 5)
     if type(s_Res) == "table" and s_Res.drones then
         m_Fleet, m_FleetAt = s_Res.drones, s_Now
+    elseif m_Fleet == nil then
+        -- Never had a list at all. Say so: an empty fleet and an unreachable DroneMan look
+        -- identical from here and mean completely different things.
+        print("TaskMan cannot reach DroneMan -- no fleet to assign work to")
     end
     return m_Fleet or {}
 end
@@ -156,8 +168,10 @@ local function pickDrones(p_Role)
             -- belt to that braces, catching a drone that died since the last sweep.
             if d.status == "idle" and not d.offline then
                 local s_Msg = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Ping", {})
+                -- Same reasoning as fleet(): a drone mid-move can take more than a second to
+                -- answer, and treating that as "dead" removes a healthy drone from the pool.
                 local s_Ok, s_Res = pcall(PowNet.sendAndWaitForResponse, d.id, s_Msg,
-                                          PowNet.DRONE_PROTOCOL)
+                                          PowNet.DRONE_PROTOCOL, 4)
                 if s_Ok and s_Res then
                     s_Free[#s_Free + 1] = d
                 else
@@ -376,12 +390,18 @@ function Tick()
                     -- most definitely-stuck tasks the only ones that can never be reclaimed.
                     local s_Age = v.assignedAt and (os.epoch("utc") - v.assignedAt) or math.huge
                     if s_Age > RECLAIM_AFTER_MS then
-                        local s_Idle = false
+                        local s_Idle, s_Saw = false, "not in fleet list"
                         for _, d in ipairs(fleet()) do
-                            if d.id == v.assignedTo and d.status == "idle" and not d.offline then
-                                s_Idle = true
+                            if d.id == v.assignedTo then
+                                s_Saw = tostring(d.status) .. (d.offline and " offline" or "")
+                                if d.status == "idle" and not d.offline then s_Idle = true end
                             end
                         end
+                        -- Log the DECISION, not just the action. A reclaim that silently declines
+                        -- is indistinguishable from one that never ran, and the difference is where
+                        -- the bug is.
+                        Log(("reclaim? task %s held by %s: %s"):format(
+                            tostring(v.id), tostring(v.assignedTo), s_Saw))
                         if s_Idle then
                             print("reclaiming task " .. tostring(v.id) .. " -- never started")
                             v.assigned, v.assignedTo, v.assignedAt = nil, nil, nil

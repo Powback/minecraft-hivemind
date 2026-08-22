@@ -529,6 +529,22 @@ function OnScan(p_ID, p_Message)
     return true, {message = "scanned " .. s_N .. " blocks at radius " .. s_R}
 end
 
+-- Report how a job ended when the job is NOT one of the RunJob verbs.
+--
+-- RunJob reports for the four that use it. Survey predates it and does not, so a survey that
+-- failed left its task at zero progress for ever: the queue reclaimed it, handed it straight back
+-- to the only scout, the scout failed again, and round it went. From outside the queue looked full
+-- and the fleet looked idle -- which is exactly what it was, in a loop.
+local function reportTask(p_Data, p_Ok, p_Reason, p_Result)
+    if p_Data == nil or p_Data.taskId == nil then return end
+    pcall(function()
+        PowNet.SendToServer("TaskMan", PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "TaskDone",
+            {id = p_Data.taskId, ok = p_Ok and true or false,
+             reason = (not p_Ok) and tostring(p_Reason) or nil,
+             result = p_Ok and p_Result or nil}))
+    end)
+end
+
 function OnSurvey(p_ID, p_Message)
     local d = p_Message.data or {}
     local s_W    = tonumber(d.w)    or 16
@@ -537,6 +553,7 @@ function OnSurvey(p_ID, p_Message)
     local s_Climb= tonumber(d.climb) or 8
 
     if executing then
+        -- Busy is NOT a failure of the task -- it will be offered again -- so it is not reported.
         return false, "busy"
     end
 
@@ -549,6 +566,9 @@ function OnSurvey(p_ID, p_Message)
         m_Status = "moving"
         if pgps.moveTo(tonumber(d.pos.x), tonumber(d.pos.y), tonumber(d.pos.z)) == false then
             m_Status = "idle"
+            trace("Survey FAILED: could not reach " .. tostring(d.pos.x) .. "," ..
+                  tostring(d.pos.y) .. "," .. tostring(d.pos.z))
+            reportTask(d, false, "could not reach the survey start")
             return false, "could not reach the survey start"
         end
     end
@@ -598,6 +618,7 @@ function OnSurvey(p_ID, p_Message)
         m_Status = "idle"
         UploadWorld()
         m_Job = nil saveResume()
+        reportTask(d, true, nil, {scanned = s_Total, sweeps = s_Scans})
         return true, {message = "scanned " .. s_Total .. " blocks in " .. s_Scans .. " sweeps"}
     end
 
@@ -640,6 +661,7 @@ function OnSurvey(p_ID, p_Message)
     m_Status = "idle"
     UploadWorld()
     m_Job = nil saveResume()
+    reportTask(d, true, nil, {cells = s_Cells, blocked = s_Blocked})
     return true, {message = "surveyed " .. s_Cells .. " cells, " .. s_Blocked .. " blocked"}
 end
 

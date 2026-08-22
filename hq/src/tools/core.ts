@@ -1043,7 +1043,10 @@ registry.register({
     if (drone.status === 'lost')
       return { sent: false, id: a.id, reason: 'drone is lost and not reporting; use recover.dispatch' };
 
-    const res: any = await bridge.call('DroneMan', 'GoTo', { id: a.id, pos: a.pos }, { timeoutMs: 15000 });
+    // 40s, not 15. DroneMan aborts the drone and waits for it to acknowledge BEFORE sending the
+    // move, so a tight budget reports failure for an order that is in fact being carried out --
+    // the most misleading outcome available, and it has now fooled me twice.
+    const res: any = await bridge.call('DroneMan', 'GoTo', { id: a.id, pos: a.pos }, { timeoutMs: 40000 });
     ctx.log(`goto #${a.id}`, { to: a.pos });
     if (res === false || res == null)
       return { sent: false, id: a.id, to: a.pos, reason: 'DroneMan did not answer' };

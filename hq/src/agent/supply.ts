@@ -184,15 +184,20 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
   //
   // A shortage that already has work outstanding does not need more work; it needs the work to
   // finish.
-  let queued = new Set<string>();
+  const queued = new Set<string>();
   try {
-    const res: any = await bridge.call('TaskMan', 'GetTasks', {}, { timeoutMs: 8000 });
+    const res: any = await bridge.call('TaskMan', 'GetTasks', {}, { timeoutMs: 15000 });
     for (const t of res?.tasks ?? res?.data?.tasks ?? []) {
       if ((t?.progress ?? 0) < 100 && typeof t?.name === 'string') queued.add(t.name);
     }
   } catch {
-    // Unknown queue: fall through and rely on the cooldown alone rather than refusing to act.
-    queued = new Set();
+    // NOT KNOWING what is queued is a reason to WAIT, not to proceed.
+    //
+    // Treating an unreadable queue as an empty one is how duplicates got created in the first
+    // place: every tick that could not reach TaskMan cheerfully added another survey for a
+    // shortage that already had three. A tick skipped costs a minute; a tick that dispatches blind
+    // costs a drone and clogs the queue behind it.
+    return { acted: false, reason: 'cannot read the task queue; not dispatching blind' };
   }
 
   const now = Date.now();
