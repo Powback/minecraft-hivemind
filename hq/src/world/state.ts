@@ -44,6 +44,8 @@ export interface Drone {
    * the other.
    */
   reported?: string;
+  /** The drone's OWN account of why it stopped. It said this; do not paraphrase it away. */
+  stuck?: string;
   /**
    * epoch ms of last heartbeat. Silence is the primary loss signal.
    *

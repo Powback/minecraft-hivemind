@@ -86,9 +86,12 @@ function OnGetPath(p_ID, p_Message)
     local z2 = p_Message.data[6]
     local discover = p_Message.data[7]
     local priority =p_Message.data[8]
-    local s_Path = PowGPSServer.a_star(x1, y1, z1, x2, y2, z2, discover, priority)
+    local s_Path, s_Why = PowGPSServer.a_star(x1, y1, z1, x2, y2, z2, discover, priority)
     if(s_Path == false) then
-        return false, {message = "failed to find path"}
+        -- Pass the SEARCH's reason through. "failed to find path" is the same string whether the
+        -- goal was solid, the budget ran out, or there is genuinely no route -- three problems
+        -- with three different fixes, reported identically.
+        return false, {message = tostring(s_Why or "failed to find path")}
     end
     print(#s_Path)
     return true, {path = s_Path}

@@ -82,6 +82,11 @@ async function refreshFleet(): Promise<void> {
         role: d.role ?? 'miner',
         status: normaliseStatus(d.status, d.offline),
         reported: typeof d.status === 'string' ? d.status : undefined,
+        // The drone's own words for why it stopped. HQ used to drop this, so a drone that had
+        // explicitly reported "stuck at -70,88,12 -- no progress over 4 legs" surfaced as the
+        // generic "has gone quiet" -- which describes a drone that said NOTHING, the opposite of
+        // what happened, and sends you looking for a comms fault instead of reading the reason.
+        stuck: typeof d.stuck === 'string' ? d.stuck : undefined,
         fuel: typeof d.fuel === 'number' ? d.fuel : 0,
         pos: d.pos && typeof d.pos.x === 'number' ? d.pos : undefined,
       };
@@ -148,7 +153,10 @@ export function buildBrief() {
 
   for (const d of drones) {
     if (d.status === 'lost') problems.push(`${d.name} (#${d.id}) is LOST — ${describeSilence(d.silentMs)}.`);
-    else if (d.status === 'stranded') problems.push(`${d.name} (#${d.id}) has gone quiet (${describeSilence(d.silentMs)}).`);
+    else if (d.status === 'stranded') problems.push(
+      d.stuck
+        ? `${d.name} (#${d.id}) is STUCK — ${d.stuck}`
+        : `${d.name} (#${d.id}) has gone quiet (${describeSilence(d.silentMs)}).`);
     else if (d.fuel < 200) problems.push(`${d.name} (#${d.id}) is low on fuel (${d.fuel}).`);
   }
   for (const o of orders) if (o.failure) problems.push(`Order ${o.id} (${o.kind}) failed: ${o.failure}`);

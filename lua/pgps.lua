@@ -588,7 +588,9 @@ end
 local MOVE_MAX_REPLANS = 40
 local MOVE_MAX_STALLS  = 4
 
-function moveTo(_targetX, _targetY, _targetZ, _targetDir, changeDir, discover)
+-- Path ONE short hop. Renamed from moveTo: this asks MapServer to plan the entire route in a
+-- single a_star, which is fine over a chunk and hopeless over a hundred blocks -- see moveTo below.
+local function moveLeg(_targetX, _targetY, _targetZ, _targetDir, changeDir, discover)
     changeDir = changeDir or false
     local s_Replans, s_Stalls, s_LastDist = 0, 0, nil
     while cachedX ~= _targetX or cachedY ~= _targetY or cachedZ ~= _targetZ do
@@ -708,6 +710,96 @@ function flyTo(_tx, _ty, _tz, _maxSteps)
             if not up() then return false, "flyTo is wedged at " .. cachedX .. "," .. cachedY .. "," .. cachedZ end
         end
     end
+    return true
+end
+
+
+-- Travel any distance by planning ONE CHUNK AT A TIME.
+--
+-- a_star's cost is superlinear in the distance searched: the open set is scanned linearly on every
+-- iteration, and over unmapped ground the frontier expands in three dimensions. A 200-block recall
+-- never returned at all -- not because the route did not exist, but because the search could not
+-- finish before the caller gave up, and every retry started it again from scratch.
+--
+-- Sixteen blocks is one chunk, and a chunk-sized search is small enough to answer immediately. The
+-- same journey becomes a dozen cheap questions instead of one impossible one, and each leg is
+-- planned with the map as it stands AFTER the previous leg -- so what the drone learned on the way
+-- is used, rather than committing to a route computed before it set off.
+-- Legs start at one chunk and GROW when the drone stops getting closer.
+--
+-- A fixed short leg is greedy: each hop aims straight at the destination with no view of anything
+-- further out, which is exactly the shape that walks into a dead end. A drone in a cave whose exit
+-- leads AWAY from the target will keep choosing the deeper passage, because from sixteen blocks up
+-- the road that is the better-looking move -- and it cannot backtrack, because backtracking looks
+-- like going the wrong way.
+--
+-- Widening the horizon is what lets it escape: a_star over a 64-block box CAN see the way out and
+-- will happily route backwards to take it. So the horizon is adaptive -- cheap searches while
+-- things are going well, expensive ones only when the drone is in trouble, which is the only time
+-- they are worth paying for.
+local MOVE_LEG_MIN = 16      -- one chunk
+local MOVE_LEG_MAX = 96      -- wide enough to see out of most dead ends
+local MOVE_STUCK   = 4       -- legs without progress before giving up
+
+function moveTo(_targetX, _targetY, _targetZ, _targetDir, changeDir, discover)
+    if cachedX == nil then return false, "no position fix" end
+    if _targetX == nil or _targetY == nil or _targetZ == nil then
+        return false, "incomplete destination"
+    end
+
+    local function remaining()
+        return math.abs(_targetX - cachedX) + math.abs(_targetY - cachedY) + math.abs(_targetZ - cachedZ)
+    end
+
+    local s_Legs, s_Leg, s_NoProgress = 0, MOVE_LEG_MIN, 0
+    local s_Best = remaining()
+
+    while cachedX ~= _targetX or cachedY ~= _targetY or cachedZ ~= _targetZ do
+        s_Legs = s_Legs + 1
+        if s_Legs > 96 then return false, "gave up after " .. s_Legs .. " legs" end
+
+        local s_Before = remaining()
+        if s_Before <= s_Leg then
+            local s_Ok, s_Why = moveLeg(_targetX, _targetY, _targetZ, _targetDir, changeDir, discover)
+            if s_Ok then return true end
+            -- Even the final hop can be blocked; fall through and let the horizon widen.
+            s_Why = s_Why or "blocked"
+        else
+            local dx, dy, dz = _targetX - cachedX, _targetY - cachedY, _targetZ - cachedZ
+            local wx, wy, wz = cachedX, cachedY, cachedZ
+            if math.abs(dx) >= math.abs(dy) and math.abs(dx) >= math.abs(dz) then
+                wx = cachedX + (dx > 0 and math.min(s_Leg, dx) or -math.min(s_Leg, -dx))
+            elseif math.abs(dz) >= math.abs(dy) then
+                wz = cachedZ + (dz > 0 and math.min(s_Leg, dz) or -math.min(s_Leg, -dz))
+            else
+                wy = cachedY + (dy > 0 and math.min(s_Leg, dy) or -math.min(s_Leg, -dy))
+            end
+            local s_Ok = moveLeg(wx, wy, wz, nil, false, discover)
+            if not s_Ok then
+                -- A waypoint on a straight line can land inside rock, and there is no plan to a
+                -- solid cell. Fly it directly; the next leg replans from wherever that ended up.
+                flyTo(wx, wy, wz, s_Leg * 8)
+            end
+        end
+
+        -- Did any of that actually help?
+        local s_After = remaining()
+        if s_After < s_Best then
+            s_Best = s_After
+            s_NoProgress = 0
+            s_Leg = MOVE_LEG_MIN                 -- back to cheap searches
+        else
+            s_NoProgress = s_NoProgress + 1
+            -- Look further before trying again. This is the escape hatch from a dead end.
+            s_Leg = math.min(MOVE_LEG_MAX, s_Leg * 2)
+            if s_NoProgress >= MOVE_STUCK then
+                return false, ("stuck at %d,%d,%d -- %d blocks from target, no progress over %d legs (horizon %d)")
+                    :format(cachedX, cachedY, cachedZ, s_After, s_NoProgress, s_Leg)
+            end
+        end
+    end
+
+    if _targetDir ~= nil and changeDir then turnTo(_targetDir) end
     return true
 end
 

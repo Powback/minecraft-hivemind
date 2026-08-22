@@ -589,15 +589,19 @@ end
 -- return: List of movement to be executed
 --
 
+-- Iterative, not recursive. One stack frame per step of the path was survivable while searches
+-- were too slow to produce long ones; now that they are not, a few hundred frames on a CC
+-- computer is a stack overflow at exactly the moment the pathfinder finally succeeds.
 local function reconstruct_path(_cameFrom, _currentNode)
-    if _cameFrom[_currentNode] ~= nil then
-        local dir, nextNode = _cameFrom[_currentNode][1], _cameFrom[_currentNode][2]
-        local path = reconstruct_path(_cameFrom, nextNode)
-        table.insert(path, dir)
-        return path
-    else
-        return {}
+    local s_Rev, s_At = {}, _currentNode
+    while _cameFrom[s_At] ~= nil do
+        local dir, prev = _cameFrom[s_At][1], _cameFrom[s_At][2]
+        s_Rev[#s_Rev + 1] = dir
+        s_At = prev
     end
+    local s_Path = {}
+    for i = #s_Rev, 1, -1 do s_Path[#s_Path + 1] = s_Rev[i] end
+    return s_Path
 end
 
 
@@ -672,85 +676,138 @@ end
 -- return: List of movement to be executed
 --
 
+
+-- PRIORITY QUEUE, not a linear scan.
+--
+-- The old search did two full passes over the open set on EVERY iteration -- one to find the
+-- lowest f, one in empty() to ask whether anything was left -- which makes the whole search
+-- O(n^2) in the size of the frontier. Over open or unmapped ground that frontier grows in three
+-- dimensions, so a route of a couple of hundred blocks did not merely take a while: it never
+-- finished, and CC:T eventually killed it for not yielding. The caller saw "no path" and concluded
+-- the route did not exist.
+--
+-- A binary heap makes each pop O(log n). Stale entries are skipped on pop rather than removed
+-- (lazy deletion), which is cheaper than finding and repairing them on every improvement.
+local function heapPush(h, f, idx, node)
+    local i = #h + 1
+    h[i] = {f = f, idx = idx, node = node}
+    while i > 1 do
+        local p = math.floor(i / 2)
+        if h[p].f <= h[i].f then break end
+        h[p], h[i] = h[i], h[p]
+        i = p
+    end
+end
+
+local function heapPop(h)
+    local n = #h
+    if n == 0 then return nil end
+    local top = h[1]
+    h[1] = h[n]
+    h[n] = nil
+    n = n - 1
+    local i = 1
+    while true do
+        local l, r, m = i * 2, i * 2 + 1, i
+        if l <= n and h[l].f < h[m].f then m = l end
+        if r <= n and h[r].f < h[m].f then m = r end
+        if m == i then break end
+        h[i], h[m] = h[m], h[i]
+        i = m
+    end
+    return top
+end
+
+-- Weighted A*: f = g + W*h.
+--
+-- W above 1 trades a guarantee of the shortest path for a large reduction in nodes expanded. That
+-- is the right trade here: a turtle walking three blocks further costs three fuel, while a search
+-- that does not return costs the drone entirely. Kept modest so paths stay sensible.
+local ASTAR_WEIGHT = 1.35
+
+-- How far outside the start/goal box the search may wander. Without this an unreachable goal makes
+-- the frontier expand in every direction until the node limit, which is slow AND useless -- if the
+-- way through is not roughly between the two ends, it is not a path worth walking.
+local ASTAR_MARGIN = 24
+local ASTAR_MAX_NODES = 20000
+
 function a_star(x1, y1, z1, x2, y2, z2, discover, priority)
     discover = discover or 1
-    local start, idx_start = {x1, y1, z1}, x1..":"..y1..":"..z1
-    local goal,  idx_goal  = {x2, y2, z2}, x2..":"..y2..":"..z2
+    local idx_start = x1..":"..y1..":"..z1
+    local idx_goal  = x2..":"..y2..":"..z2
     priority = priority or false
 
     if exclusions == nil then
         loadExclusions()
     end
-
     if exclusions[idx_goal] ~= nil and not priority then
-        print("goal is in exclusion zone")
-        return {}
+        return false, "goal is in an exclusion zone"
     end
 
-    -- If goal is empty, unknown or a turtle position.
-    --
-    -- Was `if (cachedWorld[idx_goal] == 2 or 0)`, which Lua reads as `(x == 2) or 0` -- and 0 is
-    -- TRUTHY in Lua, so the test could never fail and the guard did nothing at all. Harmless by
-    -- luck (routing into solid rock is caught per-neighbour below), but it meant a goal inside a
-    -- wall was accepted and then searched for until the node limit ran out, which looks exactly
-    -- like "no path" from the caller's side.
-    local s_Goal = cachedWorld[idx_goal]
-    if s_Goal == nil or s_Goal == 0 or s_Goal == 2 then
-        local openset, closedset, cameFrom, g_score, f_score, tries = {}, {}, {}, {}, {}, 0
+    -- Goal must be somewhere a turtle can BE: air, unknown, or occupied by another turtle.
+    local s_GoalCell = cachedWorld[idx_goal]
+    if not (s_GoalCell == nil or s_GoalCell == 0 or s_GoalCell == 2) then
+        return false, "goal is solid"
+    end
 
-        openset[idx_start] = start
-        g_score[idx_start] = 0
-        f_score[idx_start] = heuristic_cost_estimate(x1, y1, z1, x2, y2, z2)
+    local s_MinX, s_MaxX = math.min(x1, x2) - ASTAR_MARGIN, math.max(x1, x2) + ASTAR_MARGIN
+    local s_MinY, s_MaxY = math.min(y1, y2) - ASTAR_MARGIN, math.max(y1, y2) + ASTAR_MARGIN
+    local s_MinZ, s_MaxZ = math.min(z1, z2) - ASTAR_MARGIN, math.max(z1, z2) + ASTAR_MARGIN
 
-        while not empty(openset) do
-            local current, idx_current
-            local cur_f = 9999999
+    local closedset, cameFrom, g_score = {}, {}, {}
+    local heap = {}
+    local s_Nodes = 0
 
-            for idx_cur, cur in pairs(openset) do --for each entry in openset
-                if cur ~= nil and f_score[idx_cur] <= cur_f then
-                    idx_current, current, cur_f = idx_cur, cur, f_score[idx_cur]
-                end
-            end
-            if idx_current == idx_goal then
-                return reconstruct_path(cameFrom, idx_goal)
-            end
+    g_score[idx_start] = 0
+    heapPush(heap, ASTAR_WEIGHT * heuristic_cost_estimate(x1, y1, z1, x2, y2, z2), idx_start, {x1, y1, z1})
 
-            -- no more than 500 moves
-            if cur_f >= stopAt then
-                print("max limit")
-                break
-            end
+    while #heap > 0 do
+        s_Nodes = s_Nodes + 1
+        -- Yield periodically. CC:T terminates a coroutine that runs too long without one, so an
+        -- unyielding search is not slow -- it is killed, and the caller gets no answer at all.
+        if s_Nodes % 200 == 0 then os.sleep(0) end
+        if s_Nodes > ASTAR_MAX_NODES then
+            return false, ("gave up after %d nodes"):format(s_Nodes)
+        end
 
-            openset[idx_current] = nil
+        local top = heapPop(heap)
+        local idx_current, current = top.idx, top.node
+        if idx_current == idx_goal then
+            return reconstruct_path(cameFrom, idx_goal)
+        end
+        if not closedset[idx_current] then
             closedset[idx_current] = true
 
             local x3, y3, z3 = current[1], current[2], current[3]
-
-            for dir = 0, 5 do -- for all direction find the neighbor of the current position, put them on the openset
+            for dir = 0, 5 do
                 local D = deltas[dir]
                 local x4, y4, z4 = x3 + D[1], y3 + D[2], z3 + D[3]
-                local neighbor, idx_neighbor = {x4, y4, z4}, x4..":"..y4..":"..z4
-                if (exclusions[idx_neighbor] == nil or priority) and (((cachedWorld[idx_neighbor] or 0) == 0 ) or idx_neighbor == idx_goal)then -- if its free or unknow and not on exclusion list
-                    if closedset[idx_neighbor] == nil then -- if not closed
-                        local tentative_g_score = g_score[idx_current] + ((cachedWorld[idx_neighbor] == nil) and discover or 1)
-                        if (cachedWorld[idx_neighbor] == 2) then
-                            tentative_g_score = tentative_g_score - 1
-                        end
-                        --if block is undiscovered and there is a value for discover, it adds the discover value. else, it adds 1
-                        if openset[idx_neighbor] == nil or tentative_g_score <= g_score[idx_neighbor] then -- tentative_g_score is always at least 1 more than g_score[idx_neighbor] T.T
-                            --evaluates to if its not on the open list
+                if x4 >= s_MinX and x4 <= s_MaxX and y4 >= s_MinY and y4 <= s_MaxY
+                   and z4 >= s_MinZ and z4 <= s_MaxZ then
+                    local idx_neighbor = x4..":"..y4..":"..z4
+                    local s_Cell = cachedWorld[idx_neighbor]
+                    -- Free, unknown, or the goal itself. Unknown is PASSABLE and merely priced at
+                    -- `discover` -- exploring is allowed, it is just not free.
+                    if (exclusions[idx_neighbor] == nil or priority)
+                       and (((s_Cell or 0) == 0) or idx_neighbor == idx_goal)
+                       and not closedset[idx_neighbor] then
+                        local s_Step = (s_Cell == nil) and discover or 1
+                        if s_Cell == 2 then s_Step = s_Step - 1 end
+                        local tentative = g_score[idx_current] + s_Step
+                        if g_score[idx_neighbor] == nil or tentative < g_score[idx_neighbor] then
                             cameFrom[idx_neighbor] = {dir, idx_current}
-                            g_score[idx_neighbor] = tentative_g_score
-                            f_score[idx_neighbor] = tentative_g_score + heuristic_cost_estimate(x4, y4, z4, x2, y2, z2)
-                            openset[idx_neighbor] = neighbor
+                            g_score[idx_neighbor] = tentative
+                            heapPush(heap, tentative +
+                                ASTAR_WEIGHT * heuristic_cost_estimate(x4, y4, z4, x2, y2, z2),
+                                idx_neighbor, {x4, y4, z4})
                         end
                     end
                 end
             end
         end
     end
-    print("no path found")
-    return false
+
+    return false, ("no path after %d nodes"):format(s_Nodes)
 end
 
 ----------------------------------------
