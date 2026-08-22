@@ -422,10 +422,17 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
           continue;
         }
       supply.cooldowns[rule.match] = now + COOLDOWN_MS;
-      const area = frontier();
+      let area = frontier();
       if (!area) {
-        note(`${rule.match}: the whole loaded region has been surveyed -- nothing left to look at`);
-        continue;
+        // WRAP, don't stop. The spiral walking off the edge of the loaded region is not the same
+        // as the region being fully surveyed -- the cursor is a position, not a completion record,
+        // and a survey that failed still advanced it. Left as a dead end the loop simply stopped
+        // exploring for good, which is what happened here: the last prospecting run was two hours
+        // before anyone noticed.
+        supply.frontier = 0;
+        area = frontier();
+        if (!area) { note(`${rule.match}: no surveyable tile inside the loaded region`); continue; }
+        note('exploration frontier wrapped -- starting another pass from the base outward');
       }
       supply.frontier = (supply.frontier ?? 0) + 1;
       await bridge.call('TaskMan', 'Add', {

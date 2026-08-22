@@ -90,7 +90,7 @@ function Init()
     -- every single cycle: scouts were sent out to find ore that had already been found, again and
     -- again, while miners tunnelled past it. Rebuilding here is what makes a survey worth anything
     -- once the module has been restarted.
-    local s_N = IndexNames(PowGPSServer.cachedWorldDetail)
+    local s_N = IndexNames(PowGPSServer.getCachedWorldDetail())
     print("indexed " .. tostring(s_N) .. " named blocks from the saved map")
 end
 
@@ -131,8 +131,17 @@ function OnSaveWorld(p_ID, p_Message)
     -- Every thirty seconds is enough. The cost of a crash between saves is at most half a minute of
     -- observations, which the next scan re-derives; the cost of saving continuously is a map server
     -- that nobody can talk to.
+    -- FIVE MINUTES, not thirty seconds -- the map got twenty times bigger.
+    --
+    -- Thirty seconds was right for a 20,000-cell map. At 153,000 cells the save is 3.4MB written
+    -- through a Lua loop, and MapServer answers nothing at all while it runs: `hive.nodes` reported
+    -- it unreachable, path requests timed out, and drones sat in moveTo with executing=true and no
+    -- movement for minutes at a time. The fleet was not stuck, it was queued behind a file write.
+    --
+    -- Losing five minutes of observations to a crash costs nothing -- the next scan re-derives them.
+    -- A map server nobody can reach costs the whole fleet.
     m_LastSave = m_LastSave or 0
-    if os.clock() - m_LastSave > 30 then
+    if os.clock() - m_LastSave > 300 then
         m_LastSave = os.clock()
         PowGPSServer.saveAll()
     end
@@ -598,11 +607,33 @@ function OnRegionKnown(p_ID, p_Message)
         end
         -- The box can be tens of thousands of cells. Yielding keeps MapServer answering everything
         -- else while it counts, which is the difference between a slow reply and a dead module.
-        if x % 8 == 0 then os.sleep(0) end
+        -- Yield every column, not every eighth. This walk can be twenty thousand cells and
+        -- MapServer must keep answering path requests while it runs.
+        os.sleep(0)
+    end
+
+    -- STALENESS, alongside coverage. "Known" and "known recently" are different questions, and a
+    -- fleet that only asks the first re-walks ground it covered an hour ago while somewhere it has
+    -- not looked at all since the world started stays dark. The age is per chunk -- see
+    -- PowGPSServer.ChunkAge -- which is the granularity the answer is actually wanted at.
+    local s_Oldest, s_Newest = nil, nil
+    for x = math.floor(d.min.x), math.floor(d.max.x), 16 do
+        for z = math.floor(d.min.z), math.floor(d.max.z), 16 do
+            local age = PowGPSServer.ChunkAge(x, z)
+            if age == nil then
+                s_Oldest = math.huge          -- never looked at at all
+            else
+                if s_Oldest == nil or age > s_Oldest then s_Oldest = age end
+                if s_Newest == nil or age < s_Newest then s_Newest = age end
+            end
+        end
     end
 
     return true, {known = s_Known, total = s_Total,
-                  percent = s_Total > 0 and math.floor(s_Known / s_Total * 100) or 0}
+                  percent = s_Total > 0 and math.floor(s_Known / s_Total * 100) or 0,
+                  oldestMs = (s_Oldest ~= math.huge) and s_Oldest or nil,
+                  neverSeen = s_Oldest == math.huge,
+                  newestMs = s_Newest}
 end
 
 function OnFindCaves(p_ID, p_Message)

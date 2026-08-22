@@ -128,6 +128,21 @@ function getCachedWorld()
     return cachedWorld
 end
 
+--- The live detail map, via a FUNCTION rather than the API table.
+---
+--- os.loadAPI snapshots this file's globals into the PowGPSServer table when it is loaded. loadDetail
+--- then does `cachedWorldDetail = {}` and fills the new table -- so the snapshot still points at the
+--- empty one, for ever. MapServer's index rebuild read PowGPSServer.cachedWorldDetail, got that
+--- empty table, and indexed nothing: world.find answered "nothing surveyed matches" for coal, iron,
+--- copper and zinc that were all sitting in the saved map, correctly recorded.
+---
+--- A function is evaluated inside this file's environment at call time, so it returns the real one.
+--- getCachedWorld already worked for exactly this reason, which is why the occupancy grid was fine
+--- and only the names were missing.
+function getCachedWorldDetail()
+    return cachedWorldDetail
+end
+
 
 ----------------------------------------
 -- worldSize
@@ -237,6 +252,112 @@ end
 -- Old files are still read. The format is detected from the first byte rather than assumed,
 -- because the alternative is a silent upgrade that throws away every cell surveyed so far.
 
+-- THE MAP IS STORED IN CHUNKS, THE WAY MINECRAFT STORES ITS WORLD.
+--
+-- It used to be one flat table written out whole on every save. That is fine at twenty thousand
+-- cells and ruinous at a hundred and fifty thousand: 3.4MB rewritten through a Lua loop, during
+-- which MapServer answers nothing -- `hive.nodes` reported it unreachable, path requests timed out,
+-- and drones sat in moveTo with executing=true and no movement for minutes. The fleet was not
+-- stuck, it was queued behind a file write.
+--
+-- Sixteen-by-sixteen columns per file, matching Minecraft's chunks and CC's own chunk loading, so
+-- the unit the map is stored in is the same unit the world is loaded in and the same unit the
+-- drones already path by. A save then writes only the chunks that actually changed -- typically one
+-- or two, a few kilobytes -- instead of the entire world.
+--
+-- It is also the seam for splitting the map across several computers later: a chunk key is all a
+-- router needs to decide which MapServer owns a cell, and the 8MB disk limit becomes per-shard
+-- rather than a ceiling on the whole world.
+local CHUNK = 16
+local CHUNK_DIR = "/egpsData/chunks"
+
+--- Which chunk file does this cell key live in?
+local function chunkOfKey(p_Key)
+    local x, _, z = p_Key:match("^(-?%d+):(-?%d+):(-?%d+)$")
+    if x == nil then return nil end
+    return math.floor(tonumber(x) / CHUNK) .. "_" .. math.floor(tonumber(z) / CHUNK)
+end
+
+-- Chunks touched since the last save. Everything that writes to the map marks its chunk here;
+-- anything that forgets simply does not get persisted, which is why the marking lives inside the
+-- merge functions rather than at each call site.
+local m_Dirty = {}
+
+-- ONE DICTIONARY FOR THE WHOLE MAP, not one per chunk.
+--
+-- Interning names per chunk was the first cut and it is wasteful in the way that matters: the same
+-- forty-odd block names get spelled out again in every one of a hundred chunk files, and a name
+-- means something different depending on which file you read it in -- so a chunk is not portable
+-- and two chunks cannot be compared without decoding both.
+--
+-- A single append-only dictionary fixes both. An id is stable across the entire map and for the
+-- life of the world, chunk rows are pure integers, and moving a chunk to another computer only
+-- requires that computer to have the same dictionary -- which is one small file.
+--
+-- Append-only on purpose: ids are referenced by every chunk on disk, so an id must never be reused
+-- or renumbered. Names are only ever added.
+local m_Names = {}      -- id -> name
+local m_NameId = {}     -- name -> id
+
+local function nameId(p_Name)
+    if p_Name == nil then return 0 end
+    local id = m_NameId[p_Name]
+    if id then return id end
+    m_Names[#m_Names + 1] = p_Name
+    id = #m_Names
+    m_NameId[p_Name] = id
+    m_DictDirty = true
+    return id
+end
+
+local function saveNames()
+    if not m_DictDirty then return end
+    local h = fs.open("/egpsData/names", "w")
+    if not h then return end
+    for i = 1, #m_Names do h.writeLine(m_Names[i]) end
+    h.close()
+    m_DictDirty = false
+end
+
+local function loadNames()
+    m_Names, m_NameId = {}, {}
+    if not fs.exists("/egpsData/names") then return end
+    local h = fs.open("/egpsData/names", "r")
+    if not h then return end
+    while true do
+        local l = h.readLine()
+        if l == nil then break end
+        m_Names[#m_Names + 1] = l
+        m_NameId[l] = #m_Names
+    end
+    h.close()
+end
+
+-- WHEN each chunk was last looked at, so staleness is answerable.
+--
+-- Per-CELL timestamps were what made the old format 330 bytes a cell, and they bought nothing:
+-- nothing ever asked "when was this exact block last seen". What the fleet actually needs is
+-- "which ground has nobody looked at recently", and that is a property of an area, not a block. One
+-- number per chunk answers it for a hundredth of the cost.
+local m_Seen = {}       -- chunk key -> epoch ms
+
+
+function MarkChunkDirty(p_Key)
+    local c = chunkOfKey(p_Key)
+    if c then
+        m_Dirty[c] = true
+        m_Seen[c] = os.epoch("utc")
+    end
+end
+
+--- How long ago (ms) was this area last observed? nil if never. Used to target re-surveys at ground
+--- nobody has looked at instead of re-walking what was just covered.
+function ChunkAge(p_X, p_Z)
+    local c = math.floor(p_X / CHUNK) .. "_" .. math.floor(p_Z / CHUNK)
+    if m_Seen[c] == nil then return nil end
+    return os.epoch("utc") - m_Seen[c], m_Seen[c]
+end
+
 local MAP_MAGIC = "pgps1"
 
 --- Write `p_Rows()` line by line. Streaming, so nothing ever holds the whole file in memory.
@@ -299,39 +420,69 @@ end
 --
 
 function load()
-    local s_File = readLines("blockData")
-    if s_File then
-        cachedWorld = {}
-        local s_Count = 0
-        while true do
-            local s_Line = s_File.readLine()
-            if s_Line == nil then break end
-            local s_Key, s_Val = s_Line:match("^(.-)=(.+)$")
-            if s_Key then
-                cachedWorld[s_Key] = tonumber(s_Val)
-                s_Count = s_Count + 1
+    cachedWorld, cachedWorldDetail = {}, {}
+    local s_Cells = 0
+
+    if fs.isDir(CHUNK_DIR) then
+        loadNames()
+        for _, name in ipairs(fs.list(CHUNK_DIR)) do
+          -- Skip staging files from an interrupted save; they are partial by definition.
+          if not name:match("%.new$") then
+            local f = readLines("chunks/" .. name)
+            if f then
+                while true do
+                    local l = f.readLine()
+                    if l == nil or l == "=" then break end
+                    local t = l:match("^seen=(%d+)$")
+                    if t then m_Seen[name] = tonumber(t) end
+                end
+                while true do
+                    local l = f.readLine()
+                    if l == nil then break end
+                    local k, occ, nid = l:match("^(.-)=(%-?[%d.]+),(%d+)$")
+                    if k then
+                        cachedWorld[k] = tonumber(occ)
+                        local id = tonumber(nid)
+                        if id and id > 0 and m_Names[id] then
+                            cachedWorldDetail[k] = {data = {tonumber(occ) == 1, {name = m_Names[id]}}}
+                        end
+                        s_Cells = s_Cells + 1
+                    end
+                end
+                f.close()
             end
+          end
         end
-        s_File.close()
-        print("loaded " .. s_Count .. " cells")
+        print("loaded " .. s_Cells .. " cells from " .. #fs.list(CHUNK_DIR) .. " chunks")
         return true
     end
 
-    -- Fall back to the pretty-printed format so an existing map is not thrown away on upgrade.
+    -- MIGRATION. Read whichever older format is on disk and mark everything dirty, so the next
+    -- save writes it out as chunks. Silently starting empty here would throw away the entire map.
+    local s_File = readLines("blockData")
+    if s_File then
+        while true do
+            local l = s_File.readLine()
+            if l == nil then break end
+            local k, v = l:match("^(.-)=(.+)$")
+            if k then cachedWorld[k] = tonumber(v) MarkChunkDirty(k) s_Cells = s_Cells + 1 end
+        end
+        s_File.close()
+        print("migrating " .. s_Cells .. " cells to chunk storage")
+        return true
+    end
+
     local data = getFile("blockData")
     if data ~= "" then
-        cachedWorld = textutils.unserialize(data)
-        if cachedWorld ~= nil then
+        local t = textutils.unserialize(data)
+        if t ~= nil then
+            for k, v in pairs(t) do cachedWorld[k] = v MarkChunkDirty(k) s_Cells = s_Cells + 1 end
+            print("migrating " .. s_Cells .. " cells from the legacy format")
             return true
-        else
-            -- print("could not read blockData file: \n"..data)
-            cachedWorld = {}
-            return false
         end
-    else
-        print("no world data")
-        return false
     end
+    print("no world data")
+    return false
 end
 
 ----------------------------------------
@@ -342,13 +493,45 @@ end
 --
 
 function save()
-    local ok, err = writeLines("blockData", nil, function(line)
-        for k, v in pairs(cachedWorld) do
-            line(k .. "=" .. tostring(v))
+    -- Only the chunks that changed. This is the entire point of the chunk layout: a save used to be
+    -- the whole map and is now a handful of kilobytes.
+    if next(m_Dirty) == nil then return true end
+    if not fs.isDir(CHUNK_DIR) then fs.makeDir(CHUNK_DIR) end
+
+    -- Group the dirty cells by chunk in one pass. Walking the whole map once per dirty chunk would
+    -- reintroduce exactly the cost this change exists to remove.
+    local s_Buckets = {}
+    for k in pairs(cachedWorld) do
+        local c = chunkOfKey(k)
+        if c and m_Dirty[c] then
+            local b = s_Buckets[c]
+            if b == nil then b = {} s_Buckets[c] = b end
+            b[#b + 1] = k
         end
-    end)
-    if not ok then print("map save failed: " .. tostring(err)) end
-    return ok
+    end
+
+    local s_Failed = nil
+    for c, keys in pairs(s_Buckets) do
+        -- Header carries WHEN this ground was last observed, so staleness is readable straight off
+        -- the file without decoding a single cell.
+        local s_Header = {"seen=" .. tostring(m_Seen[c] or 0)}
+        local ok, err = writeLines("chunks/" .. c, s_Header, function(line)
+            for _, k in ipairs(keys) do
+                local d = cachedWorldDetail[k]
+                local n = type(d) == "table" and type(d.data) == "table"
+                          and type(d.data[2]) == "table" and d.data[2].name
+                line(k .. "=" .. tostring(cachedWorld[k]) .. "," .. nameId(n or nil))
+            end
+        end)
+        if ok then m_Dirty[c] = nil else s_Failed = err end
+    end
+
+    -- The dictionary must reach disk BEFORE anything that references it is trusted on reload --
+    -- a chunk row pointing at an id the dictionary does not have is an unreadable block name.
+    saveNames()
+
+    if s_Failed then print("map save failed: " .. tostring(s_Failed)) end
+    return s_Failed == nil
 end
 
 ----------------------------------------
@@ -359,52 +542,47 @@ end
 --
 
 function loadDetail()
+    -- Detail is stored inside the chunk files alongside occupancy, so load() has already populated
+    -- it. This only has to migrate an older standalone detail file, once.
+    if fs.isDir(CHUNK_DIR) then return true end
+
     local s_File = readLines("blockDataDetail")
     if s_File then
-        cachedWorldDetail = {}
-        -- Header first: one block name per line until the "=" terminator, indexed by line order.
         local s_Names = {}
         while true do
-            local s_Line = s_File.readLine()
-            if s_Line == nil or s_Line == "=" then break end
-            s_Names[#s_Names + 1] = s_Line
+            local l = s_File.readLine()
+            if l == nil or l == "=" then break end
+            s_Names[#s_Names + 1] = l
         end
-        local s_Count = 0
+        local n = 0
         while true do
-            local s_Line = s_File.readLine()
-            if s_Line == nil then break end
-            local s_Key, s_Solid, s_Name = s_Line:match("^(.-)=(%-?[%d.]+),(%d+)$")
-            if s_Key then
-                local s_Entry = {data = {s_Solid == "1"}}
-                local s_Id = tonumber(s_Name)
-                if s_Id and s_Id > 0 and s_Names[s_Id] then
-                    s_Entry.data[2] = {name = s_Names[s_Id]}
-                end
-                cachedWorldDetail[s_Key] = s_Entry
-                s_Count = s_Count + 1
+            local l = s_File.readLine()
+            if l == nil then break end
+            local k, solid, nid = l:match("^(.-)=(%-?[%d.]+),(%d+)$")
+            if k then
+                local id = tonumber(nid)
+                local e = {data = {solid == "1"}}
+                if id and id > 0 and s_Names[id] then e.data[2] = {name = s_Names[id]} end
+                cachedWorldDetail[k] = e
+                MarkChunkDirty(k)
+                n = n + 1
             end
         end
         s_File.close()
-        print("loaded " .. s_Count .. " named blocks")
+        print("migrating " .. n .. " named blocks to chunk storage")
         return true
     end
 
-    -- Fall back to the pretty-printed format so an existing map is not thrown away on upgrade.
     local data = getFile("blockDataDetail")
-    if data ~= {} then
-        cachedWorldDetail = textutils.unserialize(data)
-        if cachedWorldDetail ~= nil then
+    if data ~= "" then
+        local t = textutils.unserialize(data)
+        if t ~= nil then
+            for k, v in pairs(t) do cachedWorldDetail[k] = v MarkChunkDirty(k) end
+            print("migrating named blocks from the legacy format")
             return true
-        else
-            -- print("could not read blockDataDetail file: \n"..data)
-            cachedWorldDetail = {}
-            return false
         end
-    else
-        print("no detailed world data")
-        saveDetail()
-        return false
     end
+    return false
 end
 
 ----------------------------------------
@@ -415,28 +593,9 @@ end
 --
 
 function saveDetail()
-    -- Build the name table first. It is a few dozen strings however large the map gets, which is
-    -- the whole point: the names go in the header once instead of into every cell.
-    local s_Names, s_Index = {}, {}
-    for _, v in pairs(cachedWorldDetail) do
-        local s_Name = type(v.data) == "table" and type(v.data[2]) == "table" and v.data[2].name
-        if s_Name and not s_Index[s_Name] then
-            s_Names[#s_Names + 1] = s_Name
-            s_Index[s_Name] = #s_Names
-        end
-    end
-
-    local ok, err = writeLines("blockDataDetail", s_Names, function(line)
-        for k, v in pairs(cachedWorldDetail) do
-            if type(v.data) == "table" then
-                local s_Name = type(v.data[2]) == "table" and v.data[2].name
-                line(k .. "=" .. (v.data[1] and "1" or "0")
-                       .. "," .. (s_Name and s_Index[s_Name] or 0))
-            end
-        end
-    end)
-    if not ok then print("detail save failed: " .. tostring(err)) end
-    return ok
+    -- Folded into save(): a chunk file carries occupancy and names together, so writing them
+    -- separately would write every chunk twice and halve the benefit of chunking at all.
+    return true
 end
 
 
@@ -801,7 +960,7 @@ local function mergeCachedWorldDetail(newData, p_ID)
     local s_Clean = {}
     for k, v in pairs(newData) do
         local s_K = cellKey(k)
-        if s_K then s_Clean[s_K] = v end
+        if s_K then s_Clean[s_K] = v MarkChunkDirty(s_K) end
     end
     newData = s_Clean
     for k,v in pairs(newData) do
@@ -824,7 +983,7 @@ end
 local function mergeCachedWorld(newData)
     for k,v in pairs(newData) do
         local s_K = cellKey(k)
-        if s_K then cachedWorld[s_K] = v end
+        if s_K then cachedWorld[s_K] = v MarkChunkDirty(s_K) end
     end
 end
 
