@@ -92,7 +92,43 @@ const hatchery: Blueprint = {
   ],
 };
 
-export const BLUEPRINTS: Blueprint[] = [claimPost, fieldCache, smelterBank, hatchery];
+/**
+ * A storage bay: chests joined to the network so StorageMan can actually see them.
+ *
+ * "We just need more chests" is true and not sufficient. StorageMan finds inventories by NETWORK
+ * name, not by adjacency -- pushItems and pullItems both require the two inventories to be on wired
+ * modems joined by cable, so a chest placed on its own is invisible to storage and useless to every
+ * drone that tries to deposit into it. The base filled to 21 free slots out of 1,427 items while
+ * sixteen unplaced chests sat in inventory, which is exactly what that failure looks like.
+ *
+ * So a bay is chest + wired modem, repeated, with cable joining them back toward the existing run.
+ * The modem is the expensive part -- 8 stone and a redstone each -- and redstone is currently the
+ * thing the fleet has never found, so this is costed honestly rather than assumed cheap.
+ */
+const storageBay: Blueprint = {
+  name: 'storage-bay',
+  purpose: 'storage',
+  summary: 'Chests on wired modems, cabled to the network, so StorageMan can see and use them.',
+  size: { w: 3, h: 2, l: 2 },
+  blocks: [
+    // Floor first: a turtle places against an adjacent face, so the ground must exist first.
+    ...[-1, 0, 1].flatMap((dx) => [0, 1].map((dz) => ({ dx, dy: 0, dz, item: P }))),
+    // Chests sit on the pad...
+    { dx: -1, dy: 1, dz: 0, item: CHEST },
+    { dx:  0, dy: 1, dz: 0, item: CHEST },
+    { dx:  1, dy: 1, dz: 0, item: CHEST },
+    // ...each with a modem on top, which is what puts it on the network at all.
+    { dx: -1, dy: 2, dz: 0, item: 'computercraft:wired_modem_full' },
+    { dx:  0, dy: 2, dz: 0, item: 'computercraft:wired_modem_full' },
+    { dx:  1, dy: 2, dz: 0, item: 'computercraft:wired_modem_full' },
+    // Cable back along the row, joining the modems into one network run.
+    { dx: -1, dy: 1, dz: 1, item: 'computercraft:cable' },
+    { dx:  0, dy: 1, dz: 1, item: 'computercraft:cable' },
+    { dx:  1, dy: 1, dz: 1, item: 'computercraft:cable' },
+  ],
+};
+
+export const BLUEPRINTS: Blueprint[] = [claimPost, fieldCache, smelterBank, hatchery, storageBay];
 
 export function blueprint(name: string): Blueprint | undefined {
   return BLUEPRINTS.find((b) => b.name === name);

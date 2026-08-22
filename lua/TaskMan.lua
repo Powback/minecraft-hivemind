@@ -88,7 +88,9 @@ end
 local m_Fleet, m_FleetAt = nil, 0
 local function fleet(p_Force)
     local s_Now = os.clock()
-    if not p_Force and m_Fleet and (s_Now - m_FleetAt) < 5 then return m_Fleet end
+    -- Cached longer now the fleet is 23 drones: GetDrones returns every record, and
+    -- TaskMan asks for it repeatedly within a single tick.
+    if not p_Force and m_Fleet and (s_Now - m_FleetAt) < 15 then return m_Fleet end
     local s_Msg = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "GetDrones", {})
     -- FIVE seconds, not the default one.
     --
@@ -210,19 +212,22 @@ local function pickDrones(p_Role)
     local s_Free, s_Busy = {}, nil
     for _, d in ipairs(fleet()) do
         if (d.role or "miner") == p_Role then
-            -- offline is set by DroneMan when a drone misses three heartbeats; the ping is the
-            -- belt to that braces, catching a drone that died since the last sweep.
+            -- TRUST THE HEARTBEAT. DO NOT PING EVERY CANDIDATE.
+            --
+            -- This pinged each idle drone of the role with a FOUR SECOND timeout before considering
+            -- it. That is one blocking network round trip per candidate, inside the dispatch path,
+            -- and it scales with the fleet: at fourteen idle scouts a single pickDrones call can
+            -- spend the better part of a minute waiting. TaskMan's tick then never finishes,
+            -- GetTasks times out, nothing is assigned, and every drone sits idle -- which looks
+            -- exactly like a scheduler that has given up. Adding ten scouts is what pushed it over.
+            --
+            -- The ping was belt-and-braces from when the registry could not tell a docked drone
+            -- from a destroyed one. It can now: DroneMan marks a drone offline after three missed
+            -- heartbeats, so `offline` already answers the question the ping was asking, for free
+            -- and without blocking anything. The worst case is dispatching to a drone that died in
+            -- the last ninety seconds -- and that task is reclaimed on the next sweep anyway.
             if d.status == "idle" and not d.offline then
-                local s_Msg = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Ping", {})
-                -- Same reasoning as fleet(): a drone mid-move can take more than a second to
-                -- answer, and treating that as "dead" removes a healthy drone from the pool.
-                local s_Ok, s_Res = pcall(PowNet.sendAndWaitForResponse, d.id, s_Msg,
-                                          PowNet.DRONE_PROTOCOL, 4)
-                if s_Ok and s_Res then
-                    s_Free[#s_Free + 1] = d
-                else
-                    print("skipping " .. tostring(d.name) .. ": no answer")
-                end
+                s_Free[#s_Free + 1] = d
             else
                 s_Busy = s_Busy or d
             end
@@ -454,9 +459,37 @@ local RECLAIM_AFTER_MS = 90 * 1000
 -- whole queue at once -- only to place SOMETHING, reliably, every pass.
 local START_PER_TICK = 3
 
+-- FORGET FINISHED WORK.
+--
+-- Nothing ever removed a completed task, so the queue was 149 entries of which 22 were live. Every
+-- tick walked all of them, every fleet.tasks call shipped all of them, and the operator view was
+-- mostly a list of surveys that finished hours ago -- which is why "there are a bunch of survey
+-- find-ore at 100%, why are they still visible" is the obvious question to ask about it.
+--
+-- Kept briefly rather than dropped instantly: a task that has just finished is exactly the one
+-- someone is about to ask about, and its failure reason is the record of why something did not
+-- happen. Five minutes covers that; an hour just fills the operator view with surveys that finished
+-- long ago and buries the handful of things actually running.
+local KEEP_FINISHED_MS = 5 * 60 * 1000
+
+local function pruneFinished()
+    local s_Now, s_Gone = os.epoch("utc"), 0
+    for k, v in pairs(DATA["tasks"] or {}) do
+        if (v.progress or 0) >= 100 and v.finishedAt and (s_Now - v.finishedAt) > KEEP_FINISHED_MS then
+            DATA["tasks"][k] = nil
+            s_Gone = s_Gone + 1
+        end
+    end
+    if s_Gone > 0 then
+        print("pruned " .. s_Gone .. " finished tasks")
+        PowNet.MarkDirty()
+    end
+end
+
 function Tick()
     while true do
         os.sleep(TICK_SECONDS)
+        pcall(pruneFinished)
         local s_Ok, s_Err = pcall(function()
             local s_NoDrone, s_Started = {}, 0
             for k,v in pairs(DATA["tasks"]) do
@@ -612,12 +645,22 @@ function OnTaskDone(p_ID, p_Message)
         -- map with holes in it that nobody can see.
         local w = s_Task.work and s_Task.work.survey
         if w and w.min and w.max then
+            -- THREE SECONDS, NOT FIFTEEN, and no retry.
+            --
+            -- Verifying a survey against the map is worth doing and not worth blocking the whole
+            -- scheduler for. This ran with a fifteen-second budget on a single-threaded module that
+            -- also answers GetTasks, GetDrones and every dispatch -- so while MapServer counted
+            -- cells, TaskMan answered nothing, HQ's GetTasks timed out, and no work was assigned to
+            -- anybody. Every completed survey bought another stall, and surveys complete constantly.
+            --
+            -- If the check does not come back promptly the task is simply accepted as done: an
+            -- unverified survey is a small loss, a scheduler that stops scheduling is not.
             local s_Ok, s_Cov = pcall(function()
                 return PowNet.sendAndWaitForResponse(
                     PowNet.Lookup("MapServer"),
                     PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "RegionKnown",
                                       {min = w.min, max = w.max}),
-                    PowNet.SERVER_PROTOCOL, 15)
+                    PowNet.SERVER_PROTOCOL, 3)
             end)
             local s_Pct = s_Ok and type(s_Cov) == "table" and tonumber(s_Cov.percent) or nil
             if s_Pct then

@@ -56,8 +56,25 @@ export interface SupplyRule {
 
 /** Sensible starting policy. Tune with the supply.policy tool rather than editing this. */
 export const DEFAULT_RULES: SupplyRule[] = [
+  // EVERY ORE THE FLEET CAN USE, not just the two it started with.
+  //
+  // The miners were never the problem: looksValuable matches any "_ore", so a drone takes whatever
+  // it walks past. The gap was here -- with rules for coal and iron only, nothing ever DISPATCHED a
+  // gather for anything else, so 354 copper, 161 zinc and 19 lapis sat located on the map and
+  // untouched while scouts were sent to look for more of the two materials that had rules.
+  //
+  // `match` is a substring, so each of these also picks up its deepslate variant.
   { match: 'coal_ore', min: 32, action: 'gather', limit: 64, depth: 50 },
   { match: 'iron_ore', min: 32, action: 'gather', limit: 64, depth: 35 },
+  { match: 'copper_ore', min: 32, action: 'gather', limit: 64, depth: 45 },
+  { match: 'zinc_ore', min: 32, action: 'gather', limit: 64, depth: 40 },
+  // Redstone is the binding constraint on storage itself: a chest is invisible to StorageMan
+  // without a wired modem, and a modem is 8 stone and a redstone. The base filled to 21 free slots
+  // with sixteen unplaced chests in inventory for exactly this reason.
+  { match: 'redstone_ore', min: 32, action: 'gather', limit: 64, depth: 12 },
+  { match: 'lapis_ore', min: 16, action: 'gather', limit: 32, depth: 20 },
+  { match: 'gold_ore', min: 16, action: 'gather', limit: 32, depth: 20 },
+  { match: 'diamond_ore', min: 8, action: 'gather', limit: 32, depth: 0 },
   { match: 'dirt', min: 64, action: 'gather', limit: 64 },
   { match: 'oak_log', min: 32, action: 'lumber' },
   // Made, not dug. Planks gate every build the settlement will ever do, and chests gate field
@@ -438,7 +455,7 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
       await bridge.call('TaskMan', 'Add', {
         name: `find-${rule.match}`,
         priority: 3,
-        work: { survey: { radius: 8, min: area.min, max: area.max } },
+        work: { survey: { kind: 'explore', radius: 8, min: area.min, max: area.max } },
       }, { timeoutMs: 8000 });
       scoutFree = false;
       supply.dispatched++;
@@ -449,6 +466,96 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
     } catch (err) {
       supply.cooldowns[rule.match] = now + COOLDOWN_MS;
       note(`${rule.match}: dispatch failed — ${(err as Error)?.message ?? err}`);
+    }
+  }
+
+  // EXPLORE THE CAVES. Nobody was.
+  //
+  // world.caves has found them for a long time -- open pockets with an entrance, complete with
+  // their bounding boxes -- and absolutely nothing consumed that. Every cave survey so far was
+  // dispatched by hand. Meanwhile the exploration spiral sent scouts to tile solid rock in a
+  // fixed pattern, which is the least informative ground there is.
+  //
+  // A cave is the best possible place to send a scanner: the ore is already EXPOSED, so a single
+  // scan sphere reads far more usable material than the same sphere buried in stone, and a miner
+  // sent afterwards can reach it without cutting a shaft to get there.
+  if (scoutFree) {
+    try {
+      const caves: any = await callTool('world.caves', { min: 8 });
+      const list = (caves?.data?.caves ?? []) as any[];
+      for (const c of list) {
+        if (!c?.min || !c?.max) continue;
+        // Pad outward: a scan centred inside an open pocket mostly reads air. The interesting
+        // part of a cave is the rock around it, which is where the exposed ore actually sits.
+        const box = {
+          min: { x: c.min.x - 4, y: Math.max(0, c.min.y - 4), z: c.min.z - 4 },
+          max: { x: c.max.x + 4, y: c.max.y + 4, z: c.max.z + 4 },
+        };
+        const q: any = await callTool('world.query', box);
+        if ((q?.data?.coverage ?? 0) >= 60) continue;    // already read this one
+
+        await bridge.call('TaskMan', 'Add', {
+          name: `cave-${c.min.x},${c.min.y},${c.min.z}`,
+          priority: 2,
+          work: { survey: { kind: 'scout', radius: 8, min: box.min, max: box.max } },
+        }, { timeoutMs: 8000 });
+        scoutFree = false;
+        supply.dispatched++;
+        supply.lastAction = `cave survey at ${c.min.x},${c.min.y},${c.min.z}`;
+        note(`cave of ${c.size ?? '?'} cells at ${c.min.x},${c.min.y},${c.min.z} is `
+           + `${q?.data?.coverage ?? 0}% mapped → scout dispatched`);
+        did.push('cave survey');
+        break;                                            // one per tick
+      }
+    } catch (err) {
+      note(`cave survey: ${(err as Error)?.message ?? err}`);
+    }
+  }
+
+  // SEND A SCOUT TO WHERE THE MINERS ARE DIGGING BLIND.
+  //
+  // This is the collaboration the fleet was supposed to have and never did. Pairing existed only
+  // inside order.prospect -- a shaft task with a scan task depending on it -- so a miner working
+  // anywhere else dug through rock nobody had ever scanned while idle scouts were dispatched to
+  // survey tiles chosen by a spiral that knew nothing about where the fleet actually was. D13
+  // spent its shift surrounded by unknown terrain with scouts free the whole time.
+  //
+  // A geo scanner sees eight blocks THROUGH rock. A scout standing over a working miner is worth
+  // far more than the same scout surveying open ground on the other side of the base, because what
+  // it reveals is immediately actionable: the miner turns toward ore instead of past it, and does
+  // not have to turn at all where the map already answers.
+  if (scoutFree) {
+    try {
+      const fleet: any = await callTool('fleet.status', {});
+      const miners = (fleet?.data?.drones ?? []).filter(
+        (d: any) => d.role === 'miner' && d.status === 'working' && d.pos?.x !== undefined);
+
+      for (const m of miners) {
+        // How well is the ground around this miner mapped? A 24-block box centred on it.
+        const half = 12;
+        const box = {
+          min: { x: m.pos.x - half, y: Math.max(0, m.pos.y - 8), z: m.pos.z - half },
+          max: { x: m.pos.x + half, y: m.pos.y + 8, z: m.pos.z + half },
+        };
+        const q: any = await callTool('world.query', box);
+        const cov = q?.data?.coverage ?? 0;
+        if (cov >= 25) continue;          // already mapped well enough to be useful
+
+        await bridge.call('TaskMan', 'Add', {
+          name: `support-${m.name}`,
+          priority: 1,                    // ahead of speculative exploration: this has a customer
+          work: { survey: { kind: 'assist', radius: 8, min: box.min, max: box.max } },
+        }, { timeoutMs: 8000 });
+        scoutFree = false;
+        supply.dispatched++;
+        supply.lastAction = `scout support for ${m.name}`;
+        note(`${m.name} is mining at ${m.pos.x},${m.pos.y},${m.pos.z} with ${cov}% of the `
+           + `surrounding rock mapped → scout dispatched to support it`);
+        did.push(`scout support for ${m.name}`);
+        break;                            // one per tick; the next tick takes the next miner
+      }
+    } catch (err) {
+      note(`scout support: ${(err as Error)?.message ?? err}`);
     }
   }
 

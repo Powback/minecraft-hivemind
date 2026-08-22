@@ -667,13 +667,24 @@ function forward()
         -- ground truth from a drone that tried. Writing straight to cachedWorld kept it local
         -- until the next full SavePath, so other drones re-planned into the same wall.
         --
-        -- 0.5 was used for "blocked but detect() says nothing" (a mob, another turtle). That reads
-        -- back as neither 1 nor 0, i.e. UNKNOWN, throwing away the one thing we just learned. It
-        -- is recorded as solid instead: transiently wrong if a mob wanders off, and a scan will
-        -- correct it, which is much cheaper than pathing into it repeatedly.
-        local s_Solid = 1
+        -- ASK WHAT ACTUALLY STOPPED US. A failed move is not evidence of a block.
+        --
+        -- This recorded solid unconditionally, reasoning that a wrong entry would be corrected by a
+        -- later scan and that re-pathing into the obstacle was the worse cost. That was wrong in a
+        -- way that got much worse as the fleet grew: with fourteen drones flying the same corridors,
+        -- most failed moves are one drone bumping another, and every one of them wrote a permanent
+        -- solid block into the SHARED map at a spot where there is nothing at all. The result is a
+        -- map full of blocks hanging in mid-air that do not exist in the world -- visible on /map,
+        -- and worse, pathfinding routes around them for ever.
+        --
+        -- A scan does not reliably correct it either: scans record what they SEE, and a cell that
+        -- is genuinely air is only rewritten if a drone happens to scan that exact spot again.
+        --
+        -- detect() answers the question honestly. A block is a block; anything else is an entity
+        -- standing somewhere passable, and the right record for that cell is air.
+        local s_Solid = turtle.detect() and 1 or 0
         cachedWorld[idx_pos] = s_Solid
-        noteObservation(idx_pos, s_Solid, cachedWorldDetail[idx_pos])
+        noteObservation(idx_pos, s_Solid, s_Solid == 1 and cachedWorldDetail[idx_pos] or nil)
         return false
     end
 end
@@ -854,13 +865,36 @@ end
 -- return: boolean "success"
 --
 
+-- SEND WHAT CHANGED, NOT THE WHOLE MAP.
+--
+-- This shipped the drone's ENTIRE cachedWorld and cachedWorldDetail to MapServer, with a fifteen
+-- second budget and three retries, every time a move was blocked -- which for a mining drone is
+-- constantly. One drone doing that is wasteful; twenty-three of them saturates the shared rednet
+-- channel, and messages start being dropped. That is why drones parked AT THE BASE were showing
+-- 200+ seconds silent: not out of range, not crashed, just unable to get a heartbeat through the
+-- traffic their own path-saving was generating.
+--
+-- takeWorldDelta already exists and is what UploadWorld uses: the cells observed since the last
+-- push, typically a handful. The delta is drained on read, so nothing is sent twice.
+--
+-- It also used to do `cachedWorld = {}` at the end, throwing away everything the drone knew about
+-- its surroundings on every blocked move. That is why drones re-path into the same wall, and it
+-- defeats the map check the miners now use to decide whether a side wall is worth turning for.
 function SavePath()
+    local s_World, s_Detail, s_Count = takeWorldDelta()
+    if s_Count == 0 then return true end
 
-    local s_Request = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "UpdatePath", {id = os.getComputerID(), cachedWorld = cachedWorld, cachedWorldDetail = cachedWorldDetail})
-    -- Pathfinding is the most expensive call in the fleet; give it room. The default 1s made
-        -- every long route look like "no path".
-        local s_Response = PowNet.sendAndWaitForResponse("MapServer", s_Request, nil, 15)
-    cachedWorld = {}
+    local s_Request = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "UpdatePath",
+        {id = os.getComputerID(), cachedWorld = s_World, cachedWorldDetail = s_Detail})
+    -- One attempt, short budget. These are observations, not a request anyone is waiting on, and
+    -- retrying them is what turns a busy MapServer into an unreachable one.
+    local s_Ok = PowNet.sendAndWaitForResponse("MapServer", s_Request, nil, 3, 1)
+    if not s_Ok then
+        -- Keep them rather than lose them; the next push carries them.
+        for k, v in pairs(s_World) do noteObservation(k, v, s_Detail[k]) end
+        return false
+    end
+    return true
 end
 
 -- BOUNDED. This loop used to be `while not there do replan; walk; end` with no way out, so a

@@ -220,7 +220,11 @@ function SendHeartBeat()
     -- stalled drone.
     -- Five seconds, not two. DroneMan services the whole fleet from one receive loop, so a reply
     -- can legitimately take a while; a tight timeout turns "busy" into "missing".
-    local s_Reply = PowNet.sendAndWaitForResponse("DroneMan", s_Message, PowNet.SERVER_PROTOCOL, 5)
+    -- ONE attempt, SHORT timeout. A heartbeat is periodic: if this one is not answered the next is
+    -- three seconds away, so retrying buys nothing and costs DroneMan three times the traffic at
+    -- precisely the moment it is already behind. Link loss is decided by LINK_LOST_AFTER consecutive
+    -- misses, not by a single one, so nothing downstream needs the retries either.
+    local s_Reply = PowNet.sendAndWaitForResponse("DroneMan", s_Message, PowNet.SERVER_PROTOCOL, 2, 1)
     return s_Reply ~= false and s_Reply ~= nil
 end
 
@@ -2110,7 +2114,9 @@ function UploadWorld()
     end
     local s_Message = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "SaveWorld",
         {cachedWorld = s_World, cachedWorldDetail = s_Detail})
-    local s_Ok = PowNet.sendAndWaitForResponse("MapServer", s_Message, PowNet.SERVER_PROTOCOL)
+    -- One attempt: observations are re-queued on failure (below), so a retry here only duplicates
+    -- traffic against a MapServer that is already the busiest module in the fleet.
+    local s_Ok = PowNet.sendAndWaitForResponse("MapServer", s_Message, PowNet.SERVER_PROTOCOL, 5, 1)
     if(not s_Ok) then
         -- Put them back rather than lose them: an unreachable MapServer should cost a retry, not
         -- a hole in the map that nothing will ever revisit.
@@ -2350,10 +2356,14 @@ local REFIX_EVERY = 45
 local function refixLoop()
     while true do
         os.sleep(REFIX_EVERY)
-        local px = pgps.getCachedPosition()
+        local px, _, _, pd = pgps.getCachedPosition()
         if px == nil and not executing then
             local ok = pgps.verifyPosition()
             if ok then trace("re-acquired a position after losing it") end
+        elseif px ~= nil and pd == nil and not executing then
+            -- Heading recovery, moved off the heartbeat: it steps the turtle, can rise, and can
+            -- dig, so it belongs on a thread where taking a minute costs nothing.
+            if pgps.ensureHeading() then trace("re-established heading") end
         end
     end
 end
@@ -2476,16 +2486,18 @@ local function heartbeat()
             SendHeartBeat()
         end
 
-        -- Heading can be missing even when position is not, and a drone without it cannot move at
-        -- all -- see ensureHeading. Cheap to check, fatal to ignore.
-        do
-            local _, _, _, s_Dir = pgps.getCachedPosition()
-            if s_Dir == nil and pgps.getCachedPosition() ~= nil then
-                if pgps.ensureHeading() then SendHeartBeat() end
-            end
-        end
+        -- HEADING RECOVERY DOES NOT BELONG HERE. See refixLoop.
+        --
+        -- ensureHeading was called from this loop, and it is no longer cheap: it steps the turtle to
+        -- work out which way it faces, and after being taught to escape a box it will also rise up
+        -- to four blocks, probe four directions at each level with a five-second GPS fix apiece, and
+        -- dig. That is minutes of blocking work on the one coroutine whose entire job is to report
+        -- in every thirty seconds -- so the drones that needed help most were exactly the ones that
+        -- stopped heartbeating, and DroneMan marked twenty-three live, working drones as lost.
+        --
+        -- The heartbeat must stay cheap. Recovery happens on its own thread where blocking is free.
 
-        if pgps.getCachedPosition() == nil then
+        if false then
             local ok = pgps.verifyPosition()
             if ok then
                 print("position re-established")

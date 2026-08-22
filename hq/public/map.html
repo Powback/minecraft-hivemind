@@ -95,6 +95,17 @@
   input[type=checkbox] { accent-color: #5aa9e6; margin: 0; width: 15px; height: 15px; }
 
   .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+
+  /* Block colour key. Two columns because the names are short and the panel sits over the scene —
+     a single tall column would cover the terrain it is describing. */
+  #legend { max-width: 404px; }
+  .lg   { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 12px; }
+  .lg span { display: flex; align-items: center; gap: 6px; padding: 1px 0; color: var(--dim);
+             white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 11px; }
+  .lg span .swatch { flex: none; }
+  .lg-h { font-size: 10px; letter-spacing: .09em; text-transform: uppercase; color: #6f8298;
+          border-top: 1px solid var(--edge); margin-top: 7px; padding-top: 6px; }
+  #legend-blocks > .lg-h:first-child { border-top: 0; margin-top: 0; padding-top: 0; }
   .muted { color: var(--dim); }
   .note { color: var(--warn); font-size: 11px; line-height: 1.35; margin: 4px 0 0; }
 
@@ -148,6 +159,7 @@
   <div class="row"><span class="k">tasks</span><span class="v" id="h-tasks">…</span></div>
   <div class="row"><span class="k">surveyed</span><span class="v" id="h-cells">…</span></div>
   <div class="row"><span class="k">identified</span><span class="v" id="h-ident">…</span></div>
+  <div class="row"><span class="k">ore found</span><span class="v" id="h-ore">…</span></div>
   <div class="row"><span class="k">caves</span><span class="v" id="h-caves">…</span></div>
   <div class="row"><span class="k">storage</span><span class="v" id="h-stock">…</span></div>
   <div class="row"><span class="k">updated</span><span class="v" id="h-age">…</span></div>
@@ -155,6 +167,7 @@
 
   <h2>layers</h2>
   <label class="toggle"><input type="checkbox" id="t-solid" checked> terrain</label>
+  <label class="toggle"><input type="checkbox" id="t-xray"> x-ray rock (show buried ore)</label>
   <label class="toggle"><input type="checkbox" id="t-air"> surveyed air</label>
   <label class="toggle"><input type="checkbox" id="t-caves" checked> caves</label>
   <label class="toggle"><input type="checkbox" id="t-mats" checked> ore &amp; dirt (advisory)</label>
@@ -175,6 +188,8 @@
 </div>
 
 <div id="legend" class="panel">
+  <div id="legend-blocks" class="muted">terrain loading…</div>
+  <div class="lg-h">markers</div>
   <div class="row"><span class="k"><i class="swatch" style="background:#e0a33c"></i> miner</span>
                    <span class="k"><i class="swatch" style="background:#4fc3e8"></i> scout</span></div>
   <div class="row"><span class="k"><i class="swatch" style="background:#7de08a"></i> loader</span>
@@ -265,7 +280,10 @@ const CUBE = new THREE.BoxGeometry(1, 1, 1);
 function clearGroup(g) {
   for (const child of g.children.slice()) {
     g.remove(child);
-    child.geometry?.dispose?.();
+    // Every terrain mesh instances the SAME unit cube. Disposing it here would free the one
+    // geometry the next rebuild is about to instance again, forcing a needless re-upload of the
+    // buffer every single refresh.
+    if (child.geometry !== CUBE) child.geometry?.dispose?.();
     if (child.material) for (const m of [].concat(child.material)) { m.map?.dispose?.(); m.dispose?.(); }
   }
 }
@@ -273,59 +291,156 @@ function clearGroup(g) {
 // ── block colours ──────────────────────────────────────────────────────────
 
 /**
- * Block name -> colour, by substring, most specific first.
+ * Block name -> appearance, by substring, most specific first.
+ *
+ * WHERE THE NUMBERS COME FROM. These are not eyeballed. Every `c` below is the mean of the actual
+ * 1.21.1 texture's opaque pixels — vanilla out of the client jar, Create/CreatePropulsion/CC out of
+ * the pack's own mod jars — so sandstone is the sandstone in this world and not a guess at it.
+ * (The extractor lives in scratch, not here; only its output ships, because the page must stay a
+ * single self-contained file with no build step and no network.)
  *
  * Substring rather than exact match because the index carries fully-qualified names
- * ("minecraft:coarse_dirt") and mod blocks will arrive with prefixes nobody has enumerated. A
- * table of exact names would silently grey out every block added to the pack.
+ * ("minecraft:coarse_dirt") and mod blocks arrive with prefixes nobody has enumerated. A table of
+ * exact names would silently grey out every block the pack adds.
  *
- * Ores come first so that "deepslate_iron_ore" is iron and not deepslate — the ore is the reason
- * anyone is looking at that cell.
+ * Ores come first so that "deepslate_iron_ore" is iron and not deepslate — the ore is the entire
+ * reason anyone is looking at that cell.
+ *
+ *   c    body colour
+ *   m    material class, which is what actually gets drawn (see MAT below)
+ *   h    ore halo — see ORE HALOS
  */
 const PALETTE = [
-  [/diamond_ore/,   0x4fe0d4, true],
-  [/emerald_ore/,   0x35d06a, true],
-  [/gold_ore/,      0xf5cf3e, true],
-  [/redstone_ore/,  0xd63b3b, true],
-  [/lapis_ore/,     0x3a6fe0, true],
-  [/copper_ore/,    0xd07a4a, true],
-  [/iron_ore/,      0xe0b48a, true],
-  [/coal_ore/,      0x3c4048, true],
-  [/quartz|debris/, 0xe8e2d8, true],
-  [/_ore\b|_ore$/,  0xff7fd0, true],          // an ore type nobody listed is still an ore
-  [/bedrock/,       0x2a2a2e],
-  [/deepslate/,     0x4c4c54],
-  [/cobblestone/,   0x7d8085],
-  [/stone|andesite|diorite|granite|tuff/, 0x8d9096],
-  [/grass_block|moss/, 0x6ba03a],
-  [/coarse_dirt|rooted_dirt|dirt|podzol|mud/, 0x8a5f3d],
-  [/sandstone/,     0xd6c79b],
-  [/red_sand/,      0xc2703c],
-  [/sand/,          0xe3dbb0],
-  [/gravel/,        0x8d8681],
-  [/clay/,          0x9aa3b0],
-  [/water/,         0x3b6fd4],
-  [/lava|magma/,    0xe06a1c, true],
-  [/leaves/,        0x4a7a35],
-  [/log|wood|stem/, 0x7a5a30],
-  [/planks/,        0xc8a165],
-  [/glass/,         0xbfe3ec],
-  [/ice|snow/,      0xe8f2fb],
-  [/obsidian/,      0x2a2140],
-  [/netherrack/,    0x7a3535],
-  [/terracotta/,    0xa2593c],
-  [/wool|concrete/, 0xc9ced6],
+  // ── ores ───────────────────────────────────────────────────────────────
+  //
+  // ORE HALOS. `c` is the mineral's own colour, which for coal is black and for copper is a drab
+  // olive — accurate, and useless from thirty blocks away. `h` is the same mineral pushed to a
+  // brightness that survives distance and fog, and it is what the glow shell is drawn in. Without
+  // it "find the ore" degrades to "find the slightly different grey", which is the failure this
+  // whole table exists to prevent.
+  [/diamond_ore/,            { c: 0x62ede4, m: 'ore', h: 0x7dfff4 }],
+  [/emerald_ore/,            { c: 0x2acb58, m: 'ore', h: 0x4cff86 }],
+  [/gold_ore/,               { c: 0xf6d03e, m: 'ore', h: 0xffe063 }],
+  [/redstone_ore/,           { c: 0xb01905, m: 'ore', h: 0xff3b2f }],
+  [/lapis_ore/,              { c: 0x1f438c, m: 'ore', h: 0x4f8bff }],
+  [/platinum_ore/,           { c: 0x96b4bf, m: 'ore', h: 0xc2e6f2 }],
+  [/copper_ore/,             { c: 0xc06c50, m: 'ore', h: 0xff9463 }],
+  [/iron_ore/,               { c: 0xa6886b, m: 'ore', h: 0xe6bd8f }],
+  [/zinc_ore/,               { c: 0x969f95, m: 'ore', h: 0xd8e8b0 }],
+  [/coal_ore/,               { c: 0x1e1f24, m: 'ore', h: 0x7d879c }],
+  [/quartz_ore/,             { c: 0xefe7dc, m: 'ore', h: 0xfff8ec }],
+  [/ancient_debris/,         { c: 0x604038, m: 'ore', h: 0xc08a63 }],
+  // An ore type nobody enumerated is still an ore, and a loud unassigned magenta is the right
+  // answer: it is visible, it is obviously not a rock, and it asks to be added to this table.
+  [/_ore(\b|_)/,             { c: 0xff5fd0, m: 'ore', h: 0xff9ce4 }],
+
+  // ── the fleet's own hardware ───────────────────────────────────────────
+  // Every computercraft block reads as one thing — infrastructure — because that is the only
+  // distinction that matters on this map. A modem and a disk drive are both "we built that".
+  // Same off-white the computer pillars and the legend already use, so the two agree.
+  [/^computercraft:|^peripheralworks:/, { c: 0xdfe6ee, m: 'lume' }],
+
+  // ── liquids and light ──────────────────────────────────────────────────
+  // water_still.png is greyscale and tinted per biome at render time, so the texture mean is a
+  // meaningless 0xb1b1b1; this is vanilla's default water tint. Drawn translucent because you
+  // need to see the cave floor under it.
+  [/water/,                  { c: 0x3f76e4, m: 'liquid' }],
+  [/lava/,                   { c: 0xd9691a, m: 'lume' }],
+  [/magma/,                  { c: 0x8e3f1f, m: 'lume' }],
+  [/glowstone|sea_lantern|shroomlight|torch|lantern|campfire/, { c: 0xffd28a, m: 'lume' }],
+  [/glow_lichen/,            { c: 0x86a179, m: 'lume' }],
+
+  // ── rock ───────────────────────────────────────────────────────────────
+  [/bedrock/,                { c: 0x555555 }],
+  [/smooth_basalt/,          { c: 0x49484e }],
+  [/basalt/,                 { c: 0x49494e }],
+  [/blackstone/,             { c: 0x2a2429 }],
+  [/deepslate/,              { c: 0x505053 }],
+  [/cobblestone/,            { c: 0x807f80 }],
+  [/granite/,                { c: 0x956756 }],
+  [/andesite/,               { c: 0x888889 }],
+  [/diorite/,                { c: 0xbdbcbd }],
+  [/calcite/,                { c: 0xdfe0dd }],
+  [/dripstone/,              { c: 0x866c5d }],
+  [/tuff/,                   { c: 0x6c6d67 }],
+  [/obsidian/,               { c: 0x0f0b19 }],
+  [/netherrack/,             { c: 0x622626 }],
+  [/amethyst/,               { c: 0x8662bf }],
+  [/furnace|blast_furnace|smoker/, { c: 0x6b6a6a }],
+
+  // ── ground ─────────────────────────────────────────────────────────────
+  [/red_sandstone/,          { c: 0xbb631d }],
+  [/sandstone/,              { c: 0xd8cb9c }],
+  [/red_sand/,               { c: 0xbf6721 }],
+  [/sand/,                   { c: 0xdbcfa3 }],
+  [/gravel/,                 { c: 0x847f7f }],
+  [/clay/,                   { c: 0xa1a6b3 }],
+  [/coarse_dirt/,            { c: 0x77563b }],
+  [/rooted_dirt/,            { c: 0x90684d }],
+  [/podzol/,                 { c: 0x5c3f18 }],
+  [/mud/,                    { c: 0x3c393d }],
+  [/dirt/,                   { c: 0x866043 }],
+  [/grass_block/,            { c: 0x5c8a34 }],
+  [/moss/,                   { c: 0x596e2d }],
+  [/terracotta/,             { c: 0x985e44 }],
+  [/packed_ice|blue_ice/,    { c: 0x8eb4fa }],
+  [/ice/,                    { c: 0x92b8fe }],
+  [/snow/,                   { c: 0xf9fefe }],
+
+  // ── vegetation and build ───────────────────────────────────────────────
+  [/cactus/,                 { c: 0x59822d }],
+  [/dead_bush/,              { c: 0x6b4f29 }],
+  [/leaves/,                 { c: 0x4a6b28 }],
+  [/spruce_log|dark_oak_log/, { c: 0x3b2611 }],
+  [/log|wood|stem/,          { c: 0x6d5533 }],
+  [/planks/,                 { c: 0xa2834f }],
+  [/crafting_table|barrel|bookshelf/, { c: 0x816a46 }],
+  [/chest|shulker/,          { c: 0x694e23 }],
+  [/glass/,                  { c: 0xb0d6db, m: 'liquid' }],
+  [/iron_block/,             { c: 0xdcdcdc }],
+  [/gold_block/,             { c: 0xf6d03e }],
+  [/diamond_block/,          { c: 0x62ede4 }],
+  [/copper_block|cut_copper/, { c: 0xc06c50 }],
+  [/wool|concrete/,          { c: 0xc9ced6 }],
+
+  // DEAD LAST, and that placement is the rule. "sandstone" contains "stone"; so do
+  // "mossy_cobblestone", "blackstone" and "sandstone_stairs". A plain-stone rule sitting anywhere
+  // above them turns half the desert grey, which is exactly the bug this table was written to end.
+  [/stone/,                  { c: 0x7e7e7e }],
 ];
+
+/**
+ * NAMED BUT NOT IN THE TABLE is a third state, and it gets its own colour.
+ *
+ * A mod block we have never seen is not "unidentified" — the fleet told us exactly what it is and
+ * this table came up short. Drawing it as unknown terrain would hide our own gap; drawing it in a
+ * colour nothing else uses makes the gap visible in the legend, by name, so it can be fixed.
+ */
+const UNLISTED = { c: 0x8f7fa8 };
+
+/**
+ * SOLID BUT UNIDENTIFIED. Not air — the block index is a strict subset of the occupancy grid, and
+ * a missing key means "we know something is here, we do not know what".
+ *
+ * Deliberately a slate blue-violet that no real block in the table occupies, so the eye never has
+ * to decide whether a grey cell is stone or ignorance. The index currently covers a few per cent
+ * of surveyed cells; a neutral grey here would quietly imply the map is far more complete than it
+ * is.
+ */
+const UNKNOWN_COLOR = 0x4d5a72;
 
 const paletteCache = new Map();
 function blockStyle(name) {
   let hit = paletteCache.get(name);
   if (hit !== undefined) return hit;
-  hit = null;
-  for (const [re, color, glow] of PALETTE) if (re.test(name)) { hit = { color, glow: !!glow }; break; }
+  hit = UNLISTED;
+  for (const [re, style] of PALETTE) if (re.test(name)) { hit = style; break; }
   paletteCache.set(name, hit);
   return hit;
 }
+
+/** Short, human name for the legend: "minecraft:deepslate_copper_ore" -> "deepslate copper ore". */
+const shortName = (n) => n.replace(/^[a-z0-9_]+:/, '').replace(/_/g, ' ');
 
 // ── terrain ────────────────────────────────────────────────────────────────
 
@@ -341,81 +456,185 @@ const tmpColor = new THREE.Color();
  */
 let surfaceAt = new Map();
 
+/**
+ * MATERIAL CLASSES, and why there are only four.
+ *
+ * ~180,000 cells. One material per block type would be hundreds of draw calls and a rebuild that
+ * stalls the tab; one material for everything cannot say "this one is ore". So the split is by
+ * BEHAVIOUR — how the surface responds to light — and the block's own colour rides along as a
+ * per-instance attribute inside its class. Four materials, four draw calls, every block its own
+ * colour.
+ *
+ *   solid   plain lit rock. The bulk of the world.
+ *   ore     lifted off the shading curve so an ore in shadow still reads as ore and not as a
+ *           dark patch of stone. The lift is white and small; the hue stays the mineral's.
+ *   lume    things that emit in the real world — lava, glowstone, our own computers.
+ *   liquid  see-through, and never writes depth, so what is under the water still draws.
+ */
+const MAT = {
+  solid:  () => new THREE.MeshLambertMaterial(),
+  ore:    () => new THREE.MeshLambertMaterial({ emissive: 0xffffff, emissiveIntensity: 0.16 }),
+  lume:   () => new THREE.MeshLambertMaterial({ emissive: 0xffffff, emissiveIntensity: 0.34 }),
+  liquid: () => new THREE.MeshLambertMaterial({ transparent: true, opacity: 0.45, depthWrite: false }),
+};
+
+/** Rock opacity while x-ray is on. Low enough to see an ore seam three chunks in. */
+const XRAY_OPACITY = 0.22;
+
+/** What the legend is built from: block name -> {count, style}, freshest terrain build wins. */
+let blockTally = new Map();
+
 function buildTerrain(cells, bounds, blockAt) {
   clearGroup(gTerrain);
   clearGroup(gAir);
   surfaceAt = new Map();
+  blockTally = new Map();
   if (!bounds) return null;
 
-  const solid = [];
-  const air = [];
+  // One list per material class, plus ore kept apart because it also gets a halo. Flat number
+  // arrays rather than arrays-of-arrays: at this cell count the per-tuple object headers are the
+  // difference between a rebuild you do not notice and one that visibly hitches the tab.
+  const buckets = { solid: [], ore: [], lume: [], liquid: [] };
+  const air = [];      // flat x,y,z
+  const frame = [];    // flat x,y,z of everything drawn, for the camera framing box
+  let identified = 0, drawn = 0, oreCount = 0;
+
   for (const k in cells) {
     const v = cells[k];
     const p = k.split(':');
     const x = +p[0], y = +p[1], z = +p[2];
     if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
-    if (v === 1) {
-      const col = x + ',' + z;
-      const prev = surfaceAt.get(col);
-      if (prev === undefined || y > prev) surfaceAt.set(col, y);
-      // A cell whose six neighbours are all solid can never be seen. 2 (drone-occupied) and
-      // absent both count as open, so anything not known-solid can expose a face.
-      const buried =
-        cells[(x + 1) + ':' + y + ':' + z] === 1 && cells[(x - 1) + ':' + y + ':' + z] === 1 &&
-        cells[x + ':' + (y + 1) + ':' + z] === 1 && cells[x + ':' + (y - 1) + ':' + z] === 1 &&
-        cells[x + ':' + y + ':' + (z + 1)] === 1 && cells[x + ':' + y + ':' + (z - 1)] === 1;
-      if (!buried) solid.push([x, y, z, k]);
-    } else {
-      air.push([x, y, z]);
-    }
+    if (v !== 1) { air.push(x, y, z); continue; }
+
+    const col = x + ',' + z;
+    const prev = surfaceAt.get(col);
+    if (prev === undefined || y > prev) surfaceAt.set(col, y);
+
+    // ABSENT IS NOT AIR AND MISSING IS NOT AIR. `blockAt` is a strict subset of `cells`; a key it
+    // does not carry is a solid cell of unknown type, so it is drawn, in the unknown colour.
+    const name = blockAt?.[k];
+    const style = name ? blockStyle(name) : null;
+
+    // A cell whose six neighbours are all solid can never be seen. 2 (drone-occupied) and
+    // absent both count as open, so anything not known-solid can expose a face.
+    const buried =
+      cells[(x + 1) + ':' + y + ':' + z] === 1 && cells[(x - 1) + ':' + y + ':' + z] === 1 &&
+      cells[x + ':' + (y + 1) + ':' + z] === 1 && cells[x + ':' + (y - 1) + ':' + z] === 1 &&
+      cells[x + ':' + y + ':' + (z + 1)] === 1 && cells[x + ':' + y + ':' + (z - 1)] === 1;
+
+    // ORE IS NEVER CULLED. Ore is by definition surrounded by rock, so the buried test — correct
+    // for terrain, where an invisible cube is wasted GPU — deleted precisely the blocks this map
+    // exists to show. Every ore cell is drawn whether it can be seen or not; the x-ray and the
+    // halo are what make it visible, and there are only ever a few thousand of them.
+    const isOre = style?.m === 'ore';
+    if (buried && !isOre) continue;
+
+    // Counted AFTER the cull, all three of them, because the HUD says "N of M drawn" and the
+    // legend is a key to what is on screen. Tallying culled cells made it read "121409 of 21860",
+    // which is not a ratio of anything.
+    drawn++;
+    if (style) identified++;
+    if (isOre) oreCount++;
+    if (name) blockTally.set(name, (blockTally.get(name) ?? 0) + 1);
+    const cls = style?.m ?? 'solid';
+    // The height shade applies to UNKNOWN cells only, and only faintly. It is one colour, not a
+    // gradient of many: without some relief a 130,000-cube slab of a single flat colour loses all
+    // shape, and with too much it starts to look like data we do not have.
+    const shade = style ? 1 : 0.82 + 0.30 * ((y - bounds.min.y) / Math.max(1, bounds.max.y - bounds.min.y));
+    buckets[cls].push(x, y, z, (style ? style.c : UNKNOWN_COLOR), shade, isOre ? style.h : 0);
+    frame.push(x, y, z);
   }
 
-  const span = Math.max(1, bounds.max.y - bounds.min.y);
-  if (solid.length) {
-    // NOT `vertexColors: true`. That define makes the shader multiply by a per-VERTEX `color`
-    // attribute, which BoxGeometry does not have, so every instance came out multiplied by zero —
-    // a terrain of black cubes on a black background, indistinguishable from a failed load.
-    // Per-INSTANCE colour is a different define and setColorAt turns it on by itself.
-    const mesh = new THREE.InstancedMesh(CUBE, new THREE.MeshLambertMaterial(), solid.length);
-    let identified = 0;
-    solid.forEach(([x, y, z, k], i) => {
-      dummy.position.set(x, y, z);
-      dummy.updateMatrix();
-      mesh.setMatrixAt(i, dummy.matrix);
+  for (const cls in buckets) if (buckets[cls].length) addInstances(cls, buckets[cls]);
 
-      const name = blockAt?.[k];
-      const style = name ? blockStyle(name) : null;
-      if (style) {
-        identified++;
-        tmpColor.setHex(style.color);
-      } else {
-        // Unidentified is drawn as unidentified: a desaturated height band, deliberately duller
-        // than any real block colour so that "we do not know what this is" is visually distinct
-        // from "this is stone". The index covers only a fraction of the surveyed cells and
-        // pretending otherwise would make the map look far more complete than it is.
-        const t = (y - bounds.min.y) / span;
-        tmpColor.setHSL(0.58 - 0.14 * t, 0.10 + 0.08 * t, 0.30 + 0.34 * t);
-      }
-      mesh.setColorAt(i, tmpColor);
-    });
-    mesh.instanceMatrix.needsUpdate = true;
-    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-    gTerrain.add(mesh);
-    gTerrain.userData.identified = identified;
-    gTerrain.userData.drawn = solid.length;
-  }
+  gTerrain.userData.identified = identified;
+  gTerrain.userData.drawn = drawn;
+  gTerrain.userData.ore = oreCount;
+  applyXray($('t-xray').checked);
+  renderBlockLegend();
 
   if (air.length) {
     const geo = new THREE.BufferGeometry();
-    const pos = new Float32Array(air.length * 3);
-    air.forEach(([x, y, z], i) => { pos[i * 3] = x; pos[i * 3 + 1] = y; pos[i * 3 + 2] = z; });
-    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute('position', new THREE.BufferAttribute(Float32Array.from(air), 3));
     gAir.add(new THREE.Points(geo, new THREE.PointsMaterial({
       color: 0x4b6fa0, size: 0.16, transparent: true, opacity: 0.55, sizeAttenuation: true,
     })));
   }
 
-  return percentileBox(solid.length ? solid : air) ?? bounds;
+  return percentileBox(frame.length ? frame : air) ?? bounds;
+}
+
+/**
+ * One InstancedMesh for a whole material class, coloured per instance.
+ *
+ * `data` is flat groups of six: x, y, z, colour, shade, halo. Ore additionally gets a second,
+ * larger, additively-blended shell drawn in the halo colour with depth testing OFF — which is the
+ * one thing on this page that lets you see a seam that is entirely inside rock. Additive means it
+ * only ever brightens, so overlapping seams read as a stronger glow rather than a flat blob, and
+ * with depthWrite off there is no sorting to get wrong.
+ */
+function addInstances(cls, data) {
+  const n = data.length / 6;
+  const mesh = new THREE.InstancedMesh(CUBE, MAT[cls](), n);
+  // NOT `vertexColors: true`. That define makes the shader multiply by a per-VERTEX `color`
+  // attribute, which BoxGeometry does not have, so every instance came out multiplied by zero —
+  // a terrain of black cubes on a black background, indistinguishable from a failed load.
+  // Per-INSTANCE colour is a different define and setColorAt turns it on by itself.
+  for (let i = 0; i < n; i++) {
+    const o = i * 6;
+    dummy.position.set(data[o], data[o + 1], data[o + 2]);
+    dummy.updateMatrix();
+    mesh.setMatrixAt(i, dummy.matrix);
+    tmpColor.setHex(data[o + 3]).multiplyScalar(data[o + 4]);
+    mesh.setColorAt(i, tmpColor);
+  }
+  mesh.instanceMatrix.needsUpdate = true;
+  if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+  mesh.userData.cls = cls;
+  gTerrain.add(mesh);
+
+  if (cls !== 'ore') return;
+  const halo = new THREE.InstancedMesh(CUBE, new THREE.MeshBasicMaterial({
+    transparent: true, opacity: 0.34, blending: THREE.AdditiveBlending,
+    depthWrite: false, depthTest: false,
+  }), n);
+  for (let i = 0; i < n; i++) {
+    const o = i * 6;
+    dummy.position.set(data[o], data[o + 1], data[o + 2]);
+    dummy.scale.setScalar(1.55);
+    dummy.updateMatrix();
+    dummy.scale.setScalar(1);
+    halo.setMatrixAt(i, dummy.matrix);
+    tmpColor.setHex(data[o + 5]);
+    halo.setColorAt(i, tmpColor);
+  }
+  halo.instanceMatrix.needsUpdate = true;
+  if (halo.instanceColor) halo.instanceColor.needsUpdate = true;
+  // Behind the labels, in front of the terrain. Without an explicit order a depth-testless mesh
+  // lands wherever the sort happens to put it and flickers as the camera moves.
+  halo.renderOrder = 4;
+  halo.userData.cls = 'halo';
+  gTerrain.add(halo);
+}
+
+/**
+ * X-RAY: make the rock see-through so buried ore is findable.
+ *
+ * Ore halos ignore depth all the time, so a seam is always at least a hint. X-ray is for when the
+ * hint is not enough and you want to see WHERE in the rock it sits — the surrounding terrain drops
+ * to a fifth opacity and the ore cores themselves come through. Off by default because a
+ * transparent world is the wrong default for "why did the drone stop there".
+ */
+function applyXray(on) {
+  for (const m of gTerrain.children) {
+    const cls = m.userData.cls;
+    if (cls === 'halo' || cls === 'ore' || cls === 'liquid') continue;
+    const mat = m.material;
+    mat.transparent = !!on;
+    mat.opacity = on ? XRAY_OPACITY : 1;
+    mat.depthWrite = !on;
+    mat.needsUpdate = true;
+  }
 }
 
 /**
@@ -424,15 +643,51 @@ function buildTerrain(cells, bounds, blockAt) {
  * The survey has a long tail: one scout wandered to z -114 while every other cell sits between
  * -38 and -60, and framing on the extremes makes the part anyone cares about a smudge. Clipping
  * to the 3rd..97th percentile per axis throws away the strays and keeps the base.
+ *
+ * `points` is flat x,y,z triples.
  */
 function percentileBox(points, lo = 0.03, hi = 0.97) {
   if (!points.length) return null;
   const at = (i) => {
-    const v = points.map((p) => p[i]).sort((a, b) => a - b);
+    const v = [];
+    for (let j = i; j < points.length; j += 3) v.push(points[j]);
+    v.sort((a, b) => a - b);
     return [v[Math.floor((v.length - 1) * lo)], v[Math.ceil((v.length - 1) * hi)]];
   };
   const [x0, x1] = at(0), [y0, y1] = at(1), [z0, z1] = at(2);
   return { min: { x: x0, y: y0, z: z0 }, max: { x: x1, y: y1, z: z1 } };
+}
+
+/**
+ * The colour key, built from what is actually on screen rather than from the table.
+ *
+ * A static legend of forty block types would be mostly rows for blocks this world does not
+ * contain, and the reader would have to scan past them to find the four that matter. This lists
+ * exactly what was drawn, ore first and always in full — a single diamond block is the most
+ * important row on the page and must never be crowded out by ten thousand sandstone.
+ */
+function renderBlockLegend() {
+  const el = $('legend-blocks');
+  const entries = [...blockTally].sort((a, b) => b[1] - a[1]);
+  const ore = entries.filter(([n]) => blockStyle(n).m === 'ore');
+  const rest = entries.filter(([n]) => blockStyle(n).m !== 'ore').slice(0, 10);
+  const unknown = (gTerrain.userData.drawn ?? 0) - (gTerrain.userData.identified ?? 0);
+
+  const row = ([n, c]) => {
+    const s = blockStyle(n);
+    return `<span title="${esc(n)} — ${c}"><i class="swatch" style="background:${hexOf(s.m === 'ore' ? s.h : s.c)}${s.m === 'ore' ? ';box-shadow:0 0 6px ' + hexOf(s.h) : ''}"></i>${esc(shortName(n))}</span>`;
+  };
+
+  el.innerHTML =
+    (ore.length ? `<div class="lg-h">ore · ${ore.reduce((a, e) => a + e[1], 0)} blocks</div>
+                   <div class="lg">${ore.map(row).join('')}</div>` : '')
+    + (rest.length ? `<div class="lg-h">terrain</div><div class="lg">${rest.map(row).join('')}</div>` : '')
+    + `<div class="lg">
+         <span title="solid, but the block index does not say what"><i class="swatch"
+           style="background:${hexOf(UNKNOWN_COLOR)}"></i>unidentified${unknown > 0 ? ' · ' + unknown : ''}</span>
+       </div>`
+    + (entries.length ? '' : '<div class="muted">no block identities yet</div>');
+  el.className = '';
 }
 
 /** Ground level under a position, searching outward a little so a drone over a gap still gets one. */
@@ -746,6 +1001,20 @@ function guarded(fn) {
   };
 }
 
+/**
+ * The last block index that actually arrived, and when.
+ *
+ * MapServer.BlockAt times out often — roughly one poll in three at the moment. Rebuilding the
+ * terrain from a failed call repaints the whole world back to unidentified grey, so the map
+ * strobes between "here is your sandstone and three iron seams" and "we know nothing", every
+ * fifteen seconds, for a reason that has nothing to do with the world.
+ *
+ * Identity is not volatile — a block that was sandstone a minute ago still is. So the last good
+ * index is kept and reused, and the HUD says how old it is. Stale-and-labelled beats blank.
+ */
+let lastBlockAt = null;
+let blockAtAt = 0;
+
 async function pollVoxels() {
   // Say "loading" while the first fetch is in flight. A cold LoadWorld is a rednet round-trip over
   // a grid of several thousand cells and can take fifteen seconds; leaving the field as an ellipsis
@@ -758,13 +1027,19 @@ async function pollVoxels() {
     // Identity is optional. world.blocks needs a MapServer that has been synced with the BlockAt
     // endpoint; until then the terrain renders unidentified rather than not at all.
     const b = dataOf(r.blocks);
-    const focus = buildTerrain(v.cells ?? {}, v.bounds, b?.blockAt);
+    if (b?.blockAt) { lastBlockAt = b.blockAt; blockAtAt = Date.now(); }
+    const stale = !b?.blockAt && lastBlockAt;
+    const focus = buildTerrain(v.cells ?? {}, v.bounds, b?.blockAt ?? lastBlockAt);
     frameOnce(focus ?? v.bounds);
     $('h-cells').textContent = `${v.solid} solid / ${v.known} known`;
-    $('h-ident').textContent = b
-      ? `${gTerrain.userData.identified ?? 0} of ${gTerrain.userData.drawn ?? 0} drawn`
-      : 'not available';
-    $('h-ident').style.color = b ? '' : 'var(--warn)';
+    const age = Math.round((Date.now() - blockAtAt) / 1000);
+    $('h-ident').textContent = !lastBlockAt ? 'not available'
+      : `${gTerrain.userData.identified ?? 0} of ${gTerrain.userData.drawn ?? 0} drawn`
+        + (stale ? ` · ${age}s old` : '');
+    $('h-ident').style.color = !lastBlockAt || stale ? 'var(--warn)' : '';
+    const ore = gTerrain.userData.ore ?? 0;
+    $('h-ore').textContent = lastBlockAt ? `${ore} block${ore === 1 ? '' : 's'}` : 'not available';
+    $('h-ore').style.color = !lastBlockAt ? 'var(--warn)' : (ore ? '#ffe14d' : '');
   } catch (err) {
     $('h-cells').textContent = 'unavailable';
     // A bridge that is down is already reported once, in the HUD, by the state poll. Repeating it
@@ -1038,6 +1313,9 @@ addEventListener('pointermove', (e) => {
 // ── layer toggles ──────────────────────────────────────────────────────────
 
 $('t-solid').onchange = (e) => { gTerrain.visible = e.target.checked; };
+// Flips material flags on the meshes already uploaded — no rebuild, so it is instant even at
+// 140,000 instances, and the terrain poll does not have to have come back for it to work.
+$('t-xray').onchange  = (e) => { applyXray(e.target.checked); };
 $('t-air').onchange   = (e) => { gAir.visible = e.target.checked; };
 $('t-caves').onchange = (e) => { gCaves.visible = e.target.checked; };
 $('t-mats').onchange  = (e) => { gMats.visible = e.target.checked; };

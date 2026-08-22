@@ -428,29 +428,36 @@ function load()
 
     if fs.isDir(CHUNK_DIR) then
         loadNames()
+        -- Counted ACROSS files, not within one.
+        --
+        -- This was declared inside the per-file loop, so it reset on every chunk -- and with 70
+        -- chunks averaging ~3,000 rows, most files finished before the counter ever reached its
+        -- threshold. The net effect was almost no yielding across a 227,000-row load, and CC hard
+        -- kills a computer that runs ten seconds without yielding. That abort is NOT catchable by
+        -- pcall, which is why the bootloader never recorded a reason: MapServer simply vanished and
+        -- restarted, 104 times, with the map frozen throughout.
+        -- READ EACH FILE WHOLE, PARSE IN LUA.
+        --
+        -- readLine() is one call across the CC/JVM boundary per line, and this load is 227,000
+        -- lines: even with the crash loop fixed, MapServer spent minutes inside it and answered
+        -- nothing the whole time. readAll plus gmatch is a single boundary crossing per FILE, and
+        -- the parsing happens in Lua where it is cheap. Same lesson as the buffered writes.
         for _, name in ipairs(fs.list(CHUNK_DIR)) do
-          -- Skip staging files from an interrupted save; they are partial by definition.
           if not name:match("%.new$") then
-            local f = readLines("chunks/" .. name)
-            if f then
-                while true do
-                    local l = f.readLine()
-                    if l == nil or l == "=" then break end
-                    local t = l:match("^seen=(%d+)$")
+            local h = fs.open(CHUNK_DIR .. "/" .. name, "r")
+            if h then
+                local s_Body = h.readAll() or ""
+                h.close()
+                if s_Body:sub(1, #MAP_MAGIC) == MAP_MAGIC then
+                    -- Header runs to the "=" terminator; the rest is rows.
+                    local s_Split = s_Body:find("\n=\n", 1, true)
+                    local s_Head = s_Split and s_Body:sub(1, s_Split) or ""
+                    local s_Rows = s_Split and s_Body:sub(s_Split + 3) or ""
+
+                    local t = s_Head:match("seen=(%d+)")
                     if t then m_Seen[name] = tonumber(t) end
-                end
-                local s_Row = 0
-                while true do
-                    local l = f.readLine()
-                    if l == nil then break end
-                    -- YIELD. CC kills a coroutine that runs ten seconds without yielding, and
-                    -- reading 175,000 rows across fifty-two files is comfortably past that:
-                    -- MapServer died on its own map with "Too long without yielding" and
-                    -- crash-looped, taking the whole fleet's pathfinding with it.
-                    s_Row = s_Row + 1
-                    if s_Row % 2000 == 0 then os.sleep(0) end
-                    local k, occ, nid = l:match("^(.-)=(%-?[%d.]+),(%d+)$")
-                    if k then
+
+                    for k, occ, nid in s_Rows:gmatch("([^\n=]+)=([^,\n]+),(%d+)") do
                         cachedWorld[k] = tonumber(occ)
                         local id = tonumber(nid)
                         if id and id > 0 and m_Names[id] then
@@ -459,8 +466,10 @@ function load()
                         s_Cells = s_Cells + 1
                     end
                 end
-                f.close()
             end
+            -- One yield per file rather than per row: 70 yields instead of 455, and the work
+            -- between them is now bounded by one file rather than unbounded.
+            os.sleep(0)
           end
         end
         print("loaded " .. s_Cells .. " cells from " .. #fs.list(CHUNK_DIR) .. " chunks")

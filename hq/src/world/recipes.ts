@@ -123,6 +123,11 @@ export const RECIPES: Recipe[] = [
   // after which StorageMan can move items between them directly. That is the conveyor: it runs at
   // server speed, costs no fuel, and needs no drone. Turtles hauling between factories is what you
   // do BEFORE you can afford this, not the goal.
+  // The full-block form, which is what a TURTLE can place: turtle.place fills a cell, and the flat
+  // modem has to be applied to the face of an existing block. Shapeless, straight from the flat one
+  // -- verified against computercraft/recipe/wired_modem_full_from.json rather than assumed.
+  { output: 'computercraft:wired_modem_full', yields: 1, inputs: { 'computercraft:wired_modem': 1 },
+    station: 'inventory', grid: ['computercraft:wired_modem'] },
   { output: 'computercraft:wired_modem', yields: 1, inputs: { [ST]: 8, [RD]: 1 },
     station: 'inventory', grid: [ST, ST, ST, ST, RD, ST, ST, ST, ST] },
   { output: 'computercraft:cable', yields: 6, inputs: { [ST]: 5, [RD]: 1 },

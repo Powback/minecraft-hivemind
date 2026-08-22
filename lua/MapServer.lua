@@ -20,7 +20,12 @@ end
 m_Overlay = nil
 
 function Init()
+    -- Log each boot step. These go to MapServer.log, unlike print(), which goes to a terminal
+    -- nobody is looking at -- and MapServer spent several boots hung with no way to tell WHICH
+    -- step it was hung in. A boot that can be observed is a boot that can be fixed.
+    Log("boot: loading map")
     PowGPSServer.loadAll()
+    Log("boot: map loaded")
     if DATA["bounds"] == nil then
         -- Matches the force-loaded region. Deliberately a little inside it, so a drone stops
         -- before the edge rather than exactly on it.
@@ -80,7 +85,9 @@ function Init()
     end
     -- Called by global name on purpose: it is defined further down, after locals this function
     -- cannot see. Globals resolve at call time, so this works and a direct reference would not.
+    Log("boot: backfilling blockAt")
     BackfillBlockAt()
+    Log("boot: indexing names")
 
     -- REBUILD THE ORE INDEX FROM THE MAP ON DISK.
     --
@@ -95,7 +102,7 @@ function Init()
     -- again, while miners tunnelled past it. Rebuilding here is what makes a survey worth anything
     -- once the module has been restarted.
     local s_N = IndexNames(PowGPSServer.getCachedWorldDetail())
-    print("indexed " .. tostring(s_N) .. " named blocks from the saved map")
+    Log("boot: ready, indexed " .. tostring(s_N) .. " named blocks")
 end
 
 function OnSaveWorld(p_ID, p_Message)
@@ -144,8 +151,14 @@ function OnSaveWorld(p_ID, p_Message)
     --
     -- Losing five minutes of observations to a crash costs nothing -- the next scan re-derives them.
     -- A map server nobody can reach costs the whole fleet.
+    -- SIXTY SECONDS. The five-minute throttle was set when a save meant rewriting the entire map
+    -- and blocking the module for the duration. Chunked dirty saves cost a few kilobytes, so the
+    -- reason for the long interval is gone -- and the cost of it is not: `computercraft shutdown`
+    -- powers the computer off without running the module's exit save, so every restart threw away
+    -- up to five minutes of observations. The map went 294,713 -> 227,461 cells across one deploy
+    -- for exactly that reason.
     m_LastSave = m_LastSave or 0
-    if os.clock() - m_LastSave > 300 then
+    if os.clock() - m_LastSave > 60 then
         m_LastSave = os.clock()
         PowGPSServer.saveAll()
     end
@@ -167,11 +180,19 @@ function OnLoadWorld(p_ID, p_Message)
     local s_Limit  = math.min(tonumber(d.limit) or WORLD_PAGE, WORLD_PAGE)
     local s_World  = PowGPSServer.getCachedWorld() or {}
 
-    -- Whole map in one reply when the caller does not ask for a page, so anything in-world that
-    -- already depends on this keeps working.
-    if d.offset == nil and d.limit == nil then
-        return true, {cachedWorld = s_World}
-    end
+    -- NO WHOLE-MAP REPLY. There is no caller that wants one and no transport that can carry it.
+    --
+    -- This existed so that "anything in-world that already depends on this keeps working" -- but
+    -- nothing does: the only caller is HQ, and it has always paged. What it actually was is a
+    -- landmine. At 227,000 cells the reply is megabytes, which exceeds the websocket frame limit
+    -- outright and would flood rednet for every other module sharing the channel. The fleet has
+    -- already been taken down once by a drone putting its whole map on the wire (SavePath); leaving
+    -- a second way to do it, triggered by simply omitting an argument, is asking for the same
+    -- outage from a different direction.
+    --
+    -- An unpaged request now means "start at the beginning", which is what a caller that forgets
+    -- to page almost certainly wanted anyway.
+    local s_Unpaged = (d.offset == nil and d.limit == nil)
 
     -- BUILD THE KEY LIST ONCE, then serve slices of it.
     --
@@ -463,7 +484,11 @@ function BackfillBlockAt()
     if DATA["blockAt"] ~= nil then return 0 end       -- already migrated
     DATA["blockAt"] = {}
     local s_N = 0
+    local s_Walked = 0
     for name, e in pairs(DATA["blockIndex"] or {}) do
+        -- Same reason as IndexNames: this runs at boot over whatever the index has accumulated.
+        s_Walked = s_Walked + 1
+        if s_Walked % 500 == 0 then os.sleep(0) end
         for _, q in ipairs(e.at or {}) do
             if q and q.x then
                 DATA["blockAt"][q.x .. ":" .. q.y .. ":" .. q.z] = name
@@ -480,7 +505,14 @@ end
 function IndexNames(p_Detail)
     if type(p_Detail) ~= "table" then return 0 end
     local s_Changed = 0
+    -- YIELD. This is called at boot over the ENTIRE saved map -- 227,000 cells -- and CC terminates
+    -- any coroutine that runs ten seconds without yielding. MapServer died roughly 27 seconds into
+    -- every boot and restarted, 103 times, with the map frozen the whole while. It is also called
+    -- per-upload with a handful of cells, where the yield costs nothing.
+    local s_Seen = 0
     for key, info in pairs(p_Detail) do
+        s_Seen = s_Seen + 1
+        if s_Seen % 2000 == 0 then os.sleep(0) end
         local s_Name
         if type(info) == "table" then
             local s_Data = info.data

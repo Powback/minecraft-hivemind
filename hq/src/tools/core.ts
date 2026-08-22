@@ -602,7 +602,17 @@ registry.register({
 // The distinction between 0 and absent is the whole value of the map, so we never collapse them.
 
 /** How long a fetched grid stays good. */
-const VOXEL_CACHE_MS = 10_000;
+// FIVE MINUTES, not ten seconds.
+//
+// Terrain is the slowest-changing thing in the world -- drones reveal it a few hundred cells at a
+// time -- and re-reading ALL of it every ten seconds meant 115 paged round trips per refresh
+// against the single busiest module in the fleet. MapServer spent most of its life serving the same
+// 230,000 cells to the same map page, which is why it answered everything else slowly.
+//
+// It also produced the "corrupt map": when paging timed out part way, the render got whatever
+// fraction had arrived, so /map drew a world with most of the blocks missing and redrew a DIFFERENT
+// fraction on the next poll. A five-minute cache is both far cheaper and far more stable to look at.
+const VOXEL_CACHE_MS = 300_000;
 let voxelCache: { at: number; grid: Record<string, number> } | null = null;
 /**
  * A single in-flight fetch shared by every concurrent caller. The cache alone is not enough: the
@@ -717,7 +727,8 @@ registry.register({
 // of the occupancy grid -- only positions a drone reported a name for -- so a missing key means
 // "solid but unidentified", never "air". Collapsing those two would draw holes in the ground.
 
-const BLOCKS_CACHE_MS = 15_000;
+// Same reasoning as the voxel cache: block identity changes only when a drone reports a new name.
+const BLOCKS_CACHE_MS = 300_000;
 let blocksCache: { at: number; map: Record<string, string> } | null = null;
 let blocksInflight: Promise<Record<string, string>> | null = null;
 
@@ -795,7 +806,16 @@ registry.register({
     if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
     const res: any = await bridge.call('TaskMan', 'GetTasks', {}, { timeoutMs: 8000 });
     const raw = res?.tasks ?? res?.data?.tasks ?? [];
-    return { count: raw.length, tasks: raw.map(describeTask) };
+    // LIVE WORK FIRST, and only a handful of finished ones.
+    //
+    // Returning every task ever created meant 149 entries of which 22 were live, so the answer to
+    // "what is the fleet doing" was mostly surveys that completed hours ago. TaskMan prunes them on
+    // its own timer now; this caps what a caller sees regardless, because the queue can still be
+    // large right after a burst of work.
+    const all = raw.map(describeTask);
+    const live = all.filter((t: any) => (t.progress ?? 0) < 100);
+    const done = all.filter((t: any) => (t.progress ?? 0) >= 100).slice(-10);
+    return { count: all.length, live: live.length, tasks: [...live, ...done] };
   },
 });
 
@@ -810,7 +830,21 @@ registry.register({
  */
 function describeTask(t: any) {
   const work = t?.work ?? {};
-  const verb = Object.keys(work)[0];
+  const rawVerb = Object.keys(work)[0];
+  // THREE KINDS OF LOOKING, and they are not the same job.
+  //
+  //   explore  go and find ground nobody has seen. Speculative, chosen by a spiral, lowest value
+  //            per scan but the only thing that grows the map outward.
+  //   scout    examine something already known to be interesting -- a cave, an ore cluster. The
+  //            scanner reads exposed material rather than solid rock, so a scan is worth far more.
+  //   assist   support another drone where it is standing. A miner cutting through unmapped rock
+  //            with a scanner overhead stops digging blind, which is the entire point of pairing.
+  //
+  // They were all dispatched as "survey", so the queue could not distinguish a scout flying across
+  // the base on a guess from one sent to help a miner right now -- and neither could anyone reading
+  // it. The kind rides along inside work.survey, so TaskMan passes it through untouched.
+  const verb = rawVerb === 'survey' && typeof work.survey?.kind === 'string'
+    ? work.survey.kind : rawVerb;
   const w: any = verb ? work[verb] : undefined;
   let region: { min: Vec3; max: Vec3 } | null = null;
   let targets: Vec3[] | null = null;
