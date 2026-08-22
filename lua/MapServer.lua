@@ -174,11 +174,22 @@ local LOADER_REACH = 16     -- chunkyTurtleRadius is 0, i.e. its own chunk; 16 b
 -- Modem range rises with altitude: modem_range 64 at the bottom, modem_high_altitude_range 384
 -- at build height, interpolated. Hosts sitting at y=95 therefore reach roughly 196 blocks, which
 -- is why the constellation was put up there rather than at ground level.
+-- CC:T does NOT interpolate. modem_high_altitude_range applies above world height / 2 -- about
+-- y=192 in the overworld -- and below that the range is a flat modem_range, 64 blocks.
+--
+-- The old formula interpolated and reported ~191 blocks of reach for hosts at y=95, so Coverage()
+-- claimed GPS across the whole operating region and inBounds cheerfully let drones fly out of it.
+-- Two of them stranded that way at z=12, roughly 60 blocks from the constellation: unable to fix,
+-- therefore unable to navigate, therefore unable to move back into coverage.
+--
+-- Raising the constellation would not help either, because GPS is a round trip -- the DRONE's own
+-- transmitter has the same 64-block range, so it must be near the hosts regardless of how high they
+-- are. Coverage is a 64-block bubble and the honest thing is to say so.
+local GPS_HIGH_ALTITUDE_Y = 192
+
 local function gpsReach(p_Y)
-    local s_Lo, s_Hi = 64, 384
-    local t = (p_Y + 64) / 384                 -- world spans y=-64..320
-    if t < 0 then t = 0 elseif t > 1 then t = 1 end
-    return math.floor(s_Lo + t * (s_Hi - s_Lo))
+    if p_Y and p_Y > GPS_HIGH_ALTITUDE_Y then return 384 end
+    return 64
 end
 
 function Coverage()

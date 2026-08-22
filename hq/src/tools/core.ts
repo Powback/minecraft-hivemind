@@ -89,6 +89,10 @@ async function refreshFleet(): Promise<void> {
         // generic "has gone quiet" -- which describes a drone that said NOTHING, the opposite of
         // what happened, and sends you looking for a comms fault instead of reading the reason.
         stuck: typeof d.stuck === 'string' ? d.stuck : undefined,
+        // Which drones are currently acting as GPS hosts. Coverage is no longer a fixed bubble
+        // around four computers -- it is whatever the parked fleet is collectively reaching -- so
+        // "who is relaying" is now a thing an operator needs to be able to see.
+        hosting: d.hosting === true ? true : undefined,
         fuel: typeof d.fuel === 'number' ? d.fuel : 0,
         pos: d.pos && typeof d.pos.x === 'number' ? d.pos : undefined,
       };
@@ -1468,7 +1472,10 @@ registry.register({
       const o = RESCUE_OFFSETS[i % RESCUE_OFFSETS.length];
       const pos = { x: at.x + o.x, y: at.y + o.y, z: at.z + o.z };
       try {
-        await bridge.call('DroneMan', 'GoTo', { id: party[i].id, pos }, { timeoutMs: 15000 });
+        // Generous: DroneMan aborts the drone before sending, and doing that for each member of a
+        // party in turn easily outruns a tight budget -- the order then reports failure while the
+        // work is actually happening, which is the most misleading outcome available.
+        await bridge.call('DroneMan', 'GoTo', { id: party[i].id, pos }, { timeoutMs: 40000 });
         sent.push({ id: party[i].id, name: party[i].name, role: party[i].role, pos });
       } catch (err) {
         sent.push({ id: party[i].id, role: party[i].role, error: (err as Error)?.message ?? String(err) });

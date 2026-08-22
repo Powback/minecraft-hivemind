@@ -174,6 +174,27 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
     detail.filter((d: any) => typeof d.name === 'string' && d.name.includes(m))
           .reduce((n: number, d: any) => n + (d.count ?? 0), 0);
 
+  // WHAT IS ALREADY QUEUED.
+  //
+  // The cooldown stops a material being re-dispatched every tick, and it does NOT stop the queue
+  // filling with duplicates over hours: each cooldown expiry adds another identical survey while
+  // the first one is still waiting for the single scout to become free. Seven copies of
+  // "find-coal_ore" piled up that way, so the queue looked busy and nothing was being achieved --
+  // there was one scout and eight jobs that all needed one.
+  //
+  // A shortage that already has work outstanding does not need more work; it needs the work to
+  // finish.
+  let queued = new Set<string>();
+  try {
+    const res: any = await bridge.call('TaskMan', 'GetTasks', {}, { timeoutMs: 8000 });
+    for (const t of res?.tasks ?? res?.data?.tasks ?? []) {
+      if ((t?.progress ?? 0) < 100 && typeof t?.name === 'string') queued.add(t.name);
+    }
+  } catch {
+    // Unknown queue: fall through and rely on the cooldown alone rather than refusing to act.
+    queued = new Set();
+  }
+
   const now = Date.now();
   // Each role can take one job per tick. A tick can therefore start a dig AND a survey, which is
   // the point: the scan that finds the next vein should not have to wait for the current one to
@@ -206,6 +227,11 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
         supply.lastAction = `prospect for ${rule.match}`;
         note(`${rule.match}: ${have}/${rule.min} → prospecting at y=${rule.depth ?? 40}`);
         did.push(`prospect ${rule.match}`);
+        continue;
+      }
+
+      if (rule.action === 'craft' && [...queued].some((n) => n.startsWith(`craft-${stockKey(rule).replace(/^.*:/, '')}`))) {
+        note(`${rule.match}: ${have}/${rule.min}, already being crafted`);
         continue;
       }
 

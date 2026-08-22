@@ -294,7 +294,11 @@ local m_NoFixStops    = 0
 
 function verifyPosition()
     if not startGPS() then return nil, "no modem for gps" end
-    local x, y, z = gps.locate(2, false)
+    -- Five seconds, not two. The hosts are ordinary computers serving the whole fleet, and a
+    -- tight timeout turns "busy" into "out of coverage" -- which then freezes the drone, because
+    -- movement is gated on having a fix. D3 sat unable to move with all four hosts up and 50-65
+    -- blocks away, well inside range.
+    local x, y, z = gps.locate(5, false)
     if x == nil then return nil, "no gps fix" end
     if cachedX ~= nil then
         m_Drift = math.abs(x - cachedX) + math.abs(y - cachedY) + math.abs(z - cachedZ)
@@ -358,6 +362,9 @@ end
 -- True if it is safe to take another step. Re-fixes when the budget runs out, and REFUSES when no
 -- fix can be had -- a drone that stops inside the world is recoverable, one that wanders out of it
 -- is not. That is the whole trade, and it is not close.
+-- Consecutive refusals before we accept that staying put is worse than moving on dead reckoning.
+local NO_FIX_GRACE = 3
+
 function requireFix()
     if m_Recovering then return true end          -- see setRecovering
     if m_MovesSinceFix < MOVES_PER_FIX and positionVerified() then
@@ -369,6 +376,23 @@ function requireFix()
         return true
     end
     m_NoFixStops = m_NoFixStops + 1
+
+    -- DO NOT FREEZE FOREVER.
+    --
+    -- Refusing to move without a fix protects the map from a drifted drone writing nonsense. Taken
+    -- absolutely it also strands the drone: the places where a fix fails are exactly the places it
+    -- must move OUT of, and it cannot, so it sits reporting "working" and holding a task while the
+    -- fleet waits for it. That is a worse failure than a little uncertainty.
+    --
+    -- So after a few refusals it moves anyway, on the last known position. Observations stay
+    -- suppressed while unverified (see noteCleared), so it can travel back into coverage without
+    -- being trusted to describe what it sees on the way.
+    if m_NoFixStops >= NO_FIX_GRACE then
+        print("no GPS after " .. m_NoFixStops .. " tries -- moving on dead reckoning to regain coverage")
+        m_NoFixStops = 0
+        m_MovesSinceFix = 0
+        return true
+    end
     return false
 end
 

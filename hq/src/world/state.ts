@@ -46,6 +46,8 @@ export interface Drone {
   reported?: string;
   /** The drone's OWN account of why it stopped. It said this; do not paraphrase it away. */
   stuck?: string;
+  /** Answering GPS pings right now, extending coverage for everyone else. */
+  hosting?: boolean;
   /**
    * epoch ms of last heartbeat. Silence is the primary loss signal.
    *

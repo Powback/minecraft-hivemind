@@ -1819,33 +1819,73 @@ function OnRelay(p_ID, p_Message)
     return true, {hosting = true, pos = m_HostPos}
 end
 
+-- THE FLEET AS A MESH.
+--
+-- The constellation is four computers and a modem reaches 64 blocks below y=192, so GPS is a
+-- 64-block bubble around the base -- and a drone needs FOUR hosts to fix at all. Every drone that
+-- flies past that edge loses its position, and a drone with no position cannot navigate, so it
+-- cannot get back. That is how two of them stranded.
+--
+-- But the fleet is already a set of machines with wireless modems that mostly know where they are.
+-- Any drone parked with a confirmed fix can answer pings exactly as a host computer does, so
+-- coverage stops being a fixed bubble and becomes something the fleet EXTENDS by being spread out.
+-- A chain of parked drones reaches anywhere one of them can reach.
+--
+-- This was already written and limited to loaders, which is one drone. Every idle drone can do it.
+--
+-- THE THING THAT MUST NOT HAPPEN: a relay publishing a position it is not sure of. GPS has no way
+-- to say "roughly" -- a host that answers with a wrong position hands every drone in range a
+-- confidently wrong fix, and they will navigate on it. D4 is sitting 24 blocks from where it
+-- believes it is right now; if it relayed that, it would corrupt the position of every drone that
+-- trusted it. So a relay proves itself against a REAL fix before hosting, re-proves it on every
+-- cycle, and stands down the instant it moves, drifts, or loses the fix.
+local RELAY_DRIFT_LIMIT = 1     -- blocks; a host that has moved at all is no longer where it says
+
 local function gpsRelay()
     while true do
         os.sleep(10)
-        if Role() == "loader" and m_Status == "idle" and not executing then
-            local hx, hy, hz = pgps.getCachedPosition()
-            if hx and not m_Hosting then
-                local s_Modem = peripheral.find("modem")
-                if s_Modem then
-                    -- Re-anchor before broadcasting: dead reckoning is good enough to navigate
-                    -- with and not good enough to publish.
-                    local fx, fy, fz = gps.locate(4, false)
-                    if fx then
-                        s_Modem.open(gps.CHANNEL_GPS)
-                        m_Hosting = true
-                        m_HostPos = {x = fx, y = fy, z = fz}
-                        print("GPS relay hosting at " .. fx .. "," .. fy .. "," .. fz)
-                        SendHeartBeat()
-                    end
+
+        local s_Eligible = (m_Status == "idle") and not executing
+        local s_Modem = peripheral.find("modem")
+
+        if s_Eligible and s_Modem then
+            -- Anchor on a fix of our OWN, every cycle. Dead reckoning is good enough to navigate
+            -- with and never good enough to publish.
+            local fx, fy, fz = gps.locate(5, false)
+
+            if fx == nil then
+                trace("relay: no fix of my own (status=" .. tostring(m_Status) .. ")")
+                if m_Hosting then
+                    pcall(s_Modem.close, gps.CHANNEL_GPS)
+                    m_Hosting, m_HostPos = false, nil
+                    print("GPS relay stopped (lost my own fix)")
                 end
+            elseif m_Hosting and m_HostPos then
+                -- Still here? A host that has drifted is worse than no host at all.
+                local s_Drift = math.abs(fx - m_HostPos.x) + math.abs(fy - m_HostPos.y)
+                             + math.abs(fz - m_HostPos.z)
+                if s_Drift > RELAY_DRIFT_LIMIT then
+                    m_HostPos = {x = fx, y = fy, z = fz}
+                    print("GPS relay re-anchored (moved " .. s_Drift .. ")")
+                end
+            else
+                s_Modem.open(gps.CHANNEL_GPS)
+                m_Hosting = true
+                m_HostPos = {x = fx, y = fy, z = fz}
+                trace(("relay: hosting at %d,%d,%d"):format(fx, fy, fz))
+                print("GPS relay hosting at " .. fx .. "," .. fy .. "," .. fz)
+                SendHeartBeat()
             end
-        elseif m_Hosting and (m_Status ~= "idle" or executing) then
-            -- About to move: stop answering rather than lie.
-            local s_Modem = peripheral.find("modem")
+
+        elseif not s_Eligible then
+            trace("relay: not eligible (status=" .. tostring(m_Status) ..
+                  " executing=" .. tostring(executing) .. " modem=" .. tostring(s_Modem ~= nil) .. ")")
+        end
+        if m_Hosting and not s_Eligible then
+            -- About to move, or busy: stop answering rather than lie.
             if s_Modem then pcall(s_Modem.close, gps.CHANNEL_GPS) end
-            m_Hosting = false
-            m_HostPos = nil
-            print("GPS relay stopped (moving)")
+            m_Hosting, m_HostPos = false, nil
+            print("GPS relay stopped (working)")
         end
     end
 end
@@ -1874,6 +1914,84 @@ local m_Missed = 0
 local function heartbeat()
     while true do
         os.sleep(HEARTBEAT_SECONDS)
+
+        -- KEEP TRYING TO WORK OUT WHERE WE ARE.
+        --
+        -- Init establishes position once. A drone that boots while GPS happens to be unreachable
+        -- therefore has NO position for the rest of its life -- it cannot navigate, so it cannot
+        -- move somewhere with coverage, so it never gets one. It still heartbeats, so DroneMan goes
+        -- on reporting the last position it ever knew and the drone looks fine while being unable
+        -- to accept any work at all. D3 sat like that with all four GPS hosts up and in range.
+        if pgps.getCachedPosition() == nil then
+            local ok = pgps.verifyPosition()
+            if ok then
+                print("position re-established")
+                SendHeartBeat()
+            elseif pgps.trailLength() > 0 then
+                -- WALK BACK ALONG WHERE WE CAME FROM.
+                --
+                -- A drone with no position cannot navigate ANYWHERE -- it has no idea where it is,
+                -- so it cannot compute a route out of the dead zone it is sitting in. The one thing
+                -- it still knows is the sequence of moves it made getting here, and the coverage it
+                -- lost was working somewhere back along that trail.
+                --
+                -- This is the only escape that does not require knowing your position, which is
+                -- exactly the thing that is missing.
+                print("no position -- retracing " .. pgps.trailLength() .. " crumbs to find coverage")
+                m_Status = "recovering"
+                pgps.setRecovering(true)
+                local s_Steps = 0
+                while s_Steps < 80 do
+                    local bx, by, bz = pgps.trailBack()
+                    if bx == nil then break end
+                    s_Steps = s_Steps + 1
+                    pgps.flyTo(bx, by, bz, 24)
+                    if pgps.verifyPosition() then
+                        print("coverage regained after " .. s_Steps .. " crumbs")
+                        break
+                    end
+                end
+                pgps.setRecovering(false)
+                m_Status = "idle"
+                SendHeartBeat()
+            else
+                -- NO POSITION AND NO TRAIL: search for coverage.
+                --
+                -- Breadcrumbs live in memory, so a drone that reboots while stranded has nothing to
+                -- retrace and cannot compute a route either -- it does not know where it is. The
+                -- only move left is the one a real robot would make: go somewhere, anywhere, and
+                -- keep asking. Coverage is a 64-block bubble, so a drone that fell out of it is
+                -- usually just past the edge and a short walk gets back in.
+                --
+                -- Bounded and reported, because a machine wandering blind is only acceptable as a
+                -- deliberate, finite last resort.
+                print("no position and no trail -- searching for GPS coverage")
+                m_Status = "recovering"
+                pgps.setRecovering(true)
+                local s_Found = false
+                for leg = 1, 4 do
+                    if s_Found then break end
+                    for step = 1, 16 do
+                        if not pgps.forward() then break end
+                        if step % 4 == 0 and pgps.verifyPosition() then
+                            print("coverage found after " .. ((leg - 1) * 16 + step) .. " blocks")
+                            s_Found = true
+                            break
+                        end
+                    end
+                    if not s_Found then pgps.turnRight() end
+                end
+                pgps.setRecovering(false)
+                m_Status = "idle"
+                if s_Found then
+                    SendHeartBeat()
+                else
+                    -- Loud, because from outside this is indistinguishable from a drone that is
+                    -- simply idle, and it is the reason it will refuse every job it is offered.
+                    Distress("no position", "searched for coverage and found none; needs a relay")
+                end
+            end
+        end
         if SendHeartBeat() then
             m_Missed = 0
         else
