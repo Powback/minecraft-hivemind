@@ -411,3 +411,32 @@ computer is missing from it, the chunk is not loaded -- `forceload add` the area
 rather than assuming the machine was destroyed. D3 was found this way at -25,117,-129 while
 reporting -25,117,-105: 24 blocks of dead-reckoning drift had walked it out of the force-loaded
 region, where it froze and became invisible.
+
+## Turtles do not mount disk drives; computers do
+
+Tested directly, because `bin/pownet-drone.sh` asserts the opposite ("a drone parked next to the
+drive would get the module bootloader instead") and that belief cost several failed attempts at an
+in-world hatchery.
+
+The experiment: one disk drive holding a boot floppy, a blank TURTLE placed on one side and a blank
+COMPUTER on the other, both powered on.
+
+    computer #201  ->  PowNet and startup written, provisioned itself, joined the fleet
+    turtle   #200  ->  nothing at all, no files, never registered
+
+So `disk/startup` commissioning works for computers and CANNOT work for turtles. That comment in
+pownet-drone.sh is wrong and should not be trusted.
+
+Consequence for self-replication: the fleet can craft a turtle, and cannot COMMISSION one from
+inside the world. Module servers, monitors and storage controllers can be hatched; drones still need
+their first files seeded from the host. Any future attempt at turtle commissioning needs a mechanism
+other than a disk drive.
+
+The floppy itself must INSTALL before it runs. DroneBoot's first line is `os.loadAPI("PowNet")`,
+which reads /PowNet from the machine's own root -- so running it straight off the disk fails on a
+blank machine with the API sitting right there in the wrong place. `disk/startup` copies PowNet and
+the bootloader to the root and reboots.
+
+Disk drive NBT is `Item:` (singular), not `Items:[]`:
+
+    data merge block <x> <y> <z> {Item:{components:{"computercraft:disk_id":1},count:1,id:"computercraft:disk"}}

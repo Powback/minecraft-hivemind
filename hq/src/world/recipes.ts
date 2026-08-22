@@ -57,6 +57,11 @@ export const SOURCES: Record<string, { action: 'gather' | 'lumber' | 'smelt'; bl
   'minecraft:coal':      { action: 'gather', block: 'coal_ore' },
   'minecraft:raw_iron':  { action: 'gather', block: 'iron_ore' },
   'minecraft:redstone':  { action: 'gather', block: 'redstone_ore' },
+  // Deep, but reachable: prospecting already sinks shafts and drives tunnels, and diamond is the
+  // difference between a turtle that chews stone and one that works at a useful rate.
+  'minecraft:diamond':   { action: 'gather', block: 'diamond_ore' },
+  // Grows by water. Not minable, but a farm is a job the fleet already has a verb for.
+  'minecraft:sugar_cane': { action: 'gather', block: 'sugar_cane' },
 };
 
 const P = 'minecraft:oak_planks';
@@ -125,6 +130,68 @@ export const RECIPES: Recipe[] = [
 
   { output: 'computercraft:disk_drive', yields: 1, inputs: { [ST]: 7, [RD]: 2 },
     station: 'inventory', grid: [ST, ST, ST, ST, RD, ST, ST, RD, ST] },
+
+  // ── Specialised drones ───────────────────────────────────────────────────
+  { output: 'minecraft:redstone_block', yields: 1, inputs: { [RD]: 9 }, station: 'inventory',
+    grid: Array(9).fill(RD) },
+  { output: 'minecraft:iron_bars', yields: 16, inputs: { [IR]: 6 }, station: 'inventory',
+    grid: [IR, IR, IR, IR, IR, IR, null, null, null] },
+
+  { output: 'minecraft:diamond_pickaxe', yields: 1,
+    inputs: { 'minecraft:diamond': 3, [S]: 2 }, station: 'inventory',
+    grid: ['minecraft:diamond', 'minecraft:diamond', 'minecraft:diamond',
+           null, S, null, null, S, null] },
+
+  // A tool becomes an UPGRADE by being crafted alongside the turtle -- CC:T handles the transform,
+  // so the grid is simply the two items together.
+  { output: 'computercraft:turtle_normal_pickaxe', yields: 1,
+    inputs: { 'computercraft:turtle_normal': 1, 'minecraft:diamond_pickaxe': 1 },
+    station: 'inventory',
+    grid: ['computercraft:turtle_normal', 'minecraft:diamond_pickaxe', null,
+           null, null, null, null, null, null] },
+
+  // Reachable, and the only part of a geo scanner that is.
+  { output: 'advancedperipherals:peripheral_casing', yields: 1,
+    inputs: { [IR]: 4, 'minecraft:iron_bars': 4, 'minecraft:redstone_block': 1 },
+    station: 'inventory',
+    grid: [IR, 'minecraft:iron_bars', IR,
+           'minecraft:iron_bars', 'minecraft:redstone_block', 'minecraft:iron_bars',
+           IR, 'minecraft:iron_bars', IR] },
+
+  // ── The rest of the base's own infrastructure ────────────────────────────
+  //
+  // Every one of these was placed by hand to get the fleet running. Leaving them out of the graph
+  // would mean the settlement could build drones and never build the things that COMMISSION and
+  // watch them -- permanently dependent on someone reaching in from outside.
+  { output: 'computercraft:monitor_normal', yields: 1, inputs: { [ST]: 8, [GP]: 1 },
+    station: 'inventory', grid: [ST, ST, ST, ST, GP, ST, ST, ST, ST] },
+
+  // A floppy: paper plus redstone. The hatchery's whole trick is a disk with a bootloader on it,
+  // so being able to make blank disks is what makes commissioning repeatable.
+  { output: 'computercraft:disk', yields: 1,
+    inputs: { 'minecraft:paper': 1, [RD]: 1 }, station: 'inventory' },
+  { output: 'minecraft:paper', yields: 3, inputs: { 'minecraft:sugar_cane': 3 },
+    station: 'inventory', grid: ['minecraft:sugar_cane', 'minecraft:sugar_cane', 'minecraft:sugar_cane',
+                                 null, null, null, null, null, null] },
+
+  // These two are recorded with their REAL inputs even though the fleet cannot complete them.
+  //
+  // Leaving them out entirely made the planner say "no recipe", which reads as "we forgot to add
+  // it". Recorded properly it says what it actually is: a scanner needs an observer (nether quartz)
+  // and a chunk loader needs an ender eye (blaze powder), so both are gated behind a NETHER
+  // EXPEDITION, not behind more mining. That is a different problem and worth naming as one.
+  { output: 'advancedperipherals:geo_scanner', yields: 1,
+    inputs: { 'minecraft:diamond': 4, 'computercraft:wired_modem_full': 1,
+              'advancedperipherals:peripheral_casing': 1, 'minecraft:redstone_block': 1,
+              'minecraft:observer': 1 },
+    station: 'inventory',
+    grid: ['minecraft:diamond', 'computercraft:wired_modem_full', 'minecraft:diamond',
+           'minecraft:diamond', 'advancedperipherals:peripheral_casing', 'minecraft:diamond',
+           'minecraft:redstone_block', 'minecraft:observer', 'minecraft:redstone_block'] },
+
+  { output: 'advancedperipherals:chunk_controller', yields: 1,
+    inputs: { [IR]: 4, [RD]: 4, 'minecraft:ender_eye': 1 }, station: 'inventory',
+    grid: [IR, RD, IR, RD, 'minecraft:ender_eye', RD, IR, RD, IR] },
 
   // A drone is useless without a tool. Iron rather than diamond: reachable from ore the fleet can
   // actually prospect for, and a turtle digs stone just as well with it.

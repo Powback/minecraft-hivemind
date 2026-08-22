@@ -68,7 +68,31 @@ const claimPost: Blueprint = {
   blocks: [0, 1, 2, 3].map((dy) => ({ dx: 0, dy, dz: 0, item: P })),
 };
 
-export const BLUEPRINTS: Blueprint[] = [claimPost, fieldCache, smelterBank];
+/**
+ * The hatchery: a disk drive holding a bootloader floppy, with a pad to stand a new machine on.
+ *
+ * A freshly crafted computer is blank -- no PowNet, no bootloader, no label -- and cannot be told
+ * anything over rednet because it is running nothing that listens. A drive with a boot floppy is
+ * the one mechanism that fixes that from inside the world: the ROM runs `disk/startup`, which
+ * installs PowNet and the bootloader and reboots into the fleet.
+ *
+ * VERIFIED, AND WITH A LIMIT WORTH KNOWING: a COMPUTER placed beside the drive commissions itself.
+ * A TURTLE placed beside the same drive does not -- turtles do not mount disk drives at all, only
+ * computers do. So this hatches module servers, monitors and storage controllers, and a crafted
+ * turtle still needs seeding from outside until a different mechanism is found.
+ */
+const hatchery: Blueprint = {
+  name: 'hatchery',
+  purpose: 'crafting',
+  summary: 'A disk drive with a boot floppy: commissions a blank COMPUTER into a fleet module.',
+  size: { w: 3, h: 2, l: 2 },
+  blocks: [
+    ...[-1, 0, 1].flatMap((dx) => [0, 1].map((dz) => ({ dx, dy: 0, dz, item: P }))),
+    { dx: 0, dy: 1, dz: 0, item: 'computercraft:disk_drive' },
+  ],
+};
+
+export const BLUEPRINTS: Blueprint[] = [claimPost, fieldCache, smelterBank, hatchery];
 
 export function blueprint(name: string): Blueprint | undefined {
   return BLUEPRINTS.find((b) => b.name === name);
