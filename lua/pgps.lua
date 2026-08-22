@@ -120,8 +120,14 @@ function setBounds(p_B)
         m_Chunks = p_B.minx and {p_B} or p_B
         m_Gps = nil
     end
-    print(("coverage: %d chunk region(s), %d gps region(s)"):format(
-        m_Chunks and #m_Chunks or 0, m_Gps and #m_Gps or 0))
+    -- m_Gps is now hosts+radius rather than a list of boxes, so describe whichever arrived.
+    local s_Gps = "none"
+    if m_Gps and m_Gps.hosts then
+        s_Gps = ("%d host(s) within %d"):format(#m_Gps.hosts, m_Gps.range or 64)
+    elseif m_Gps then
+        s_Gps = ("%d box(es)"):format(#m_Gps)
+    end
+    print(("coverage: %d chunk region(s), gps %s"):format(m_Chunks and #m_Chunks or 0, s_Gps))
 end
 
 function getBounds() return {chunks = m_Chunks, gps = m_Gps} end
@@ -140,8 +146,33 @@ local function distanceOutside(p_List, x, y, z)
     return s_Best or 0
 end
 
+-- Can a position hear enough GPS hosts to get a fix?
+--
+-- Radio range is a SPHERE and a fix needs four hosts. Testing an axis-aligned box instead said yes
+-- at the corners, which are half again as far as the range allows, and with only one host audible.
+-- A margin on top, because a drone that turns back exactly at the limit has already lost the link
+-- it needs to be told to turn back.
+local GPS_MARGIN = 8
+
+local function gpsOk(p_Gps, x, y, z)
+    if p_Gps == nil then return true end                 -- unspecified means unrestricted
+    if p_Gps.hosts == nil then return inAny(p_Gps, x, y, z) end   -- old box form, still honoured
+
+    local s_Range = (p_Gps.range or 64) - GPS_MARGIN
+    local s_Need  = p_Gps.need or 4
+    local s_Heard = 0
+    for _, h in ipairs(p_Gps.hosts) do
+        local dx, dy, dz = h.x - x, h.y - y, h.z - z
+        if (dx * dx + dy * dy + dz * dz) <= (s_Range * s_Range) then
+            s_Heard = s_Heard + 1
+            if s_Heard >= s_Need then return true end
+        end
+    end
+    return false
+end
+
 function inBounds(x, y, z)
-    return inAny(m_Chunks, x, y, z) and inAny(m_Gps, x, y, z)
+    return inAny(m_Chunks, x, y, z) and gpsOk(m_Gps, x, y, z)
 end
 
 -- May we take this step?
@@ -159,8 +190,20 @@ function mayStep(x, y, z)
     local cx, cy, cz = cachedX, cachedY, cachedZ
     if cx == nil then return false end
 
-    local s_Now  = distanceOutside(m_Chunks, cx, cy, cz) + distanceOutside(m_Gps, cx, cy, cz)
-    local s_Next = distanceOutside(m_Chunks, x, y, z)    + distanceOutside(m_Gps, x, y, z)
+    -- How far outside coverage each position is. For GPS that is distance to the nearest host,
+    -- which is what "closer to home" means when the constraint is radio range.
+    local function gpsMiss(px, py, pz)
+        if m_Gps == nil or m_Gps.hosts == nil then return distanceOutside(m_Gps, px, py, pz) end
+        local s_Best = nil
+        for _, h in ipairs(m_Gps.hosts) do
+            local d = math.abs(h.x - px) + math.abs(h.y - py) + math.abs(h.z - pz)
+            if s_Best == nil or d < s_Best then s_Best = d end
+        end
+        return s_Best or 0
+    end
+
+    local s_Now  = distanceOutside(m_Chunks, cx, cy, cz) + gpsMiss(cx, cy, cz)
+    local s_Next = distanceOutside(m_Chunks, x, y, z)    + gpsMiss(x, y, z)
     if s_Next < s_Now then return true end
     return false, "out of bounds"
 end

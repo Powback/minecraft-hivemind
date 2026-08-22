@@ -620,12 +620,35 @@ async function loadVoxels(): Promise<Record<string, number>> {
     // so accept both shapes rather than returning an empty world on a wrapper change.
     const grid: Record<string, number> = {};
     let offset: number | undefined = 0;
+    let truncated = false;
     for (let page = 0; page < 200 && offset !== undefined; page++) {
-      const res: any = await bridge.call('MapServer', 'LoadWorld', { offset }, { timeoutMs: 20_000 });
-      const chunk = res?.cachedWorld ?? res?.data?.cachedWorld ?? {};
+      let res: any;
+      try {
+        res = await bridge.call('MapServer', 'LoadWorld', { offset }, { timeoutMs: 20_000 });
+      } catch {
+        res = null;
+      }
+      const chunk = res?.cachedWorld ?? res?.data?.cachedWorld;
+      // A FAILED PAGE IS NOT THE END OF THE MAP.
+      //
+      // Missing cachedWorld left `next` undefined, which the loop read as "that was the last page"
+      // -- so one timeout mid-walk silently returned a fraction of the world as if it were all of
+      // it. The map went from 111,684 cells to 9,216 and reported success. Partial data presented
+      // as complete is worse than an error: everything downstream trusts it.
+      if (!chunk || typeof chunk !== 'object') {
+        truncated = true;
+        break;
+      }
       Object.assign(grid, chunk);
       const nxt = res?.next ?? res?.data?.next;
       offset = typeof nxt === 'number' ? nxt : undefined;
+    }
+
+    // Keep the better answer. A truncated read must not replace a complete one in the cache,
+    // because the next caller cannot tell the difference.
+    if (truncated && voxelCache && Object.keys(voxelCache.grid).length > Object.keys(grid).length) {
+      console.log(`[voxels] partial read (${Object.keys(grid).length} cells); keeping the previous ${Object.keys(voxelCache.grid).length}`);
+      return voxelCache.grid;
     }
     voxelCache = { at: Date.now(), grid };
     return grid;

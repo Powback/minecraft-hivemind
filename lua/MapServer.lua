@@ -73,6 +73,7 @@ end
 -- whole meant the map could render NOTHING -- the reply was refused entirely rather than trimmed.
 -- Paging is the difference between a size limit costing latency and costing the whole feature.
 local WORLD_PAGE = 2000
+m_PageKeys = nil   -- key list for a paged walk; rebuilt when a walk starts
 
 function OnLoadWorld(p_ID, p_Message)
     -- Registered in m_ServerEvents but never written, so the entry pointed at nil. PowNet prints
@@ -88,15 +89,32 @@ function OnLoadWorld(p_ID, p_Message)
         return true, {cachedWorld = s_World}
     end
 
-    local s_Page, s_N, s_Sent = {}, 0, 0
-    for key, v in pairs(s_World) do
-        if s_N >= s_Offset and s_Sent < s_Limit then
+    -- BUILD THE KEY LIST ONCE, then serve slices of it.
+    --
+    -- This walked the ENTIRE world on every page request to find its slice: 111,000 iterations per
+    -- call, fifty-six calls, six million iterations to read the map once. The later pages ran long
+    -- enough for CC to kill them, the caller read a failed page as the end of the map, and the
+    -- whole thing silently returned 16,476 cells of 111,684 -- as a success.
+    --
+    -- The cache is rebuilt whenever a walk starts from offset 0, so a paged read is consistent and
+    -- fresh observations are picked up on the next full pass.
+    if s_Offset == 0 or m_PageKeys == nil then
+        m_PageKeys = {}
+        for key in pairs(s_World) do m_PageKeys[#m_PageKeys + 1] = key end
+    end
+
+    local s_N = #m_PageKeys
+    local s_Page, s_Sent = {}, 0
+    for i = s_Offset + 1, math.min(s_Offset + s_Limit, s_N) do
+        local key = m_PageKeys[i]
+        local v = s_World[key]
+        if v ~= nil then
             s_Page[key] = v
             s_Sent = s_Sent + 1
         end
-        s_N = s_N + 1
     end
-    local s_Next = s_Offset + s_Sent
+
+    local s_Next = s_Offset + math.min(s_Limit, math.max(0, s_N - s_Offset))
     return true, {cachedWorld = s_Page, count = s_N, offset = s_Offset, sent = s_Sent,
                   next = (s_Next < s_N) and s_Next or nil}
 end
@@ -199,14 +217,20 @@ function Coverage()
     -- Every GPS host projects a bubble. Four are needed for a fix, but they are placed as a
     -- cluster, so the intersection of their bubbles is close enough to any one of them -- and
     -- being generous here is safe, since failing to get a fix is not dangerous, only useless.
+    -- HOSTS AND A RADIUS, not boxes.
+    --
+    -- A box of +/-64 per axis has corners 110 blocks from its centre, so "inside the box" was true
+    -- far outside real radio range -- and a fix needs FOUR hosts, not one. D8 walked to a corner at
+    -- -147,-48 where exactly one host was reachable, lost its position, and stranded. The bounds
+    -- check said yes the whole way.
+    --
+    -- Sent as positions so the drone can do the only test that matters: how many hosts can I
+    -- actually hear from where I am about to stand.
+    local s_Hosts = {}
     for _, h in ipairs(DATA["gpsHosts"] or {}) do
-        local r = gpsReach(h.y)
-        s_Gps[#s_Gps + 1] = {
-            minx = h.x - r, maxx = h.x + r,
-            miny = 0,       maxy = 250,
-            minz = h.z - r, maxz = h.z + r,
-        }
+        s_Hosts[#s_Hosts + 1] = {x = h.x, y = h.y, z = h.z}
     end
+    s_Gps = {hosts = s_Hosts, range = gpsReach(85), need = 4}
 
     -- Loaders are mobile ticking ground: sending one out genuinely opens territory, recalling it
     -- genuinely closes it.
