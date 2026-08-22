@@ -26,10 +26,31 @@ PowNet.UpdateModule('DroneBoot.lua', '/startup')
 PowNet.UpdateModule('DroneLogic.lua', '/DroneLogic.lua')
 PowNet.UpdateModule('pgps.lua', '/pgps')
 
--- pcall around the module for the same reason the bootloader guards its write-back: whatever
--- happens in there, this turtle must come back, or it is simply lost until noticed by hand.
-local s_Ok, s_Err = pcall(shell.run, "DroneLogic.lua")
-if not s_Ok then print("DroneLogic error: " .. tostring(s_Err)) end
+-- RECORD WHY IT STOPPED, AND MAKE THE NEXT RUN SAY SO.
+--
+-- shell.run catches the program's own error and returns false, so this pcall always succeeded and
+-- always reported nothing -- a drone crash-looping on its first line was indistinguishable from one
+-- running perfectly. That is exactly what happened when DroneLogic's parallel list gained a nil
+-- entry: fourteen drones died at startup, rebooted, died again, and the fleet view showed them all
+-- as "idle" at their last known position because DroneMan was still holding the final heartbeat
+-- from before the crash. The error was on the turtle's screen and nowhere else.
+--
+-- loadfile + pcall surfaces the real message; writing it down is what lets DroneLogic report it to
+-- the fleet on the next boot instead of it being visible only to somebody standing in front of the
+-- turtle. The same fix was made in the module bootloader for the same reason.
+local s_Fn, s_LoadErr = loadfile("DroneLogic.lua", nil, _ENV)
+local s_Ok, s_Err
+if s_Fn then s_Ok, s_Err = pcall(s_Fn)
+else s_Ok, s_Err = false, "loadfile: " .. tostring(s_LoadErr) end
+
+if not s_Ok then
+    print("DroneLogic error: " .. tostring(s_Err))
+    local h = fs.open("/last-run.txt", "w")
+    if h then h.write(tostring(s_Err) .. "\n") h.close() end
+else
+    -- A clean exit must clear the marker, or one old crash is reported for ever.
+    if fs.exists("/last-run.txt") then fs.delete("/last-run.txt") end
+end
 
 print("EXITED")
 os.sleep(3)

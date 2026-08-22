@@ -10,7 +10,21 @@ MESSAGE_TYPE = {
     INIT = 2,
     REGISTER = 3,
     UPDATE = 4,
-    CALL = 5
+    CALL = 5,
+    -- A REPLY IS NOT A REQUEST, and until now the wire could not tell them apart.
+    --
+    -- A server answers by mutating the message it was sent -- setting .status and .data -- and
+    -- sending the SAME object back. dataKey stays "Heartbeat" and type stays CALL, so to any
+    -- receiver it is indistinguishable from a fresh incoming call. Every drone runs PowNet.main
+    -- alongside its own request/response code, so both coroutines see the reply: one correctly
+    -- treats it as an answer, the other tries to DISPATCH it and prints
+    --
+    --     No handler for "Heartbeat" (type 5) on D2
+    --
+    -- On a drone that is only noise, because drones implement none of the server verbs. On a MODULE
+    -- it is worse than noise: a reply whose dataKey matches a verb that module implements gets
+    -- executed a second time, with the reply's payload, as though a peer had asked for it.
+    RESPONSE = 6
 }
 local m_ServerEvents = {}
 local m_DroneEvents = {}
@@ -51,8 +65,41 @@ if not rednet.isOpen() then
     end
 end
 
+-- CACHE THE LOOKUP. It is a network round trip, not a table read.
+--
+-- rednet.lookup broadcasts a query and waits up to two seconds for hosts to answer, and this was
+-- called on EVERY send addressed by name -- every heartbeat, every path request, every observation
+-- upload, from every drone. Fourteen drones therefore kept a continuous broadcast storm running
+-- just to re-discover module ids that had not changed since boot, and when a lookup happened to
+-- time out under that load, Send returned false and the drone reported "no answer from DroneMan"
+-- about a module that was up, idle and perfectly healthy.
+--
+-- Module ids are stable for the life of a world -- they are computer ids -- so this is safe to keep
+-- until something proves it wrong. Forget() is that proof: a failed exchange drops the entry and
+-- the next call re-resolves, so a module that genuinely moves is picked up on the next attempt
+-- rather than cached wrong for ever.
+-- Cached with a TTL, NOT for ever.
+--
+-- A permanent cache was the first attempt and it is wrong: module ids are stable only while nothing
+-- restarts, and this fleet restarts constantly. A stale entry sends every subsequent message to the
+-- wrong computer, which answers "No handler for GetPath" -- a module that is up, reachable and
+-- simply not the one being addressed. Re-resolving once a minute keeps essentially all of the
+-- traffic saving (a drone sends many messages a second, not many a minute) while guaranteeing the
+-- fleet heals itself within a minute of anything moving.
+local m_Hosts = {}
+local HOST_TTL = 60
+
 function Lookup(p_Name)
-    return rednet.lookup(SERVER_PROTOCOL, p_Name)
+    local s_Entry = m_Hosts[p_Name]
+    if s_Entry ~= nil and (os.clock() - s_Entry.at) < HOST_TTL then return s_Entry.id end
+    local s_ID = rednet.lookup(SERVER_PROTOCOL, p_Name)
+    if s_ID ~= nil then m_Hosts[p_Name] = {id = s_ID, at = os.clock()} end
+    return s_ID
+end
+
+--- Drop a cached id after a failed exchange, so the next send re-discovers it.
+function Forget(p_Name)
+    if type(p_Name) == "string" then m_Hosts[p_Name] = nil else m_Hosts = {} end
 end
 
 function Connect(p_Module)
@@ -435,7 +482,9 @@ function main()
     while true do
         print("Waiting for Server signal...")
         local serverID, serverMessage = rednet.receive(PowNet.SERVER_PROTOCOL)
-        if type(serverMessage) == "table" then
+        -- Skip replies. Every computer that makes a request also runs this loop, so without this
+        -- the answer to our own question comes back round and gets dispatched as a new question.
+        if type(serverMessage) == "table" and not serverMessage.reply then
             if(serverMessage.type == PowNet.MESSAGE_TYPE.INIT and serverMessage.ID == 0) then
                 print("Server has been re-initialized. Ending execution.")
                 do
@@ -467,10 +516,19 @@ function main()
                 if(s_Result ~= nil) then
                     serverMessage.status = s_Result
                     serverMessage.data = s_Response
+                    -- Tag it, so the receiver's dispatch loop knows to leave it alone. The waiting
+                    -- caller matches on message ID and does not care about the type.
+                    serverMessage.reply = true
                     rednet.send(serverID, serverMessage, SERVER_PROTOCOL)
                 end
             else
-                print("No server event with the name: " .. serverMessage.dataKey .. serverMessage.type)
+                -- Was `dataKey .. type` with no separator, which rendered as "GetPath5" and read
+                -- like a corrupted event name rather than "GetPath, message type 5". Naming the
+                -- module that refused is the actually useful part: this error always means the
+                -- message reached the WRONG module, so the question is which one it landed on.
+                print(("No handler for %q (type %s) on %s")
+                    :format(tostring(serverMessage.dataKey), tostring(serverMessage.type),
+                            tostring(os.getComputerLabel() or os.getComputerID())))
             end
         end
         Update()
@@ -481,7 +539,8 @@ function droneMain()
     while true do
         print("Waiting for Drone signal...")
         local droneID, droneMessage = rednet.receive(PowNet.DRONE_PROTOCOL)
-        if type(droneMessage) == "table" then
+        -- Same reason as PowNet.main: our own answers come back round this loop otherwise.
+        if type(droneMessage) == "table" and not droneMessage.reply then
            --if(droneMessage.type == PowNet.MESSAGE_TYPE.INIT and droneID.ID == 0) then
            --    print("Server has been initialized. Rebooting and performing updates.")
            --    Save()
@@ -520,6 +579,7 @@ function droneMain()
                 if(s_Result ~= nil) then
                     droneMessage.status = s_Result
                     droneMessage.data = s_Response
+                    droneMessage.reply = true   -- see MESSAGE_TYPE.RESPONSE
                     rednet.send(droneID, droneMessage, DRONE_PROTOCOL)
                 end
             else
@@ -579,6 +639,9 @@ function sendAndWaitForResponse(p_Recipient, message, protocol, p_Timeout)
 
     local s_Status, s_RecipientID = Send(p_Recipient, message, protocol)
     if(s_Status == false) then
+        -- The name did not resolve. Drop it so the next attempt asks the network again rather
+        -- than failing identically for ever off a stale cache.
+        Forget(p_Recipient)
         return false, "Failed to send message"
     end
     local attemptNumber = 1
@@ -591,6 +654,9 @@ function sendAndWaitForResponse(p_Recipient, message, protocol, p_Timeout)
                 rednet.send(s_RecipientID, message, protocol)
                 attemptNumber = attemptNumber + 1
             else
+                -- Three silent attempts against a module that should be there: assume the id is
+                -- wrong rather than the module dead, and make the next call re-resolve it.
+                Forget(p_Recipient)
                 return false
             end
         end

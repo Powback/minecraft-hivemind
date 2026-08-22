@@ -142,14 +142,60 @@ local function committed(p_DroneId)
     return false
 end
 
-local function pickDrone(p_Role)
-    local s_Busy = nil
-    for _, d in ipairs(fleet()) do
-        if (d.role or "miner") == p_Role then
-            if d.status == "idle" and not committed(d.id) then return d end
-            s_Busy = s_Busy or d
+-- WHERE IS THIS WORK? Assignment has to know, or it cannot be sensible about who goes.
+local function workPos(p_Task)
+    local w = p_Task and p_Task.work
+    if type(w) ~= "table" then return nil end
+    if w.mine and w.mine.pos then return w.mine.pos end
+    if w.build and w.build.origin then return w.build.origin end
+    if w.gather and w.gather.pos then return w.gather.pos end
+    if w.survey then
+        if w.survey.pos then return w.survey.pos end
+        if w.survey.min and w.survey.max then
+            return {x = (w.survey.min.x + w.survey.max.x) / 2,
+                    y = (w.survey.min.y + w.survey.max.y) / 2,
+                    z = (w.survey.min.z + w.survey.max.z) / 2}
         end
     end
+    if w.dig and w.dig.min and w.dig.max then
+        return {x = (w.dig.min.x + w.dig.max.x) / 2,
+                y = (w.dig.min.y + w.dig.max.y) / 2,
+                z = (w.dig.min.z + w.dig.max.z) / 2}
+    end
+    return nil
+end
+
+local function distTo(p_Drone, p_Pos)
+    if p_Pos == nil or p_Drone == nil or p_Drone.pos == nil or p_Drone.pos.x == nil then
+        return math.huge
+    end
+    return math.abs(p_Drone.pos.x - p_Pos.x) + math.abs(p_Drone.pos.y - p_Pos.y)
+         + math.abs(p_Drone.pos.z - p_Pos.z)
+end
+
+-- NEAREST FREE DRONE, not the first one in the list.
+--
+-- This returned whichever matching drone happened to come first out of the registry, which is
+-- insertion order and therefore meaningless. So a scout parked beside the miners kept being passed
+-- over while one a hundred and sixty blocks away was sent instead -- it would spend several minutes
+-- flying, arrive, and by then the work it was meant to support had moved on. The map is the same
+-- either way; the difference is entirely wasted travel.
+--
+-- A drone with no known position sorts last rather than being excluded: it can still take work, it
+-- is just the worst candidate for work with a location.
+local function pickDrone(p_Role, p_Pos)
+    local s_Busy, s_Best, s_BestD = nil, nil, nil
+    for _, d in ipairs(fleet()) do
+        if (d.role or "miner") == p_Role then
+            if d.status == "idle" and not committed(d.id) then
+                local s_D = distTo(d, p_Pos)
+                if s_BestD == nil or s_D < s_BestD then s_Best, s_BestD = d, s_D end
+            else
+                s_Busy = s_Busy or d
+            end
+        end
+    end
+    if s_Best then return s_Best end
     return nil, s_Busy
 end
 
@@ -229,7 +275,8 @@ function OnStartTask(p_ID, p_Message)
             tostring(s_Id), #s_Slabs, table.concat(s_Names, " ")), workers = #s_Slabs}
     end
 
-    local s_Drone, s_Busy = pickDrone(s_Role)
+    local s_Where = workPos(s_Task)
+    local s_Drone, s_Busy = pickDrone(s_Role, s_Where)
 
     -- PLACING A BLOCK NEEDS NO SPECIAL HARDWARE.
     --
@@ -239,7 +286,7 @@ function OnStartTask(p_ID, p_Message)
     -- miner, then take whoever is free.
     if s_Drone == nil and s_Task.work and s_Task.work.build then
         for _, alt in ipairs({"crafter", "loader", "scout"}) do
-            s_Drone = pickDrone(alt)
+            s_Drone = pickDrone(alt, s_Where)
             if s_Drone ~= nil then
                 print("build going to a " .. alt .. " -- no miner free")
                 break
@@ -449,15 +496,40 @@ function Tick()
                         for _, d in ipairs(fleet()) do
                             if d.id == v.assignedTo then
                                 s_Saw = tostring(d.status) .. (d.offline and " offline" or "")
+                                -- Idle means it took the order and finished or refused it. Safe.
                                 if d.status == "idle" and not d.offline then s_Free = true end
-                                if d.status == "stuck" or d.status == "blocked"
-                                   or d.status == "lost" or d.offline then s_Free = true end
+
+                                -- STUCK MUST BE SUSTAINED, NOT MOMENTARY.
+                                --
+                                -- Reclaiming on a single stuck/blocked report was too eager: a
+                                -- drone reports "blocked" transiently while travelling -- one
+                                -- refused step is enough -- and reclaiming there took the job off a
+                                -- drone that was on its way to do it. TaskMan then reassigned it,
+                                -- DroneMan sent Abort + a fresh order, and the drone started over.
+                                -- D1's log shows "JOB Mine start" for task 80 three times in two
+                                -- minutes, travelling from scratch each time. From outside that is
+                                -- a drone twitching back and forth achieving nothing.
+                                --
+                                -- So a stuck drone must STAY stuck for a full reclaim window before
+                                -- its work is taken. Genuinely wedged drones still lose the task;
+                                -- drones having a bad second keep it.
+                                if d.status == "stuck" or d.status == "blocked" or d.status == "lost" then
+                                    v.stuckSince = v.stuckSince or os.epoch("utc")
+                                    if (os.epoch("utc") - v.stuckSince) > RECLAIM_AFTER_MS then
+                                        s_Free = true
+                                    end
+                                elseif d.offline then
+                                    s_Free = true
+                                else
+                                    v.stuckSince = nil    -- moving again: forget it ever stalled
+                                end
                             end
                         end
                         -- A drone nobody can even see is the strongest case of all: it is not
                         -- coming back to finish this, and holding the task for it helps no one.
                         if s_Saw == "not in fleet list" then s_Free = true end
                         local s_Idle = s_Free
+                        if s_Idle then v.stuckSince = nil end
                         -- Log the DECISION, not just the action. A reclaim that silently declines
                         -- is indistinguishable from one that never ran, and the difference is where
                         -- the bug is.

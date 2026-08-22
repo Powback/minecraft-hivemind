@@ -556,23 +556,62 @@ function ensureHeading()
 
     -- Step, look, step back. The only way to learn which way you face is to move and see what
     -- changed -- there is no API for it.
-    for _ = 1, 4 do
-        if turtle.forward() then
-            local nx, _, nz = gps.locate(5, false)
-            turtle.back()
-            if nx ~= nil and nz ~= nil then
-                if     nz < cachedZ then cachedDir = North
-                elseif nz > cachedZ then cachedDir = South
-                elseif nx < cachedX then cachedDir = West
-                elseif nx > cachedX then cachedDir = East end
+    local function probe()
+        for _ = 1, 4 do
+            if turtle.forward() then
+                local nx, _, nz = gps.locate(5, false)
+                turtle.back()
+                if nx ~= nil and nz ~= nil then
+                    if     nz < cachedZ then cachedDir = North
+                    elseif nz > cachedZ then cachedDir = South
+                    elseif nx < cachedX then cachedDir = West
+                    elseif nx > cachedX then cachedDir = East end
+                end
+                if cachedDir ~= nil then
+                    print("heading re-established: " .. tostring(shortNames[cachedDir]))
+                    return true
+                end
             end
-            if cachedDir ~= nil then
-                print("heading re-established: " .. tostring(shortNames[cachedDir]))
-                return true
-            end
+            turtle.turnLeft()   -- blocked that way; try another
         end
-        turtle.turnLeft()   -- blocked that way; try another
+        return false
     end
+
+    if probe() then return true end
+
+    -- BEING BOXED IN MUST NOT BE TERMINAL.
+    --
+    -- Four blocked horizontals used to end the function, and a drone with no heading cannot move at
+    -- all -- forward() refuses, so it can never reach anywhere less enclosed. It reports "heading
+    -- unknown -- boxed in, cannot step to derive it" for ever. That is the state three drones were
+    -- in at once, and every one of them was sitting in a shaft IT HAD DUG ITSELF: four stone walls
+    -- is the normal shape of a mine, not an exceptional accident.
+    --
+    -- There are two ways out of a box and the drone usually has both. Rise into the open and probe
+    -- from there -- a shaft is enclosed sideways, not upwards -- and put the drone back afterwards
+    -- so nothing else has to know this happened.
+    local s_Risen = 0
+    for _ = 1, 4 do
+        if not turtle.up() then break end
+        s_Risen = s_Risen + 1
+        cachedY = cachedY + 1
+        if probe() then
+            for _ = 1, s_Risen do if turtle.down() then cachedY = cachedY - 1 end end
+            return true
+        end
+    end
+    for _ = 1, s_Risen do if turtle.down() then cachedY = cachedY - 1 end end
+
+    -- Still boxed: dig a peephole. Only a drone with a pickaxe can do this, which is fine -- it is
+    -- also the only kind of drone that can bury itself in the first place.
+    if turtle.dig then
+        for _ = 1, 4 do
+            if turtle.detect() then turtle.dig() end
+            if probe() then return true end
+            turtle.turnLeft()
+        end
+    end
+
     return false, "could not determine heading"
 end
 

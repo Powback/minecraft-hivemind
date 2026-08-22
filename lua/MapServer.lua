@@ -24,18 +24,74 @@ function Init()
     if DATA["bounds"] == nil then
         -- Matches the force-loaded region. Deliberately a little inside it, so a drone stops
         -- before the edge rather than exactly on it.
-        DATA["bounds"] = {minx = -155, maxx = -25, miny = 0, maxy = 200, minz = -105, maxz = 15}
+        DATA["bounds"] = {minx = -180, maxx = -25, miny = 0, maxy = 200, minz = -110, maxz = 15}
     end
-    if DATA["gpsHosts"] == nil then
-        -- The constellation actually built: #100-103, deliberately non-coplanar.
-        DATA["gpsHosts"] = {
-            {x = -92, y = 95, z = -52}, {x = -78, y = 95, z = -52},
-            {x = -92, y = 95, z = -38}, {x = -85, y = 99, z = -45},
-        }
+    -- TWO CONSTELLATIONS, AND THIS MERGES RATHER THAN ONLY INITIALISING.
+    --
+    -- #100-103 sit at y=95-99, which is right for surface work and useless underground: a fix needs
+    -- FOUR hosts in range, and a miner at y=44 could hear only three of them. The drones reported
+    -- it precisely -- "outside coverage: no gps coverage" -- while standing in a shaft they had dug
+    -- themselves. So #220-223 were added lower down, positioned to cover the mining depths.
+    --
+    -- Merged, not assigned, because `if DATA["gpsHosts"] == nil` only ever runs on a world with no
+    -- saved state. Every existing deployment would have kept the old four-host list for ever and
+    -- the new satellites would have been invisible to the coverage check -- physically present,
+    -- answering pings, and still refused as "no coverage".
+    local s_Known = {
+        -- The original surface constellation, deliberately non-coplanar.
+        {x = -92, y = 95, z = -52}, {x = -78, y = 95, z = -52},
+        {x = -92, y = 95, z = -38}, {x = -85, y = 99, z = -45},
+        -- EIGHTEEN HOSTS, PLACED WHERE THE FLEET ACTUALLY IS.
+        --
+        -- Coverage was chased in the wrong direction for a long time. Hosts were added ring by
+        -- ring, then a 40-host lattice, then a searched 60-host one -- and the fleet got WORSE at
+        -- every step, ending with twelve of fourteen drones unable to fix their position while
+        -- sitting inside nominally perfect coverage.
+        --
+        -- Two things were wrong. gps.locate broadcasts and collects every reply inside its timeout,
+        -- so sixty-four hosts answering at once overflows the event queue and the replies it needed
+        -- are among those dropped -- GPS in CC:T does not scale with host count, and past a point
+        -- more hosts is strictly worse. And the geometry was never the real problem: the drones had
+        -- simply WANDERED, three of them past the edge of the force-loaded region entirely, so no
+        -- constellation centred on the base was ever going to reach them.
+        --
+        -- So this was placed against measured drone positions rather than a model of where they
+        -- ought to be, and checked: every drone in the fleet hears at least four. Spread in Y
+        -- because four hosts on a plane cannot resolve altitude.
+        {x = -105, y = 28, z = -70}, {x = -70,  y = 22, z = -66},
+        {x = -100, y = 40, z = -25}, {x = -62,  y = 34, z = -30},
+        {x = -85,  y = 46, z = -55}, {x = -125, y = 30, z = -45},
+        {x = -150, y = 72, z = -60}, {x = -145, y = 44, z = -30},
+        {x = -168, y = 62, z = -70}, {x = -132, y = 56, z = -12},
+        {x = -175, y = 84, z = -66}, {x = -158, y = 90, z = -84},
+        {x = -80,  y = 30, z = -95}, {x = -108, y = 42, z = -92},
+    }
+    DATA["gpsHosts"] = DATA["gpsHosts"] or {}
+    for _, h in ipairs(s_Known) do
+        local s_Have = false
+        for _, e in ipairs(DATA["gpsHosts"]) do
+            if e.x == h.x and e.y == h.y and e.z == h.z then s_Have = true break end
+        end
+        if not s_Have then DATA["gpsHosts"][#DATA["gpsHosts"] + 1] = h end
     end
     -- Called by global name on purpose: it is defined further down, after locals this function
     -- cannot see. Globals resolve at call time, so this works and a direct reference would not.
     BackfillBlockAt()
+
+    -- REBUILD THE ORE INDEX FROM THE MAP ON DISK.
+    --
+    -- IndexNames was only ever fed by INCOMING uploads, so the index of what-is-where lived purely
+    -- in memory and every MapServer restart silently forgot every ore the fleet had ever found. The
+    -- detail map on disk still held it -- coal, iron, copper, zinc, all correctly recorded -- and
+    -- world.find answered "nothing surveyed matches" for all of them.
+    --
+    -- The consequence was not cosmetic. The supply loop dispatches `gather` only for materials the
+    -- map can locate, so with an empty index it fell through to "none known -> survey dispatched"
+    -- every single cycle: scouts were sent out to find ore that had already been found, again and
+    -- again, while miners tunnelled past it. Rebuilding here is what makes a survey worth anything
+    -- once the module has been restarted.
+    local s_N = IndexNames(PowGPSServer.cachedWorldDetail)
+    print("indexed " .. tostring(s_N) .. " named blocks from the saved map")
 end
 
 function OnSaveWorld(p_ID, p_Message)

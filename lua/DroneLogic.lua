@@ -131,6 +131,22 @@ function SendHeartBeat()
     -- then offered jobs it could only fail, and an operator looking at the fleet saw a healthy
     -- drone standing around. Availability and health are different, and this field is about
     -- availability.
+    -- A STATUS MUST NOT OUTLIVE THE JOB THAT SET IT.
+    --
+    -- m_Status is set by a job ("moving", "scanning", "mining") and cleared when it finishes. If the
+    -- job throws, or is aborted between the two, the label is simply left behind -- and a drone
+    -- reporting "moving" is reported as BUSY, so TaskMan never offers it work and it stands there
+    -- for ever looking productive. D7 was in exactly this state: `status=moving executing=false`,
+    -- flying around an unsurveyed area scanning nothing, because as far as the fleet was concerned
+    -- it was already in the middle of something.
+    --
+    -- `executing` is the authority -- it is set and cleared by the job machinery itself -- so when
+    -- nothing is executing, the drone is idle by definition, whatever the last label happened to be.
+    if not executing and m_Status ~= "idle" and m_Status ~= "docking" then
+        trace(("status %s left behind with no job running -- clearing to idle"):format(tostring(m_Status)))
+        m_Status = "idle"
+    end
+
     local s_Report = m_Status
     -- SAY WHY. "blocked" on its own sends whoever reads it looking in the wrong place.
     --
@@ -140,8 +156,21 @@ function SendHeartBeat()
     local s_Why = m_Stuck
     if s_Report == "idle" then
         local px, py, pz, pd = pgps.getCachedPosition()
+
+        -- Re-acquiring a lost fix belongs OUTSIDE the heartbeat. See refixLoop.
+        --
+        -- Doing it here was a mistake with a nasty shape: gps.locate blocks for five seconds, so
+        -- every drone without a fix delayed its own heartbeat by five seconds, every time. DroneMan
+        -- marks a drone offline after three missed beats, so the drones that most needed help were
+        -- precisely the ones that got marked dead -- and once offline they were excluded from
+        -- assignment, which guaranteed they stayed that way. Nine of fourteen went stranded within
+        -- two minutes of adding it.
+
         if px == nil then
-            s_Report, s_Why = "blocked", "no position fix -- cannot hear four GPS hosts"
+            -- Do not assert a cause that has not been checked. The previous wording claimed the
+            -- drone could not hear four hosts, which sent me looking at the constellation for an
+            -- hour while the actual fault was that nothing ever retried.
+            s_Report, s_Why = "blocked", "no position fix (re-fix attempted and failed)"
         elseif pd == nil then
             s_Report, s_Why = "blocked", "heading unknown -- boxed in, cannot step to derive it"
         elseif not pgps.mayStep(px, py, pz) then
@@ -152,8 +181,20 @@ function SendHeartBeat()
         end
     end
 
+    -- A crash recorded by the bootloader is reported to the fleet, once, on the way back up.
+    -- Otherwise a drone that dies on its first line every three seconds shows as "idle" for ever,
+    -- because the last heartbeat DroneMan received was the healthy one before it broke.
+    if m_LastCrash == nil then
+        m_LastCrash = false
+        if fs.exists("/last-run.txt") then
+            local h = fs.open("/last-run.txt", "r")
+            if h then m_LastCrash = (h.readAll() or ""):gsub("%s+$", "") h.close() end
+        end
+    end
+
     local s_Data = {pos = s_Pos, status = s_Report, fuel = s_Fuel, role = Role(),
-                    stuck = s_Why, hosting = m_Hosting}
+                    stuck = s_Why, hosting = m_Hosting,
+                    crash = (m_LastCrash ~= false and m_LastCrash ~= "") and m_LastCrash or nil}
     local s_Message = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Heartbeat", s_Data)
     -- WAIT FOR THE ANSWER.
     --
@@ -325,8 +366,25 @@ end
 -- passes 0 and gets the old behaviour.
 local HOVER = 3
 
+-- IDEMPOTENT, which the first version was not.
+--
+-- Hovering three blocks up means detectDown is FALSE, so a second call would happily descend to the
+-- ground again and climb straight back -- six moves, zero net displacement, repeated on every scan
+-- cell. Watching a drone bob up and down on the spot for ever is exactly what that looks like, and
+-- it is the same shape as the earlier bug where a post-move settle fought stepForward's climb.
+--
+-- Remembering where we settled is the fix: if the drone has not moved since, there is nothing to do.
+local m_Settled = nil
+
 local function settle(p_MaxDrop, p_Hover)
     local s_Hover = p_Hover or HOVER
+
+    local cx, cy, cz = pgps.getCachedPosition()
+    if cx ~= nil and m_Settled ~= nil
+       and m_Settled.x == cx and m_Settled.y == cy and m_Settled.z == cz then
+        return 0        -- already settled here; moving would only undo it
+    end
+
     local s_Drops = 0
     while s_Drops < p_MaxDrop and not turtle.detectDown() do
         if not pgps.down() then break end
@@ -338,6 +396,9 @@ local function settle(p_MaxDrop, p_Hover)
         if turtle.detectUp() or not pgps.up() then break end
         s_Drops = s_Drops - 1
     end
+
+    local nx, ny, nz = pgps.getCachedPosition()
+    if nx ~= nil then m_Settled = {x = nx, y = ny, z = nz} end
     return s_Drops
 end
 
@@ -1460,7 +1521,149 @@ local function noteFace(p_Dx, p_Dy, p_Dz, p_Ok, p_Blk)
     end
 end
 
---- Look at the three faces a turtle can see without turning, and take anything worth taking.
+--- FOLLOW THE VEIN, AND LOOK AT EVERY WALL.
+--
+-- The tunnel loop checked forward, up and down on each step but the SIDE walls only every sixth
+-- step, so five blocks in six went past with their walls never inspected -- and when something was
+-- found, exactly one block of it was taken and the rest of the vein left in the ground. Watching a
+-- miner drive a corridor straight past exposed iron is what that looks like from the surface, and
+-- it is the single most expensive thing the fleet was doing: the tunnel is already paid for, the
+-- ore beside it is free, and turning costs time but no fuel.
+--
+-- Bounded rather than exhaustive. A budget and a depth limit mean a miner that breaks into a large
+-- deposit takes a useful bite and returns to its tunnel, instead of wandering off through the rock
+-- and losing the grid it was cutting.
+local VEIN_BUDGET = 32   -- blocks per strike
+local VEIN_DEPTH  = 6    -- how far from the tunnel a vein may pull us
+
+--- Dig into an adjacent ore block, recurse from inside it, then step back out.
+local function veinFrom(p_Budget, p_Depth)
+    if p_Depth > VEIN_DEPTH or p_Budget[1] <= 0 or not executing then return 0 end
+    local s_Got = 0
+
+    -- Vertical faces first: they need no turning.
+    local s_Vert = {
+        {turtle.inspectUp,   DigUp,   pgps.up,   pgps.down},
+        {turtle.inspectDown, DigDown, pgps.down, pgps.up},
+    }
+    for _, v in ipairs(s_Vert) do
+        if p_Budget[1] <= 0 or not executing then break end
+        local ok, blk = v[1]()
+        if ok and blk and looksValuable(blk.name) then
+            if v[2]() then
+                p_Budget[1] = p_Budget[1] - 1
+                s_Got = s_Got + 1
+                -- Step in to see what the block was hiding, then come straight back out so the
+                -- caller's position is unchanged whatever the vein does.
+                if v[3]() then
+                    s_Got = s_Got + veinFrom(p_Budget, p_Depth + 1)
+                    v[4]()
+                end
+            end
+        end
+    end
+
+    -- Then the four horizontals. Four right turns end on the original heading, so the drone is
+    -- facing the way it started whether or not anything was found.
+    for _ = 1, 4 do
+        if p_Budget[1] <= 0 or not executing then break end
+        local ok, blk = turtle.inspect()
+        if ok and blk and looksValuable(blk.name) then
+            if DigForward() then
+                p_Budget[1] = p_Budget[1] - 1
+                s_Got = s_Got + 1
+                if pgps.forward() then
+                    s_Got = s_Got + veinFrom(p_Budget, p_Depth + 1)
+                    pgps.back()
+                end
+            end
+        end
+        pgps.turnRight()
+    end
+
+    return s_Got
+end
+
+--- Check the two SIDE walls only, and only when the map cannot already rule them out.
+---
+--- The first version turned right four times on every step. That inspects forward -- which
+--- boreForward has already done -- and backward, which is the tunnel we just dug, so half the
+--- spinning was re-examining known blocks and it made the miners look demented. Only left and
+--- right are new information.
+---
+--- Better still is not turning at all. A turn costs no fuel but it costs TIME, and time is the
+--- whole budget of a mining run. The scouts scan eight blocks through solid rock, so the map very
+--- often already knows what is beside the tunnel -- and this is exactly the collaboration the
+--- fleet is supposed to have: the scout looks through the wall so the miner does not have to turn
+--- around to find out. When the map says stone, we walk on. When it says ore, or says nothing at
+--- all, we look.
+local function sideKnownWorthless(p_Dx, p_Dz)
+    local cx, cy, cz = pgps.getCachedPosition()
+    if cx == nil then return false end
+    local idx = (cx + p_Dx) .. ":" .. (cy) .. ":" .. (cz + p_Dz)
+
+    -- Air is nothing to mine.
+    if pgps.cachedWorld and pgps.cachedWorld[idx] == 0 then return true end
+
+    local s_Det = pgps.cachedWorldDetail and pgps.cachedWorldDetail[idx]
+    if type(s_Det) == "table" and type(s_Det[2]) == "table" and s_Det[2].name then
+        return not looksValuable(s_Det[2].name)
+    end
+    return false      -- unknown: worth a look
+end
+
+local function harvestAround()
+    local s_Budget = {VEIN_BUDGET}
+    local s_Got = 0
+
+    -- Which way is left and right, in world terms, from the current heading.
+    local _, _, _, s_Dir = pgps.getCachedPosition()
+    local s_Side = {
+        [0] = {{-1, 0}, {1, 0}},   -- facing north: left is -x, right is +x
+        [1] = {{0, 1}, {0, -1}},   -- west
+        [2] = {{1, 0}, {-1, 0}},   -- south
+        [3] = {{0, -1}, {0, 1}},   -- east
+    }
+    local s_LR = s_Dir and s_Side[s_Dir]
+
+    local s_Left  = (not s_LR) or (not sideKnownWorthless(s_LR[1][1], s_LR[1][2]))
+    local s_Right = (not s_LR) or (not sideKnownWorthless(s_LR[2][1], s_LR[2][2]))
+
+    -- Nothing worth turning for: walk on. This is the case the scouts are meant to create.
+    if not s_Left and not s_Right then return 0 end
+
+    if s_Left then
+        pgps.turnLeft()
+        local ok, blk = turtle.inspect()
+        if ok and blk and looksValuable(blk.name) and DigForward() then
+            s_Budget[1] = s_Budget[1] - 1
+            s_Got = s_Got + 1
+            if pgps.forward() then
+                s_Got = s_Got + veinFrom(s_Budget, 2)
+                pgps.back()
+            end
+        end
+        pgps.turnRight()
+    end
+
+    if s_Right then
+        pgps.turnRight()
+        local ok, blk = turtle.inspect()
+        if ok and blk and looksValuable(blk.name) and DigForward() then
+            s_Budget[1] = s_Budget[1] - 1
+            s_Got = s_Got + 1
+            if pgps.forward() then
+                s_Got = s_Got + veinFrom(s_Budget, 2)
+                pgps.back()
+            end
+        end
+        pgps.turnLeft()
+    end
+
+    return s_Got
+end
+
+-- Look at the three faces a turtle can see without turning, and take anything worth taking.
 local function workFace(p_Inspect, p_Dig, p_Dx, p_Dy, p_Dz)
     local s_Ok, s_Blk = p_Inspect()
     noteFace(p_Dx, p_Dy, p_Dz, s_Ok, s_Blk)
@@ -1508,12 +1711,23 @@ function OnMine(p_ID, p_Message)
 
         -- 1. Sink the access shaft.
         if d.pos and d.pos.x then
-            if pgps.moveTo(tonumber(d.pos.x), tonumber(d.pos.y), tonumber(d.pos.z)) == false then
-                error("could not reach the shaft head", 0)
+            -- Traced on BOTH sides. The mine loop logged nothing at all while drones visibly bobbed
+            -- up and down, which narrowed it to this line: the job had not started, it was still
+            -- travelling. A long silent call is indistinguishable from a hung one without this.
+            local sx, sy, sz = pgps.getCachedPosition()
+            trace(("mine: travelling %s,%s,%s -> %s,%s,%s"):format(
+                tostring(sx), tostring(sy), tostring(sz),
+                tostring(d.pos.x), tostring(d.pos.y), tostring(d.pos.z)))
+            local s_At, s_Why = pgps.moveTo(tonumber(d.pos.x), tonumber(d.pos.y), tonumber(d.pos.z))
+            if s_At == false then
+                trace("mine: could not reach shaft head -- " .. tostring(s_Why))
+                error("could not reach the shaft head: " .. tostring(s_Why), 0)
             end
+            trace("mine: arrived at shaft head")
         end
 
         local _, cy = pgps.getCachedPosition()
+        trace(("mine: sinking shaft from y=%s to y=%s"):format(tostring(cy), tostring(s_Depth)))
         while cy and cy > s_Depth do
             if not executing then break end
             if not depositIfFull() then break end
@@ -1533,21 +1747,17 @@ function OnMine(p_ID, p_Message)
                 if not depositIfFull() then break end
 
                 local s_Ore = boreForward()
-                if s_Ore == nil then break end
+                if s_Ore == nil then
+                    trace(("mine: bore blocked on line %d step %d"):format(line, step))
+                    break
+                end
                 s_Got = s_Got + s_Ore
                 s_Steps = s_Steps + 1
 
-                s_Got = s_Got + workFace(turtle.inspectDown, DigDown, 0, -1, 0)
-
-                -- Side walls cost two turns each way. Occasional, because the SCOUT is what is
-                -- meant to see through these walls -- this is only a cheap second opinion.
-                if step % s_WallEvery == 0 then
-                    pgps.turnRight()
-                    s_Got = s_Got + workFace(turtle.inspect, DigForward, 0, 0, 0)
-                    pgps.turnLeft() pgps.turnLeft()
-                    s_Got = s_Got + workFace(turtle.inspect, DigForward, 0, 0, 0)
-                    pgps.turnRight()
-                end
+                -- Every wall, every step, and follow whatever turns up. See harvestAround: the
+                -- old code sampled the side walls once every s_WallEvery steps and took a single
+                -- block when it hit, which is how a corridor gets driven straight past a vein.
+                s_Got = s_Got + harvestAround()
             end
 
             -- Step across to the next line of the grid, cutting the crosscut as we go so the whole
@@ -1988,61 +2198,60 @@ end
 -- cycle, and stands down the instant it moves, drifts, or loses the fix.
 local RELAY_DRIFT_LIMIT = 1     -- blocks; a host that has moved at all is no longer where it says
 
--- Every drone is a rednet repeater, always, whatever else it is doing.
+-- A PARKED RELAY repeats rednet traffic. A BUSY drone does not, and does not even listen.
 --
--- THIS is the piece the "mesh" was missing. gpsRelay lets a distant drone work out WHERE it is;
--- it does nothing whatsoever about being HEARD. Those are separate radios: GPS runs on
--- CHANNEL_GPS, fleet traffic runs on the recipient's own channel, and a drone past the 64-block
--- modem range of the base loses the second one no matter how good its fix is. D8 sat at -148,65,-33
--- -- 63 blocks out, right on the edge -- powered on, chunk loaded, running fine, and completely
--- inaudible. Nothing was broken. Nobody was listening.
+-- rednet.send already copies every message to CHANNEL_REPEAT so anything in earshot can pass it on,
+-- and that is genuinely how a drone past the 64-block modem range gets heard -- D8 sat at
+-- -148,65,-33, powered on, running fine, and completely inaudible.
 --
--- rednet already supports this and the fleet simply never used it: rednet.send transmits a copy of
--- every message on CHANNEL_REPEAT precisely so that anything in earshot can pass it along. So each
--- drone becomes a hop, and range stops being a radius around the base and becomes a radius around
--- the furthest drone. Twelve drones spread out cover far more ground than the base ever could.
+-- Getting the COST of this right took two failures worth recording, because both looked free:
 --
--- Unconditional, unlike the GPS relay, which only hosts while idle. Repeating is a few
--- microseconds of work with no position requirement and no way to be WRONG -- the worst a bad
--- repeater can do is forward a message twice, and the seen-set below stops even that. A drone that
--- only relays while idle is a drone that stops relaying the moment the fleet gets busy, which is
--- exactly when someone is most likely to be out at the edge needing a hop.
+--  1. Running it on every drone unconditionally. Fourteen drones rebroadcasting every message on
+--     two channels turns one send into hundreds of modem_message events. CC's event queue is
+--     finite, and what gets dropped on overflow is the rednet replies the JOB coroutine is waiting
+--     for. The entire fleet froze -- reporting "mining" and "scanning", clocks ticking, relay loop
+--     logging every ten seconds -- and moved zero blocks in sixty seconds, confirmed twice against
+--     `computercraft dump`.
+--  2. Gating it, but waking the loop on a 2-second timer to re-check the gate. That creates a timer
+--     per received event, which fills the same queue with timers instead of messages. Movement went
+--     from 35 blocks a minute to 1.
+--
+-- So: no timer, and the gate is enforced by whether the channel is OPEN at all -- gpsRelay opens it
+-- when the drone parks as a relay and closes it when it stops. A busy drone is not handed these
+-- events by the modem in the first place, which is the only version of "cheap" that survived
+-- contact with the event queue.
 local REPEAT_MEMORY = 30       -- seconds to remember a message id
+local REPEAT_MAX_PER_SEC = 20  -- ceiling, so a storm cannot start even if the gate is ever wrong
 
 local function meshRepeat()
     local s_Modem = peripheral.find("modem")
     if not s_Modem then return end
-    pcall(s_Modem.open, rednet.CHANNEL_REPEAT)
 
-    -- A message rebroadcast by two drones that can hear each other comes straight back, gets
-    -- rebroadcast again, and saturates the channel in about a second. Remembering ids for half a
-    -- minute is what makes a mesh a mesh instead of a broadcast storm.
     local s_Seen = {}
+    local s_Window, s_Count = 0, 0
 
     while true do
         local _, _, s_Channel, s_Reply, s_Message = os.pullEvent("modem_message")
-        if s_Channel == rednet.CHANNEL_REPEAT
+
+        if s_Channel == rednet.CHANNEL_REPEAT and m_Hosting and not executing
            and type(s_Message) == "table"
-           and s_Message.nMessageID and s_Message.nRecipient then
+           and s_Message.nMessageID and type(s_Message.nRecipient) == "number" then
 
             local s_Now = os.clock()
-            if not s_Seen[s_Message.nMessageID] then
+            if s_Now - s_Window >= 1 then s_Window, s_Count = s_Now, 0 end
+
+            if s_Count < REPEAT_MAX_PER_SEC and not s_Seen[s_Message.nMessageID] then
                 for k, v in pairs(s_Seen) do
                     if v < s_Now then s_Seen[k] = nil end
                 end
                 s_Seen[s_Message.nMessageID] = s_Now + REPEAT_MEMORY
+                s_Count = s_Count + 1
 
-                -- A computer id is not a channel. rednet.send maps one to the other, and a
-                -- repeater that skips the mapping transmits into a channel nobody is listening on.
-                local s_Channel = s_Message.nRecipient
-                if s_Channel ~= rednet.CHANNEL_BROADCAST then
-                    s_Channel = s_Channel % rednet.MAX_ID_CHANNELS
-                end
-
-                -- Both channels: the recipient's, so the intended machine hears it if it is in
-                -- range of US, and the repeat channel, so the next drone along can carry it
-                -- further. Dropping the second is what turns a mesh into a single extra hop.
-                pcall(s_Modem.transmit, s_Channel, s_Reply, s_Message)
+                -- A computer id is not a channel; rednet.send maps one to the other, and a repeater
+                -- that skips the mapping transmits where nobody is listening.
+                local s_Ch = s_Message.nRecipient
+                if s_Ch ~= rednet.CHANNEL_BROADCAST then s_Ch = s_Ch % rednet.MAX_ID_CHANNELS end
+                pcall(s_Modem.transmit, s_Ch, s_Reply, s_Message)
                 pcall(s_Modem.transmit, rednet.CHANNEL_REPEAT, s_Reply, s_Message)
             end
         end
@@ -2051,15 +2260,13 @@ end
 
 -- SCAN WHILE TRAVELLING, NOT ONLY ON ARRIVAL.
 --
--- A scout crossing forty blocks to reach its survey site learned absolutely nothing on the way: the
--- scanner only ran at the grid points of a Survey job, so every recall, every reposition and every
--- rescue flight was dead mileage over ground nobody had mapped. That is backwards -- the trip is
--- free, the scanner is already fitted, and the unmapped ground between two places is exactly the
--- ground that makes the next path search fail.
+-- A scout crossing forty blocks to reach its survey site learned nothing on the way: the scanner
+-- only ran at the grid points of a Survey job, so every recall, reposition and rescue flight was
+-- dead mileage over unmapped ground. The trip is already being paid for and the scanner is already
+-- fitted, and the unmapped ground between two places is exactly what makes the next path search
+-- fail.
 --
--- So this runs independently of whatever job is in progress and fires on DISTANCE, not on a timer:
--- a parked drone rescans nothing, and a fast one does not skip ground. The cooldown is respected by
--- simply not scanning while a Survey is mid-scan, so the two never fight over the peripheral.
+-- Fires on DISTANCE, not on a timer: a parked drone rescans nothing and a fast one skips nothing.
 local SCAN_EVERY = 12          -- blocks travelled between opportunistic scans
 
 local function scanOnTheMove()
@@ -2079,12 +2286,35 @@ local function scanOnTheMove()
                                   + math.abs(cz - s_LastZ)
                     if s_Moved >= SCAN_EVERY then
                         s_LastX, s_LastY, s_LastZ = cx, cy, cz
-                        -- pcall: the scanner is on a cooldown shared with the survey job, and a
-                        -- refusal here is completely routine. It must never take the drone down.
+                        -- pcall: the scanner shares a cooldown with the survey job and a refusal
+                        -- here is routine. It must never take the drone down.
                         pcall(absorbScan, s_Sc, 8)
                     end
                 end
             end
+        end
+    end
+end
+
+-- KEEP TRYING TO FIND OURSELVES, on our own thread.
+--
+-- A drone with no cached position cannot move at all -- mayStep refuses every step without one --
+-- so it cannot travel somewhere with better reception, and with no job running nothing calls
+-- verifyPosition either. Left alone it sits for ever, inside perfectly good coverage, reporting
+-- that it does not know where it is.
+--
+-- On its own coroutine because gps.locate BLOCKS for its full timeout when it fails, and anything
+-- sharing a thread with it inherits that delay. Rate-limited because a drone genuinely out of range
+-- would otherwise spend its entire life in gps.locate.
+local REFIX_EVERY = 45
+
+local function refixLoop()
+    while true do
+        os.sleep(REFIX_EVERY)
+        local px = pgps.getCachedPosition()
+        if px == nil and not executing then
+            local ok = pgps.verifyPosition()
+            if ok then trace("re-acquired a position after losing it") end
         end
     end
 end
@@ -2109,6 +2339,7 @@ local function gpsRelay()
                 trace("relay: no fix of my own (status=" .. tostring(m_Status) .. ")")
                 if m_Hosting then
                     pcall(s_Modem.close, gps.CHANNEL_GPS)
+                    pcall(s_Modem.close, rednet.CHANNEL_REPEAT)
                     m_Hosting, m_HostPos = false, nil
                     print("GPS relay stopped (lost my own fix)")
                 end
@@ -2143,6 +2374,8 @@ local function gpsRelay()
                         :format(fx, fy, fz, cx, cy, cz))
                 else
                 s_Modem.open(gps.CHANNEL_GPS)
+                -- Listen for traffic to pass along only while parked as a relay. See meshRepeat.
+                pcall(s_Modem.open, rednet.CHANNEL_REPEAT)
                 m_Hosting = true
                 m_HostPos = {x = fx, y = fy, z = fz}
                 trace(("relay: hosting at %d,%d,%d"):format(fx, fy, fz))
@@ -2321,4 +2554,27 @@ end
 
 PowNet.SetShutdownHook(OnShutdown)
 
-parallel.waitForAny(PowNet.main, PowNet.droneMain, PowNet.control, heartbeat, resumeBranch, gpsRelay, gpsServe, meshRepeat, scanOnTheMove)
+-- Name the nil instead of dying on "bad argument #9".
+--
+-- parallel.waitForAny reports a missing entry by POSITION, and position tells you nothing when the
+-- list is nine long -- you get "DroneLogic:2286: bad argument #9" on a turtle screen and no way to
+-- know which function is missing or why. That is what a whole fleet crash-looping looked like from
+-- outside, and counting arguments by hand to find the culprit is not a debugging strategy.
+--
+-- A local function referenced before its definition -- or deleted by an edit above -- is nil here
+-- and nowhere else, so this is the one place the check is worth anything.
+local s_Loops = {
+    {"PowNet.main", PowNet.main}, {"PowNet.droneMain", PowNet.droneMain},
+    {"PowNet.control", PowNet.control}, {"heartbeat", heartbeat},
+    {"resumeBranch", resumeBranch}, {"gpsRelay", gpsRelay}, {"gpsServe", gpsServe},
+    {"meshRepeat", meshRepeat}, {"scanOnTheMove", scanOnTheMove}, {"refixLoop", refixLoop},
+}
+local s_Fns = {}
+for _, e in ipairs(s_Loops) do
+    if type(e[2]) ~= "function" then
+        error(("background loop %q is %s, not a function -- DroneLogic cannot start")
+            :format(e[1], type(e[2])), 0)
+    end
+    s_Fns[#s_Fns + 1] = e[2]
+end
+parallel.waitForAny(table.unpack(s_Fns))

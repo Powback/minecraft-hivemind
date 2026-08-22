@@ -46,6 +46,8 @@ export interface Drone {
   reported?: string;
   /** The drone's OWN account of why it stopped. It said this; do not paraphrase it away. */
   stuck?: string;
+  /** Error recorded by the bootloader when the drone's program died. Present means crash-looping. */
+  crash?: string;
   /** Answering GPS pings right now, extending coverage for everyone else. */
   hosting?: boolean;
   /**

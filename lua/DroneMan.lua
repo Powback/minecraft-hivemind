@@ -577,6 +577,107 @@ Render()
 -- position and fuel so a rescue has somewhere to start looking -- the record is stale, not wrong.
 local OFFLINE_AFTER_MS = 3 * 30 * 1000
 
+-- LOADERS PLACE THEMSELVES OVER THE WORK.
+--
+-- A chunky turtle keeps the chunk it is standing in ticking. A drone whose chunk stops ticking does
+-- not fail, it simply stops -- mid-job, reporting nothing, indistinguishable from destroyed. So the
+-- fleet's working area has to stay loaded, and until now that was arranged by hand: loaders sat at
+-- their spawn point until a rescue happened to send one somewhere.
+--
+-- The demand is already known. Every drone reports its position on every heartbeat, so DroneMan can
+-- see where the fleet actually is and park the loaders on top of it. This runs IN-WORLD rather than
+-- in HQ on purpose: losing coverage freezes drones, and it must not depend on the Bridge being up.
+--
+-- Chunk loading is column-wide, which makes this much safer than it first looks -- a loader covers
+-- a miner at y=35 while itself sitting at y=87. It never has to descend into the workings, so it
+-- cannot get walled in down there, and its own travel stays at open altitude.
+local CHUNK = 16
+
+local function chunkOf(p_Pos)
+    return math.floor(p_Pos.x / CHUNK), math.floor(p_Pos.z / CHUNK)
+end
+
+local function Coverage()
+    while true do
+        os.sleep(30)
+
+        local s_Ok, s_Err = pcall(function()
+            -- Where is the work? Loaders are excluded -- covering each other is a feedback loop
+            -- that parks the whole set on top of itself and leaves the miners dark.
+            local s_Demand, s_Loaders = {}, {}
+            for _, d in pairs(DATA["drones"] or {}) do
+                if not d.offline and d.pos and d.pos.x then
+                    if d.role == "loader" then
+                        -- Only IDLE loaders are movable. One on a rescue is already somewhere it
+                        -- was deliberately sent, and yanking it away mid-recovery would strand the
+                        -- drone it was sent to save.
+                        if d.status == "idle" then s_Loaders[#s_Loaders + 1] = d end
+                    elseif d.status ~= "idle" and d.status ~= "offline" then
+                        local cx, cz = chunkOf(d.pos)
+                        local k = cx .. ":" .. cz
+                        s_Demand[k] = s_Demand[k] or {cx = cx, cz = cz, n = 0}
+                        s_Demand[k].n = s_Demand[k].n + 1
+                    end
+                end
+            end
+
+            if #s_Loaders == 0 then return end
+
+            -- Busiest chunks first, so with fewer loaders than hotspots the ones that matter win.
+            local s_Wanted = {}
+            for _, v in pairs(s_Demand) do s_Wanted[#s_Wanted + 1] = v end
+            table.sort(s_Wanted, function(a, b) return a.n > b.n end)
+            if #s_Wanted == 0 then return end
+
+            -- A loader ALREADY covering a wanted chunk stays put. Without this the assignment is
+            -- recomputed from scratch every 30s and loaders trade places forever, spending their
+            -- whole lives in transit and covering nothing while they fly.
+            local s_Covered, s_Free = {}, {}
+            for _, l in ipairs(s_Loaders) do
+                local lx, lz = chunkOf(l.pos)
+                local k = lx .. ":" .. lz
+                if s_Demand[k] and not s_Covered[k] then
+                    s_Covered[k] = true
+                else
+                    s_Free[#s_Free + 1] = l
+                end
+            end
+
+            for _, want in ipairs(s_Wanted) do
+                if #s_Free == 0 then break end
+                local k = want.cx .. ":" .. want.cz
+                if not s_Covered[k] then
+                    -- Nearest free loader, so the fleet is covered as soon as possible rather than
+                    -- optimally-eventually.
+                    local s_Best, s_BestD, s_BestI = nil, nil, nil
+                    local s_Tx = want.cx * CHUNK + CHUNK / 2
+                    local s_Tz = want.cz * CHUNK + CHUNK / 2
+                    for i, l in ipairs(s_Free) do
+                        local d = math.abs(l.pos.x - s_Tx) + math.abs(l.pos.z - s_Tz)
+                        if s_BestD == nil or d < s_BestD then s_Best, s_BestD, s_BestI = l, d, i end
+                    end
+
+                    -- Keep the loader's own altitude. The chunk is loaded as a column, so there is
+                    -- nothing to gain by descending and a great deal to lose.
+                    PowNet.Send(s_Best.id,
+                        PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Abort", {}),
+                        PowNet.SERVER_PROTOCOL)
+                    os.sleep(0.2)
+                    PowNet.SendToDrone(s_Best.id, PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "GoTo",
+                        {pos = {x = s_Tx, y = s_Best.pos.y, z = s_Tz}}))
+                    print(("coverage: %s -> chunk %d,%d (%d drone(s) working there)")
+                        :format(tostring(s_Best.name), want.cx, want.cz, want.n))
+
+                    s_Covered[k] = true
+                    table.remove(s_Free, s_BestI)
+                end
+            end
+        end)
+
+        if not s_Ok then print("coverage failed: " .. tostring(s_Err)) end
+    end
+end
+
 local function Tick()
     while true do
         os.sleep(20)
@@ -600,7 +701,7 @@ local function Tick()
     end
 end
 
-parallel.waitForAny(PowNet.main, PowNet.droneMain, PowNet.control, Tick)
+parallel.waitForAny(PowNet.main, PowNet.droneMain, PowNet.control, Tick, Coverage)
 
 print("Unhosting")
 rednet.unhost(PowNet.SERVER_PROTOCOL)

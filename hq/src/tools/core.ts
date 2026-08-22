@@ -117,6 +117,11 @@ async function doRefreshFleet(): Promise<void> {
         // generic "has gone quiet" -- which describes a drone that said NOTHING, the opposite of
         // what happened, and sends you looking for a comms fault instead of reading the reason.
         stuck: typeof d.stuck === 'string' ? d.stuck : undefined,
+        // A crash-looping drone reports the error its bootloader recorded. Without this it appears
+        // as "idle" at its last known position -- DroneMan is still holding the healthy heartbeat
+        // from before it broke -- which is how fourteen drones dying on startup looked like a fleet
+        // standing around with nothing to do.
+        crash: typeof d.crash === 'string' ? d.crash : undefined,
         // Which drones are currently acting as GPS hosts. Coverage is no longer a fixed bubble
         // around four computers -- it is whatever the parked fleet is collectively reaching -- so
         // "who is relaying" is now a thing an operator needs to be able to see.
