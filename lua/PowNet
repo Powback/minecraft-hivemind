@@ -267,19 +267,60 @@ function UpdateModule(p_Module, p_Path)
     }
 
     local s_Response = sendAndWaitForResponse(MAINFRAME, s_Message, SERVER_PROTOCOL)
-    if not s_Response then
-        print("Failed to receive program: " .. p_Module)
-        return
-    end
-    if(s_Response == "InvalidName") then
-        print("No module by this name: " .. p_Module)
-    end
     if(p_Path == nil) then
         p_Path = "/" .. p_Module
     end
-    local file = fs.open(p_Path, "w")
-    file.write(s_Response)
-    file.close()
+
+    -- NEVER TRUNCATE THE LIVE FILE BEFORE THE REPLACEMENT IS KNOWN GOOD.
+    --
+    -- This opened the destination with "w" -- which truncates immediately -- and only then wrote
+    -- whatever had come back. So any bad fetch left an EMPTY module on disk, and when that module
+    -- is PowNet itself the computer can never boot again to repair it: os.loadAPI fails, the
+    -- bootloader dies before it runs anything, and the machine sits powered on doing nothing. The
+    -- Bridge was bricked that way twice and had to be restored from the host filesystem by hand,
+    -- which is exactly the kind of intervention a self-updating fleet is supposed to remove.
+    --
+    -- Validate, write to a scratch file, check what landed, and only then replace.
+    if not s_Response then
+        return false, "no reply from MainFrame for " .. tostring(p_Module)
+    end
+    if type(s_Response) ~= "string" then
+        return false, ("MainFrame sent a %s for %s, not source"):format(type(s_Response), tostring(p_Module))
+    end
+    if s_Response == "InvalidName" then
+        return false, "no module named " .. tostring(p_Module)
+    end
+    if #s_Response == 0 then
+        return false, "MainFrame sent an empty " .. tostring(p_Module)
+    end
+
+    local s_Tmp = p_Path .. ".new"
+    local s_Ok, s_Err = pcall(function()
+        local h = fs.open(s_Tmp, "w")
+        if h == nil then error("cannot open " .. s_Tmp) end
+        h.write(s_Response)
+        h.close()
+    end)
+    if not s_Ok then
+        pcall(fs.delete, s_Tmp)
+        return false, "could not stage " .. tostring(p_Module) .. ": " .. tostring(s_Err)
+    end
+
+    -- Confirm the bytes actually landed. A disk that is full fails HERE rather than after the
+    -- live file has already been destroyed.
+    local s_Size = 0
+    pcall(function() s_Size = fs.getSize(s_Tmp) end)
+    if s_Size < #s_Response then
+        pcall(fs.delete, s_Tmp)
+        return false, ("%s wrote %d of %d bytes -- disk full?"):format(tostring(p_Module), s_Size, #s_Response)
+    end
+
+    pcall(fs.delete, p_Path)
+    local s_Moved, s_MoveErr = pcall(fs.move, s_Tmp, p_Path)
+    if not s_Moved then
+        return false, "could not install " .. tostring(p_Module) .. ": " .. tostring(s_MoveErr)
+    end
+    return true
 end
 
 -- Write-back of a module's DATA to MainFrame's VFS.

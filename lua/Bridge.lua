@@ -113,9 +113,39 @@ local function connect()
   return true
 end
 
+-- CC:T refuses to send a websocket frame over its size limit, and an unguarded oversized reply
+-- takes the whole link down: the send throws, the socket is closed, and every in-flight call is
+-- lost along with it. One big answer -- a block index, a status with logs attached -- therefore
+-- disconnected the fleet from HQ, repeatedly, and looked like a flaky bridge.
+--
+-- A reply that will not fit is a REPLY, not a disconnection. Say so and keep the socket.
+local MAX_FRAME = 60 * 1024
+
 local function send(tbl)
   if not m_Socket then return false end
-  local ok, err = pcall(function() m_Socket.send(textutils.serialiseJSON(tbl)) end)
+
+  local okSer, payload = pcall(textutils.serialiseJSON, tbl)
+  if not okSer then
+    log("could not serialise a " .. tostring(tbl and tbl.type) .. " frame")
+    return false
+  end
+
+  if #payload > MAX_FRAME then
+    log(("reply too large (%d bytes) for %s"):format(#payload, tostring(tbl and tbl.id)))
+    -- Answer the CALLER rather than dying. A tool that asked for too much can ask for less; a
+    -- dropped socket gives it nothing to act on and costs everyone else their answers too.
+    if tbl and tbl.type == "REPLY" and tbl.id then
+      local s_Small = textutils.serialiseJSON({
+        v = PROTOCOL, type = "REPLY", id = tbl.id, ok = false,
+        error = ("reply too large (%d bytes, limit %d) -- ask for less"):format(#payload, MAX_FRAME),
+      })
+      local okSmall = pcall(function() m_Socket.send(s_Small) end)
+      if okSmall then return false end
+    end
+    return false
+  end
+
+  local ok, err = pcall(function() m_Socket.send(payload) end)
   if not ok then
     log("send failed: " .. tostring(err))
     closeSocket()           -- close it, do not merely forget it, or the handle leaks
@@ -309,10 +339,29 @@ end
 
 --=====================================================================
 
+-- JOIN THE FLEET RELOAD.
+--
+-- Every other module runs PowNet.main, which handles MainFrame's INIT broadcast by standing down
+-- so the bootloader can pull new code. The Bridge does not run main -- it has its own loops -- so
+-- it never heard a single deploy and went on running whatever version it booted with, for hours.
+-- Three separate fixes to this file appeared to do nothing, and it had to be restored by hand
+-- twice, because the one component that carries every deploy could not receive one.
+local function reloadLoop()
+  while true do
+    local id, msg = rednet.receive(PowNet.SERVER_PROTOCOL)
+    if type(msg) == "table" and msg.type == PowNet.MESSAGE_TYPE.INIT then
+      log("fleet reload from #" .. tostring(id) .. " -- rebooting to pull new code")
+      closeSocket()          -- hand the socket back rather than leaking it across the reboot
+      os.sleep(1)
+      os.reboot()
+    end
+  end
+end
+
 log("starting; HQ = " .. HQ_URL)
 if not PowNet.Connect() then
   log("WARNING: MainFrame not reachable — relaying HQ traffic only")
 end
 
-parallel.waitForAny(socketLoop, pingLoop, rednetLoop, PowNet.control)
+parallel.waitForAny(socketLoop, pingLoop, rednetLoop, reloadLoop, PowNet.control)
 log("stopped")

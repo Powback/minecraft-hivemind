@@ -119,8 +119,58 @@ function SendHeartBeat()
 
     local s_Data = {pos = s_Pos, status = m_Status, fuel = s_Fuel, role = Role(), stuck = m_Stuck, hosting = m_Hosting}
     local s_Message = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Heartbeat", s_Data)
-    PowNet.SendToServer("DroneMan", s_Message)
-    print("Sent heartbeat")
+    -- WAIT FOR THE ANSWER.
+    --
+    -- This was fire-and-forget, which meant a drone could not tell a healthy fleet from being out
+    -- of radio range: it shouted into the dark on a timer and carried on working. Out of range is
+    -- precisely when a drone most needs to know, because it is the one condition it can still fix
+    -- by itself -- by going back the way it came until someone answers.
+    --
+    -- Short timeout: this runs on a loop and a slow DroneMan should cost a missed beat, not a
+    -- stalled drone.
+    local s_Reply = PowNet.sendAndWaitForResponse("DroneMan", s_Message, PowNet.SERVER_PROTOCOL, 2)
+    return s_Reply ~= false and s_Reply ~= nil
+end
+
+-- WALK BACK UNTIL SOMEONE ANSWERS.
+--
+-- The route the drone walked in on is the one route it KNOWS is passable, and the link worked
+-- somewhere along it. So losing contact is recoverable without any help: retrace the trail, testing
+-- after every crumb, and stop the moment the fleet replies.
+--
+-- This is the only situation where moving on an unverified position is right. The guard that
+-- normally forbids it exists because drift walked a drone out of the world -- but out of range that
+-- same guard freezes it exactly where it must not stay, turning a recoverable drone into a lost
+-- one. Retracing is safe because it is going back, not reasoning about somewhere new.
+local RECOVER_MAX_CRUMBS = 120
+
+function RecoverLink()
+    local s_Was = m_Status
+    m_Status = "recovering"
+    pgps.setRecovering(true)
+    print("link lost -- retracing " .. tostring(pgps.trailLength()) .. " crumbs")
+
+    local s_Steps = 0
+    while s_Steps < RECOVER_MAX_CRUMBS do
+        local bx, by, bz = pgps.trailBack()
+        if bx == nil then break end
+        s_Steps = s_Steps + 1
+        pgps.flyTo(bx, by, bz, 32)
+        if SendHeartBeat() then
+            pgps.setRecovering(false)
+            m_Status = s_Was
+            print("link regained after " .. s_Steps .. " crumbs")
+            Distress("link lost and regained", "retraced " .. s_Steps .. " crumbs")
+            return true
+        end
+    end
+
+    pgps.setRecovering(false)
+    m_Status = "stuck"
+    -- Out of trail and still alone. Say so on the terminal and in the fault file: nobody is
+    -- listening on rednet by definition, so this is the only place it can be recorded.
+    Distress("link lost", "retraced " .. s_Steps .. " crumbs without regaining contact")
+    return false
 end
 
 -- Cheap liveness. The registry cannot tell a docked drone from one that no longer exists:
@@ -480,6 +530,20 @@ function OnSurvey(p_ID, p_Message)
     if executing then
         return false, "busy"
     end
+
+    -- Go where the survey was ORDERED, not wherever the scout happens to be parked.
+    --
+    -- Without this a scan always started at the dock, which is why surveying could never find iron:
+    -- the scanner reaches 8 blocks and the ore is fifty below. Sending the scout down a shaft a
+    -- miner has already cut is the whole point of pairing them.
+    if d.pos and d.pos.x then
+        m_Status = "moving"
+        if pgps.moveTo(tonumber(d.pos.x), tonumber(d.pos.y), tonumber(d.pos.z)) == false then
+            m_Status = "idle"
+            return false, "could not reach the survey start"
+        end
+    end
+
     m_Job = {verb = "Survey", data = d}
     saveResume()
 
@@ -1197,6 +1261,161 @@ function OnCraft(p_ID, p_Message)
     end)
 end
 
+
+-- BRANCH MINING: how the fleet finds ore it has never seen.
+--
+-- Everything before this could only mine ore the map already knew about, and the map could only
+-- learn about ore a SCOUT had scanned. That loop cannot close for iron: a turtle carries two
+-- upgrades and the wireless modem takes one, so a scout has a geo scanner and no pickaxe while a
+-- miner has a pickaxe and cannot see through rock. The scanner reaches 8 blocks, so surveying the
+-- surface at y=85 can never reveal iron at y=30. "We are short of iron" was therefore unanswerable
+-- by any combination of drones -- not because of a bug, but because nothing in the system ever went
+-- underground to look.
+--
+-- A miner does not need to see through rock. It needs to EXPOSE rock and look at what it exposed,
+-- which is exactly what a human does: sink a shaft, drive tunnels, and check the faces you open.
+--
+-- Cost model, because every move counts: inspecting forward, up and down costs nothing extra --
+-- the turtle is already facing forward and inspectUp/inspectDown need no turning. Checking the
+-- side walls needs two turns plus two back, four wasted steps per block, so it is done on an
+-- interval instead. Ore missed in a side wall is picked up by the neighbouring branch.
+local ORE_HINTS = {"_ore", "ancient_debris", "raw_"}
+
+local function looksValuable(p_Name)
+    if p_Name == nil then return false end
+    if IsProtected(p_Name) then return false end
+    for _, hint in ipairs(ORE_HINTS) do
+        if string.find(p_Name, hint, 1, true) then return true end
+    end
+    return false
+end
+
+-- Record what we just looked at, so exposing a face TEACHES THE MAP even when we leave the block
+-- alone. A tunnel is a survey the fleet paid for anyway; throwing the observations away would mean
+-- digging the same ground again later to learn the same thing.
+local function noteFace(p_Dx, p_Dy, p_Dz, p_Ok, p_Blk)
+    local cx, cy, cz = pgps.getCachedPosition()
+    if cx == nil then return end
+    local idx = (cx + p_Dx) .. ":" .. (cy + p_Dy) .. ":" .. (cz + p_Dz)
+    if p_Ok and p_Blk then
+        pgps.noteObservation(idx, 1, {true, {name = p_Blk.name}})
+    else
+        pgps.noteObservation(idx, 0)
+    end
+end
+
+--- Look at the three faces a turtle can see without turning, and take anything worth taking.
+local function workFace(p_Inspect, p_Dig, p_Dx, p_Dy, p_Dz)
+    local s_Ok, s_Blk = p_Inspect()
+    noteFace(p_Dx, p_Dy, p_Dz, s_Ok, s_Blk)
+    if s_Ok and s_Blk and looksValuable(s_Blk.name) then
+        if p_Dig() then return 1 end
+    end
+    return 0
+end
+
+function OnMine(p_ID, p_Message)
+    return RunJob("Mine", p_Message.data, {status = "mining", travel = false}, function(d)
+        local s_Depth   = tonumber(d.depth)    or 35    -- target Y for the grid
+        local s_Length  = tonumber(d.length)   or 32    -- how far each tunnel runs
+        local s_Lines   = tonumber(d.branches) or 4     -- tunnels in the grid
+        -- SPACED FOR THE SCANNER, not for the pickaxe.
+        --
+        -- A geo scanner reaches 8 blocks, so tunnels 16 apart let the scan spheres tile the rock
+        -- between them with nothing missed. Digging densely to find ore by touch is the expensive
+        -- way round: cut a sparse grid, then let one scan read thousands of cells of the rock it
+        -- opens up. The tunnels are scaffolding for the SCOUT, not the search itself.
+        local s_Spacing = tonumber(d.spacing)  or 16
+        local s_WallEvery = tonumber(d.wallEvery) or 6
+
+        local s_Got, s_Steps = 0, 0
+
+        -- Cut a tunnel a person can walk down: floor, plus two blocks of air.
+        --
+        -- The turtle rides at floor level and clears the block ahead and the one above it before
+        -- stepping in. That is two digs per block instead of one, and digs are FREE -- they cost
+        -- time, not fuel -- while the move is what actually costs. So headroom is nearly free, and
+        -- a one-high tunnel nobody can walk through is a worse artefact for the same fuel.
+        local function boreForward()
+            local s_Ore = 0
+            s_Ore = s_Ore + workFace(turtle.inspect,   DigForward, 0, 0, 0)
+            if not DigForward() then return nil end
+            s_Ore = s_Ore + workFace(turtle.inspectUp, DigUp,      0, 1, 0)
+            DigUp()                                   -- headroom, whether or not it held ore
+            if not pgps.forward() then return nil end
+            -- Now standing in the new block: clear the head-height block ahead of us too, so the
+            -- corridor stays two high the whole way rather than only where it happened to be air.
+            s_Ore = s_Ore + workFace(turtle.inspectUp, DigUp, 0, 1, 0)
+            DigUp()
+            return s_Ore
+        end
+
+        -- 1. Sink the access shaft.
+        if d.pos and d.pos.x then
+            if pgps.moveTo(tonumber(d.pos.x), tonumber(d.pos.y), tonumber(d.pos.z)) == false then
+                error("could not reach the shaft head", 0)
+            end
+        end
+
+        local _, cy = pgps.getCachedPosition()
+        while cy and cy > s_Depth do
+            if not executing then break end
+            if not depositIfFull() then break end
+            s_Got = s_Got + workFace(turtle.inspectDown, DigDown, 0, -1, 0)
+            if not DigDown() then break end
+            if not pgps.down() then break end
+            _, cy = pgps.getCachedPosition()
+            s_Steps = s_Steps + 1
+        end
+
+        -- 2. Cut the grid, serpentine, so no leg is walked empty.
+        for line = 1, s_Lines do
+            if not executing then break end
+
+            for step = 1, s_Length do
+                if not executing then break end
+                if not depositIfFull() then break end
+
+                local s_Ore = boreForward()
+                if s_Ore == nil then break end
+                s_Got = s_Got + s_Ore
+                s_Steps = s_Steps + 1
+
+                s_Got = s_Got + workFace(turtle.inspectDown, DigDown, 0, -1, 0)
+
+                -- Side walls cost two turns each way. Occasional, because the SCOUT is what is
+                -- meant to see through these walls -- this is only a cheap second opinion.
+                if step % s_WallEvery == 0 then
+                    pgps.turnRight()
+                    s_Got = s_Got + workFace(turtle.inspect, DigForward, 0, 0, 0)
+                    pgps.turnLeft() pgps.turnLeft()
+                    s_Got = s_Got + workFace(turtle.inspect, DigForward, 0, 0, 0)
+                    pgps.turnRight()
+                end
+            end
+
+            -- Step across to the next line of the grid, cutting the crosscut as we go so the whole
+            -- thing stays connected and walkable rather than being a set of dead-end corridors.
+            if line < s_Lines then
+                pgps.turnRight()
+                for _ = 1, s_Spacing do
+                    if not executing then break end
+                    if boreForward() == nil then break end
+                    s_Steps = s_Steps + 1
+                end
+                pgps.turnRight()
+                -- Face back along the next line; the serpentine reverses direction each pass.
+                s_Length = s_Length          -- unchanged; direction comes from the two turns above
+            end
+        end
+
+        UploadWorld()
+        return {message = ("cut %d tunnel blocks at y=%d, took %d ore")
+                    :format(s_Steps, s_Depth, s_Got),
+                got = s_Got, steps = s_Steps, depth = s_Depth}
+    end)
+end
+
 function OnLumber(p_ID, p_Message)
     return RunJob("Lumber", p_Message.data, {status = "logging"}, function(d)
         local s_W = tonumber(d.w) or 8
@@ -1278,6 +1497,10 @@ local m_DroneEvents = {
     -- serve it; OnCraft says so plainly rather than failing somewhere less obvious.
     Craft = {
         func = OnCraft,
+    },
+    -- Prospecting. The only job that can find ore nobody has scanned.
+    Mine = {
+        func = OnMine,
     },
     Ping = {
         func = OnPing,
@@ -1468,10 +1691,28 @@ local function gpsServe()
 end
 
 local HEARTBEAT_SECONDS = 30
+-- Consecutive unanswered beats before we conclude the link is gone rather than merely busy.
+-- Three, because one missed reply is normal (DroneMan servicing another call) and waiting for
+-- three costs at most a minute while avoiding a drone that abandons its job over a hiccup.
+local LINK_LOST_AFTER = 3
+local m_Missed = 0
+
 local function heartbeat()
     while true do
         os.sleep(HEARTBEAT_SECONDS)
-        SendHeartBeat()
+        if SendHeartBeat() then
+            m_Missed = 0
+        else
+            m_Missed = m_Missed + 1
+            print("no answer from DroneMan (" .. m_Missed .. "/" .. LINK_LOST_AFTER .. ")")
+            if m_Missed >= LINK_LOST_AFTER then
+                m_Missed = 0
+                -- Stop whatever we are doing first. Carrying on digging while out of contact is
+                -- how a drone ends up deep in unmapped ground with nobody able to reach it.
+                executing = false
+                RecoverLink()
+            end
+        end
         UploadWorld()
         -- Only when idle: a drone mid-task is not at the dock and sucking from whatever happens
         -- to be next to it would steal from a chest it is standing over.

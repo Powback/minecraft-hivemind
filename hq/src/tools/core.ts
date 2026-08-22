@@ -18,7 +18,7 @@ import { bridge } from '../bridge/ws.js';
 import { expand, craftable, RECIPES } from '../world/recipes.js';
 import { allocate, checkOrder, SPEC, type Purpose } from '../world/plots.js';
 import { city, saveCity } from '../world/city.js';
-import { supply, runSupplyTick, stockKey, type SupplyRule } from '../agent/supply.js';
+import { supply, runSupplyTick, saveSupply, stockKey, type SupplyRule } from '../agent/supply.js';
 
 /**
  * Pull the fleet from DroneMan, which owns the registry.
@@ -450,7 +450,7 @@ registry.register({
     enabled: z.boolean().optional(),
     match: z.string().min(2).optional().describe('Material to add or adjust.'),
     min: z.number().int().min(0).max(10000).optional(),
-    action: z.enum(['gather', 'lumber']).optional(),
+    action: z.enum(['gather', 'lumber', 'craft']).optional(),
     limit: z.number().int().min(1).max(512).optional(),
     runNow: z.boolean().optional().describe('Run one tick immediately rather than waiting.'),
   }).strict(),
@@ -469,6 +469,9 @@ registry.register({
                             action: a.action ?? 'gather', limit: a.limit } as SupplyRule);
       }
     }
+    // Persist BEFORE running a tick: if the tick throws, the operator's decision to enable
+    // autonomy must still have been recorded. Losing it silently is how the loop ended up off.
+    saveSupply();
     let tick;
     if (a.runNow) tick = await runSupplyTick();
     ctx.log('supply.set', { enabled: supply.enabled, rules: supply.rules.length });
@@ -647,8 +650,18 @@ async function loadBlocks(): Promise<Record<string, string>> {
     // Shorter than the voxel fetch it rides alongside. Identity is an enrichment: if MapServer
     // does not have this endpoint yet, the map must fall back to unidentified terrain quickly
     // rather than hold the whole terrain refresh open waiting for a call that will never answer.
-    const res: any = await bridge.call('MapServer', 'BlockAt', {}, { timeoutMs: 8000 });
-    const map = res?.blockAt ?? res?.data?.blockAt ?? {};
+    // Page through it. MapServer caps each reply so it fits in a websocket frame -- asking for
+    // the whole map in one go produced 427KB, which CC:T refuses to send, and the failed send
+    // closed the socket and dropped the WHOLE FLEET off HQ every time this ran.
+    const map: Record<string, string> = {};
+    let offset: number | undefined = 0;
+    for (let page = 0; page < 40 && offset !== undefined; page++) {
+      const res: any = await bridge.call('MapServer', 'BlockAt', { offset }, { timeoutMs: 8000 });
+      const chunk = res?.blockAt ?? res?.data?.blockAt ?? {};
+      Object.assign(map, chunk);
+      const nxt = res?.next ?? res?.data?.next;
+      offset = typeof nxt === 'number' ? nxt : undefined;
+    }
     blocksCache = { at: Date.now(), map };
     return map;
   })().finally(() => { blocksInflight = null; });
@@ -769,7 +782,24 @@ function describeTask(t: any) {
 // Drones report themselves on a heartbeat; the machines that command them reported nothing, so
 // the entire control plane was invisible from outside the game. Five idle drones look identical
 // whether there is no work to do or TaskMan has been dead since the last chunk unload.
-const NODE_MODULES = ['MainFrame', 'DroneMan', 'TaskMan', 'MapServer', 'StorageMan', 'DockingMan'];
+// Display name -> the name the module actually HOSTS under on rednet.
+//
+// MainFrame hosts itself as "MAINFRAME". Probing "MainFrame" therefore looked up a host that has
+// never existed, and the panel reported the one module the entire fleet had just booted from as
+// "not answering" -- a monitor that cries wolf is worse than no monitor, because the next real
+// outage gets ignored.
+const NODE_MODULES: Array<{ label: string; host: string; noStatus?: boolean }> = [
+  // MainFrame runs its own receive loop and never registered a Status event, so probing it is
+  // guaranteed to time out. Reporting that as "not answering" put the one module the whole fleet
+  // had just booted from at the top of the panel as a failure. It is flagged instead: absent
+  // endpoint, not absent module.
+  { label: 'MainFrame',  host: 'MAINFRAME', noStatus: true },
+  { label: 'DroneMan',   host: 'DroneMan' },
+  { label: 'TaskMan',    host: 'TaskMan' },
+  { label: 'MapServer',  host: 'MapServer' },
+  { label: 'StorageMan', host: 'StorageMan' },
+  { label: 'DockingMan', host: 'DockingMan' },
+];
 
 /**
  * Cached hard, and backed off harder when nothing answers.
@@ -826,11 +856,18 @@ async function probeNodes() {
     // Asked in parallel: six sequential rednet round-trips at up to 5s each is long enough that
     // the page polling this would never see a complete answer.
     const nodes = await Promise.all(NODE_MODULES.map(async (m) => {
+      if (m.noStatus) {
+        return {
+          module: m.label, reachable: null, id: null, label: null, pos: null, upSec: null,
+          faults: 0, lastFault: null, monitor: null, log: [],
+          note: 'serves the VFS; does not implement Status, so it cannot be probed this way',
+        };
+      }
       try {
-        const r: any = await bridge.call(m, 'Status', {}, { timeoutMs: 5000 });
+        const r: any = await bridge.call(m.host, 'Status', {}, { timeoutMs: 5000 });
         const s = r?.data ?? r ?? {};
         return {
-          module: m, reachable: true,
+          module: m.label, reachable: true,
           id: s.id ?? null, label: s.label ?? null,
           pos: s.pos && typeof s.pos.x === 'number' ? s.pos : null,
           upSec: typeof s.up === 'number' ? Math.round(s.up) : null,
@@ -843,7 +880,7 @@ async function probeNodes() {
         // Unreachable is the answer, not an error. A module that cannot be asked is the most
         // important thing on this list, and throwing would hide the five that did reply.
         return {
-          module: m, reachable: false,
+          module: m.label, reachable: false,
           id: null, label: null, pos: null, upSec: null, faults: 0, lastFault: null,
           monitor: null, log: [],
           error: (err as Error)?.message ?? String(err),
@@ -864,7 +901,7 @@ async function probeNodes() {
   const all = [...nodes, bridgeNode];
   // "Any PowNet module answered" — the Bridge is excluded deliberately, because it answers on its
   // own path and would mask the case this backoff exists for: Status not deployed anywhere.
-  const anyUp = nodes.some((n) => n.reachable);
+  const anyUp = nodes.some((n) => n.reachable === true);
   const value = {
     count: all.length, up: all.filter((n) => n.reachable).length, nodes: all,
     // Said plainly rather than left to be inferred from six identical timeouts.
@@ -1199,6 +1236,142 @@ registry.register({
       { pos: a.pos, peripheral: a.peripheral }, { timeoutMs: 8000 });
     if (typeof res === 'string') throw new ToolError(res, 'Check storage.stock for valid chest names.');
     return res;
+  },
+});
+
+
+// ── order.mine ─────────────────────────────────────────────────────────────
+registry.register({
+  name: 'order.mine',
+  summary: 'Sink a shaft and drive branch tunnels, taking any ore the digging exposes.',
+  description:
+    'The only way the fleet can find ore it has never seen. gather revisits coordinates the map ' +
+    'already holds; a surface survey cannot reach ore at depth, because a geo scanner sees 8 ' +
+    'blocks and iron is fifty below the base. This digs down and inspects what it opens, so it ' +
+    'both PRODUCES ore and TEACHES the map where more of it is. Depth matters: coal is common ' +
+    'around y=50, iron around y=35, and below y=0 is deepslate and lava.',
+  params: z.object({
+    depth: z.number().int().min(-40).max(120).default(40).describe('Target Y for the tunnels.'),
+    length: z.number().int().min(4).max(64).default(24).describe('How far each branch runs.'),
+    branches: z.number().int().min(1).max(8).default(4),
+    spacing: z.number().int().min(2).max(8).default(3).describe('Blocks between parallel branches.'),
+    pos: vec3.optional().describe('Shaft head. Defaults to the drone starting where it is.'),
+  }).strict(),
+  returns: 'The queued prospecting task.',
+  danger: 'destructive',
+  bounds: 'Bounded by branch count and length; abortable via order.abort. Digs only ore it exposes plus the tunnels themselves.',
+  teach: [{
+    situation: 'We are short of iron and nothing in the survey has ever seen any.',
+    args: { depth: 35, length: 24, branches: 4, spacing: 3 },
+    result: { task: 31, depth: 35, note: 'prospecting; ore found is added to the map as well as the chest' },
+    takeaway: 'Iron is not findable from the surface. Send someone down to look.',
+  }],
+  handler: async (a, ctx) => {
+    const res: any = await bridge.call('TaskMan', 'Add', {
+      name: `prospect-y${a.depth}`,
+      priority: 3,
+      work: { mine: { depth: a.depth, length: a.length, branches: a.branches, spacing: a.spacing, pos: a.pos } },
+    }, { timeoutMs: 8000 });
+    if (typeof res === 'string') throw new ToolError(`TaskMan refused: ${res}`, 'Check fleet.tasks.');
+    ctx.log('order.mine', { depth: a.depth });
+    return { task: res?.id, depth: a.depth, length: a.length, branches: a.branches };
+  },
+});
+
+
+// ── order.prospect ─────────────────────────────────────────────────────────
+//
+// A MISSION, not a job: two drones with complementary hardware, in sequence.
+//
+// Neither can prospect alone, and the reason is physical rather than a limitation of the code. A
+// turtle has two upgrade slots and the wireless modem takes one, so a scout carries a geo scanner
+// and no pickaxe -- it can see 8 blocks through solid rock and cannot dig a single one. A miner
+// carries a pickaxe and no scanner: it can reach any depth and can only learn what a block is by
+// breaking the one in front of it. Surface surveying can never find iron, because the scanner's
+// reach is 8 blocks and the ore is fifty below.
+//
+// Paired, they cover each other exactly: the miner cuts an access shaft, the scout walks down it
+// and scans from inside -- where one sphere reveals thousands of cells of ore-bearing rock -- and
+// the located veins go into the map for gather to collect. That is the whole loop, and it needs
+// the two of them.
+registry.register({
+  name: 'order.prospect',
+  summary: 'Send a miner and a scout underground together to find ore nobody has seen.',
+  description:
+    'Allocates (or reuses) a mine_head plot so shafts are SITED rather than dug wherever a drone ' +
+    'was standing, queues a miner to sink the shaft and drive branches, then queues a scout to ' +
+    'descend and scan from depth once the shaft exists. Ore found this way enters the world model, ' +
+    'so ordinary gather orders can collect it afterwards. Use when a material is short and the ' +
+    'survey has never seen any of it.',
+  params: z.object({
+    depth: z.number().int().min(-40).max(120).default(35).describe('Target Y. Coal ~50, iron ~35.'),
+    length: z.number().int().min(4).max(64).default(24),
+    branches: z.number().int().min(1).max(8).default(4),
+    plot: z.string().optional().describe('Reuse a named mine_head plot instead of allocating one.'),
+  }).strict(),
+  returns: 'The plot used and both queued tasks.',
+  danger: 'destructive',
+  bounds: 'The SHAFT HEAD is confined to an allocated mine_head plot, so the surface keeps one ' +
+    'tidy entrance per mine instead of holes wherever a drone happened to stand. The tunnels ' +
+    'themselves run well beyond that footprint underground, by design — plots zone the ' +
+    'settlement, not the rock beneath it.',
+  teach: [{
+    situation: 'Iron is at 0/32 and nothing in the survey has ever seen any.',
+    args: { depth: 35, length: 24, branches: 4 },
+    result: { plot: 'mine_head-01', shaftTask: 31, scanTask: 32,
+              note: 'scout descends once the shaft is cut' },
+    takeaway: 'One order, two drones, in dependency order — and the hole is inside a plot.',
+  }],
+  handler: async (a, ctx) => {
+    // SITE IT. A shaft is permanent and ugly in the wrong place; the registry exists precisely so
+    // the settlement does not end up pockmarked with holes nobody meant to leave.
+    let plot = a.plot
+      ? city.plots.find((p) => p.name === a.plot)
+      : city.plots.find((p) => p.purpose === 'mine_head' && p.status !== 'active');
+    if (!plot) {
+      const r = allocate(city, 'mine_head');
+      if ('error' in r) throw new ToolError(r.error, 'Free ground or widen the operating bounds.');
+      plot = r;
+    }
+    plot.status = 'active';
+    saveCity();
+
+    // Shaft head at the middle of the plot.
+    //
+    // Only the HEAD is bounded. A grid of 32-block tunnels 16 apart covers far more ground than a
+    // 5x5 plot, and pretending otherwise would be a comfortable lie: what the plot actually buys
+    // is one deliberate entrance on the surface instead of a scatter of holes across the base.
+    const head = {
+      x: Math.floor((plot.min.x + plot.max.x) / 2),
+      y: plot.ground,
+      z: Math.floor((plot.min.z + plot.max.z) / 2),
+    };
+
+    const shaft: any = await bridge.call('TaskMan', 'Add', {
+      name: `shaft-${plot.name}`,
+      priority: 2,
+      work: { mine: { pos: head, depth: a.depth, length: a.length, branches: a.branches, spacing: 3 } },
+    }, { timeoutMs: 8000 });
+    if (typeof shaft === 'string') throw new ToolError(`TaskMan refused the shaft: ${shaft}`, 'Check fleet.tasks.');
+
+    // The scout waits for the shaft. dependsOn is what makes this a mission rather than two
+    // unrelated orders racing each other -- sending the scout first would strand it on the surface
+    // scanning dirt, which is exactly what surveying has been doing.
+    const scan: any = await bridge.call('TaskMan', 'Add', {
+      name: `scan-${plot.name}-y${a.depth}`,
+      priority: 2,
+      dependsOn: shaft?.id,
+      work: { survey: { w: 4, h: 4, radius: 8, pos: { x: head.x, y: a.depth, z: head.z } } },
+    }, { timeoutMs: 8000 });
+    if (typeof scan === 'string') throw new ToolError(`TaskMan refused the scan: ${scan}`, 'Check fleet.tasks.');
+
+    ctx.log('order.prospect', { plot: plot.name, depth: a.depth });
+    return {
+      plot: plot.name, bounds: { min: plot.min, max: plot.max },
+      head, depth: a.depth,
+      shaftTask: shaft?.id, scanTask: scan?.id,
+      note: 'scout descends and scans once the shaft is cut; found ore enters the map for gather',
+    };
   },
 });
 

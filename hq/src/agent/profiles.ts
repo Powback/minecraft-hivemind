@@ -72,6 +72,8 @@ export const PROFILES: Record<string, AgentProfile> = {
       'fleet.goto',
       'plan.make',
       'plan.execute',
+      'order.mine',
+      'order.prospect',
       'storage.pickup',
       'plot.alloc',
       'plot.list',

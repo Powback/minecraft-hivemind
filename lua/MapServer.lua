@@ -406,11 +406,37 @@ end
 -- a name for, which is a small subset of the cells cachedWorld knows the occupancy of. A caller
 -- must treat a missing key as "solid but unidentified", never as air -- cachedWorld remains the
 -- authority on what is solid.
+-- PAGED, because the whole map does not fit in a websocket frame.
+--
+-- This returned every known position in one reply. At 1,900 entries that is 427KB of JSON, and
+-- CC:T refuses to send a frame that size -- so the send threw, the Bridge closed the socket, and
+-- the entire fleet dropped off HQ every time the map page asked for terrain. One oversized answer
+-- was taking down the link for everything else.
+local BLOCKAT_PAGE = 400
+
 function OnBlockAt(p_ID, p_Message)
+    local d = p_Message.data or {}
+    local s_Offset = tonumber(d.offset) or 0
+    local s_Limit  = math.min(tonumber(d.limit) or BLOCKAT_PAGE, BLOCKAT_PAGE)
     local s_At = DATA["blockAt"] or {}
-    local s_N = 0
-    for _ in pairs(s_At) do s_N = s_N + 1 end
-    return true, {blockAt = s_At, count = s_N}
+
+    -- pairs() order is not stable across calls in general, but this table is only mutated by
+    -- observations, so a page walk between polls is close enough for a display. Sorting 1,900 keys
+    -- on every request to guarantee it would cost more than the imprecision is worth.
+    local s_Page, s_N, s_Sent = {}, 0, 0
+    for key, name in pairs(s_At) do
+        if s_N >= s_Offset and s_Sent < s_Limit then
+            s_Page[key] = name
+            s_Sent = s_Sent + 1
+        end
+        s_N = s_N + 1
+    end
+
+    local s_Next = s_Offset + s_Sent
+    return true, {
+        blockAt = s_Page, count = s_N, offset = s_Offset, sent = s_Sent,
+        next = (s_Next < s_N) and s_Next or nil,
+    }
 end
 
 -- Connected pockets of surveyed AIR. A cave is air that is enclosed -- so ignore anything at or

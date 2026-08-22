@@ -308,6 +308,43 @@ function verifyPosition()
     return true, m_Drift
 end
 
+-- BREADCRUMBS: the way back.
+--
+-- A drone that loses contact has, by definition, no way to be told what to do about it. The one
+-- thing it always knows is where it has just BEEN -- and the route it walked in on is guaranteed
+-- to be passable, which is more than can be said for any route it might compute. So every
+-- successful move drops a crumb, and losing the link becomes "retrace until someone answers"
+-- rather than "stop and hope".
+local m_Trail = {}
+local TRAIL_MAX = 160
+
+local function breadcrumb()
+    if cachedX == nil then return end
+    m_Trail[#m_Trail + 1] = {cachedX, cachedY, cachedZ}
+    if #m_Trail > TRAIL_MAX then table.remove(m_Trail, 1) end
+end
+
+function trailBack()
+    local n = #m_Trail
+    if n == 0 then return nil end
+    local crumb = m_Trail[n]
+    m_Trail[n] = nil
+    return crumb[1], crumb[2], crumb[3]
+end
+
+function trailLength() return #m_Trail end
+
+-- Retracing is the ONE case where moving without a confirmed position is correct.
+--
+-- The guard that stops a drone travelling on an unverified position exists because drift walked D3
+-- out of the loaded world. But out there, out of GPS range, that same guard freezes it in the one
+-- place it must not stay -- it can no longer move back into range, so a recoverable drone becomes
+-- a lost one. Retracing a recorded trail is safe precisely because the drone is going back the way
+-- it came, not somewhere it has reasoned about.
+local m_Recovering = false
+function setRecovering(p_On) m_Recovering = p_On and true or false end
+function isRecovering() return m_Recovering end
+
 function positionVerified()
     return m_LastFix ~= nil and (os.clock() - m_LastFix) <= FIX_MAX_AGE
 end
@@ -322,6 +359,7 @@ end
 -- fix can be had -- a drone that stops inside the world is recoverable, one that wanders out of it
 -- is not. That is the whole trade, and it is not close.
 function requireFix()
+    if m_Recovering then return true end          -- see setRecovering
     if m_MovesSinceFix < MOVES_PER_FIX and positionVerified() then
         m_MovesSinceFix = m_MovesSinceFix + 1
         return true
@@ -397,6 +435,7 @@ function forward()
 
     if turtle.forward() then
         cachedX, cachedY, cachedZ = x, y, z
+        breadcrumb()
         detectAll()
         return true
     else
@@ -431,6 +470,7 @@ function back()
 
     if turtle.back() then
         cachedX, cachedY, cachedZ = x, y, z
+        breadcrumb()
         detectAll()
         return true
     else
@@ -457,6 +497,7 @@ function up()
 
     if turtle.up() then
         cachedX, cachedY, cachedZ = x, y, z
+        breadcrumb()
         detectAll()
         return true
     else
@@ -483,6 +524,7 @@ function down()
 
     if turtle.down() then
         cachedX, cachedY, cachedZ = x, y, z
+        breadcrumb()
         detectAll()
         return true
     else

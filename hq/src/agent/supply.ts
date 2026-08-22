@@ -19,6 +19,8 @@
  *     the index is a request to SCAN, not to dig hopefully.
  */
 
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { join, dirname } from 'node:path';
 import { bridge } from '../bridge/ws.js';
 import { registry } from '../tools/registry.js';
 
@@ -37,18 +39,31 @@ export interface SupplyRule {
   stock?: string;
   /** Dispatch when storage holds fewer than this. */
   min: number;
-  /** How to get more. */
-  action: 'gather' | 'lumber';
+  /**
+   * How to get more.
+   *
+   * `craft` is what makes the loop reach anything the fleet MAKES rather than digs. Without it the
+   * recipe graph was only reachable by hand: the fleet could notice it was short of coal and go
+   * mine some, and could not notice it was short of chests, because "short of chests" was not
+   * something a rule could say.
+   */
+  action: 'gather' | 'lumber' | 'craft' | 'mine';
   /** Cap for a single dispatch. */
   limit?: number;
+  /** For `mine`: what depth to prospect at. Iron and coal live far below any surface scan. */
+  depth?: number;
 }
 
 /** Sensible starting policy. Tune with the supply.policy tool rather than editing this. */
 export const DEFAULT_RULES: SupplyRule[] = [
-  { match: 'coal_ore', min: 32, action: 'gather', limit: 64 },
-  { match: 'iron_ore', min: 32, action: 'gather', limit: 64 },
+  { match: 'coal_ore', min: 32, action: 'gather', limit: 64, depth: 50 },
+  { match: 'iron_ore', min: 32, action: 'gather', limit: 64, depth: 35 },
   { match: 'dirt', min: 64, action: 'gather', limit: 64 },
   { match: 'oak_log', min: 32, action: 'lumber' },
+  // Made, not dug. Planks gate every build the settlement will ever do, and chests gate field
+  // caches -- so the fleet should keep a working stock of both without being asked.
+  { match: 'minecraft:oak_planks', stock: 'minecraft:oak_planks', min: 32, action: 'craft', limit: 32 },
+  { match: 'minecraft:chest', stock: 'minecraft:chest', min: 4, action: 'craft', limit: 4 },
 ];
 
 const COOLDOWN_MS = 10 * 60 * 1000;
@@ -68,14 +83,55 @@ export interface SupplyState {
   log: string[];
 }
 
-export const supply: SupplyState = {
-  enabled: false,          // opt in explicitly; an autonomous fleet should not start itself
-  rules: [...DEFAULT_RULES],
-  lastRun: 0,
-  cooldowns: {},
-  dispatched: 0,
-  log: [],
-};
+/**
+ * Autonomy has to SURVIVE A RESTART.
+ *
+ * This state was in memory only, so every HQ rebuild silently switched the loop back off. The
+ * fleet then sat idle looking perfectly healthy, and the reason was invisible -- nothing had
+ * failed, a deploy had just quietly revoked the decision to be autonomous. Turning it on is an
+ * explicit choice by the operator; a container restart is not a reason to un-make it.
+ *
+ * Rules persist too: a policy tuned through supply.set is exactly the kind of thing nobody
+ * remembers having changed, so losing it is worse than losing the flag.
+ */
+const STATE_DIR = process.env.STATE_DIR ?? '/state';
+const SUPPLY_FILE = join(STATE_DIR, 'supply.json');
+
+function loadSupply(): SupplyState {
+  const base: SupplyState = {
+    enabled: false,        // opt in explicitly; an autonomous fleet should not start itself
+    rules: [...DEFAULT_RULES],
+    lastRun: 0,
+    cooldowns: {},
+    dispatched: 0,
+    log: [],
+  };
+  try {
+    const raw = JSON.parse(readFileSync(SUPPLY_FILE, 'utf8'));
+    return {
+      ...base,
+      enabled: raw.enabled === true,
+      // Fall back to the defaults rather than an empty list: a corrupt file should cost the tuning,
+      // not leave a loop that is enabled and has nothing to act on.
+      rules: Array.isArray(raw.rules) && raw.rules.length ? raw.rules : base.rules,
+      dispatched: typeof raw.dispatched === 'number' ? raw.dispatched : 0,
+    };
+  } catch {
+    return base;
+  }
+}
+
+export const supply: SupplyState = loadSupply();
+
+export function saveSupply(): void {
+  try {
+    mkdirSync(dirname(SUPPLY_FILE), { recursive: true });
+    writeFileSync(SUPPLY_FILE, JSON.stringify(
+      { enabled: supply.enabled, rules: supply.rules, dispatched: supply.dispatched }, null, 2));
+  } catch (err) {
+    console.error(`[supply] could not persist ${SUPPLY_FILE}: ${(err as Error).message}`);
+  }
+}
 
 function note(msg: string) {
   supply.log.unshift(`${new Date().toISOString().slice(11, 19)} ${msg}`);
@@ -108,7 +164,9 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
   const idle = (role: string) => live.find((d: any) => (d.role ?? 'miner') === role && d.status === 'idle');
   const idleMiner = idle('miner');
   const idleScout = idle('scout');
-  if (!idleMiner && !idleScout) return { acted: false, reason: 'no idle miner or scout' };
+  const idleCrafter = idle('crafter');
+  if (!idleMiner && !idleScout && !idleCrafter)
+    return { acted: false, reason: 'no idle miner, scout or crafter' };
 
   const stock: any = await bridge.call('StorageMan', 'stock', {}, { timeoutMs: 8000 });
   const detail = stock?.detail ?? stock?.data?.detail ?? [];
@@ -122,15 +180,58 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
   // finish being mined.
   let minerFree = !!idleMiner;
   let scoutFree = !!idleScout;
+  let crafterFree = !!idleCrafter;
   const did: string[] = [];
 
   for (const rule of supply.rules) {
-    if (!minerFree && !scoutFree) break;
+    if (!minerFree && !scoutFree && !crafterFree) break;
     const have = held(stockKey(rule));
     if (have >= rule.min) continue;
     if ((supply.cooldowns[rule.match] ?? 0) > now) continue;
 
     try {
+      if (rule.action === 'mine') {
+        // Go and LOOK. gather can only revisit coordinates the map already holds, so a material
+        // that has never been seen -- iron, at depth, below anything a surface scan can reach --
+        // is unreachable by any amount of gathering. This is the job that changes that.
+        if (!minerFree) continue;
+        supply.cooldowns[rule.match] = now + COOLDOWN_MS;
+        const r: any = await callTool('order.prospect', { depth: rule.depth ?? 40 });
+        if (r?.ok === false) {
+          note(`${rule.match}: ${have}/${rule.min}, prospecting refused — ${r?.error ?? '?'}`);
+          continue;
+        }
+        minerFree = false;
+        supply.dispatched++;
+        supply.lastAction = `prospect for ${rule.match}`;
+        note(`${rule.match}: ${have}/${rule.min} → prospecting at y=${rule.depth ?? 40}`);
+        did.push(`prospect ${rule.match}`);
+        continue;
+      }
+
+      if (rule.action === 'craft') {
+        // Needs a crafter, not a miner. Nothing else can serve the job, so waiting for one is the
+        // correct behaviour rather than dispatching it at a drone that will refuse at the last step.
+        if (!idleCrafter) continue;                 // no cooldown burned: retry when one frees up
+        supply.cooldowns[rule.match] = now + COOLDOWN_MS;
+        // The TARGET, not the deficit. expand() already subtracts what storage holds, so passing
+        // (target - have) subtracts the same stock twice: asking for "8 more chests" while holding
+        // 8 planned to zero steps and the loop reported "nothing craftable" with a full chest.
+        const want = rule.limit ?? rule.min;
+        const r: any = await callTool('plan.execute', { item: stockKey(rule), quantity: want });
+        const queued = r?.data?.queued ?? r?.queued ?? [];
+        if (!queued.length) {
+          note(`${rule.match}: ${have}/${rule.min}, nothing craftable — ${JSON.stringify(r?.data?.needsSite ?? [])}`);
+          continue;
+        }
+        crafterFree = false;
+        supply.dispatched++;
+        supply.lastAction = `craft ${stockKey(rule)}`;
+        note(`${rule.match}: ${have}/${rule.min} → craft x${want} queued (${queued.length} steps)`);
+        did.push(`craft ${stockKey(rule)}`);
+        continue;
+      }
+
       if (rule.action !== 'gather') {
         supply.cooldowns[rule.match] = now + COOLDOWN_MS;
         note(`${rule.match}: ${have}/${rule.min} → ${rule.action} not yet automatable`);

@@ -64,6 +64,7 @@ function OnAddTask(p_ID, p_Message)
         name = s_Task.name,
         id = s_Task.id,
         work = s_Work,
+        dependsOn = p_Message.data.dependsOn,
         progress = 0,
         enabled = true,
         paused = false
@@ -104,6 +105,7 @@ function RoleForWork(p_Work)
     -- simply does not exist on a miner, so routing a craft to one wastes the trip and fails at the
     -- last step rather than the first.
     if p_Work["craft"] then return "crafter" end
+    if p_Work["mine"] then return "miner" end
     if p_Work["gather"] then return "miner" end
     -- Lumber goes to a miner: roles are derived from HARDWARE (geoscanner -> scout, chunky ->
     -- loader, otherwise miner) and there is no wood-specific upgrade. A turtle digs wood with
@@ -227,7 +229,13 @@ function OnStartTask(p_ID, p_Message)
     local s_Verb, s_Payload
     if s_Role == "scout" then
         local w = s_Task.work.survey or {}
-        s_Verb, s_Payload = "Survey", {w = w.w, h = w.h, radius = w.radius, taskId = s_Task.id}
+        s_Verb, s_Payload = "Survey", {w = w.w, h = w.h, radius = w.radius, pos = w.pos, taskId = s_Task.id}
+    elseif s_Task.work.mine then
+        -- Prospecting: sink a shaft and drive branches, inspecting what gets exposed. The only job
+        -- that can find ore the map has never seen.
+        local w = s_Task.work.mine
+        s_Verb, s_Payload = "Mine", {pos = w.pos, depth = w.depth, length = w.length,
+                                     branches = w.branches, spacing = w.spacing, taskId = s_Task.id}
     elseif s_Task.work.craft then
         -- The output of the recipe planner, executed. grid and inputs travel with the task because
         -- the drone has no recipe book: turtle.craft reads the inventory layout and infers what is
@@ -359,8 +367,24 @@ function Tick()
                     end
                 end
 
+                -- A task can WAIT FOR ANOTHER.
+                --
+                -- Some work is only possible once other work has happened, and the fleet had no way
+                -- to say so. A scout cannot scan at y=35 because it carries a geo scanner instead
+                -- of a pickaxe and cannot dig down to get there -- but it can walk down a shaft a
+                -- miner has already sunk. Expressing "after the shaft exists" is what turns two
+                -- drones that each cannot prospect into a pair that can.
+                local s_Blocked = false
+                if v.dependsOn ~= nil then
+                    local dep = DATA["tasks"][v.dependsOn] or DATA["tasks"][tostring(v.dependsOn)]
+                                or DATA["tasks"][tonumber(v.dependsOn)]
+                    -- A dependency that no longer exists is treated as met rather than blocking
+                    -- for ever: a task nobody can ever run is worse than one that runs early.
+                    if dep ~= nil and (dep.progress or 0) < 100 then s_Blocked = true end
+                end
+
                 if v.enabled ~= false and not v.paused and v.assigned == nil
-                   and (v.progress or 0) < 100 then
+                   and not s_Blocked and (v.progress or 0) < 100 then
                     OnStartTask(0, {data = {id = v.id}})
                 end
             end
