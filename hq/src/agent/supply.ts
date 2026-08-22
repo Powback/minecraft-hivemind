@@ -90,6 +90,8 @@ export interface SupplyState {
   cooldowns: Record<string, number>;
   dispatched: number;
   log: string[];
+  /** How far along the exploration spiral the fleet has got. Persisted -- see frontier(). */
+  frontier?: number;
 }
 
 /**
@@ -129,6 +131,7 @@ function loadSupply(): SupplyState {
     lastRun: 0,
     cooldowns: {},
     dispatched: 0,
+    frontier: 0,
     log: [],
   };
   try {
@@ -148,6 +151,7 @@ function loadSupply(): SupplyState {
       // Operator tuning still wins; it just no longer discards fields it has never heard of.
       rules: mergeRules(base.rules, Array.isArray(raw.rules) ? raw.rules : []),
       dispatched: typeof raw.dispatched === 'number' ? raw.dispatched : 0,
+      frontier: typeof raw.frontier === 'number' ? raw.frontier : 0,
     };
   } catch {
     return base;
@@ -155,6 +159,53 @@ function loadSupply(): SupplyState {
 }
 
 export const supply: SupplyState = loadSupply();
+
+/**
+ * WHERE TO LOOK NEXT.
+ *
+ * The prospecting survey was dispatched as `{ w: 8, h: 8, radius: 8 }` -- a grid size and nothing
+ * else. No region, no position. A scout given that scans wherever it happens to be standing, so
+ * three scouts parked in three unrelated places rescanned the same ground indefinitely while the
+ * map stayed blank everywhere they were not, and the loop dutifully reported "survey dispatched"
+ * every time. Searching for something you have never seen without going anywhere new cannot work.
+ *
+ * A spiral outward from the base, one tile per dispatch, with the cursor persisted. It is not
+ * clever, and that is the point: it is EXHAUSTIVE, it never revisits, it degrades gracefully if a
+ * tile fails, and after N dispatches you can say exactly which ground the fleet has walked. A
+ * cleverer heuristic that chases ore concentrations tends to circle the same promising area and
+ * leave the rest of the world dark.
+ */
+const BASE = { x: -85, z: -44 };
+const TILE = 24;
+const REGION = { minX: -155, maxX: -25, minZ: -105, maxZ: 15 };
+
+type Pt = { x: number; y: number; z: number };
+function frontier(): { min: Pt; max: Pt } | null {
+  // Walk the spiral from the start each time and take the nth valid tile. The spiral is a few
+  // hundred steps at most, so recomputing costs nothing and needs no stored geometry -- only an
+  // integer, which is what makes the cursor safe to persist across restarts and code changes.
+  const want = supply.frontier ?? 0;
+  let x = 0, z = 0, dx = 0, dz = -1, found = 0;
+  for (let i = 0; i < 4096; i++) {
+    const cx = BASE.x + x * TILE;
+    const cz = BASE.z + z * TILE;
+    const min = { x: cx - TILE / 2, y: 58, z: cz - TILE / 2 };
+    const max = { x: cx + TILE / 2, y: 95, z: cz + TILE / 2 };
+    // Only tiles wholly inside the loaded region. A survey ordered outside it sends a drone
+    // somewhere it will stop ticking and be lost, which is a far worse outcome than a gap.
+    if (min.x >= REGION.minX && max.x <= REGION.maxX
+        && min.z >= REGION.minZ && max.z <= REGION.maxZ) {
+      if (found === want) return { min, max };
+      found++;
+    }
+    // Standard square spiral: turn at the corners.
+    if (x === z || (x < 0 && x === -z) || (x > 0 && x === 1 - z)) { const t = dx; dx = -dz; dz = t; }
+    x += dx; z += dz;
+  }
+  return null;
+}
+
+
 
 export function saveSupply(): void {
   try {
@@ -371,15 +422,22 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
           continue;
         }
       supply.cooldowns[rule.match] = now + COOLDOWN_MS;
+      const area = frontier();
+      if (!area) {
+        note(`${rule.match}: the whole loaded region has been surveyed -- nothing left to look at`);
+        continue;
+      }
+      supply.frontier = (supply.frontier ?? 0) + 1;
       await bridge.call('TaskMan', 'Add', {
         name: `find-${rule.match}`,
         priority: 3,
-        work: { survey: { w: 8, h: 8, radius: 8 } },
+        work: { survey: { radius: 8, min: area.min, max: area.max } },
       }, { timeoutMs: 8000 });
       scoutFree = false;
       supply.dispatched++;
       supply.lastAction = `survey for ${rule.match}`;
-      note(`${rule.match}: ${have}/${rule.min}, none known → survey dispatched`);
+      note(`${rule.match}: ${have}/${rule.min}, none known → survey tile ${supply.frontier} `
+         + `at ${area.min.x},${area.min.z}..${area.max.x},${area.max.z}`);
       did.push(`survey for ${rule.match}`);
     } catch (err) {
       supply.cooldowns[rule.match] = now + COOLDOWN_MS;

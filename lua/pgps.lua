@@ -187,7 +187,23 @@ end
 function mayStep(x, y, z)
     if inBounds(x, y, z) then return true end
 
-    local cx, cy, cz = cachedX, cachedY, cachedZ
+    -- getCachedPosition(), NOT cachedX.
+    --
+    -- `local cachedX, cachedY, cachedZ, cachedDir` is declared BELOW this function, so the name
+    -- `cachedX` here does not refer to it -- it compiles to a global lookup, and that global is
+    -- never assigned. cx was therefore nil on every single call, this returned false immediately,
+    -- and the entire "a step that gets closer to home is allowed" escape hatch was dead code from
+    -- the moment it was written.
+    --
+    -- That is the whole reason drones outside coverage could not move. D3, D7 and D8 each reported
+    -- the same three failures in a row -- no mapped route, flyTo wedged, digTo wedged -- all at
+    -- their exact current position, having never taken a step. It was never terrain and never the
+    -- pathfinder: every direction was refused by policy, including the ones leading home, and the
+    -- one rule written to prevent that could not see where the drone was standing.
+    --
+    -- Calling the accessor works because global FUNCTION lookups resolve when called, not when
+    -- compiled, so it finds the real one defined further down.
+    local cx, cy, cz = getCachedPosition()
     if cx == nil then return false end
 
     -- How far outside coverage each position is. For GPS that is distance to the nearest host,
@@ -211,7 +227,10 @@ end
 -- Which of the two refused, so the fix is obvious rather than guessed at.
 function boundsReason(x, y, z)
     if not inAny(m_Chunks, x, y, z) then return "unloaded chunk" end
-    if not inAny(m_Gps, x, y, z)    then return "no gps coverage" end
+    -- gpsOk, not inAny: coverage stopped being a list of boxes when it became hosts-and-radius, and
+    -- inAny on the new shape iterates a list of hosts as though they were boxes and always says no.
+    -- A diagnostic that blames the wrong constraint is worse than none.
+    if not gpsOk(m_Gps, x, y, z)    then return "no gps coverage" end
     return nil
 end
 
@@ -378,6 +397,17 @@ function verifyPosition()
     -- blocks away, well inside range.
     local x, y, z = gps.locate(5, false)
     if x == nil then return nil, "no gps fix" end
+    -- A BLOCK COORDINATE IS AN INTEGER. ALWAYS.
+    --
+    -- gps.locate trilaterates from whatever hosts answered, and the answer is only as round as its
+    -- inputs. Once drones became GPS relays, a relay that anchored on a slightly-off fix began
+    -- publishing it, and the error spread: 3,708 of 12,484 cells in the saved map were filed under
+    -- keys like "-103.58:34.36:-48.22". Thirty per cent of the world, scanned correctly, recorded
+    -- carefully, and completely unreachable -- because every lookup asks for "-103:34:-48" and no
+    -- string comparison will ever match. The base looked unsurveyed while sitting in the map.
+    --
+    -- Flooring here rather than at each use, because this is where a position enters the system.
+    x, y, z = math.floor(x), math.floor(y), math.floor(z)
     if cachedX ~= nil then
         m_Drift = math.abs(x - cachedX) + math.abs(y - cachedY) + math.abs(z - cachedZ)
         if m_Drift > 0 then
@@ -899,6 +929,89 @@ function flyTo(_tx, _ty, _tz, _maxSteps)
 end
 
 
+-- Make a path where there is none.
+--
+-- moveTo can only route through cells someone has surveyed, and flyTo can only go OVER things.
+-- Neither helps a miner facing solid rock between it and the target: a_star answers "no path" and
+-- flyTo answers by climbing to the ceiling, which is how drones end up stranded in the sky. A
+-- turtle with a pickaxe has a third option nothing else in the fleet has, and it should use it.
+--
+-- Deliberately NOT a replacement for moveTo. Digging is destructive and slow, so it is the last
+-- resort after a real path search has failed -- but it is a far better last resort than flying,
+-- because the tunnel it leaves behind is mapped, reusable, and on the ground.
+--
+-- The tunnel is two blocks high because a hole a human cannot walk down is a hole in the base.
+--
+-- Gravel and sand fall into the space just cleared, so every dig is a short loop rather than one
+-- call; the cap stops a drone under a gravel column from digging for ever.
+local DIG_RETRY = 12
+
+local function clearAhead()
+    local s_Tries = 0
+    while turtle.detect() do
+        if not turtle.dig() then return false end       -- bedrock, or nothing that can be broken
+        s_Tries = s_Tries + 1
+        if s_Tries > DIG_RETRY then return false end
+        os.sleep(0.05)                                   -- let falling blocks settle before retrying
+    end
+    return true
+end
+
+function digTo(_tx, _ty, _tz, _maxSteps)
+    if cachedX == nil then return false, "no position fix" end
+    if not turtle.dig then return false, "no pickaxe: this drone cannot make a path" end
+    -- An omitted axis means "stay where you are on it", not "travel to nil". Left unguarded the
+    -- comparison below is always true and the drone digs until its step budget runs out.
+    _tx, _ty, _tz = _tx or cachedX, _ty or cachedY, _tz or cachedZ
+    local s_Max = _maxSteps or 256
+    local s_Steps = 0
+
+    while cachedX ~= _tx or cachedY ~= _ty or cachedZ ~= _tz do
+        s_Steps = s_Steps + 1
+        if s_Steps > s_Max then return false, "digTo gave up after " .. s_Max .. " steps" end
+
+        -- Horizontal first, the opposite of flyTo. Altitude is the cheap axis when you are flying
+        -- and the expensive one when you are digging, because every block of vertical shaft is a
+        -- block that has to come out. Level tunnels are also what makes the result walkable.
+        local s_Moved = false
+        for _, s_Axis in ipairs({ "x", "z", "y" }) do
+            if s_Moved then break end
+            local s_Dx, s_Dy, s_Dz = 0, 0, 0
+            if s_Axis == "x" and cachedX ~= _tx then s_Dx = cachedX < _tx and 1 or -1
+            elseif s_Axis == "z" and cachedZ ~= _tz then s_Dz = cachedZ < _tz and 1 or -1
+            elseif s_Axis == "y" and cachedY ~= _ty then s_Dy = cachedY < _ty and 1 or -1 end
+            if s_Dx == 0 and s_Dy == 0 and s_Dz == 0 then goto continue end
+
+            -- Check the destination cell BEFORE breaking anything. forward()/up()/down() each
+            -- refuse to leave the loaded region, but they refuse AFTER we would already have dug
+            -- the wall down -- which would quietly mine a hole through the boundary every time.
+            if not mayStep(cachedX + s_Dx, cachedY + s_Dy, cachedZ + s_Dz) then goto continue end
+
+            if s_Dy > 0 then
+                if turtle.detectUp() then turtle.digUp() end
+                s_Moved = up()
+            elseif s_Dy < 0 then
+                if turtle.detectDown() then turtle.digDown() end
+                s_Moved = down()
+            else
+                turnTo(s_Dx ~= 0 and (s_Dx > 0 and East or West) or (s_Dz > 0 and South or North))
+                if clearAhead() then
+                    s_Moved = forward()
+                    -- Head room, so what we leave behind is a corridor and not a crawlspace.
+                    if s_Moved and turtle.detectUp() then turtle.digUp() end
+                end
+            end
+            ::continue::
+        end
+
+        if not s_Moved then
+            return false, "digTo is wedged at " .. cachedX .. "," .. cachedY .. "," .. cachedZ
+        end
+    end
+    return true
+end
+
+
 -- Travel any distance by planning ONE CHUNK AT A TIME.
 --
 -- a_star's cost is superlinear in the distance searched: the open set is scanned linearly on every
@@ -1065,6 +1178,10 @@ function setLocationFromGPS()
     if startGPS() then
         -- get the current position
         cachedX, cachedY, cachedZ  = gps.locate(4, false)
+        -- Integer block coordinates -- see the note in verifyPosition.
+        if cachedX then
+            cachedX, cachedY, cachedZ = math.floor(cachedX), math.floor(cachedY), math.floor(cachedZ)
+        end
 
         -- NO FIX IS AN ANSWER, NOT A CRASH.
         --

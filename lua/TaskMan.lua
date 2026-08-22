@@ -261,7 +261,40 @@ function OnStartTask(p_ID, p_Message)
     local s_Verb, s_Payload
     if s_Role == "scout" then
         local w = s_Task.work.survey or {}
-        s_Verb, s_Payload = "Survey", {w = w.w, h = w.h, radius = w.radius, pos = w.pos, taskId = s_Task.id}
+        local s_Pos, s_W, s_H = w.pos, w.w, w.h
+        local s_R = tonumber(w.radius) or 8
+
+        -- A REGION IS NOT A DESTINATION UNTIL SOMEBODY TURNS IT INTO ONE.
+        --
+        -- order.issue{kind="explore"} records a region -- {min, max} -- and nothing else. This
+        -- passed w.pos straight through, so `pos` was nil, and OnSurvey only travels `if d.pos`.
+        -- Every explore order therefore told a scout to survey a box on the other side of the base
+        -- and the scout scanned where it was already standing, indefinitely, reporting "scanning"
+        -- the whole time. Four scouts sat in four unrelated places rescanning ground they had
+        -- already covered while nine tiles over the base went untouched.
+        --
+        -- The region has everything needed to fix that: start in a corner, one scan-diameter in so
+        -- the first sphere lands inside the box, and take as many steps as it takes to tile it.
+        if s_Pos == nil and w.min and w.max then
+            -- NO Y. The scout supplies its own.
+            --
+            -- Aiming at w.max.y sends it to the top of the box -- y=95, well into open sky -- which
+            -- is wrong twice over. It burns a long vertical climb to reach a height the survey
+            -- immediately gives back by settling to the ground, and over unmapped terrain the climb
+            -- often cannot be pathed at all, so the task fails with "could not reach the survey
+            -- start", requeues, and the next scout repeats it. Scouts going idle in place is what
+            -- that looks like from outside.
+            --
+            -- The scout already knows a workable altitude: the one it is flying at. Travel across
+            -- at that height and let settle() find the ground once it arrives.
+            s_Pos = {x = w.min.x + s_R, z = w.min.z + s_R}
+            local s_Step = s_R * 2
+            s_W = s_W or math.max(1, math.ceil((w.max.x - w.min.x) / s_Step))
+            s_H = s_H or math.max(1, math.ceil((w.max.z - w.min.z) / s_Step))
+        end
+
+        s_Verb, s_Payload = "Survey", {w = s_W, h = s_H, radius = w.radius, pos = s_Pos,
+                                       taskId = s_Task.id}
     elseif s_Task.work.build then
         -- The layout arrives as data. HQ costed it, checked it against the plot registry and
         -- ordered it bottom-up before any of this was dispatched.
@@ -396,13 +429,35 @@ function Tick()
                     -- most definitely-stuck tasks the only ones that can never be reclaimed.
                     local s_Age = v.assignedAt and (os.epoch("utc") - v.assignedAt) or math.huge
                     if s_Age > RECLAIM_AFTER_MS then
-                        local s_Idle, s_Saw = false, "not in fleet list"
+                        -- RECLAIM FROM A STUCK DRONE TOO, NOT ONLY AN IDLE ONE.
+                        --
+                        -- This asked for `idle` and nothing else, which quietly excluded the exact
+                        -- case the reclaim exists for. D7 and D8 sat wedged for hours reporting
+                        -- "stuck", and every fifteen seconds TaskMan logged
+                        --
+                        --     reclaim? task 54 held by 210: stuck
+                        --
+                        -- and then declined, because stuck is not idle. The task stayed assigned to
+                        -- a drone that could not move, so it was never given to one that could, and
+                        -- the drone stayed "on a job" so nothing else would recall it. Two drones
+                        -- and two tasks, deadlocked on a word.
+                        --
+                        -- Idle means "took the order and finished or refused it". Stuck, blocked and
+                        -- offline all mean "will not finish it". For a task that has already outlived
+                        -- the reclaim window, they are the same thing and should be treated alike.
+                        local s_Free, s_Saw = false, "not in fleet list"
                         for _, d in ipairs(fleet()) do
                             if d.id == v.assignedTo then
                                 s_Saw = tostring(d.status) .. (d.offline and " offline" or "")
-                                if d.status == "idle" and not d.offline then s_Idle = true end
+                                if d.status == "idle" and not d.offline then s_Free = true end
+                                if d.status == "stuck" or d.status == "blocked"
+                                   or d.status == "lost" or d.offline then s_Free = true end
                             end
                         end
+                        -- A drone nobody can even see is the strongest case of all: it is not
+                        -- coming back to finish this, and holding the task for it helps no one.
+                        if s_Saw == "not in fleet list" then s_Free = true end
+                        local s_Idle = s_Free
                         -- Log the DECISION, not just the action. A reclaim that silently declines
                         -- is indistinguishable from one that never ran, and the difference is where
                         -- the bug is.
@@ -473,15 +528,82 @@ function OnTaskDone(p_ID, p_Message)
     if s_Task == nil then return false, "No task " .. tostring(d.id) end
 
     if d.ok then
+        -- VERIFY A SURVEY AGAINST THE MAP INSTEAD OF BELIEVING IT.
+        --
+        -- A scout reports success when it has walked its scan grid, which is a claim about the
+        -- drone, not about the region. Tasks were reading 100% over ground that was still blank --
+        -- "it says 100% but it didn't scan the entire area" is exactly right, and the queue had no
+        -- way to know because nothing ever compared the two.
+        --
+        -- So ask MapServer what it now knows about the box that was ordered. A survey that left
+        -- most of its region unknown is not finished, and going round again is far cheaper than a
+        -- map with holes in it that nobody can see.
+        local w = s_Task.work and s_Task.work.survey
+        if w and w.min and w.max then
+            local s_Ok, s_Cov = pcall(function()
+                return PowNet.sendAndWaitForResponse(
+                    PowNet.Lookup("MapServer"),
+                    PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "RegionKnown",
+                                      {min = w.min, max = w.max}),
+                    PowNet.SERVER_PROTOCOL, 15)
+            end)
+            local s_Pct = s_Ok and type(s_Cov) == "table" and tonumber(s_Cov.percent) or nil
+            if s_Pct then
+                s_Task.coverage = s_Pct
+                s_Task.attempts = (s_Task.attempts or 0) + 1
+                -- A geo scanner sees a sphere, so a swept region is never 100% cells-known --
+                -- the corners between spheres stay dark. Sixty per cent means it genuinely
+                -- covered the ground; single digits mean it scanned somewhere else entirely.
+                if s_Pct < 60 and s_Task.attempts < 3 then
+                    s_Task.assigned, s_Task.assignedTo, s_Task.assignedAt = nil, nil, nil
+                    s_Task.failure = ("only %d%% of the region is known -- resurveying"):format(s_Pct)
+                    PowNet.MarkDirty()
+                    print(("task %s reported done at %d%% coverage -- requeued")
+                        :format(tostring(d.id), s_Pct))
+                    return true, {id = d.id, requeued = true, coverage = s_Pct}
+                end
+            end
+        end
         s_Task.progress = 100
         s_Task.result   = d.result
         s_Task.failure  = nil
     else
-        -- Record the reason and STOP. Re-queuing a job that failed for a real reason -- short of
-        -- material, site unreachable -- just repeats it; the reason is what a human or the planner
-        -- needs in order to do something different.
-        s_Task.progress = 100
-        s_Task.failure  = tostring(d.reason or "failed")
+        -- A FAILURE IS NOT A COMPLETION.
+        --
+        -- This set progress = 100 on failure, which made a refused job indistinguishable from a
+        -- finished one: the queue showed "done, unassigned" and nothing ever went back for it. Nine
+        -- survey tiles were issued over the base, four scouts took one each, and the other five
+        -- were handed to drones that were already busy -- so five tiles were marked complete
+        -- without a single drone ever visiting them. The map stayed blank over the base and the
+        -- idle scouts had nothing to pick up, which is exactly what it looked like from outside:
+        -- drones standing around while work "finished" itself.
+        --
+        -- The original instinct was right, though, and worth keeping: re-queuing a job that failed
+        -- for a REAL reason just repeats it. So the two cases are separated.
+        --
+        -- A refusal ("busy", "already executing") says nothing about the task -- only about when we
+        -- asked. That is a free retry. A real failure ("no path", "short of material") counts, and
+        -- after a few of those the task is genuinely given up on, with the reason kept.
+        local s_Reason = tostring(d.reason or "failed")
+        local s_Busy   = s_Reason:find("busy") or s_Reason:find("executing") or s_Reason:find("refused")
+
+        s_Task.failure  = s_Reason
+        s_Task.attempts = (s_Task.attempts or 0) + (s_Busy and 0 or 1)
+
+        if s_Task.attempts >= 3 then
+            -- Out of attempts: this one really is finished, unsuccessfully, and says why.
+            s_Task.progress   = 100
+            s_Task.finishedAt = os.epoch("utc")
+            print(("task %s GIVING UP after %d attempts: %s")
+                :format(tostring(d.id), s_Task.attempts, s_Reason))
+        else
+            -- Back in the queue for someone else. Progress deliberately untouched.
+            print(("task %s failed (%s) -- requeued, attempt %d")
+                :format(tostring(d.id), s_Reason, s_Task.attempts))
+        end
+        s_Task.assigned, s_Task.assignedTo, s_Task.assignedAt = nil, nil, nil
+        PowNet.MarkDirty()
+        return true, {id = d.id, requeued = s_Task.progress ~= 100}
     end
     s_Task.finishedAt = os.epoch("utc")
     s_Task.assigned, s_Task.assignedTo, s_Task.assignedAt = nil, nil, nil

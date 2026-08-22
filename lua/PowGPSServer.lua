@@ -204,6 +204,94 @@ function saveAll()
 end
 
 ----------------------------------------
+-- THE MAP FORMAT, AND WHY IT IS NOT textutils.serialize
+--
+-- The map stopped growing at 23,792 cells and nobody could see why: MapServer reported 111,684
+-- cells in memory, the disk held a fifth of that, and the shortfall came back after every reload.
+-- It was not a paging bug and it was not a leak. Every single save was failing:
+--
+--     module=MapServer ok=false err=/PowGPSServer:179: Out of space
+--
+-- textutils.serialize pretty-prints, and each cell was carrying a `discoverer`, a `discovered`
+-- {day,time} and a `lastUpdated` {day,time} alongside the one thing anybody reads -- the block
+-- name. That is 330 bytes per cell to record "sandstone". At 111k cells the serialized detail map
+-- is about 36 MB against a computer_space_limit of 8 MB, so the write died part way, took
+-- MapServer down with it, and the reboot reloaded the last file small enough to have been written.
+-- The map could never exceed what fitted, and everything above it was discarded on every cycle.
+--
+-- Three changes, in order of how much they win:
+--
+--   1. Do not persist the metadata. Nothing reads `discoverer` or `discovered` at all, and
+--      `lastUpdated` is only consulted through the `aged` list, which keeps its own copy and is
+--      rebuilt in memory on every merge. Three hundred of those 330 bytes were dead weight.
+--   2. Intern the block names. A map is tens of thousands of cells drawn from a few dozen distinct
+--      blocks, so the names belong in a header and the cells should hold an index. No information
+--      is lost -- the renderer still gets "minecraft:sandstone", it is just not spelled out 3,791
+--      times.
+--   3. Stream it. Building the whole file as one Lua string first is what makes a large map fail
+--      as a memory problem instead of merely a slow write.
+--
+-- Together that is roughly 330 bytes per cell down to about 22, so the same 8 MB now holds a map
+-- several times larger than the one we were losing.
+--
+-- Old files are still read. The format is detected from the first byte rather than assumed,
+-- because the alternative is a silent upgrade that throws away every cell surveyed so far.
+
+local MAP_MAGIC = "pgps1"
+
+--- Write `p_Rows()` line by line. Streaming, so nothing ever holds the whole file in memory.
+local function writeLines(p_Name, p_Header, p_Rows)
+    if not fs.isDir("/egpsData") then fs.makeDir("/egpsData") end
+    local s_Tmp = "/egpsData/" .. p_Name .. ".new"
+
+    -- Stage, then move. A save that runs out of space part way through leaves a truncated file,
+    -- and a truncated map file reads back as a SHORTER map rather than as an error -- which is how
+    -- a failed write turns into quiet data loss instead of a loud one.
+    local s_File = fs.open(s_Tmp, "w")
+    if not s_File then return false, "could not open " .. s_Tmp end
+
+    -- Buffer, then write in blocks. One writeLine per cell is tens of thousands of calls across
+    -- the CC/JVM boundary and it made MapServer unresponsive for the whole save -- long enough
+    -- that Status stopped answering and the module looked dead. The rows are handed a `line`
+    -- function instead of the file handle so callers cannot bypass this.
+    local s_Buf, s_Sink = {}, nil
+    s_Sink = function(p_Line)
+        s_Buf[#s_Buf + 1] = p_Line
+        if #s_Buf >= 512 then
+            s_File.write(table.concat(s_Buf, "\n") .. "\n")
+            s_Buf = {}
+        end
+    end
+
+    local s_Ok, s_Err = pcall(function()
+        s_Sink(MAP_MAGIC)
+        for _, line in ipairs(p_Header or {}) do s_Sink(line) end
+        s_Sink("=")
+        p_Rows(s_Sink)
+        if #s_Buf > 0 then s_File.write(table.concat(s_Buf, "\n") .. "\n") end
+    end)
+    s_File.close()
+
+    if not s_Ok then
+        fs.delete(s_Tmp)
+        return false, tostring(s_Err)
+    end
+    if fs.exists("/egpsData/" .. p_Name) then fs.delete("/egpsData/" .. p_Name) end
+    fs.move(s_Tmp, "/egpsData/" .. p_Name)
+    return true
+end
+
+--- Read a streamed file back. Returns nil if it is not one, so the caller can try the old format.
+local function readLines(p_Name)
+    local s_Path = "/egpsData/" .. p_Name
+    if not fs.exists(s_Path) then return nil end
+    local s_File = fs.open(s_Path, "r")
+    if not s_File then return nil end
+    if s_File.readLine() ~= MAP_MAGIC then s_File.close() return nil end
+    return s_File
+end
+
+----------------------------------------
 -- load
 --
 -- function: load cachedWorld from a file
@@ -211,6 +299,25 @@ end
 --
 
 function load()
+    local s_File = readLines("blockData")
+    if s_File then
+        cachedWorld = {}
+        local s_Count = 0
+        while true do
+            local s_Line = s_File.readLine()
+            if s_Line == nil then break end
+            local s_Key, s_Val = s_Line:match("^(.-)=(.+)$")
+            if s_Key then
+                cachedWorld[s_Key] = tonumber(s_Val)
+                s_Count = s_Count + 1
+            end
+        end
+        s_File.close()
+        print("loaded " .. s_Count .. " cells")
+        return true
+    end
+
+    -- Fall back to the pretty-printed format so an existing map is not thrown away on upgrade.
     local data = getFile("blockData")
     if data ~= "" then
         cachedWorld = textutils.unserialize(data)
@@ -235,7 +342,13 @@ end
 --
 
 function save()
-    setFile("blockData", cachedWorld)
+    local ok, err = writeLines("blockData", nil, function(line)
+        for k, v in pairs(cachedWorld) do
+            line(k .. "=" .. tostring(v))
+        end
+    end)
+    if not ok then print("map save failed: " .. tostring(err)) end
+    return ok
 end
 
 ----------------------------------------
@@ -246,6 +359,37 @@ end
 --
 
 function loadDetail()
+    local s_File = readLines("blockDataDetail")
+    if s_File then
+        cachedWorldDetail = {}
+        -- Header first: one block name per line until the "=" terminator, indexed by line order.
+        local s_Names = {}
+        while true do
+            local s_Line = s_File.readLine()
+            if s_Line == nil or s_Line == "=" then break end
+            s_Names[#s_Names + 1] = s_Line
+        end
+        local s_Count = 0
+        while true do
+            local s_Line = s_File.readLine()
+            if s_Line == nil then break end
+            local s_Key, s_Solid, s_Name = s_Line:match("^(.-)=(%-?[%d.]+),(%d+)$")
+            if s_Key then
+                local s_Entry = {data = {s_Solid == "1"}}
+                local s_Id = tonumber(s_Name)
+                if s_Id and s_Id > 0 and s_Names[s_Id] then
+                    s_Entry.data[2] = {name = s_Names[s_Id]}
+                end
+                cachedWorldDetail[s_Key] = s_Entry
+                s_Count = s_Count + 1
+            end
+        end
+        s_File.close()
+        print("loaded " .. s_Count .. " named blocks")
+        return true
+    end
+
+    -- Fall back to the pretty-printed format so an existing map is not thrown away on upgrade.
     local data = getFile("blockDataDetail")
     if data ~= {} then
         cachedWorldDetail = textutils.unserialize(data)
@@ -271,7 +415,28 @@ end
 --
 
 function saveDetail()
-    setFile("blockDataDetail", cachedWorldDetail)
+    -- Build the name table first. It is a few dozen strings however large the map gets, which is
+    -- the whole point: the names go in the header once instead of into every cell.
+    local s_Names, s_Index = {}, {}
+    for _, v in pairs(cachedWorldDetail) do
+        local s_Name = type(v.data) == "table" and type(v.data[2]) == "table" and v.data[2].name
+        if s_Name and not s_Index[s_Name] then
+            s_Names[#s_Names + 1] = s_Name
+            s_Index[s_Name] = #s_Names
+        end
+    end
+
+    local ok, err = writeLines("blockDataDetail", s_Names, function(line)
+        for k, v in pairs(cachedWorldDetail) do
+            if type(v.data) == "table" then
+                local s_Name = type(v.data[2]) == "table" and v.data[2].name
+                line(k .. "=" .. (v.data[1] and "1" or "0")
+                       .. "," .. (s_Name and s_Index[s_Name] or 0))
+            end
+        end
+    end)
+    if not ok then print("detail save failed: " .. tostring(err)) end
+    return ok
 end
 
 
@@ -619,7 +784,26 @@ local function isAged(p_Day, p_Time)
 end
 
 
+-- Normalise a cell key to integer block coordinates, or reject it.
+--
+-- Belt and braces alongside the flooring in pgps: this is the one place every observation from
+-- every drone passes through, so a drone running an old copy -- or a future one with a new way of
+-- being wrong -- cannot poison the map. A key that will not parse is dropped rather than stored,
+-- because an unparseable key is not a cell, it is a cell nobody can ever look up again.
+local function cellKey(p_Key)
+    if type(p_Key) ~= "string" then return nil end
+    local x, y, z = p_Key:match("^(-?%d+%.?%d*):(-?%d+%.?%d*):(-?%d+%.?%d*)$")
+    if x == nil then return nil end
+    return math.floor(tonumber(x)) .. ":" .. math.floor(tonumber(y)) .. ":" .. math.floor(tonumber(z))
+end
+
 local function mergeCachedWorldDetail(newData, p_ID)
+    local s_Clean = {}
+    for k, v in pairs(newData) do
+        local s_K = cellKey(k)
+        if s_K then s_Clean[s_K] = v end
+    end
+    newData = s_Clean
     for k,v in pairs(newData) do
         if(cachedWorldDetail[k] == nil) then
             cachedWorldDetail[k] = {}
@@ -639,8 +823,22 @@ end
 
 local function mergeCachedWorld(newData)
     for k,v in pairs(newData) do
-        cachedWorld[k] = v
+        local s_K = cellKey(k)
+        if s_K then cachedWorld[s_K] = v end
     end
+end
+
+--- Drop every key that is not an integer cell. Used once, to clean out what is already stored.
+function PruneBadKeys()
+    local s_Dropped = 0
+    for _, t in ipairs({cachedWorld, cachedWorldDetail}) do
+        local s_Bad = {}
+        for k in pairs(t) do
+            if cellKey(k) ~= k then s_Bad[#s_Bad + 1] = k end
+        end
+        for _, k in ipairs(s_Bad) do t[k] = nil s_Dropped = s_Dropped + 1 end
+    end
+    return s_Dropped
 end
 
 function UpdateCachedWorld(newData, p_ID)

@@ -132,13 +132,28 @@ function SendHeartBeat()
     -- drone standing around. Availability and health are different, and this field is about
     -- availability.
     local s_Report = m_Status
+    -- SAY WHY. "blocked" on its own sends whoever reads it looking in the wrong place.
+    --
+    -- These are three genuinely different faults with three different fixes -- extend GPS coverage,
+    -- re-derive heading, send a chunk loader -- and they were all reported with the same word and
+    -- no detail, so the only way to tell them apart was to read the drone's log by hand.
+    local s_Why = m_Stuck
     if s_Report == "idle" then
-        local px, _, _, pd = pgps.getCachedPosition()
-        if px == nil then s_Report = "blocked"          -- does not know where it is
-        elseif pd == nil then s_Report = "blocked" end  -- does not know which way it faces
+        local px, py, pz, pd = pgps.getCachedPosition()
+        if px == nil then
+            s_Report, s_Why = "blocked", "no position fix -- cannot hear four GPS hosts"
+        elseif pd == nil then
+            s_Report, s_Why = "blocked", "heading unknown -- boxed in, cannot step to derive it"
+        elseif not pgps.mayStep(px, py, pz) then
+            -- Standing somewhere it is not allowed to be, which is the one that stranded D3, D7
+            -- and D8. boundsReason names which constraint refused.
+            s_Report = "blocked"
+            s_Why = "outside coverage: " .. tostring(pgps.boundsReason(px, py, pz) or "unknown")
+        end
     end
 
-    local s_Data = {pos = s_Pos, status = s_Report, fuel = s_Fuel, role = Role(), stuck = m_Stuck, hosting = m_Hosting}
+    local s_Data = {pos = s_Pos, status = s_Report, fuel = s_Fuel, role = Role(),
+                    stuck = s_Why, hosting = m_Hosting}
     local s_Message = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Heartbeat", s_Data)
     -- WAIT FOR THE ANSWER.
     --
@@ -254,6 +269,17 @@ function OnGoTo(p_ID, p_Message)
         trace("GoTo: no mapped route (" .. tostring(s_Message) .. ") -- flying direct")
         s_Status, s_Message = pgps.flyTo(tonumber(d.pos.x), tonumber(d.pos.y), tonumber(d.pos.z))
     end
+    if s_Status == false and turtle.dig then
+        -- Last resort, and only for a drone that carries a pickaxe: cut a tunnel to the target.
+        --
+        -- This is the answer to the case both of the above lose: rock between here and there. The
+        -- path search says "no path" because none exists yet, and flying says "wedged" because it
+        -- cannot climb out. A miner is not stuck in that situation -- it is simply being asked the
+        -- wrong question. The tunnel it leaves gets surveyed on the way through, so the route
+        -- exists for everyone afterwards and the next drone does not have to dig it again.
+        trace("GoTo: cannot fly either (" .. tostring(s_Message) .. ") -- digging a path")
+        s_Status, s_Message = pgps.digTo(tonumber(d.pos.x), tonumber(d.pos.y), tonumber(d.pos.z))
+    end
     TaskEnd()
     m_Status = "idle"
 
@@ -286,11 +312,31 @@ end
 -- So it follows the terrain: step forward, climb if something blocks the way, sink if the ground
 -- falls away. One or two moves per cell, and the block below is the surface at every step, which
 -- is exactly the height field the map wants.
-local function settle(p_MaxDrop)
+-- HOVER, DON'T HUG.
+--
+-- settle() used to descend until the block below was solid, which put the drone directly on the
+-- surface. That is the worst altitude to travel at: every bump, dune and tree in the way has to be
+-- climbed and then dropped off again, and a scout crossing broken ground spent most of its moves
+-- going up and down rather than forward.
+--
+-- The scan does not need it. A geo scanner reads a sphere of radius 8, so from three blocks up
+-- there are still five blocks of rock inside the sphere -- essentially the same reading, for a
+-- fraction of the manoeuvring. Anything that genuinely must touch down (a miner starting a shaft)
+-- passes 0 and gets the old behaviour.
+local HOVER = 3
+
+local function settle(p_MaxDrop, p_Hover)
+    local s_Hover = p_Hover or HOVER
     local s_Drops = 0
     while s_Drops < p_MaxDrop and not turtle.detectDown() do
         if not pgps.down() then break end
         s_Drops = s_Drops + 1
+    end
+    -- Back off to the hover height. Only as far as it actually goes -- if something is in the way
+    -- above, sitting lower is fine and far better than refusing to scan at all.
+    for _ = 1, s_Hover do
+        if turtle.detectUp() or not pgps.up() then break end
+        s_Drops = s_Drops - 1
     end
     return s_Drops
 end
@@ -593,7 +639,16 @@ function OnSurvey(p_ID, p_Message)
     -- miner has already cut is the whole point of pairing them.
     if d.pos and d.pos.x then
         m_Status = "moving"
-        if pgps.moveTo(tonumber(d.pos.x), tonumber(d.pos.y), tonumber(d.pos.z)) == false then
+        -- An omitted Y means "come across at whatever height you are already at", which is both
+        -- reachable and close to the ground the scan actually wants. settle() drops to the surface
+        -- on arrival, so there is nothing to gain by naming an altitude here and a long, often
+        -- unpathable climb to lose.
+        local s_Ty = tonumber(d.pos.y)
+        if s_Ty == nil then
+            local _, cy = pgps.getCachedPosition()
+            s_Ty = cy
+        end
+        if pgps.moveTo(tonumber(d.pos.x), s_Ty, tonumber(d.pos.z)) == false then
             m_Status = "idle"
             trace("Survey FAILED: could not reach " .. tostring(d.pos.x) .. "," ..
                   tostring(d.pos.y) .. "," .. tostring(d.pos.z))
@@ -896,6 +951,13 @@ function RunJob(p_Name, p_Data, p_Opts, p_Body)
     if o.travel ~= false and d.pos and d.pos.x and d.pos.z then
         local s_Ty = tonumber(d.pos.y)
         local s_Arrived = pgps.moveTo(tonumber(d.pos.x), s_Ty and (s_Ty + 1) or nil, tonumber(d.pos.z))
+        -- A miner that cannot find a route to its own shaft head should make one, not give up. The
+        -- site is a place the fleet chose deliberately; refusing to reach it strands the whole job
+        -- over ground that a pickaxe removes in a few seconds.
+        if s_Arrived == false and turtle.dig then
+            trace("site unreachable by path -- digging in")
+            s_Arrived = pgps.digTo(tonumber(d.pos.x), s_Ty and (s_Ty + 1) or nil, tonumber(d.pos.z))
+        end
         if s_Arrived == false then
             Distress("cannot reach site",
                 tostring(d.pos.x) .. "," .. tostring(d.pos.y) .. "," .. tostring(d.pos.z))
@@ -903,7 +965,8 @@ function RunJob(p_Name, p_Data, p_Opts, p_Body)
         end
     end
 
-    if o.settle ~= false then settle(tonumber(d.drop) or 24) end
+    -- Hover 0: a miner about to sink a shaft has to be standing on the ground it is cutting.
+    if o.settle ~= false then settle(tonumber(d.drop) or 24, 0) end
 
     -- table.pack, NOT `local ok, res = pcall(...)`.
     --
@@ -1925,6 +1988,107 @@ end
 -- cycle, and stands down the instant it moves, drifts, or loses the fix.
 local RELAY_DRIFT_LIMIT = 1     -- blocks; a host that has moved at all is no longer where it says
 
+-- Every drone is a rednet repeater, always, whatever else it is doing.
+--
+-- THIS is the piece the "mesh" was missing. gpsRelay lets a distant drone work out WHERE it is;
+-- it does nothing whatsoever about being HEARD. Those are separate radios: GPS runs on
+-- CHANNEL_GPS, fleet traffic runs on the recipient's own channel, and a drone past the 64-block
+-- modem range of the base loses the second one no matter how good its fix is. D8 sat at -148,65,-33
+-- -- 63 blocks out, right on the edge -- powered on, chunk loaded, running fine, and completely
+-- inaudible. Nothing was broken. Nobody was listening.
+--
+-- rednet already supports this and the fleet simply never used it: rednet.send transmits a copy of
+-- every message on CHANNEL_REPEAT precisely so that anything in earshot can pass it along. So each
+-- drone becomes a hop, and range stops being a radius around the base and becomes a radius around
+-- the furthest drone. Twelve drones spread out cover far more ground than the base ever could.
+--
+-- Unconditional, unlike the GPS relay, which only hosts while idle. Repeating is a few
+-- microseconds of work with no position requirement and no way to be WRONG -- the worst a bad
+-- repeater can do is forward a message twice, and the seen-set below stops even that. A drone that
+-- only relays while idle is a drone that stops relaying the moment the fleet gets busy, which is
+-- exactly when someone is most likely to be out at the edge needing a hop.
+local REPEAT_MEMORY = 30       -- seconds to remember a message id
+
+local function meshRepeat()
+    local s_Modem = peripheral.find("modem")
+    if not s_Modem then return end
+    pcall(s_Modem.open, rednet.CHANNEL_REPEAT)
+
+    -- A message rebroadcast by two drones that can hear each other comes straight back, gets
+    -- rebroadcast again, and saturates the channel in about a second. Remembering ids for half a
+    -- minute is what makes a mesh a mesh instead of a broadcast storm.
+    local s_Seen = {}
+
+    while true do
+        local _, _, s_Channel, s_Reply, s_Message = os.pullEvent("modem_message")
+        if s_Channel == rednet.CHANNEL_REPEAT
+           and type(s_Message) == "table"
+           and s_Message.nMessageID and s_Message.nRecipient then
+
+            local s_Now = os.clock()
+            if not s_Seen[s_Message.nMessageID] then
+                for k, v in pairs(s_Seen) do
+                    if v < s_Now then s_Seen[k] = nil end
+                end
+                s_Seen[s_Message.nMessageID] = s_Now + REPEAT_MEMORY
+
+                -- A computer id is not a channel. rednet.send maps one to the other, and a
+                -- repeater that skips the mapping transmits into a channel nobody is listening on.
+                local s_Channel = s_Message.nRecipient
+                if s_Channel ~= rednet.CHANNEL_BROADCAST then
+                    s_Channel = s_Channel % rednet.MAX_ID_CHANNELS
+                end
+
+                -- Both channels: the recipient's, so the intended machine hears it if it is in
+                -- range of US, and the repeat channel, so the next drone along can carry it
+                -- further. Dropping the second is what turns a mesh into a single extra hop.
+                pcall(s_Modem.transmit, s_Channel, s_Reply, s_Message)
+                pcall(s_Modem.transmit, rednet.CHANNEL_REPEAT, s_Reply, s_Message)
+            end
+        end
+    end
+end
+
+-- SCAN WHILE TRAVELLING, NOT ONLY ON ARRIVAL.
+--
+-- A scout crossing forty blocks to reach its survey site learned absolutely nothing on the way: the
+-- scanner only ran at the grid points of a Survey job, so every recall, every reposition and every
+-- rescue flight was dead mileage over ground nobody had mapped. That is backwards -- the trip is
+-- free, the scanner is already fitted, and the unmapped ground between two places is exactly the
+-- ground that makes the next path search fail.
+--
+-- So this runs independently of whatever job is in progress and fires on DISTANCE, not on a timer:
+-- a parked drone rescans nothing, and a fast one does not skip ground. The cooldown is respected by
+-- simply not scanning while a Survey is mid-scan, so the two never fight over the peripheral.
+local SCAN_EVERY = 12          -- blocks travelled between opportunistic scans
+
+local function scanOnTheMove()
+    local s_LastX, s_LastY, s_LastZ
+
+    while true do
+        os.sleep(2)
+
+        local s_Sc = Scanner()
+        if s_Sc and m_Status ~= "scanning" then
+            local cx, cy, cz = pgps.getCachedPosition()
+            if cx ~= nil then
+                if s_LastX == nil then
+                    s_LastX, s_LastY, s_LastZ = cx, cy, cz
+                else
+                    local s_Moved = math.abs(cx - s_LastX) + math.abs(cy - s_LastY)
+                                  + math.abs(cz - s_LastZ)
+                    if s_Moved >= SCAN_EVERY then
+                        s_LastX, s_LastY, s_LastZ = cx, cy, cz
+                        -- pcall: the scanner is on a cooldown shared with the survey job, and a
+                        -- refusal here is completely routine. It must never take the drone down.
+                        pcall(absorbScan, s_Sc, 8)
+                    end
+                end
+            end
+        end
+    end
+end
+
 local function gpsRelay()
     while true do
         os.sleep(10)
@@ -1936,6 +2100,10 @@ local function gpsRelay()
             -- Anchor on a fix of our OWN, every cycle. Dead reckoning is good enough to navigate
             -- with and never good enough to publish.
             local fx, fy, fz = gps.locate(5, false)
+            -- Floor before hosting. A relay publishes its position to every drone in range, so a
+            -- fractional fix here is not one bad cell -- it is every cell every listener records
+            -- from now on, filed under keys nothing can look up.
+            if fx then fx, fy, fz = math.floor(fx), math.floor(fy), math.floor(fz) end
 
             if fx == nil then
                 trace("relay: no fix of my own (status=" .. tostring(m_Status) .. ")")
@@ -2153,4 +2321,4 @@ end
 
 PowNet.SetShutdownHook(OnShutdown)
 
-parallel.waitForAny(PowNet.main, PowNet.droneMain, PowNet.control, heartbeat, resumeBranch, gpsRelay, gpsServe)
+parallel.waitForAny(PowNet.main, PowNet.droneMain, PowNet.control, heartbeat, resumeBranch, gpsRelay, gpsServe, meshRepeat, scanOnTheMove)

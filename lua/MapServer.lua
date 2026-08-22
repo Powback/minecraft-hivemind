@@ -64,7 +64,22 @@ function OnSaveWorld(p_ID, p_Message)
     -- ...and index the OCCUPANCY too. A mined block reports itself only here, as a 0; it never
     -- appears in the detail map again. Reading names alone is what made the index append-only.
     IndexOccupancy(p_Message.data.cachedWorld)
-    PowGPSServer.saveAll()
+    -- THROTTLED. Persisting the whole map on every upload is what made MapServer stop answering.
+    --
+    -- Six drones uploading scans every few seconds each triggered a full rewrite of every cell the
+    -- fleet has ever seen. At twenty thousand cells that is a long, blocking write, and MapServer
+    -- spent more time saving the map than serving it -- Status timed out, `hive.nodes` reported the
+    -- module unreachable, and drones queued up behind a module that was not stuck at all, just busy
+    -- writing the same file over and over.
+    --
+    -- Every thirty seconds is enough. The cost of a crash between saves is at most half a minute of
+    -- observations, which the next scan re-derives; the cost of saving continuously is a map server
+    -- that nobody can talk to.
+    m_LastSave = m_LastSave or 0
+    if os.clock() - m_LastSave > 30 then
+        m_LastSave = os.clock()
+        PowGPSServer.saveAll()
+    end
     MapRender.invalidate()
     return true, true
 end
@@ -502,6 +517,38 @@ end
 
 -- Connected pockets of surveyed AIR. A cave is air that is enclosed -- so ignore anything at or
 -- above the highest solid block in its column, which is open sky rather than a cave.
+-- HOW MUCH OF A REGION DO WE ACTUALLY KNOW?
+--
+-- Needed because "the drone said it finished" and "the area is surveyed" turned out to be
+-- completely different claims. A scout reports done when it has walked its scan grid; whether that
+-- grid covered the region nobody ever checked, so tasks read 100% over ground that was still blank
+-- on the map. Progress that cannot be contradicted by the world is not progress, it is a rumour.
+--
+-- Counts the KNOWN cells in the box rather than sampling, because the box is bounded by the caller
+-- and the map is a hash -- walking the box is cheap and exact, and an estimate here would put us
+-- straight back to guessing.
+function OnRegionKnown(p_ID, p_Message)
+    local d = p_Message.data or {}
+    if not (d.min and d.max) then return false, "need min and max" end
+
+    local s_World = PowGPSServer.getCachedWorld()
+    local s_Known, s_Total = 0, 0
+    for x = math.floor(d.min.x), math.floor(d.max.x) do
+        for y = math.floor(d.min.y), math.floor(d.max.y) do
+            for z = math.floor(d.min.z), math.floor(d.max.z) do
+                s_Total = s_Total + 1
+                if s_World[x .. ":" .. y .. ":" .. z] ~= nil then s_Known = s_Known + 1 end
+            end
+        end
+        -- The box can be tens of thousands of cells. Yielding keeps MapServer answering everything
+        -- else while it counts, which is the difference between a slow reply and a dead module.
+        if x % 8 == 0 then os.sleep(0) end
+    end
+
+    return true, {known = s_Known, total = s_Total,
+                  percent = s_Total > 0 and math.floor(s_Known / s_Total * 100) or 0}
+end
+
 function OnFindCaves(p_ID, p_Message)
     local d = p_Message.data or {}
     local s_MinSize = tonumber(d.min) or 8
@@ -587,6 +634,7 @@ local m_ServerEvents = {
     GetBounds = { func = OnGetBounds },
     FindBlocks = { func = OnFindBlocks },
     FindCaves  = { func = OnFindCaves },
+    RegionKnown = { func = OnRegionKnown },
     BlockAt    = { func = OnBlockAt },
     gpshost = {
         func = OnAddGpsHost, callable = true,
