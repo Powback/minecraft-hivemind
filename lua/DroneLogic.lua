@@ -549,7 +549,10 @@ function OnSurvey(p_ID, p_Message)
     local d = p_Message.data or {}
     local s_W    = tonumber(d.w)    or 16
     local s_H    = tonumber(d.h)    or 16
-    local s_Drop = tonumber(d.drop) or 24
+    -- Generous, because the entire value of a scan is being NEAR the ground. Twenty-four is not
+    -- enough to come down from cruising height over low terrain, and a drone that stops short spends
+    -- the rest of the sweep scanning sky.
+    local s_Drop = tonumber(d.drop) or 64
     local s_Climb= tonumber(d.climb) or 8
 
     if executing then
@@ -591,6 +594,19 @@ function OnSurvey(p_ID, p_Message)
                 -- drifted position poisons the map wholesale rather than one cell at a time. Fix
                 -- first, scan second.
                 pgps.verifyPosition()
+                -- SCAN THE GROUND, NOT THE SKY.
+                --
+                -- The scanner reads a SPHERE of radius r around the drone, so where the drone is standing
+                -- decides what the scan is worth. From cruising height almost all of it is air: at y=95
+                -- with r=8 it covers y=87..103, and over terrain twenty blocks below that is thousands of
+                -- cells of nothing, recorded diligently.
+                --
+                -- The WALKING survey below already settles before every step. This branch -- the one a
+                -- scout with a scanner actually takes -- never did, so the better-equipped drone did the
+                -- worse survey. Dropping to the surface re-centres the sphere so half of it is underground,
+                -- which is where the ore is and the entire reason for scanning.
+                settle(s_Drop)
+                
                 local n = absorbScan(s_Sc, s_R)
                 s_Total, s_Scans = s_Total + n, s_Scans + 1
                 UploadWorld()
@@ -599,6 +615,7 @@ function OnSurvey(p_ID, p_Message)
                         if not executing then break end
                         if not stepForward(s_Climb) then break end
                     end
+                    settle(s_Drop)   -- follow the ground DOWN too; stepForward only gives back what it climbed
                     os.sleep(SCAN_COOLDOWN)
                 end
             end
@@ -610,6 +627,7 @@ function OnSurvey(p_ID, p_Message)
                     if not executing then break end
                     if not stepForward(s_Climb) then break end
                 end
+                settle(s_Drop)   -- follow the ground DOWN too; stepForward only gives back what it climbed
                 s_Turn()
                 os.sleep(SCAN_COOLDOWN)
             end
