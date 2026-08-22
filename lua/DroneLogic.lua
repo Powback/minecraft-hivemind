@@ -135,7 +135,9 @@ function SendHeartBeat()
     --
     -- Short timeout: this runs on a loop and a slow DroneMan should cost a missed beat, not a
     -- stalled drone.
-    local s_Reply = PowNet.sendAndWaitForResponse("DroneMan", s_Message, PowNet.SERVER_PROTOCOL, 2)
+    -- Five seconds, not two. DroneMan services the whole fleet from one receive loop, so a reply
+    -- can legitimately take a while; a tight timeout turns "busy" into "missing".
+    local s_Reply = PowNet.sendAndWaitForResponse("DroneMan", s_Message, PowNet.SERVER_PROTOCOL, 5)
     return s_Reply ~= false and s_Reply ~= nil
 end
 
@@ -1423,6 +1425,116 @@ function OnMine(p_ID, p_Message)
     end)
 end
 
+
+-- BUILDING: turning material into infrastructure.
+--
+-- The fleet could dig, carry, smelt and craft, and everything it made went straight into a chest.
+-- Nothing could PLACE a block, so the settlement could accumulate chests forever and never own a
+-- single structure -- no field caches, no smelter banks, nothing that makes the next job cheaper.
+--
+-- The layout arrives as data rather than being computed here on purpose. HQ has already costed it,
+-- checked it against the plot registry, and ordered the blocks bottom-up; a builder that worked out
+-- its own geometry could not have any of that checked before it started swinging.
+
+--- Find a slot holding p_Name and select it.
+local function selectItem(p_Name)
+    for i = 1, 16 do
+        local d = turtle.getItemDetail(i)
+        if d and d.name == p_Name then
+            turtle.select(i)
+            return true
+        end
+    end
+    return false
+end
+
+function OnBuild(p_ID, p_Message)
+    return RunJob("Build", p_Message.data, {status = "building", travel = false}, function(d)
+        local s_Origin = d.origin
+        local s_Blocks = d.blocks
+        if type(s_Origin) ~= "table" or s_Origin.x == nil then error("no origin", 0) end
+        if type(s_Blocks) ~= "table" or #s_Blocks == 0 then error("nothing to build", 0) end
+
+        -- 1. Collect the materials. Same handover chest crafting uses.
+        local s_Need = {}
+        for _, b in ipairs(s_Blocks) do
+            if b.item then s_Need[b.item] = (s_Need[b.item] or 0) + 1 end
+        end
+        local s_Req = {}
+        for name, count in pairs(s_Need) do s_Req[#s_Req + 1] = {name = name, count = count} end
+
+        local s_Hand = PowNet.sendAndWaitForResponse("StorageMan",
+            PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Provide", {items = s_Req}),
+            PowNet.SERVER_PROTOCOL, 8)
+        if type(s_Hand) ~= "table" or s_Hand.pos == nil then
+            error("storage would not hand over materials", 0)
+        end
+        if s_Hand.complete == false then
+            local s_Miss = ""
+            for _, m in ipairs(s_Hand.short or {}) do s_Miss = s_Miss .. m.name .. " x" .. m.count .. " " end
+            error("short of " .. s_Miss, 0)
+        end
+
+        if pgps.moveTo(s_Hand.pos.x, s_Hand.pos.y + 1, s_Hand.pos.z) == false then
+            error("could not reach the pickup chest", 0)
+        end
+        emptyInventory()
+        local s_Stage, s_StageErr = stageFromChest(s_Need)
+        if s_Stage == nil then error(s_StageErr, 0) end
+
+        -- Materials live in the staging slots; spread them into the main inventory so placeDown
+        -- has something in the selected slot regardless of which kind is wanted next.
+        for _, slot in ipairs(STAGE_SLOTS) do
+            local dd = turtle.getItemDetail(slot)
+            if dd then
+                turtle.select(slot)
+                for i = 1, 12 do
+                    if turtle.getItemCount(i) == 0 then turtle.transferTo(i) break end
+                end
+            end
+        end
+
+        -- 2. Place. The drone stands ABOVE each target and places downwards, which is the one
+        --    placement that needs no knowledge of which way it is facing.
+        local s_Placed, s_Skipped = 0, 0
+        for _, b in ipairs(s_Blocks) do
+            if not executing then break end
+            local bx = s_Origin.x + (tonumber(b.dx) or 0)
+            local by = s_Origin.y + (tonumber(b.dy) or 0)
+            local bz = s_Origin.z + (tonumber(b.dz) or 0)
+
+            if pgps.moveTo(bx, by + 1, bz) == false then
+                s_Skipped = s_Skipped + 1
+            else
+                -- Something already here. Leave it: overwriting is how a build eats whatever was
+                -- standing on the site, and the plot check cannot see blocks that arrived after it
+                -- ran. Refusing costs one block; the alternative destroyed a drone once already.
+                local s_Occupied, s_What = turtle.inspectDown()
+                if s_Occupied then
+                    if s_What and s_What.name == b.item then
+                        s_Placed = s_Placed + 1        -- already correct; count it as done
+                    else
+                        s_Skipped = s_Skipped + 1
+                    end
+                elseif not selectItem(b.item) then
+                    error("ran out of " .. tostring(b.item) .. " partway through", 0)
+                elseif turtle.placeDown() then
+                    s_Placed = s_Placed + 1
+                    pgps.noteObservation(bx .. ":" .. by .. ":" .. bz, 1, {true, {name = b.item}})
+                else
+                    s_Skipped = s_Skipped + 1
+                end
+            end
+        end
+
+        Deposit()          -- leftovers go back rather than riding around in a turtle
+        UploadWorld()
+        return {message = ("built %d of %d blocks (%d skipped)")
+                    :format(s_Placed, #s_Blocks, s_Skipped),
+                placed = s_Placed, skipped = s_Skipped, total = #s_Blocks}
+    end)
+end
+
 function OnLumber(p_ID, p_Message)
     return RunJob("Lumber", p_Message.data, {status = "logging"}, function(d)
         local s_W = tonumber(d.w) or 8
@@ -1513,6 +1625,11 @@ local m_DroneEvents = {
     -- lost its position.
     Relay = {
         func = OnRelay,
+    },
+    -- Placing blocks: the difference between a fleet that accumulates chests and one that owns
+    -- infrastructure.
+    Build = {
+        func = OnBuild,
     },
     Ping = {
         func = OnPing,
@@ -1737,7 +1854,7 @@ local HEARTBEAT_SECONDS = 30
 -- Consecutive unanswered beats before we conclude the link is gone rather than merely busy.
 -- Three, because one missed reply is normal (DroneMan servicing another call) and waiting for
 -- three costs at most a minute while avoiding a drone that abandons its job over a hiccup.
-local LINK_LOST_AFTER = 3
+local LINK_LOST_AFTER = 5
 local m_Missed = 0
 
 local function heartbeat()
@@ -1750,10 +1867,24 @@ local function heartbeat()
             print("no answer from DroneMan (" .. m_Missed .. "/" .. LINK_LOST_AFTER .. ")")
             if m_Missed >= LINK_LOST_AFTER then
                 m_Missed = 0
-                -- Stop whatever we are doing first. Carrying on digging while out of contact is
-                -- how a drone ends up deep in unmapped ground with nobody able to reach it.
-                executing = false
-                RecoverLink()
+                -- IS THE RADIO ACTUALLY DEAD, OR IS DRONEMAN JUST BUSY?
+                --
+                -- These look identical from here and demand opposite responses. Unanswered
+                -- heartbeats alone are not evidence of being out of range: DroneMan answers the
+                -- whole fleet from a single loop, and treating slowness as loss made drones sitting
+                -- ON THEIR DOCKS abandon their work and declare themselves stranded -- which is
+                -- worse than the problem, because it takes healthy drones out of service.
+                --
+                -- A lookup is the discriminator. It is a broadcast on the same radio: if anything
+                -- answers, the link is fine and the silence is congestion.
+                if PowNet.Lookup("DroneMan") ~= nil then
+                    print("DroneMan is slow, not gone -- staying put")
+                else
+                    -- Stop whatever we are doing first. Carrying on digging while out of contact is
+                    -- how a drone ends up deep in unmapped ground with nobody able to reach it.
+                    executing = false
+                    RecoverLink()
+                end
             end
         end
         UploadWorld()

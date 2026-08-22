@@ -106,6 +106,8 @@ function RoleForWork(p_Work)
     -- last step rather than the first.
     if p_Work["craft"] then return "crafter" end
     if p_Work["mine"] then return "miner" end
+    -- Any turtle can place a block; miners are the general workers.
+    if p_Work["build"] then return "miner" end
     if p_Work["gather"] then return "miner" end
     -- Lumber goes to a miner: roles are derived from HARDWARE (geoscanner -> scout, chunky ->
     -- loader, otherwise miner) and there is no wood-specific upgrade. A turtle digs wood with
@@ -214,6 +216,22 @@ function OnStartTask(p_ID, p_Message)
     end
 
     local s_Drone, s_Busy = pickDrone(s_Role)
+
+    -- PLACING A BLOCK NEEDS NO SPECIAL HARDWARE.
+    --
+    -- Digging needs a pickaxe and scanning needs a geo scanner, so those jobs genuinely belong to
+    -- one role. Building needs neither -- every turtle can place -- and routing it to "miner" left
+    -- a build queued indefinitely while a crafter and a loader sat idle on their docks. Prefer a
+    -- miner, then take whoever is free.
+    if s_Drone == nil and s_Task.work and s_Task.work.build then
+        for _, alt in ipairs({"crafter", "loader", "scout"}) do
+            s_Drone = pickDrone(alt)
+            if s_Drone ~= nil then
+                print("build going to a " .. alt .. " -- no miner free")
+                break
+            end
+        end
+    end
     if s_Drone == nil then
         if s_Busy then
             return false, "every " .. s_Role .. " is busy (" .. tostring(s_Busy.name) .. ")"
@@ -230,6 +248,11 @@ function OnStartTask(p_ID, p_Message)
     if s_Role == "scout" then
         local w = s_Task.work.survey or {}
         s_Verb, s_Payload = "Survey", {w = w.w, h = w.h, radius = w.radius, pos = w.pos, taskId = s_Task.id}
+    elseif s_Task.work.build then
+        -- The layout arrives as data. HQ costed it, checked it against the plot registry and
+        -- ordered it bottom-up before any of this was dispatched.
+        local w = s_Task.work.build
+        s_Verb, s_Payload = "Build", {origin = w.origin, blocks = w.blocks, taskId = s_Task.id}
     elseif s_Task.work.mine then
         -- Prospecting: sink a shaft and drive branches, inspecting what gets exposed. The only job
         -- that can find ore the map has never seen.

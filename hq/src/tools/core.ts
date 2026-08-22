@@ -18,6 +18,7 @@ import { bridge } from '../bridge/ws.js';
 import { expand, craftable, RECIPES } from '../world/recipes.js';
 import { allocate, checkOrder, SPEC, type Purpose } from '../world/plots.js';
 import { city, saveCity } from '../world/city.js';
+import { BLUEPRINTS, blueprint, materials, placementOrder, footprint } from '../world/blueprints.js';
 import { supply, runSupplyTick, saveSupply, stockKey, type SupplyRule } from '../agent/supply.js';
 
 /**
@@ -1489,6 +1490,136 @@ registry.register({
     ctx.log('rescue.relay', { count: out.length });
     return { relays: out };
   },
+});
+
+
+// ── order.build ────────────────────────────────────────────────────────────
+//
+// The end of the loop: material becomes infrastructure, on ground that was reserved for it.
+//
+// Everything is checked BEFORE a drone moves, because a half-built structure is far more annoying
+// than one that never started: the site is validated against the plot registry, the cost is
+// expanded through the recipe graph, and any missing material is CRAFTED first. The build itself is
+// queued to depend on those craft steps, so it cannot begin and stall halfway.
+registry.register({
+  name: 'order.build',
+  summary: 'Build a blueprint on a plot, crafting whatever it needs first.',
+  description:
+    'Sites the structure in a plot of the right purpose (allocating one if needed), refuses it if ' +
+    'the footprint would leave that plot or enter another, costs it through the recipe graph, ' +
+    'queues any crafting, and queues the build behind it. Use blueprints:list to see what exists.',
+  params: z.object({
+    blueprint: z.string().describe('Blueprint name, e.g. "field-cache".'),
+    plot: z.string().optional().describe('Reuse a named plot instead of allocating one.'),
+  }).strict(),
+  returns: 'The plot, the footprint, what had to be crafted, and the queued tasks.',
+  danger: 'destructive',
+  bounds: 'Confined to the named plot; refused outright if the footprint leaves it or overlaps another.',
+  teach: [{
+    situation: 'Miners are commuting home to unload; we want a cache at the dig.',
+    args: { blueprint: 'field-cache' },
+    result: { plot: 'storage-02', crafted: [{ item: 'minecraft:chest', runs: 1 }], buildTask: 41 },
+    takeaway: 'One order: sited, costed, crafted, then built — in that order.',
+  }],
+  handler: async (a, ctx) => {
+    const bp = blueprint(a.blueprint);
+    if (!bp) throw new ToolError(
+      `No blueprint "${a.blueprint}".`,
+      `Known: ${BLUEPRINTS.map((b) => b.name).join(', ')}`);
+
+    let plot = a.plot
+      ? city.plots.find((p) => p.name === a.plot)
+      : city.plots.find((p) => p.purpose === bp.purpose && p.status === 'planned');
+    if (!plot) {
+      const r = allocate(city, bp.purpose);
+      if ('error' in r) throw new ToolError(r.error, 'Free ground or widen the operating bounds.');
+      plot = r;
+    }
+
+    // Centre it, then check. Siting and checking are separate on purpose: the check is the rule,
+    // and a rule that only ever sees positions the same code chose is not a rule.
+    const origin = {
+      x: Math.floor((plot.min.x + plot.max.x) / 2),
+      // dy=0 is the WORKING SURFACE, not the block above it. Siting at ground+1 pushed every
+      // structure one block higher than the plot was sized for, and the registry duly refused a
+      // four-block post on a four-block plot -- correctly, which is the point of having the check
+      // rather than trusting the code that chose the position.
+      y: plot.ground,
+      z: Math.floor((plot.min.z + plot.max.z) / 2),
+    };
+    const fp = footprint(bp, origin);
+    const refusal = checkOrder(city, plot.name, fp);
+    if (refusal) throw new ToolError(
+      `Cannot build ${bp.name} on ${plot.name}: ${refusal}.`,
+      'Allocate a bigger plot for this purpose, or name a different one.');
+
+    // Cost it, and make anything missing.
+    let stock: Record<string, number> = {};
+    try {
+      const res: any = await bridge.call('StorageMan', 'stock', {}, { timeoutMs: 8000 });
+      for (const d of res?.detail ?? res?.data?.detail ?? []) {
+        if (typeof d?.name === 'string') stock[d.name] = (stock[d.name] ?? 0) + (d.count ?? 0);
+      }
+    } catch { stock = {}; }
+
+    const need = materials(bp);
+    const crafted: any[] = [];
+    const cannot: string[] = [];
+    let lastCraftTask: number | undefined;
+    for (const [item, count] of Object.entries(need)) {
+      if ((stock[item] ?? 0) >= count) continue;
+      const plan = expand(item, count, (i) => stock[i] ?? 0);
+      if (plan.missing.length) { cannot.push(`${item} (needs ${plan.missing.join(', ')})`); continue; }
+      for (const step of plan.steps) {
+        if (step.action !== 'craft') continue;
+        const res: any = await bridge.call('TaskMan', 'Add', {
+          name: `craft-${step.item.replace('minecraft:', '')}`,
+          priority: 2,
+          work: { craft: { item: step.item, runs: step.runs, grid: step.grid, inputs: recipeInputs(step.item) } },
+        }, { timeoutMs: 8000 });
+        if (typeof res !== 'string') { crafted.push({ item: step.item, runs: step.runs, task: res?.id }); lastCraftTask = res?.id; }
+      }
+    }
+    if (cannot.length) throw new ToolError(
+      `Cannot build ${bp.name}: ${cannot.join('; ')}.`,
+      'Obtain those materials first — order.prospect for ore, order.issue lumber for wood.');
+
+    // The build waits for the last craft step. Without that it would start, find the chest short,
+    // and abandon a half-finished structure on a plot now marked active.
+    const build: any = await bridge.call('TaskMan', 'Add', {
+      name: `build-${bp.name}-${plot.name}`,
+      priority: 2,
+      dependsOn: lastCraftTask,
+      work: { build: { origin, blocks: placementOrder(bp) } },
+    }, { timeoutMs: 12000 });
+    if (typeof build === 'string') throw new ToolError(`TaskMan refused the build: ${build}`, 'Check fleet.tasks.');
+
+    plot.status = 'clearing';
+    plot.owner = `build-${bp.name}`;
+    saveCity();
+    ctx.log('order.build', { blueprint: bp.name, plot: plot.name });
+    return {
+      blueprint: bp.name, plot: plot.name, origin, footprint: fp,
+      needs: need, crafted, buildTask: build?.id,
+      note: crafted.length ? 'build waits for the crafting to finish' : 'materials already in stock',
+    };
+  },
+});
+
+// ── blueprints.list ────────────────────────────────────────────────────────
+registry.register({
+  name: 'blueprints.list',
+  summary: 'What the fleet knows how to build, and what each costs.',
+  description: 'Costs are in finished items; order.build expands them through the recipe graph.',
+  params: z.object({}).strict(),
+  returns: 'Each blueprint with its purpose, size and material cost.',
+  danger: 'read',
+  handler: async () => ({
+    blueprints: BLUEPRINTS.map((b) => ({
+      name: b.name, purpose: b.purpose, summary: b.summary,
+      size: b.size, blocks: b.blocks.length, materials: materials(b),
+    })),
+  }),
 });
 
 // ── recover.dispatch ───────────────────────────────────────────────────────
