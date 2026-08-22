@@ -402,11 +402,17 @@ function OnGoTo(p_ID, p_Message)
     local s_Sent = {}
     for k,v in pairs(s_Mesage.data.drones) do
 
-        local s_AbortMessage = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Abort", {})
-        local s_AbortResponse = PowNet.sendAndWaitForResponse(v, s_AbortMessage, PowNet.SERVER_PROTOCOL) -- Override the current drone action
-        if(s_AbortResponse) then
-           os.sleep(1) -- Wait for abortion to complete. Takes 1 tick.
-        end
+        -- Fire the abort, do not WAIT for it.
+        --
+        -- This blocked on an acknowledgement with a 1s budget and three retries, so a single GoTo
+        -- could spend seconds here before the move was even sent -- and the caller, waiting on the
+        -- whole exchange, timed out and reported "no response" for an order that was in fact being
+        -- carried out. That misreport fooled me three separate times.
+        --
+        -- Waiting bought nothing anyway: OnAbort is idempotent and always clears, and the GoTo that
+        -- follows is what the drone acts on.
+        PowNet.Send(v, PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Abort", {}), PowNet.SERVER_PROTOCOL)
+        os.sleep(0.2)   -- let the abort land before the new order arrives
 
         local s_Message = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "GoTo",
             {pos = p_Message.data.pos, heading = p_Message.data.heading})

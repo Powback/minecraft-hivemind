@@ -126,8 +126,43 @@ end
 
 function getBounds() return {chunks = m_Chunks, gps = m_Gps} end
 
+-- How far outside a set of boxes a point is. Zero when inside.
+local function distanceOutside(p_List, x, y, z)
+    if p_List == nil then return 0 end
+    local s_Best = nil
+    for _, b in ipairs(p_List) do
+        local dx = math.max(b.minx - x, 0, x - b.maxx)
+        local dy = math.max(b.miny - y, 0, y - b.maxy)
+        local dz = math.max(b.minz - z, 0, z - b.maxz)
+        local d = dx + dy + dz
+        if s_Best == nil or d < s_Best then s_Best = d end
+    end
+    return s_Best or 0
+end
+
 function inBounds(x, y, z)
     return inAny(m_Chunks, x, y, z) and inAny(m_Gps, x, y, z)
+end
+
+-- May we take this step?
+--
+-- Being outside the operating region must not be a life sentence. The bounds check is there to stop
+-- a drone LEAVING coverage -- but applied to a drone that is already outside, it forbids every move
+-- including the ones that would bring it home. Two drones sat unable to take a single step for
+-- exactly this reason, and the cause was my own correction of the GPS reach: honest coverage put
+-- them outside a region they were already standing in.
+--
+-- So: inside, the rule is unchanged. Outside, a step is allowed if it gets CLOSER to the region.
+function mayStep(x, y, z)
+    if inBounds(x, y, z) then return true end
+
+    local cx, cy, cz = cachedX, cachedY, cachedZ
+    if cx == nil then return false end
+
+    local s_Now  = distanceOutside(m_Chunks, cx, cy, cz) + distanceOutside(m_Gps, cx, cy, cz)
+    local s_Next = distanceOutside(m_Chunks, x, y, z)    + distanceOutside(m_Gps, x, y, z)
+    if s_Next < s_Now then return true end
+    return false, "out of bounds"
 end
 
 -- Which of the two refused, so the fix is obvious rather than guessed at.
@@ -433,7 +468,48 @@ end
 -- return: boolean "success"
 --
 
+-- WORK OUT WHICH WAY WE ARE FACING.
+--
+-- Position and heading are separate, and only setLocationFromGPS establishes heading -- by actually
+-- moving and comparing fixes. Once that was made to bail safely on a missing fix, a drone could end
+-- up knowing exactly where it is and not which way it points.
+--
+-- That is not a degraded state, it is a fatal one: deltas[nil] is nil, so the very next line of
+-- forward() indexed nil and THREW. The error killed moveTo, which killed the GoTo, and the drone
+-- sat reporting "moving" while standing perfectly still. Two of them did, for an hour.
+function ensureHeading()
+    if cachedDir ~= nil then return true end
+    if cachedX == nil then return false, "no position, so no way to deduce heading" end
+
+    -- Step, look, step back. The only way to learn which way you face is to move and see what
+    -- changed -- there is no API for it.
+    for _ = 1, 4 do
+        if turtle.forward() then
+            local nx, _, nz = gps.locate(5, false)
+            turtle.back()
+            if nx ~= nil and nz ~= nil then
+                if     nz < cachedZ then cachedDir = North
+                elseif nz > cachedZ then cachedDir = South
+                elseif nx < cachedX then cachedDir = West
+                elseif nx > cachedX then cachedDir = East end
+            end
+            if cachedDir ~= nil then
+                print("heading re-established: " .. tostring(shortNames[cachedDir]))
+                return true
+            end
+        end
+        turtle.turnLeft()   -- blocked that way; try another
+    end
+    return false, "could not determine heading"
+end
+
 function forward()
+    -- Facing is as necessary as position, and is NOT implied by it.
+    if cachedDir == nil then
+        local ok, why = ensureHeading()
+        if not ok then return false, why or "no heading" end
+    end
+
     -- A bounds check is only as good as the position it is checking.
     --
     -- D3 was found 24 blocks OUTSIDE the force-loaded region, frozen and invisible to the server,
@@ -448,7 +524,7 @@ function forward()
     -- Refuse rather than step out of the world we can operate in.
     if cachedDir and cachedX then
         local F = deltas[cachedDir]
-        if not inBounds(cachedX + F[1], cachedY + F[2], cachedZ + F[3]) then
+        if not mayStep(cachedX + F[1], cachedY + F[2], cachedZ + F[3]) then
             m_BoundsStops = m_BoundsStops + 1
             return false, "out of bounds"
         end
@@ -511,7 +587,7 @@ end
 --
 
 function up()
-    if cachedY and not inBounds(cachedX, cachedY + (1), cachedZ) then
+    if cachedY and not mayStep(cachedX, cachedY + (1), cachedZ) then
         m_BoundsStops = m_BoundsStops + 1
         return false, "out of bounds"
     end
@@ -538,7 +614,7 @@ end
 --
 
 function down()
-    if cachedY and not inBounds(cachedX, cachedY + (-1), cachedZ) then
+    if cachedY and not mayStep(cachedX, cachedY + (-1), cachedZ) then
         m_BoundsStops = m_BoundsStops + 1
         return false, "out of bounds"
     end

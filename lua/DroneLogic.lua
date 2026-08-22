@@ -1966,6 +1966,15 @@ local function heartbeat()
         -- move somewhere with coverage, so it never gets one. It still heartbeats, so DroneMan goes
         -- on reporting the last position it ever knew and the drone looks fine while being unable
         -- to accept any work at all. D3 sat like that with all four GPS hosts up and in range.
+        -- Heading can be missing even when position is not, and a drone without it cannot move at
+        -- all -- see ensureHeading. Cheap to check, fatal to ignore.
+        do
+            local _, _, _, s_Dir = pgps.getCachedPosition()
+            if s_Dir == nil and pgps.getCachedPosition() ~= nil then
+                if pgps.ensureHeading() then SendHeartBeat() end
+            end
+        end
+
         if pgps.getCachedPosition() == nil then
             local ok = pgps.verifyPosition()
             if ok then
