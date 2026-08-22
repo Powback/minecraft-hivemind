@@ -1268,6 +1268,9 @@ registry.register({
     depth: z.number().int().min(-40).max(120).default(40).describe('Target Y for the tunnels.'),
     length: z.number().int().min(4).max(64).default(24).describe('How far each branch runs.'),
     branches: z.number().int().min(1).max(8).default(4),
+    // Dense on purpose, and different from order.prospect. A miner working ALONE finds ore only
+    // by exposing it, so tight branches are correct. Prospecting spaces them for a scout's scanner
+    // instead, which sees 8 blocks through rock and makes close branches wasted digging.
     spacing: z.number().int().min(2).max(8).default(3).describe('Blocks between parallel branches.'),
     pos: vec3.optional().describe('Shaft head. Defaults to the drone starting where it is.'),
   }).strict(),
@@ -1276,7 +1279,7 @@ registry.register({
   bounds: 'Bounded by branch count and length; abortable via order.abort. Digs only ore it exposes plus the tunnels themselves.',
   teach: [{
     situation: 'We are short of iron and nothing in the survey has ever seen any.',
-    args: { depth: 35, length: 24, branches: 4, spacing: 16 },
+    args: { depth: 35, length: 24, branches: 4, spacing: 3 },
     result: { task: 31, depth: 35, note: 'prospecting; ore found is added to the map as well as the chest' },
     takeaway: 'Iron is not findable from the surface. Send someone down to look.',
   }],
