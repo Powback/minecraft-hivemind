@@ -135,30 +135,62 @@ function OnReboot(p_ID, p_Message)
     os.reboot()
 end
 
-function OnGoTo(p_ID, p_Message)
-    print(os.time())
-    x,y,z = pgps.setLocationFromGPS()
-    if(p_Message.data.pos == nil) then
-        print("No pos specified")
-        return
-    end
-    m_Status = "moving"
+-- A CC terminal cannot be read from outside the game, so a handler that misbehaves is completely
+-- opaque -- which is exactly why "the drone accepts GoTo and does not move" was unfalsifiable.
+-- Truncating, not growing. The Bridge learned this the hard way: an append-only log reached the
+-- 8MB computer_space_limit and then killed the module with "Out of space" -- a diagnostic that
+-- destroys the thing it is meant to explain.
+local TRACE_LIMIT = 32 * 1024
+local function trace(p_What)
+    pcall(function()
+        if fs.exists("/drone.log") and fs.getSize("/drone.log") > TRACE_LIMIT then
+            fs.delete("/drone.log")
+        end
+        local h = fs.open("/drone.log", "a")
+        if h then h.writeLine(("%s %s"):format(tostring(os.clock()), tostring(p_What))) h.close() end
+    end)
+end
 
+function OnGoTo(p_ID, p_Message)
+    trace("GoTo received from " .. tostring(p_ID))
+    local d = p_Message and p_Message.data
+    if d == nil or d.pos == nil then
+        trace("GoTo REFUSED: no pos")
+        return false, "no pos specified"
+    end
+
+    -- Re-fix cheaply instead of setLocationFromGPS, which STEPS THE TURTLE forward and back to
+    -- work out its heading. That is fine once at boot and wrong here: it is a move, so it can be
+    -- blocked, and when it is the heading comes back nil and every later moveTo has no idea which
+    -- way the drone is facing.
+    pgps.verifyPosition()
+    local cx, cy, cz = pgps.getCachedPosition()
+    if cx == nil then
+        trace("GoTo REFUSED: no position fix")
+        return false, "no position fix"
+    end
+    x, y, z = cx, cy, cz
+
+    m_Status = "moving"
     TaskStart()
-    local s_Status, s_message = pgps.moveTo(p_Message.data.pos.x, p_Message.data.pos.y, p_Message.data.pos.z)
+    trace(("GoTo %s,%s,%s -> %s,%s,%s"):format(cx, cy, cz, tostring(d.pos.x), tostring(d.pos.y), tostring(d.pos.z)))
+    local s_Status, s_Message = pgps.moveTo(tonumber(d.pos.x), tonumber(d.pos.y), tonumber(d.pos.z))
     TaskEnd()
     m_Status = "idle"
+
     if(s_Status == false) then
-        print("Failed to move to position")
-        return false, "Failed to move to position"
+        trace("GoTo FAILED: " .. tostring(s_Message))
+        Distress("GoTo failed", tostring(s_Message))
+        return false, tostring(s_Message or "could not reach position")
     end
-    if(p_Message.data.heading == nil) then
-        print("No heading specified")
-    else
+
+    if d.heading ~= nil then
         m_Status = "rotation"
-        print(pgps.turnTo(p_Message.data.heading))
+        pgps.turnTo(d.heading)
         m_Status = "idle"
     end
+    trace("GoTo done")
+    return true, {arrived = {x = d.pos.x, y = d.pos.y, z = d.pos.z}}
 end
 
 
@@ -605,8 +637,13 @@ end
 function RunJob(p_Name, p_Data, p_Opts, p_Body)
     local d = p_Data or {}
     local o = p_Opts or {}
-    if executing then return false, "busy" end
+    if executing then
+        trace(("JOB %s REFUSED: busy"):format(p_Name))
+        return false, "busy"
+    end
 
+    trace(("JOB %s start %s"):format(p_Name, textutils.serialiseJSON and
+        (pcall(textutils.serialiseJSON, d) and textutils.serialiseJSON(d) or "?") or "?"))
     m_Job = {verb = p_Name, data = d}
     saveResume()
     m_Status = o.status or "working"
@@ -635,13 +672,33 @@ function RunJob(p_Name, p_Data, p_Opts, p_Body)
 
     if o.settle ~= false then settle(tonumber(d.drop) or 24) end
 
-    local s_Ok, s_Res = pcall(p_Body, d)
-    if not s_Ok then
+    -- table.pack, NOT `local ok, res = pcall(...)`.
+    --
+    -- Two locals keep the first return value and throw the rest away, so a body ending in the
+    -- ordinary Lua idiom `return nil, "reason"` handed back res=nil and the reason vanished --
+    -- and, because pcall itself succeeded, RunJob reported the job DONE. Every "short of planks",
+    -- "could not reach the chest" and "no item to craft" was silently converted into success. A
+    -- job that fails quietly is worse than one that crashes: the fleet moves on believing the work
+    -- happened, and the shortfall surfaces much later as something inexplicable.
+    --
+    -- So both conventions are honoured: throwing reports, and returning nil/false reports.
+    local s_Ret = table.pack(pcall(p_Body, d))
+    if not s_Ret[1] then
         -- A job that throws must report, not vanish: the drone is left somewhere unexpected and
         -- somebody has to know why.
-        Distress(p_Name .. " failed", tostring(s_Res))
-        return finish(false, tostring(s_Res))
+        trace(("JOB %s THREW %s"):format(p_Name, tostring(s_Ret[2])))
+        Distress(p_Name .. " failed", tostring(s_Ret[2]))
+        return finish(false, tostring(s_Ret[2]))
     end
+
+    local s_Res, s_Why = s_Ret[2], s_Ret[3]
+    if s_Res == nil or s_Res == false then
+        local s_Reason = tostring(s_Why or "job returned no result and gave no reason")
+        trace(("JOB %s FAILED %s"):format(p_Name, s_Reason))
+        Distress(p_Name .. " failed", s_Reason)
+        return finish(false, s_Reason)
+    end
+    trace(("JOB %s done"):format(p_Name))
     return finish(true, s_Res)
 end
 
@@ -894,35 +951,69 @@ local function emptyInventory()
     end
 end
 
---- Pull everything from the chest below and consolidate by item name.
+--- Pull from the chest below, keep only the wanted kinds, and put everything else straight back.
 --- Returns name -> staging slot.
-local function stageFromChest()
+---
+--- The "put everything else back" half is not tidiness. turtle.suck cannot ask for a named item,
+--- so a drone drawing from the fleet's MAIN store hoovers up sandstone, glass and everything else
+--- along with the logs. Two things go wrong if that is left alone: the base is quietly emptied into
+--- a turtle, and -- worse -- the junk sits in slots 1-11, which ARE the crafting grid, so the craft
+--- either produces the wrong item or silently nothing.
+local function stageFromChest(p_Wanted)
     local s_Where = {}
-    -- Suck in bulk first; sorting afterwards is far cheaper than one round trip per item.
-    for _ = 1, 32 do
-        turtle.select(1)
-        if not turtle.suckDown() then break end
-    end
 
+    -- PULL IN BULK FIRST, sort afterwards.
+    --
+    -- turtle.suckDown always takes the chest's FIRST occupied slot. Sucking one stack, deciding it
+    -- is not wanted and dropping it straight back puts it right back in that first slot -- so the
+    -- drone cycles the same stack of glass for ever and never reaches the logs four slots further
+    -- in. Staging came back empty every time while the chest plainly held 64 logs.
+    --
+    -- Filling all twelve non-staging slots before returning anything means the leading stacks stay
+    -- OUT of the chest while we look past them, which is the only way to see what is behind them.
+    local s_Pulled = 0
+    for i = 1, 12 do
+        turtle.select(i)
+        if turtle.getItemCount(i) == 0 then
+            if not turtle.suckDown() then break end
+            s_Pulled = s_Pulled + 1
+        end
+    end
+    if s_Pulled == 0 then return nil, "the pickup chest gave up nothing" end
+
+    -- Keep what the recipe asked for...
     for i = 1, 12 do
         local d = turtle.getItemDetail(i)
-        if d then
+        if d and p_Wanted[d.name] then
             local s_Slot = s_Where[d.name]
             if s_Slot == nil then
-                -- Claim a staging slot for this kind.
                 for _, cand in ipairs(STAGE_SLOTS) do
                     local cd = turtle.getItemDetail(cand)
                     if cd == nil or cd.name == d.name then s_Slot = cand break end
                 end
-                if s_Slot == nil then return nil, "more ingredient kinds than staging slots" end
+                if s_Slot == nil then
+                    for j = 1, 12 do
+                        if turtle.getItemCount(j) > 0 then turtle.select(j) turtle.dropDown() end
+                    end
+                    return nil, "more ingredient kinds than staging slots"
+                end
                 s_Where[d.name] = s_Slot
             end
-            if i ~= s_Slot then
-                turtle.select(i)
-                turtle.transferTo(s_Slot)
-            end
+            turtle.select(i)
+            turtle.transferTo(s_Slot)
         end
     end
+
+    -- ...and hand everything else straight back. The fleet's whole store passes through this
+    -- turtle; none of it may stay there, and anything left in slots 1-11 is IN the crafting grid
+    -- and would change what turtle.craft believes it is making.
+    for i = 1, 12 do
+        if turtle.getItemCount(i) > 0 then
+            turtle.select(i)
+            turtle.dropDown()
+        end
+    end
+
     return s_Where
 end
 
@@ -978,8 +1069,21 @@ function OnCraft(p_ID, p_Message)
         -- 3. Load the grid. Layout IS the recipe: turtle.craft reads the slots and infers the
         --    result, so a misplaced ingredient yields the wrong item or nothing at all.
         emptyInventory()                   -- leftovers change what the grid means
-        local s_Stage, s_StageErr = stageFromChest()
+
+        -- How many of each kind this batch needs, so staging stops as soon as it has enough
+        -- instead of pulling the whole store through the turtle.
+        local s_Wanted = {}
+        for name, per in pairs(s_Inputs) do s_Wanted[name] = per * s_Runs end
+        local s_Stage, s_StageErr = stageFromChest(s_Wanted)
         if s_Stage == nil then error(s_StageErr, 0) end
+        do
+            local s_Rep = ""
+            for n, sl in pairs(s_Stage) do
+                s_Rep = s_Rep .. n .. "@" .. sl .. "x" .. turtle.getItemCount(sl) .. " "
+            end
+            trace("craft staged: [" .. s_Rep .. "] wanted " ..
+                  (function() local t = "" for n, c in pairs(s_Wanted) do t = t .. n .. "x" .. c .. " " end return t end)())
+        end
 
         if s_Grid then
             for i = 1, 9 do

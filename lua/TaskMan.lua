@@ -100,6 +100,10 @@ end
 function RoleForWork(p_Work)
     if p_Work == nil then return "miner" end
     if p_Work["survey"] or p_Work["scan"] then return "scout" end
+    -- Crafting needs a crafting-table upgrade, which is a different turtle entirely: turtle.craft
+    -- simply does not exist on a miner, so routing a craft to one wastes the trip and fails at the
+    -- last step rather than the first.
+    if p_Work["craft"] then return "crafter" end
     if p_Work["gather"] then return "miner" end
     -- Lumber goes to a miner: roles are derived from HARDWARE (geoscanner -> scout, chunky ->
     -- loader, otherwise miner) and there is no wood-specific upgrade. A turtle digs wood with
@@ -107,11 +111,26 @@ function RoleForWork(p_Work)
     return "miner"
 end
 
+-- Is this drone already holding work we handed it?
+--
+-- `status` comes from heartbeats and therefore LAGS. Two tasks started in the same tick both saw
+-- the drone as idle, both were sent, and the drone refused the second as "busy" -- but the task was
+-- already marked assigned, so it never ran and never retried. Four chests stalled behind that
+-- forever while the planks for them sat finished in storage.
+local function committed(p_DroneId)
+    for _, t in pairs(DATA["tasks"] or {}) do
+        if t.assignedTo == p_DroneId and (t.progress or 0) < 100 and t.enabled ~= false then
+            return true
+        end
+    end
+    return false
+end
+
 local function pickDrone(p_Role)
     local s_Busy = nil
     for _, d in ipairs(fleet()) do
         if (d.role or "miner") == p_Role then
-            if d.status == "idle" then return d end
+            if d.status == "idle" and not committed(d.id) then return d end
             s_Busy = s_Busy or d
         end
     end
@@ -185,6 +204,7 @@ function OnStartTask(p_ID, p_Message)
 
         s_Task.assigned   = table.concat(s_Names, ",")
         s_Task.assignedTo = s_Free[1].id
+        s_Task.assignedAt = os.epoch("utc")
         s_Task.paused     = false
         PowNet.MarkDirty()
         return true, {message = ("task %s -> %d miner(s): %s"):format(
@@ -208,6 +228,12 @@ function OnStartTask(p_ID, p_Message)
     if s_Role == "scout" then
         local w = s_Task.work.survey or {}
         s_Verb, s_Payload = "Survey", {w = w.w, h = w.h, radius = w.radius}
+    elseif s_Task.work.craft then
+        -- The output of the recipe planner, executed. grid and inputs travel with the task because
+        -- the drone has no recipe book: turtle.craft reads the inventory layout and infers what is
+        -- being made, so the layout has to arrive with the order.
+        local w = s_Task.work.craft
+        s_Verb, s_Payload = "Craft", {item = w.item, runs = w.runs, grid = w.grid, inputs = w.inputs}
     elseif s_Task.work.gather then
         -- Targeted collection: the survey already knows where these blocks are.
         local w = s_Task.work.gather
@@ -225,6 +251,7 @@ function OnStartTask(p_ID, p_Message)
 
     s_Task.assigned = s_Drone.name
     s_Task.assignedTo = s_Drone.id
+    s_Task.assignedAt = os.epoch("utc")
     s_Task.paused = false
     PowNet.MarkDirty()
     return true, {message = "task " .. tostring(s_Id) .. " -> " .. tostring(s_Drone.name) ..
@@ -295,6 +322,8 @@ end
 -- TaskMan is the right owner because it is the only module that knows both halves -- what needs
 -- doing and (via DroneMan) who is free. It runs as a fourth branch of the module's parallel set.
 local TICK_SECONDS = 15
+local RECLAIM_AFTER_MS = 90 * 1000
+
 function Tick()
     while true do
         os.sleep(TICK_SECONDS)
@@ -303,6 +332,33 @@ function Tick()
                 -- Unassigned, enabled, not paused, not finished: try to place it. pickDrone
                 -- returns nothing when every drone of that role is busy, so this quietly
                 -- retries next tick rather than failing loudly every 15 seconds.
+                -- RECLAIM A DEAD ASSIGNMENT.
+                --
+                -- Dispatch is fire-and-forget, so a drone that refuses the order ("busy") leaves
+                -- the task marked assigned and it is never looked at again -- which is how a chest
+                -- task sat forever behind planks that had already been made. If the drone we gave
+                -- it to has gone idle again and the task still shows no progress, the order did
+                -- not take; put it back in the queue rather than leaving it stranded.
+                if v.assigned ~= nil and (v.progress or 0) < 100 and v.enabled ~= false then
+                    -- No stamp means the task was assigned before assignments were stamped -- i.e. long ago.
+                    -- Defaulting that to 0 reads as "just assigned" and makes exactly the oldest,
+                    -- most definitely-stuck tasks the only ones that can never be reclaimed.
+                    local s_Age = v.assignedAt and (os.epoch("utc") - v.assignedAt) or math.huge
+                    if s_Age > RECLAIM_AFTER_MS then
+                        local s_Idle = false
+                        for _, d in ipairs(fleet()) do
+                            if d.id == v.assignedTo and d.status == "idle" and not d.offline then
+                                s_Idle = true
+                            end
+                        end
+                        if s_Idle then
+                            print("reclaiming task " .. tostring(v.id) .. " -- never started")
+                            v.assigned, v.assignedTo, v.assignedAt = nil, nil, nil
+                            PowNet.MarkDirty()
+                        end
+                    end
+                end
+
                 if v.enabled ~= false and not v.paused and v.assigned == nil
                    and (v.progress or 0) < 100 then
                     OnStartTask(0, {data = {id = v.id}})

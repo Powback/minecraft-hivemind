@@ -143,10 +143,29 @@ function ParseMessage(p_Message)
                 table.insert(s_Drones, v.id)
             end
         else
-            if(DATA["drones"][tostring(p_Message.data.id)] == nil) then
+            -- TWO ids exist for every drone and they are not interchangeable:
+            --
+            --   droneID  the registry key -- a sequence, "1", "2", "3" -- and what "D3" is named after
+            --   id       the COMPUTER id, e.g. 123, which is what rednet actually addresses
+            --
+            -- This looked up the registry key only. Every caller that sensibly passed the computer
+            -- id (which is what GetDrones, fleet.status and `computercraft dump` all show) got
+            -- "Could not find drone", and because that comes back as a plain string on the wire it
+            -- read as a successful reply -- so orders were reported sent and silently went nowhere.
+            --
+            -- Accept either. The ambiguity is real and unavoidable in the data; making callers
+            -- guess which one a given endpoint wants is not.
+            local s_Rec = DATA["drones"][tostring(p_Message.data.id)]
+            if(s_Rec == nil) then
+                local s_Want = tonumber(p_Message.data.id)
+                for _, v in pairs(DATA["drones"]) do
+                    if v.id == s_Want then s_Rec = v break end
+                end
+            end
+            if(s_Rec == nil) then
                 return false, "Could not find drone with ID: " .. tostring(p_Message.data.id)
             end
-            table.insert(s_Drones, DATA["drones"][tostring(p_Message.data.id)].id)
+            table.insert(s_Drones, s_Rec.id)
         end
     end
 
@@ -333,6 +352,7 @@ function OnGoTo(p_ID, p_Message)
     if(s_Status == false) then
         return s_Status, s_Mesage
     end
+    local s_Sent = {}
     for k,v in pairs(s_Mesage.data.drones) do
 
         local s_AbortMessage = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Abort", {})
@@ -341,13 +361,22 @@ function OnGoTo(p_ID, p_Message)
            os.sleep(1) -- Wait for abortion to complete. Takes 1 tick.
         end
 
-        local s_Message = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "GoTo", {pos = p_Message.data.pos})
+        local s_Message = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "GoTo",
+            {pos = p_Message.data.pos, heading = p_Message.data.heading})
         local s_GoToResponse = PowNet.SendToDrone(v, s_Message)
-        print(s_GoToResponse)
-        print("Sent to: " .. v)
+        print("Sent GoTo to #" .. tostring(v) .. " -> " .. tostring(s_GoToResponse))
+        if s_GoToResponse then s_Sent[#s_Sent + 1] = v end
     end
 
-    return true
+    -- Say WHICH computers were actually addressed, rather than a bare `true`.
+    --
+    -- A caller cannot otherwise tell "the order went to the drone" from "the order matched no
+    -- drone and did nothing" -- and that is exactly how a broken GoTo went unnoticed: it reported
+    -- success every time, including when it had resolved to an empty list.
+    if #s_Sent == 0 then
+        return false, "no drone matched -- nothing was sent"
+    end
+    return true, {sent = s_Sent, count = #s_Sent}
 end
 
 local m_DroneEvents = {

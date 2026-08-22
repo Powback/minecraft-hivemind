@@ -47,14 +47,29 @@ local m_IdemAge  = {}           -- insertion order, for trimming
 -- Also to a file. A CC terminal cannot be read from outside the game, so a Bridge that is
 -- misbehaving is otherwise completely opaque -- which cost real time when DroneMan calls were
 -- timing out and there was no way to see whether the call had even arrived.
-local LOG_FILE = "bridge.log"
+local LOG_FILE  = "bridge.log"
+local LOG_LIMIT = 64 * 1024     -- bytes; diagnostics, not an audit trail
+
+-- Truncate rather than grow.
+--
+-- Every relayed call was appended here and nothing ever removed a line. Over a few hours that
+-- reached 8.1MB -- exactly computer_space_limit -- and the bridge then died on its own logging
+-- with "Out of space", taking HQ's entire view of the fleet with it. A diagnostic that kills the
+-- thing it is diagnosing is worse than no diagnostic; the last few hundred lines are what anyone
+-- actually reads.
+--
+-- pcall around the size check as well as the write: once the disk is full, fs.open for append
+-- throws, and an unguarded log call inside the reconnect path would make recovery impossible.
 local function log(msg)
   print(("[bridge] %s"):format(msg))
-  local ok, h = pcall(fs.open, LOG_FILE, "a")
-  if ok and h then
-    h.writeLine(("%s %s"):format(tostring(os.clock()), msg))
-    h.close()
-  end
+  pcall(function()
+    if fs.exists(LOG_FILE) and fs.getSize(LOG_FILE) > LOG_LIMIT then fs.delete(LOG_FILE) end
+    local h = fs.open(LOG_FILE, "a")
+    if h then
+      h.writeLine(("%s %s"):format(tostring(os.clock()), msg))
+      h.close()
+    end
+  end)
 end
 
 --=====================================================================
@@ -153,9 +168,10 @@ local function handleCall(msg)
     -- Everything else is a PowNet call to a module (TaskMan, DroneMan, ...).
     local message = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, msg.key, msg.data)
     local target = PowNet.Lookup(msg.module)
-    log(("call %s.%s -> lookup=%s"):format(tostring(msg.module), tostring(msg.key), tostring(target)))
     local response = PowNet.sendAndWaitForResponse(msg.module, message, PowNet.SERVER_PROTOCOL)
-    log(("call %s.%s -> response=%s"):format(tostring(msg.module), tostring(msg.key), tostring(response)))
+    if response == false or response == nil then
+      log(("call %s.%s FAILED (lookup=%s)"):format(tostring(msg.module), tostring(msg.key), tostring(target)))
+    end
     if response == false or response == nil then
       reply = { ok = false, error = ("no response from %s.%s"):format(msg.module, msg.key) }
     else

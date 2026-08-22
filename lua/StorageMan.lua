@@ -129,10 +129,27 @@ function OnProvide(p_ID, p_Message)
 
     -- The pickup chest. Deliberately the SAME chest drones already unload into: one physical
     -- rendezvous point, one thing to keep clear, one place to look when something goes missing.
-    local s_Point
-    for _, d in ipairs(DATA["deposits"] or {}) do s_Point = d break end
+    local s_Point = DATA["pickup"]
     if s_Point == nil then
-        return false, "no deposit point to hand over at -- add one with: p StorageMan deposit -pos x y z"
+        for _, d in ipairs(DATA["deposits"] or {}) do s_Point = d break end
+    end
+    if s_Point == nil then
+        return false, "no pickup point -- set one with StorageMan.SetPickup {pos, peripheral}"
+    end
+
+    -- A deposit may be recorded as a POSITION ONLY -- `deposit -pos x y z` does not require the
+    -- network name, and the one the base actually has was added that way. pushItems needs a name,
+    -- and pushing to nil silently moves nothing: every request came back "short of oak_log" while
+    -- 64 logs sat in the very chest the drone was about to fly to.
+    local s_Dest = s_Point.peripheral
+    if s_Dest == nil then
+        if #m_Chests == 1 then
+            s_Dest = m_Chests[1]                  -- unambiguous: there is only one chest
+        else
+            return false, ("deposit at %d,%d,%d has no peripheral name and there are %d chests" ..
+                " -- re-add it with: p StorageMan deposit -pos x y z -peripheral <name>")
+                :format(s_Point.pos.x, s_Point.pos.y, s_Point.pos.z, #m_Chests)
+        end
     end
 
     local s_Given, s_Short = {}, {}
@@ -149,10 +166,18 @@ function OnProvide(p_ID, p_Message)
             if name == s_Name then
                 for _, at in ipairs(e.at or {}) do
                     if s_Moved >= s_Need then break end
-                    local src = peripheral.wrap(at.where)
-                    if src and src.pushItems then
-                        local ok, n = pcall(src.pushItems, s_Point.peripheral, at.slot, s_Need - s_Moved)
-                        if ok and type(n) == "number" then s_Moved = s_Moved + n end
+                    if at.where == s_Dest then
+                        -- ALREADY at the handover point. Pushing a chest's contents into itself
+                        -- moves nothing and returns 0, so counting only what was pushed reported
+                        -- "short of oak_log x4" while 64 logs sat in the very chest the drone was
+                        -- about to fly to. With a single-chest base that is the ONLY case.
+                        s_Moved = s_Moved + math.min(at.count or 0, s_Need - s_Moved)
+                    else
+                        local src = peripheral.wrap(at.where)
+                        if src and src.pushItems then
+                            local ok, n = pcall(src.pushItems, s_Dest, at.slot, s_Need - s_Moved)
+                            if ok and type(n) == "number" then s_Moved = s_Moved + n end
+                        end
                     end
                 end
             end
@@ -166,11 +191,29 @@ function OnProvide(p_ID, p_Message)
 
     Rescan()
     return true, {
-        pos = s_Point.pos, peripheral = s_Point.peripheral,
+        pos = s_Point.pos, peripheral = s_Dest,
         provided = s_Given, short = s_Short,
         complete = (#s_Short == 0),
         message = ("handed over %d kinds at %d,%d,%d"):format(#s_Given, s_Point.pos.x, s_Point.pos.y, s_Point.pos.z),
     }
+end
+
+-- Where Provide hands items over.
+--
+-- This must NOT be the bulk store. A turtle has twelve usable slots and turtle.suck always takes
+-- the chest's first occupied slot, so pulling from a chest holding nineteen stacks can never reach
+-- the ones behind the first twelve -- the crafter sat above 64 logs reporting "short of oak_log"
+-- because glass, sandstone and sand were in front of them. A handover chest that contains only
+-- what was asked for makes the drone's job trivial and deterministic.
+function OnSetPickup(p_ID, p_Message)
+    local d = p_Message.data or {}
+    local p = d.pos or d.gps
+    if p == nil or p.x == nil then return false, "Missing pos" end
+    if d.peripheral == nil then return false, "Missing peripheral -- see storage.stock for names" end
+    DATA["pickup"] = {pos = {x = p.x, y = p.y, z = p.z}, peripheral = d.peripheral}
+    PowNet.MarkDirty()
+    return true, {message = ("pickup set to %s at %d,%d,%d"):format(d.peripheral, p.x, p.y, p.z),
+                  pickup = DATA["pickup"]}
 end
 
 function OnStock(p_ID, p_Message)
@@ -187,7 +230,13 @@ function OnStock(p_ID, p_Message)
     end
     table.sort(s_Detail, function(a, b) return a.count > b.count end)
     for _, f in pairs(m_Free) do s_Slots = s_Slots + f end
-    return true, {message = string.format("%d kinds, %d items, %d chests, %d free slots, %d furnaces",
+    -- Chest NAMES and their free space, so a handover point can be chosen deliberately. Without
+    -- this the network names are invisible from outside the world and `pickup` is unconfigurable.
+    local s_Chests = {}
+    for _, name in ipairs(m_Chests) do
+        s_Chests[#s_Chests + 1] = {name = name, free = m_Free[name]}
+    end
+    return true, {chests = s_Chests, message = string.format("%d kinds, %d items, %d chests, %d free slots, %d furnaces",
         s_Kinds, s_Items, #m_Chests, s_Slots, #m_Furnaces),
         kinds = s_Kinds, items = s_Items, free = s_Slots, detail = s_Detail}
 end
@@ -352,6 +401,8 @@ local m_ServerEvents = {
     GetStock     = { func = OnStock },
     -- The other direction. Storage was deposit-only, which blocked every job that needs inputs.
     Provide      = { func = OnProvide },
+    SetPickup    = { func = OnSetPickup },
+    GetPickup    = { func = function() return true, {pickup = DATA["pickup"]} end },
 
     find = {
         func = OnFind, callable = true,

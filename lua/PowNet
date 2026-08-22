@@ -448,17 +448,33 @@ function droneMain()
            --end
             if(m_DroneEvents[droneMessage.dataKey] ~= nil) then
                 print("Received: " .. droneMessage.dataKey)
-                if(type(m_DroneEvents[droneMessage.dataKey]) == "function") then
-                    local s_Result, s_Response = m_DroneEvents[droneMessage.dataKey](droneID, droneMessage)
-                elseif(type(m_DroneEvents[droneMessage.dataKey]) == "table") then
-                    print(m_DroneEvents[droneMessage.dataKey].func)
-                    if(m_DroneEvents[droneMessage.dataKey].func == nil) then
+                -- Declared HERE, not inside the branches.
+                --
+                -- `local s_Result` inside an if-branch dies at the end of that branch, so the test
+                -- below read a nil GLOBAL and no drone ever replied to anything -- every order was
+                -- fire-and-forget whatever the handler returned. The caller cannot tell "done"
+                -- from "refused" from "never arrived", which is precisely the ambiguity that made
+                -- a silently-failing GoTo impossible to diagnose.
+                local s_Result, s_Response
+                -- pcall, because a handler that throws must not take the drone's whole message
+                -- loop down with it. Without this one bad order deafens the drone permanently.
+                local s_Handler = m_DroneEvents[droneMessage.dataKey]
+                if(type(s_Handler) == "function") then
+                    local ok, a, b = pcall(s_Handler, droneID, droneMessage)
+                    if ok then s_Result, s_Response = a, b
+                    else s_Result, s_Response = false, tostring(a) print("handler error: " .. tostring(a)) end
+                elseif(type(s_Handler) == "table") then
+                    if(s_Handler.func == nil) then
                         print("Event registered, but pointing to nothing")
+                        s_Result, s_Response = false, "event registered but pointing to nothing"
                     else
-                        local s_Result, s_Response = m_DroneEvents[droneMessage.dataKey].func(droneID, droneMessage)
+                        local ok, a, b = pcall(s_Handler.func, droneID, droneMessage)
+                        if ok then s_Result, s_Response = a, b
+                        else s_Result, s_Response = false, tostring(a) print("handler error: " .. tostring(a)) end
                     end
                 else
                     print("Unknown drone message handle")
+                    s_Result, s_Response = false, "unknown drone message handle"
                 end
                 if(s_Result ~= nil) then
                     droneMessage.status = s_Result

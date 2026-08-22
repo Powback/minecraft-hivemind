@@ -15,7 +15,7 @@ import { z } from 'zod';
 import { registry, ToolError } from './registry.js';
 import { state, STALE_MS, type Vec3, type DroneStatus } from '../world/state.js';
 import { bridge } from '../bridge/ws.js';
-import { expand, craftable } from '../world/recipes.js';
+import { expand, craftable, RECIPES } from '../world/recipes.js';
 import { allocate, checkOrder, SPEC, type Purpose } from '../world/plots.js';
 import { city, saveCity } from '../world/city.js';
 import { supply, runSupplyTick, stockKey, type SupplyRule } from '../agent/supply.js';
@@ -101,6 +101,11 @@ async function refreshFleet(): Promise<void> {
     // most misleading possible answer.
     console.log(`[fleet] refresh failed: ${(err as Error)?.message ?? err}`);
   }
+}
+
+/** A step carries its grid but not its ingredient list; the drone needs both to load the grid. */
+function recipeInputs(item: string): Record<string, number> {
+  return RECIPES.find((r) => r.output === item)?.inputs ?? {};
 }
 
 const vec3 = z.object({ x: z.number().int(), y: z.number().int(), z: z.number().int() });
@@ -979,7 +984,15 @@ registry.register({
     ctx.log(`goto #${a.id}`, { to: a.pos });
     if (res === false || res == null)
       return { sent: false, id: a.id, to: a.pos, reason: 'DroneMan did not answer' };
-    return { sent: true, id: a.id, to: a.pos };
+    // A REFUSAL COMES BACK AS A PLAIN STRING.
+    //
+    // PowNet puts the handler's error message in the same `data` field a success uses, so
+    // `{ok:true, data:"Could not find drone with ID: 121"}` is what a rejection looks like from
+    // here. Treating any non-null answer as success reported every failed order as sent -- which
+    // is how a GoTo that matched no drone at all looked like it had worked.
+    if (typeof res === 'string')
+      return { sent: false, id: a.id, to: a.pos, reason: res };
+    return { sent: true, id: a.id, to: a.pos, addressed: res?.sent ?? undefined };
   },
 });
 
@@ -1091,6 +1104,93 @@ registry.register({
       out.check = { allowed: reason === null, reason };
     }
     return out;
+  },
+});
+
+
+// ── plan.execute ───────────────────────────────────────────────────────────
+//
+// The join between knowing and doing. plan.make answers "what would it take"; without this the
+// answer had to be retyped by hand as individual orders, which is exactly the manual step the
+// recipe graph exists to remove.
+registry.register({
+  name: 'plan.execute',
+  summary: 'Expand a goal and queue the craftable steps as tasks.',
+  description:
+    'Runs plan.make and submits its CRAFT steps to TaskMan in dependency order, so a crafter ' +
+    'picks them up as it frees. Gather and lumber steps are reported but NOT queued: those need ' +
+    'a site, and guessing where to dig is how drones get sent to the wrong place. Refuses ' +
+    'outright if anything in the plan is unobtainable, rather than queueing a chain that must ' +
+    'stall partway.',
+  params: z.object({
+    item: z.string(),
+    quantity: z.number().int().min(1).max(512).default(1),
+  }).strict(),
+  returns: 'What was queued, what still needs a site, and what could not be planned at all.',
+  danger: 'mutate',
+  teach: [{
+    situation: 'We have logs and want four chests.',
+    args: { item: 'minecraft:chest', quantity: 4 },
+    result: { queued: [{ item: 'minecraft:oak_planks', runs: 8 }, { item: 'minecraft:chest', runs: 4 }], needsSite: [], missing: [] },
+    takeaway: 'Both craft steps queued in order; nothing needed a dig site because the logs were held.',
+  }],
+  handler: async (a, ctx) => {
+    let stock: Record<string, number> = {};
+    try {
+      const res: any = await bridge.call('StorageMan', 'stock', {}, { timeoutMs: 8000 });
+      for (const d of res?.detail ?? res?.data?.detail ?? []) {
+        if (typeof d?.name === 'string') stock[d.name] = (stock[d.name] ?? 0) + (d.count ?? 0);
+      }
+    } catch { stock = {}; }
+
+    const plan = expand(a.item, a.quantity, (i) => stock[i] ?? 0);
+    if (plan.missing.length)
+      throw new ToolError(
+        `Cannot plan ${a.item}: no way to obtain ${plan.missing.join(', ')}.`,
+        'Add a recipe or a source for those, or pick a different goal.');
+
+    const queued: any[] = [];
+    const needsSite: any[] = [];
+    for (const step of plan.steps) {
+      if (step.action !== 'craft') { needsSite.push({ item: step.item, action: step.action, runs: step.runs }); continue; }
+      const res: any = await bridge.call('TaskMan', 'Add', {
+        name: `craft-${step.item.replace('minecraft:', '')}`,
+        priority: 3,
+        work: { craft: { item: step.item, runs: step.runs, grid: step.grid, inputs: recipeInputs(step.item) } },
+      }, { timeoutMs: 8000 });
+      if (typeof res === 'string') throw new ToolError(`TaskMan refused ${step.item}: ${res}`, 'Check fleet.tasks.');
+      queued.push({ item: step.item, runs: step.runs, task: res?.id });
+    }
+    ctx.log(`plan.execute ${a.item} x${a.quantity}`, { queued: queued.length });
+    return { goal: a.item, quantity: a.quantity, queued, needsSite, missing: plan.missing, satisfied: plan.satisfied };
+  },
+});
+
+
+// ── storage.pickup ─────────────────────────────────────────────────────────
+registry.register({
+  name: 'storage.pickup',
+  summary: 'Set or read the chest where storage hands items over to drones.',
+  description:
+    'Crafting and any other job needing INPUTS collects from this chest. It must be a chest that ' +
+    'is otherwise kept EMPTY: a turtle has twelve usable slots and turtle.suck always takes the ' +
+    'first occupied slot, so a handover chest that doubles as bulk storage hides everything ' +
+    'behind the first twelve stacks. Call storage.stock first to see chest names.',
+  params: z.object({
+    pos: vec3.optional().describe('The chest position. Omit to just read the current setting.'),
+    peripheral: z.string().optional().describe('Its network name, from storage.stock.'),
+  }).strict(),
+  returns: 'The configured pickup point.',
+  danger: 'mutate',
+  handler: async (a) => {
+    if (!a.pos || !a.peripheral) {
+      const cur: any = await bridge.call('StorageMan', 'GetPickup', {}, { timeoutMs: 8000 });
+      return { pickup: typeof cur === 'string' ? null : cur?.pickup ?? null };
+    }
+    const res: any = await bridge.call('StorageMan', 'SetPickup',
+      { pos: a.pos, peripheral: a.peripheral }, { timeoutMs: 8000 });
+    if (typeof res === 'string') throw new ToolError(res, 'Check storage.stock for valid chest names.');
+    return res;
   },
 });
 
