@@ -1375,6 +1375,122 @@ registry.register({
   },
 });
 
+
+// ── rescue.party ───────────────────────────────────────────────────────────
+//
+// THE RESCUE TACTIC. Three drones, each carrying the one thing a casualty might be missing.
+//
+// A drone stops being reachable for exactly three reasons, and they need different answers:
+//
+//   no chunk    it left the force-loaded region and stopped ticking -- a LOADER parked nearby
+//               makes the ground live again
+//   no GPS      it is outside the constellation, so it cannot establish a position and (before
+//               this) crashed in a reboot loop trying -- relays extend coverage to it
+//   entombed    it is walled in and cannot move -- a MINER can cut it out
+//
+// Guessing which one it is wastes the trip, so the party carries all three answers. The members
+// anchor at deliberately non-coplanar offsets, because four hosts sharing a plane cannot resolve a
+// fix -- the same reason the base constellation is built the way it is.
+const RESCUE_OFFSETS = [
+  { x:  10, y:  6, z:   0 },
+  { x: -10, y:  4, z:   6 },
+  { x:   0, y:  8, z: -10 },
+];
+
+registry.register({
+  name: 'rescue.party',
+  summary: 'Send a loader, a scout and a miner to recover a drone that has stopped reporting.',
+  description:
+    'Use when a drone is lost or stranded and recover.dispatch is not enough. The party parks ' +
+    'around its last known position and each member becomes a GPS relay, which both restores ' +
+    'coverage and keeps the chunk ticking; the miner can dig it out if it is walled in. Members ' +
+    'are chosen by role, so a fleet missing a loader gets a smaller party rather than a refusal.',
+  params: z.object({
+    id: z.number().int().describe('The casualty, from fleet.status.'),
+    at: vec3.optional().describe('Where to search. Defaults to its last reported position.'),
+  }).strict(),
+  returns: 'Who was sent, where they were parked, and what the casualty last reported.',
+  danger: 'mutate',
+  teach: [{
+    situation: 'D3 (#123) has been silent for 40 minutes at the edge of the map.',
+    args: { id: 123 },
+    result: { casualty: 123, at: { x: -90, y: 89, z: 12 },
+              sent: [{ id: 120, role: 'loader' }, { id: 121, role: 'miner' }] },
+    takeaway: 'Coverage goes TO the casualty, because the casualty cannot come to it.',
+  }],
+  handler: async (a, ctx) => {
+    const target = state.listDrones().find((d) => d.id === a.id);
+    const at = a.at ?? target?.pos;
+    if (!at) throw new ToolError(
+      `No position known for #${a.id}.`,
+      'Pass `at` explicitly — computercraft dump shows where a computer really is.');
+
+    // One of each role, and never the casualty itself.
+    const live = state.listDrones().filter((d) =>
+      d.id !== a.id && d.status !== 'lost' && d.status !== 'stranded');
+    const party: any[] = [];
+    for (const role of ['loader', 'scout', 'miner']) {
+      const pick = live.find((d) => d.role === role && !party.some((p) => p.id === d.id));
+      if (pick) party.push(pick);
+    }
+    if (!party.length) throw new ToolError(
+      'No drone is available to send.', 'Everything else is lost or busy; free one first.');
+
+    const sent: any[] = [];
+    for (let i = 0; i < party.length; i++) {
+      const o = RESCUE_OFFSETS[i % RESCUE_OFFSETS.length];
+      const pos = { x: at.x + o.x, y: at.y + o.y, z: at.z + o.z };
+      try {
+        await bridge.call('DroneMan', 'GoTo', { id: party[i].id, pos }, { timeoutMs: 15000 });
+        sent.push({ id: party[i].id, name: party[i].name, role: party[i].role, pos });
+      } catch (err) {
+        sent.push({ id: party[i].id, role: party[i].role, error: (err as Error)?.message ?? String(err) });
+      }
+    }
+
+    ctx.log('rescue.party', { casualty: a.id, sent: sent.length });
+    return {
+      casualty: a.id,
+      casualtyStatus: target?.status ?? 'unknown',
+      casualtyReported: target?.stuck ?? null,
+      at, sent,
+      next: 'once they arrive, call rescue.relay to have them anchor and answer GPS pings',
+    };
+  },
+});
+
+// ── rescue.relay ───────────────────────────────────────────────────────────
+registry.register({
+  name: 'rescue.relay',
+  summary: 'Have drones anchor where they are and answer GPS pings, extending the constellation.',
+  description:
+    'A fix needs FOUR hosts, so a single relay does not create coverage on its own — it adds to ' +
+    'the pool. Run this once a rescue party has arrived. Each drone anchors on a real fix of its ' +
+    'own before broadcasting, so it can never hand the casualty a confidently wrong position.',
+  params: z.object({
+    ids: z.array(z.number().int()).min(1).max(8),
+    on: z.boolean().default(true),
+  }).strict(),
+  returns: 'Which drones are now relaying.',
+  danger: 'mutate',
+  handler: async (a, ctx) => {
+    const out: any[] = [];
+    for (const id of a.ids) {
+      try {
+        // Through DroneMan: the Bridge can only address MODULES, so anything aimed at a drone has
+        // to be relayed by the module that owns the registry.
+        const res: any = await bridge.call('DroneMan', 'Relay', { id, on: a.on }, { timeoutMs: 12000 });
+        if (typeof res === 'string') out.push({ id, relaying: false, error: res });
+        else out.push({ id, relaying: a.on, result: res ?? null });
+      } catch (err) {
+        out.push({ id, relaying: false, error: (err as Error)?.message ?? String(err) });
+      }
+    }
+    ctx.log('rescue.relay', { count: out.length });
+    return { relays: out };
+  },
+});
+
 // ── recover.dispatch ───────────────────────────────────────────────────────
 registry.register({
   name: 'recover.dispatch',

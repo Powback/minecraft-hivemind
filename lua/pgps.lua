@@ -922,6 +922,18 @@ function setLocationFromGPS()
     if startGPS() then
         -- get the current position
         cachedX, cachedY, cachedZ  = gps.locate(4, false)
+
+        -- NO FIX IS AN ANSWER, NOT A CRASH.
+        --
+        -- Without this the code below compared `newZ < cachedZ` against nil and threw. DroneLogic
+        -- died, DroneBoot caught it and rebooted, and the drone looped for ever -- re-fetching its
+        -- modules on every pass, so it looked like a perfectly healthy machine that simply never
+        -- registered. D3 sat in that loop for hours and nothing anywhere said "no GPS".
+        if cachedX == nil then
+            print("no GPS fix -- cannot establish position")
+            return nil, nil, nil
+        end
+
         local d = cachedDir or nil
         cachedDir = nil
 
@@ -934,6 +946,13 @@ function setLocationFromGPS()
             if turtle.forward() then
                 local newX, _, newZ = gps.locate(4, false) -- get the new position
                 turtle.back()              -- and go back
+
+                -- The fix can vanish between the two calls -- a drone at the edge of coverage gets
+                -- one and not the next. Bail rather than compare against nil.
+                if newX == nil or newZ == nil then
+                    print("lost GPS while establishing heading")
+                    return cachedX, cachedY, cachedZ
+                end
 
                 -- deduce the curent direction
                 if newZ < cachedZ then
@@ -950,7 +969,13 @@ function setLocationFromGPS()
                     d = "east"
                 end
 
-                -- Cancel out the tries
+                -- Cancel out the tries. cachedDir can still be nil here if the drone moved but
+                -- the coordinates did not change in any axis we test, and arithmetic on nil throws
+                -- from inside the one routine every drone runs at boot.
+                if cachedDir == nil then
+                    print("moved but could not deduce heading")
+                    break
+                end
                 turnTo((cachedDir - tries + 4) % 4)
 
                 -- exit the loop

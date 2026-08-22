@@ -340,6 +340,28 @@ function OnSurveyDrones(p_ID, p_Message)
     return true, {message = "survey dispatched to " .. s_Sent .. " drone(s)"}
 end
 
+-- Forward a relay command to drones. Same shape as GoTo: the Bridge can only address MODULES, so
+-- anything aimed at a drone has to be relayed by the module that owns the registry.
+function OnRelayCmd(p_ID, p_Message)
+    if(p_Message.data.id == nil and p_Message.data.range == nil) then
+        return false, "Missing id/range"
+    end
+    local s_Status, s_Parsed = ParseMessage(p_Message)
+    if(s_Status == false) then return s_Status, s_Parsed end
+
+    local s_On = p_Message.data.on
+    if s_On == nil then s_On = true end
+
+    local s_Done = {}
+    for _, v in pairs(s_Parsed.data.drones) do
+        local s_Msg = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Relay", {on = s_On})
+        local s_Res = PowNet.sendAndWaitForResponse(v, s_Msg, PowNet.DRONE_PROTOCOL, 8)
+        s_Done[#s_Done + 1] = {id = v, ok = (s_Res ~= false and s_Res ~= nil), result = s_Res}
+    end
+    if #s_Done == 0 then return false, "no drone matched" end
+    return true, {relays = s_Done}
+end
+
 function OnGoTo(p_ID, p_Message)
     if(p_Message.data.pos == nil and p_Message.data.gps == nil) then
         return false, "Missing pos"
@@ -451,6 +473,11 @@ local m_ServerEvents = {
             drop  = { optional = true },
             climb = { optional = true },
         }
+    },
+    Relay = {
+        func = OnRelayCmd,
+        callable = true,
+        params = { id = { optional = true }, on = { optional = true } }
     },
     GoTo = {
         func = OnGoTo,

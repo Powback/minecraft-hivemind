@@ -62,12 +62,19 @@ function Init()
     if(os.getComputerLabel() == nil) then
         print("Who am i...?")
         if(x == nil or y == nil or z == nil) then
-            print("I have no GPS, my battery is low and it’s getting dark...")
-            return
+            -- REGISTER ANYWAY.
+            --
+            -- Returning here left the drone with no name, no registration and no way to say so:
+            -- invisible to DroneMan, absent from every tool, and indistinguishable from a turtle
+            -- that had been destroyed. A drone that cannot work out WHERE it is still knows THAT
+            -- it is, and that is the one fact a rescue needs.
+            print("no GPS -- registering without a position so someone can come and find me")
+            Distress("no GPS fix", "registered without a position; needs coverage extending to it")
         end
         local s_Fuel = turtle.getFuelLevel()
-        local s_Data = {id = os.getComputerID(), pos = {x = x, y = y, z = z}, fuel = s_Fuel,
-                        role = Role()}
+        local s_Data = {id = os.getComputerID(),
+                        pos = (x and {x = x, y = y, z = z}) or nil, fuel = s_Fuel,
+                        role = Role(), noGps = (x == nil) or nil}
         PowNet.WaitForService("DroneMan", 90)
         local s_Message = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "RegisterDrone", s_Data)
         local s_Response = PowNet.AskInsisting("DroneMan", s_Message, 3)
@@ -1502,6 +1509,11 @@ local m_DroneEvents = {
     Mine = {
         func = OnMine,
     },
+    -- Anchor here and answer GPS pings, so a rescue party can extend coverage to a drone that has
+    -- lost its position.
+    Relay = {
+        func = OnRelay,
+    },
     Ping = {
         func = OnPing,
     },
@@ -1644,6 +1656,37 @@ end
 -- Note four hosts are still required for a fix, so a lone relay does not create coverage by
 -- itself; it adds to the pool, letting a drone combine two originals with two relays.
 m_Hosting = false
+
+-- Become a GPS host on command, whatever role this drone is.
+--
+-- The automatic relay only runs on loaders, which is right for standing coverage and useless for a
+-- rescue: a fix needs FOUR hosts, so extending the constellation to somewhere it does not reach
+-- takes a party, not one chunk loader. This lets every member of a rescue party anchor itself and
+-- answer pings, which is the actual mechanism by which a stranded drone gets its position back.
+function OnRelay(p_ID, p_Message)
+    local d = p_Message.data or {}
+    local s_Modem = peripheral.find("modem")
+    if s_Modem == nil then return false, "no modem" end
+
+    if d.on == false then
+        pcall(s_Modem.close, gps.CHANNEL_GPS)
+        m_Hosting, m_HostPos = false, nil
+        return true, {hosting = false}
+    end
+
+    -- Anchor on a REAL fix before broadcasting. Publishing a dead-reckoned position would hand the
+    -- casualty a confidently wrong fix, which is worse than no fix at all -- it would navigate on it.
+    local fx, fy, fz = gps.locate(4, false)
+    if fx == nil then
+        return false, "cannot relay without a fix of my own"
+    end
+    s_Modem.open(gps.CHANNEL_GPS)
+    m_Hosting = true
+    m_HostPos = {x = fx, y = fy, z = fz}
+    print("relaying GPS at " .. fx .. "," .. fy .. "," .. fz)
+    SendHeartBeat()
+    return true, {hosting = true, pos = m_HostPos}
+end
 
 local function gpsRelay()
     while true do
