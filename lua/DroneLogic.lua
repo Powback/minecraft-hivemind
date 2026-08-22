@@ -225,9 +225,24 @@ end
 -- drifts above the terrain is not surveying anything, it is just burning fuel politely.
 local function stepForward(p_MaxClimb)
     local s_Climbs = 0
-    while not pgps.forward() do
-        if s_Climbs >= p_MaxClimb then return false end
-        if not pgps.up() then return false end
+    while true do
+        local s_Ok, s_Why = pgps.forward()
+        if s_Ok then break end
+
+        -- CLIMBING ONLY HELPS OVER A BLOCK.
+        --
+        -- forward() refuses for two quite different reasons: something is in the way, or we are
+        -- not allowed to go there (the operating bounds, or no position fix). Treating the second
+        -- as an obstacle makes the drone climb against the boundary -- and since the boundary is
+        -- vertical, it never clears it. D3 rode the map edge all the way to y=200 doing exactly
+        -- this, scanning empty sky the whole way. Going up cannot fix a refusal that is not about
+        -- height.
+        if s_Why == "out of bounds" or s_Why == "position unverified" then
+            return false, s_Why
+        end
+
+        if s_Climbs >= p_MaxClimb then return false, "obstacle taller than " .. p_MaxClimb end
+        if not pgps.up() then return false, "blocked above" end
         s_Climbs = s_Climbs + 1
     end
 
@@ -656,6 +671,19 @@ function RunJob(p_Name, p_Data, p_Opts, p_Body)
         m_Job = nil
         saveResume()
         if o.upload ~= false then pcall(UploadWorld) end
+
+        -- Tell TaskMan how it ended. Without this progress stays at 0 for ever, and once stalled
+        -- assignments started being reclaimed that turned into a loop: the crafter repeated a
+        -- finished chest order every ninety seconds, correctly reporting it was short of the
+        -- planks it had already made into chests.
+        if d.taskId ~= nil then
+            pcall(function()
+                PowNet.SendToServer("TaskMan", PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL,
+                    "TaskDone", {id = d.taskId, ok = p_Ok and true or false,
+                                 reason = (not p_Ok) and tostring(p_Res) or nil,
+                                 result = p_Ok and p_Res or nil}))
+            end)
+        end
         return p_Ok, p_Res
     end
 

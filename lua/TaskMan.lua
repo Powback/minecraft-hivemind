@@ -227,25 +227,25 @@ function OnStartTask(p_ID, p_Message)
     local s_Verb, s_Payload
     if s_Role == "scout" then
         local w = s_Task.work.survey or {}
-        s_Verb, s_Payload = "Survey", {w = w.w, h = w.h, radius = w.radius}
+        s_Verb, s_Payload = "Survey", {w = w.w, h = w.h, radius = w.radius, taskId = s_Task.id}
     elseif s_Task.work.craft then
         -- The output of the recipe planner, executed. grid and inputs travel with the task because
         -- the drone has no recipe book: turtle.craft reads the inventory layout and infers what is
         -- being made, so the layout has to arrive with the order.
         local w = s_Task.work.craft
-        s_Verb, s_Payload = "Craft", {item = w.item, runs = w.runs, grid = w.grid, inputs = w.inputs}
+        s_Verb, s_Payload = "Craft", {item = w.item, runs = w.runs, grid = w.grid, inputs = w.inputs, taskId = s_Task.id}
     elseif s_Task.work.gather then
         -- Targeted collection: the survey already knows where these blocks are.
         local w = s_Task.work.gather
-        s_Verb, s_Payload = "Gather", {targets = w.targets, match = w.match, limit = w.limit}
+        s_Verb, s_Payload = "Gather", {targets = w.targets, match = w.match, limit = w.limit, taskId = s_Task.id}
     elseif s_Task.work.lumber then
         -- Wood gates chests, planks and sticks, and therefore every factory the fleet might
         -- build. Nothing else produces it.
         local w = s_Task.work.lumber
-        s_Verb, s_Payload = "Lumber", {w = w.w, l = w.l, drop = w.drop, pos = w.start}
+        s_Verb, s_Payload = "Lumber", {w = w.w, l = w.l, drop = w.drop, pos = w.start, taskId = s_Task.id}
     else
         local w = s_Task.work.dig or {}
-        s_Verb, s_Payload = "Dig", {w = w.w, l = w.l, depth = w.depth, pos = w.start}
+        s_Verb, s_Payload = "Dig", {w = w.w, l = w.l, depth = w.depth, pos = w.start, taskId = s_Task.id}
     end
     PowNet.SendToDrone(s_Drone.id, PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, s_Verb, s_Payload))
 
@@ -369,6 +369,35 @@ function Tick()
     end
 end
 
+-- A drone telling us how its job ended.
+--
+-- Nothing reported completion before, so progress sat at 0 for ever. That was invisible while
+-- assignments were permanent; the moment stalled assignments began to be reclaimed it became a
+-- loop -- the crafter redid a finished chest order every ninety seconds, correctly reporting it
+-- was short of the planks it had already turned into chests.
+function OnTaskDone(p_ID, p_Message)
+    local d = p_Message.data or {}
+    local s_Task = DATA["tasks"][d.id] or DATA["tasks"][tostring(d.id)] or DATA["tasks"][tonumber(d.id or -1)]
+    if s_Task == nil then return false, "No task " .. tostring(d.id) end
+
+    if d.ok then
+        s_Task.progress = 100
+        s_Task.result   = d.result
+        s_Task.failure  = nil
+    else
+        -- Record the reason and STOP. Re-queuing a job that failed for a real reason -- short of
+        -- material, site unreachable -- just repeats it; the reason is what a human or the planner
+        -- needs in order to do something different.
+        s_Task.progress = 100
+        s_Task.failure  = tostring(d.reason or "failed")
+    end
+    s_Task.finishedAt = os.epoch("utc")
+    s_Task.assigned, s_Task.assignedTo, s_Task.assignedAt = nil, nil, nil
+    PowNet.MarkDirty()
+    print(("task %s %s"):format(tostring(d.id), d.ok and "done" or ("failed: " .. tostring(s_Task.failure))))
+    return true, {id = d.id}
+end
+
 function OnListFleet(p_ID, p_Message)
     local s_Msg, s_N = "", 0
     for _, d in ipairs(fleet(true)) do
@@ -418,6 +447,7 @@ local m_ServerEvents = { -- Runs on a different thread so that we can interrupt 
         params = {}
     },
     GetTasks = { func = OnGetTasks },
+    TaskDone = { func = OnTaskDone },
     StartTask = { func = OnStartTask },
     PauseTask = { func = OnPauseTask },
     AbortTask = { func = OnAbortTask },
