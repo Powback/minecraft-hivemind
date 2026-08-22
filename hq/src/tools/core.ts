@@ -17,7 +17,8 @@ import { state, STALE_MS, type Vec3, type DroneStatus } from '../world/state.js'
 import { bridge } from '../bridge/ws.js';
 import { expand, craftable, RECIPES } from '../world/recipes.js';
 import { allocate, checkOrder, SPEC, type Purpose } from '../world/plots.js';
-import { city, saveCity } from '../world/city.js';
+import { city, saveCity, factories } from '../world/city.js';
+import { chain, unmetInputs, buildOrder, inputsOf, type Factory } from '../world/factories.js';
 import { BLUEPRINTS, blueprint, materials, placementOrder, footprint } from '../world/blueprints.js';
 import { supply, runSupplyTick, saveSupply, stockKey, type SupplyRule } from '../agent/supply.js';
 
@@ -1671,6 +1672,146 @@ registry.register({
     if (typeof r === 'string') throw new ToolError(r, 'Check storage.stock for valid peripheral names.');
     ctx.log('factory.route', { from: a.from, to: a.to });
     return r;
+  },
+});
+
+
+// ── factory.create ─────────────────────────────────────────────────────────
+//
+// A factory is a plot, a recipe, an input chest and an output chest. The interesting part is what
+// happens on creation: the plant REWIRES ITSELF. Links are derived from the recipe graph, so adding
+// a computer line to a plant that already smelts stone connects the two without anyone saying so --
+// and a human saying so by hand is how a plant ends up subtly mis-wired in a way nothing detects.
+registry.register({
+  name: 'factory.create',
+  summary: 'Add a production line for one item, and auto-connect it to the rest of the plant.',
+  description:
+    'Allocates a crafting plot, registers the line, and derives its links from the recipes: ' +
+    'anything already produced here that this line consumes is routed to it, and anything it ' +
+    'produces is routed onward to lines that need it. Physical chests are attached later with ' +
+    'factory.attach, at which point the routes become real item movement.',
+  params: z.object({
+    produces: z.string().describe('Item id this line makes, e.g. "computercraft:computer_normal".'),
+    name: z.string().max(40).optional(),
+  }).strict(),
+  returns: 'The factory, the links it created, and what the plant still cannot supply.',
+  danger: 'mutate',
+  teach: [{
+    situation: 'We can smelt stone and want to start making computers.',
+    args: { produces: 'computercraft:computer_normal' },
+    result: {
+      factory: { name: 'computer_normal-1', produces: 'computercraft:computer_normal', plot: 'crafting-01' },
+      links: [{ from: 'stone-1', to: 'computer_normal-1', item: 'minecraft:stone' }],
+      unmet: [{ item: 'minecraft:redstone', source: 'gather' }],
+    },
+    takeaway: 'The stone link was not configured — the recipe already implied it.',
+  }],
+  handler: async (a, ctx) => {
+    const recipe = RECIPES.find((r) => r.output === a.produces);
+    if (!recipe) throw new ToolError(
+      `Nothing knows how to make ${a.produces}.`,
+      'Add a recipe first, or pick an item from plan.make.');
+
+    const short = a.produces.replace(/^.*:/, '');
+    const name = a.name ?? `${short}-${factories.filter((f) => f.produces === a.produces).length + 1}`;
+    if (factories.some((f) => f.name === name)) throw new ToolError(
+      `A factory called ${name} already exists.`, 'Pass a different name.');
+
+    const r = allocate(city, 'crafting');
+    if ('error' in r) throw new ToolError(r.error, 'Free ground or widen the operating bounds.');
+
+    const factory: Factory = { name, produces: a.produces, plot: r.name, status: 'planned' };
+    factories.push(factory);
+    saveCity();
+
+    const links = chain(factories).filter((l) => l.from === name || l.to === name);
+    const unmet = unmetInputs(factories).filter((u) => u.factory === name);
+
+    // Make the derived links REAL wherever both ends already have chests. Lines without chests yet
+    // keep the link as intent; factory.attach turns it into item movement.
+    const wired: any[] = [];
+    for (const l of chain(factories)) {
+      const from = factories.find((f) => f.name === l.from);
+      const to = factories.find((f) => f.name === l.to);
+      if (!from?.output || !to?.input) continue;
+      try {
+        await bridge.call('StorageMan', 'AddRoute',
+          { from: from.output, to: to.input, item: l.item }, { timeoutMs: 8000 });
+        wired.push(l);
+      } catch { /* reported via the links list; the route can be retried */ }
+    }
+
+    ctx.log('factory.create', { name, produces: a.produces });
+    return { factory, plot: r, links, wired, unmet,
+             note: 'attach chests with factory.attach to turn these links into real item movement' };
+  },
+});
+
+// ── factory.attach ─────────────────────────────────────────────────────────
+registry.register({
+  name: 'factory.attach',
+  summary: 'Give a factory its input and output chests, turning its derived links into real routes.',
+  description:
+    'Until a line has chests it is intent, not plant. Both must be on the wired network — see ' +
+    'storage.stock for names. Attaching immediately creates every route the recipe graph implies ' +
+    'between this line and the others.',
+  params: z.object({
+    name: z.string(),
+    input: z.string().optional(),
+    output: z.string().optional(),
+  }).strict(),
+  returns: 'The factory and the routes now carrying material to and from it.',
+  danger: 'mutate',
+  handler: async (a, ctx) => {
+    const f = factories.find((x) => x.name === a.name);
+    if (!f) throw new ToolError(`No factory "${a.name}".`, 'See factory.list.');
+    if (a.input) f.input = a.input;
+    if (a.output) f.output = a.output;
+    f.status = f.input && f.output ? 'running' : 'planned';
+    saveCity();
+
+    const wired: any[] = [];
+    const pending: any[] = [];
+    for (const l of chain(factories)) {
+      if (l.from !== f.name && l.to !== f.name) continue;
+      const from = factories.find((x) => x.name === l.from);
+      const to = factories.find((x) => x.name === l.to);
+      if (!from?.output || !to?.input) { pending.push({ ...l, why: 'both ends need chests' }); continue; }
+      try {
+        const res: any = await bridge.call('StorageMan', 'AddRoute',
+          { from: from.output, to: to.input, item: l.item }, { timeoutMs: 8000 });
+        if (typeof res === 'string') pending.push({ ...l, why: res });
+        else wired.push(l);
+      } catch (err) {
+        pending.push({ ...l, why: (err as Error)?.message ?? String(err) });
+      }
+    }
+    ctx.log('factory.attach', { name: f.name, wired: wired.length });
+    return { factory: f, wired, pending };
+  },
+});
+
+// ── factory.list ───────────────────────────────────────────────────────────
+registry.register({
+  name: 'factory.list',
+  summary: 'The plant: every line, how they are chained, and what the chain cannot supply itself.',
+  description:
+    'The unmet list is the useful part — it is the plant boundary, the materials that must arrive ' +
+    'from mining or smelting rather than from another line. A chain that quietly assumes they ' +
+    'appear is a chain that stalls with no explanation.',
+  params: z.object({}).strict(),
+  returns: 'Factories, derived links, build order, and unmet inputs.',
+  danger: 'read',
+  handler: async () => {
+    const { order, cycles } = buildOrder(factories);
+    return {
+      count: factories.length,
+      factories: factories.map((f) => ({ ...f, consumes: inputsOf(f.produces) })),
+      links: chain(factories),
+      buildOrder: order,
+      cycles,
+      unmet: unmetInputs(factories),
+    };
   },
 });
 

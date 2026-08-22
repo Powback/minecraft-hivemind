@@ -13,6 +13,7 @@
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { newRegistry, type Registry, type Plot } from './plots.js';
+import type { Factory } from './factories.js';
 
 const STATE_DIR = process.env.STATE_DIR ?? '/state';
 const FILE = join(STATE_DIR, 'city.json');
@@ -27,9 +28,13 @@ const FILE = join(STATE_DIR, 'city.json');
 const ORIGIN = { x: -85, y: 81, z: -44 };
 const BOUNDS = { min: { x: -155, y: 0, z: -105 }, max: { x: -25, y: 200, z: 15 } };
 
+/** The plant. Persisted beside the plots, because a factory without its plot is meaningless. */
+export const factories: Factory[] = [];
+
 function load(): Registry {
   try {
     const raw = JSON.parse(readFileSync(FILE, 'utf8'));
+    if (Array.isArray(raw?.factories)) factories.push(...raw.factories);
     if (Array.isArray(raw?.plots)) {
       return { origin: raw.origin ?? ORIGIN, bounds: raw.bounds ?? BOUNDS, plots: raw.plots as Plot[] };
     }
@@ -46,7 +51,7 @@ export const city: Registry = load();
 export function saveCity(): void {
   try {
     mkdirSync(dirname(FILE), { recursive: true });
-    writeFileSync(FILE, JSON.stringify(city, null, 2));
+    writeFileSync(FILE, JSON.stringify({ ...city, factories }, null, 2));
   } catch (err) {
     // Report rather than throw: failing to persist should not fail the allocation the operator
     // just made. It should, however, be loud -- a registry that silently stops saving looks fine
