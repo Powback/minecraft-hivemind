@@ -486,10 +486,22 @@ end
 -- every heartbeat, so the fleet view shows it even if this message is lost.
 m_Stuck = nil
 
+-- REPORTING A PROBLEM IS NOT THE SAME AS BEING OUT OF SERVICE.
+--
+-- This set m_Status = "stuck" and nothing ever cleared it except an explicit abort. So a drone that
+-- merely failed ONE order -- arriving a single block short of a target, say -- was marked
+-- permanently unavailable: TaskMan will not offer work to a drone that is not idle, so it sat out
+-- every subsequent job while being in perfect health, parked at its dock with full fuel.
+--
+-- D3 did exactly that. It completed a 60-block recall, stopped one block from the mark, reported
+-- "GoTo failed", and was thereby retired.
+--
+-- The reason is worth recording and travels on the heartbeat as m_Stuck. Availability is a separate
+-- question, and the answer to it is "is this drone doing something right now" -- which callers set
+-- around their own work.
 function Distress(p_Reason, p_Detail)
     local hx, hy, hz = pgps.getCachedPosition()
     m_Stuck = p_Reason
-    m_Status = "stuck"
     local s_Data = {
         reason = p_Reason,
         detail = p_Detail,
@@ -1984,6 +1996,14 @@ local function heartbeat()
         -- move somewhere with coverage, so it never gets one. It still heartbeats, so DroneMan goes
         -- on reporting the last position it ever knew and the drone looks fine while being unable
         -- to accept any work at all. D3 sat like that with all four GPS hosts up and in range.
+        -- A stale distress reason keeps a healthy drone looking troubled. If it is idle, not
+        -- executing, and knows where it is, whatever went wrong is over.
+        if m_Stuck ~= nil and not executing and m_Status == "idle" and pgps.getCachedPosition() ~= nil then
+            print("clearing stale distress: " .. tostring(m_Stuck))
+            ClearDistress()
+            SendHeartBeat()
+        end
+
         -- Heading can be missing even when position is not, and a drone without it cannot move at
         -- all -- see ensureHeading. Cheap to check, fatal to ignore.
         do
