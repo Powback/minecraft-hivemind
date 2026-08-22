@@ -687,8 +687,15 @@ function a_star(x1, y1, z1, x2, y2, z2, discover, priority)
         return {}
     end
 
-    -- If goal is empty, unknown or a turtle position
-    if (cachedWorld[idx_goal] == 2 or 0)then
+    -- If goal is empty, unknown or a turtle position.
+    --
+    -- Was `if (cachedWorld[idx_goal] == 2 or 0)`, which Lua reads as `(x == 2) or 0` -- and 0 is
+    -- TRUTHY in Lua, so the test could never fail and the guard did nothing at all. Harmless by
+    -- luck (routing into solid rock is caught per-neighbour below), but it meant a goal inside a
+    -- wall was accepted and then searched for until the node limit ran out, which looks exactly
+    -- like "no path" from the caller's side.
+    local s_Goal = cachedWorld[idx_goal]
+    if s_Goal == nil or s_Goal == 0 or s_Goal == 2 then
         local openset, closedset, cameFrom, g_score, f_score, tries = {}, {}, {}, {}, {}, 0
 
         openset[idx_start] = start

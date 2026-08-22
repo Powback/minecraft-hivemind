@@ -520,13 +520,21 @@ function SendToAllDrones(p_Message)
     return true
 end
 
-function sendAndWaitForResponse(p_Recipient, message, protocol)
+-- p_Timeout, because ONE SECOND is not a universal answer.
+--
+-- Every call in the fleet waited REDNET_TIMEOUT (1s) and retried three times. That is generous for
+-- "what is in the chest" and hopeless for MapServer.a_star, which searches thousands of cells in
+-- interpreted Lua: the reply never arrived inside a second, each retry made the server start the
+-- same expensive search AGAIN, and the caller concluded there was no path. Recalling D3 failed this
+-- way -- reported as "GoTo FAILED: nil" -- while a perfectly good route existed.
+function sendAndWaitForResponse(p_Recipient, message, protocol, p_Timeout)
     if(p_Recipient == -1) then
         p_Recipient = MAINFRAME
     end
     if(protocol == nil) then
         protocol = SERVER_PROTOCOL
     end
+    local s_Timeout = p_Timeout or REDNET_TIMEOUT
 
     local s_Status, s_RecipientID = Send(p_Recipient, message, protocol)
     if(s_Status == false) then
@@ -534,7 +542,7 @@ function sendAndWaitForResponse(p_Recipient, message, protocol)
     end
     local attemptNumber = 1
     while true do
-        local senderID, reply = rednet.receive(protocol, REDNET_TIMEOUT)
+        local senderID, reply = rednet.receive(protocol, s_Timeout)
         if senderID == s_RecipientID and reply.ID == message.ID then
             return reply.data
         elseif not senderID then

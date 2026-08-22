@@ -175,6 +175,12 @@ function OnGoTo(p_ID, p_Message)
     TaskStart()
     trace(("GoTo %s,%s,%s -> %s,%s,%s"):format(cx, cy, cz, tostring(d.pos.x), tostring(d.pos.y), tostring(d.pos.z)))
     local s_Status, s_Message = pgps.moveTo(tonumber(d.pos.x), tonumber(d.pos.y), tonumber(d.pos.z))
+    if s_Status == false then
+        -- Fall back to flying it directly. A recall is most needed exactly where the map is
+        -- thinnest, so refusing to move because the SERVER cannot plot a route is backwards.
+        trace("GoTo: no mapped route (" .. tostring(s_Message) .. ") -- flying direct")
+        s_Status, s_Message = pgps.flyTo(tonumber(d.pos.x), tonumber(d.pos.y), tonumber(d.pos.z))
+    end
     TaskEnd()
     m_Status = "idle"
 
@@ -270,6 +276,23 @@ local SCAN_COOLDOWN = 2.2   -- config says 2000ms; a little margin beats a faile
 
 -- Record one scan into the pending delta. Coordinates come back relative, so they are offset by
 -- wherever pgps thinks we are -- which is why this needs a GPS fix to be worth anything.
+-- A scan reports only the blocks that EXIST. Recording just those teaches the map where walls are
+-- and never where space is -- and a_star cannot route through a cell it has not been told is empty,
+-- so "unknown" is impassable. The result was a world model that could not answer the one question
+-- navigation asks. D3 flew to y=200 scanning the whole way and the server still had no path back
+-- down, because the sky it had flown through was unknown rather than air.
+--
+-- The emptiness is free information: the scanner already guarantees it returned every non-air block
+-- in the cube, so anything it did NOT return is air, definitionally.
+--
+-- Air is filled in over a SMALLER cube than the solids are read from. A radius-8 scan is 4,913
+-- cells and marking them all would put thousands of observations per scan onto rednet every 2.2s,
+-- which is a lot of traffic to describe an empty sky. Radius 4 is 729 cells -- enough to give the
+-- pathfinder a genuinely navigable corridor around wherever the drone has been -- while solids keep
+-- the full radius, because knowing about a distant wall is worth more than knowing about distant
+-- nothing.
+local AIR_RADIUS = 4
+
 local function absorbScan(p_Scanner, p_Radius)
     local s_Blocks, s_Err = p_Scanner.scan(p_Radius)
     if not s_Blocks then
@@ -279,12 +302,37 @@ local function absorbScan(p_Scanner, p_Radius)
     if cx == nil then
         return 0, "no position fix"
     end
+
+    -- Index the solids first so the air pass can skip them.
+    local s_Solid = {}
     for _, b in ipairs(s_Blocks) do
+        local idx = (cx + b.x) .. ":" .. (cy + b.y) .. ":" .. (cz + b.z)
+        s_Solid[idx] = true
         -- Detail shaped like {turtle.inspect()} so it matches what detectAll writes and what the
         -- renderer reads: entry [2] is the block table with .name.
-        pgps.noteObservation((cx + b.x) .. ":" .. (cy + b.y) .. ":" .. (cz + b.z),
-                             1, {true, {name = b.name}})
+        pgps.noteObservation(idx, 1, {true, {name = b.name}})
     end
+
+    -- Only claim emptiness from a CONFIRMED position. Solids are additive and a drifted one is
+    -- corrected by the next scan; air is subtractive -- it prunes the block index -- so writing 729
+    -- of them from a position the drone only believes it is at would erase real map data over a
+    -- wide area. Drift is not hypothetical: D3 was found 24 blocks from where it reported.
+    if not pgps.positionVerified() then
+        return #s_Blocks
+    end
+
+    local s_R = math.min(AIR_RADIUS, p_Radius)
+    for dx = -s_R, s_R do
+        for dy = -s_R, s_R do
+            for dz = -s_R, s_R do
+                local idx = (cx + dx) .. ":" .. (cy + dy) .. ":" .. (cz + dz)
+                if not s_Solid[idx] then
+                    pgps.noteObservation(idx, 0)
+                end
+            end
+        end
+    end
+
     return #s_Blocks
 end
 

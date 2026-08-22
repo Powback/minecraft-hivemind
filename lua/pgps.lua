@@ -570,7 +570,9 @@ end
 function SavePath()
 
     local s_Request = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "UpdatePath", {id = os.getComputerID(), cachedWorld = cachedWorld, cachedWorldDetail = cachedWorldDetail})
-    local s_Response = PowNet.sendAndWaitForResponse("MapServer", s_Request)
+    -- Pathfinding is the most expensive call in the fleet; give it room. The default 1s made
+        -- every long route look like "no path".
+        local s_Response = PowNet.sendAndWaitForResponse("MapServer", s_Request, nil, 15)
     cachedWorld = {}
 end
 
@@ -612,13 +614,12 @@ function moveTo(_targetX, _targetY, _targetZ, _targetDir, changeDir, discover)
         local s_Request = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "GetPath", {cachedX, cachedY, cachedZ, _targetX, _targetY, _targetZ, discover})
         local s_Response = PowNet.sendAndWaitForResponse("MapServer", s_Request)
         if (not s_Response) then
-            print("Failed to get path")
-            print(s_Response)
-            return false
+            -- Say WHY. A bare `false` here surfaced as "GoTo FAILED: nil", which is the least
+            -- useful thing a failing recall can report.
+            return false, "MapServer did not answer the path request"
         end
         if(type(s_Response) == "table" and s_Response.message ~= nil) then
-            print(s_Response.message)
-            return false
+            return false, "no path: " .. tostring(s_Response.message)
         end
         local path = s_Response.path
 
@@ -671,6 +672,44 @@ end
 -- function: Set the current X, Y, Z and direction of the turtle
 -- d can be the direction name or number
 --
+
+-- Fly straight at a target without asking anyone for a path.
+--
+-- moveTo delegates pathfinding to MapServer's a_star, which can only route through cells the
+-- fleet has actually surveyed. That is right for work inside the base and useless for RECOVERY:
+-- a drone stranded at y=200 is stranded precisely because it is somewhere nobody has mapped, so
+-- every recall failed with "no path" and left it there. D3 rode the ceiling for hours behind this.
+--
+-- Greedy and dumb on purpose. Altitude first, because open sky is the cheap axis and getting to
+-- the target height usually removes the horizontal obstacles too.
+function flyTo(_tx, _ty, _tz, _maxSteps)
+    local s_Max = _maxSteps or 512
+    local s_Steps = 0
+    while cachedX ~= _tx or cachedY ~= _ty or cachedZ ~= _tz do
+        s_Steps = s_Steps + 1
+        if s_Steps > s_Max then return false, "flyTo gave up after " .. s_Max .. " steps" end
+
+        local s_Moved = false
+        if cachedY < _ty then s_Moved = up()
+        elseif cachedY > _ty then s_Moved = down() end
+
+        if not s_Moved and cachedX ~= _tx then
+            turnTo(cachedX < _tx and East or West)
+            s_Moved = forward()
+        end
+        if not s_Moved and cachedZ ~= _tz then
+            turnTo(cachedZ < _tz and South or North)
+            s_Moved = forward()
+        end
+
+        -- Every useful axis is blocked: go over it. If we cannot even rise, we are genuinely
+        -- wedged and saying so beats grinding against a wall until the step budget runs out.
+        if not s_Moved then
+            if not up() then return false, "flyTo is wedged at " .. cachedX .. "," .. cachedY .. "," .. cachedZ end
+        end
+    end
+    return true
+end
 
 function setLocation(x, y, z, d)
     cachedX, cachedY, cachedZ = x, y, z
