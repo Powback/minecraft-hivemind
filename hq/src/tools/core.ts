@@ -1276,7 +1276,7 @@ registry.register({
   bounds: 'Bounded by branch count and length; abortable via order.abort. Digs only ore it exposes plus the tunnels themselves.',
   teach: [{
     situation: 'We are short of iron and nothing in the survey has ever seen any.',
-    args: { depth: 35, length: 24, branches: 4, spacing: 3 },
+    args: { depth: 35, length: 24, branches: 4, spacing: 16 },
     result: { task: 31, depth: 35, note: 'prospecting; ore found is added to the map as well as the chest' },
     takeaway: 'Iron is not findable from the surface. Send someone down to look.',
   }],
@@ -1321,6 +1321,16 @@ registry.register({
     depth: z.number().int().min(-40).max(120).default(35).describe('Target Y. Coal ~50, iron ~35.'),
     length: z.number().int().min(4).max(64).default(24),
     branches: z.number().int().min(1).max(8).default(4),
+    /**
+     * Spaced for the SCANNER, not the pickaxe.
+     *
+     * A geo scanner reaches 8 blocks, so tunnels 16 apart let the scan spheres tile the rock
+     * between them with nothing missed. This was hardcoded to 3, which is dense branch-mining
+     * spacing -- it finds ore by brute exposure and digs roughly five times as much tunnel to
+     * cover the same ground. That is the right strategy for a miner working ALONE and the wrong
+     * one the moment a scout is coming down behind it, which is the entire point of the pair.
+     */
+    spacing: z.number().int().min(2).max(24).default(16),
     plot: z.string().optional().describe('Reuse a named mine_head plot instead of allocating one.'),
   }).strict(),
   returns: 'The plot used and both queued tasks.',
@@ -1331,7 +1341,7 @@ registry.register({
     'settlement, not the rock beneath it.',
   teach: [{
     situation: 'Iron is at 0/32 and nothing in the survey has ever seen any.',
-    args: { depth: 35, length: 24, branches: 4 },
+    args: { depth: 35, length: 24, branches: 4, spacing: 16 },
     result: { plot: 'mine_head-01', shaftTask: 31, scanTask: 32,
               note: 'scout descends once the shaft is cut' },
     takeaway: 'One order, two drones, in dependency order — and the hole is inside a plot.',
@@ -1364,7 +1374,7 @@ registry.register({
     const shaft: any = await bridge.call('TaskMan', 'Add', {
       name: `shaft-${plot.name}`,
       priority: 2,
-      work: { mine: { pos: head, depth: a.depth, length: a.length, branches: a.branches, spacing: 3 } },
+      work: { mine: { pos: head, depth: a.depth, length: a.length, branches: a.branches, spacing: a.spacing } },
     }, { timeoutMs: 8000 });
     if (typeof shaft === 'string') throw new ToolError(`TaskMan refused the shaft: ${shaft}`, 'Check fleet.tasks.');
 
