@@ -66,7 +66,16 @@ export const DEFAULT_RULES: SupplyRule[] = [
   { match: 'minecraft:chest', stock: 'minecraft:chest', min: 4, action: 'craft', limit: 4 },
 ];
 
-const COOLDOWN_MS = 10 * 60 * 1000;
+/**
+ * How long to leave a material alone after acting on it.
+ *
+ * Ten minutes was chosen when the cooldown was the ONLY thing stopping the loop re-dispatching the
+ * same shortage every tick. The queue check does that job properly now -- it refuses to add work a
+ * material already has -- so this only needs to stop a material that keeps FAILING from being
+ * retried instantly. Three minutes is enough for that, and ten meant five idle drones and two
+ * materials at 0/32 sitting out most of every hour.
+ */
+const COOLDOWN_MS = 3 * 60 * 1000;
 
 /** What to COUNT for a rule, as opposed to what to mine. */
 export function stockKey(r: SupplyRule): string {
@@ -97,6 +106,22 @@ export interface SupplyState {
 const STATE_DIR = process.env.STATE_DIR ?? '/state';
 const SUPPLY_FILE = join(STATE_DIR, 'supply.json');
 
+/**
+ * Saved policy on top of current defaults, field by field.
+ *
+ * A saved rule keeps every value the operator set. Anything the default has and the saved copy does
+ * not is filled in -- that is precisely the case a wholesale replace gets wrong. Rules that exist
+ * only in the save are kept too, since they were added deliberately.
+ */
+function mergeRules(defaults: SupplyRule[], saved: SupplyRule[]): SupplyRule[] {
+  const out = defaults.map((d) => {
+    const s = saved.find((r) => r.match === d.match);
+    return s ? { ...d, ...s, depth: s.depth ?? d.depth } : { ...d };
+  });
+  for (const s of saved) if (!out.some((r) => r.match === s.match)) out.push(s);
+  return out;
+}
+
 function loadSupply(): SupplyState {
   const base: SupplyState = {
     enabled: false,        // opt in explicitly; an autonomous fleet should not start itself
@@ -111,9 +136,17 @@ function loadSupply(): SupplyState {
     return {
       ...base,
       enabled: raw.enabled === true,
-      // Fall back to the defaults rather than an empty list: a corrupt file should cost the tuning,
-      // not leave a loop that is enabled and has nothing to act on.
-      rules: Array.isArray(raw.rules) && raw.rules.length ? raw.rules : base.rules,
+      // MERGE, do not replace.
+      //
+      // Persisted rules shadowed the defaults entirely, so any field ADDED to a default rule later
+      // never reached a running deployment -- the saved copy simply lacked it. That is how both ore
+      // rules ended up with no `depth`: prospecting requires one, the saved policy predated it, and
+      // the fallback that sends a miner underground could never fire. The loop reported "nothing to
+      // dispatch" with two materials at 0/32 and five idle drones, and it was right -- it had no
+      // way to act that it could see.
+      //
+      // Operator tuning still wins; it just no longer discards fields it has never heard of.
+      rules: mergeRules(base.rules, Array.isArray(raw.rules) ? raw.rules : []),
       dispatched: typeof raw.dispatched === 'number' ? raw.dispatched : 0,
     };
   } catch {
@@ -219,12 +252,20 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
   let scoutFree = !!idleScout;
   let crafterFree = !!idleCrafter;
   const did: string[] = [];
+  const waiting: string[] = [];
 
   for (const rule of supply.rules) {
     if (!minerFree && !scoutFree && !crafterFree) break;
     const have = held(stockKey(rule));
     if (have >= rule.min) continue;
-    if ((supply.cooldowns[rule.match] ?? 0) > now) continue;
+    // Say when a cooldown is the reason. Skipping silently makes "waiting a few minutes" look
+    // exactly like "nothing to do", which is how idle drones and an empty log get read as a broken
+    // scheduler rather than a timer.
+    if ((supply.cooldowns[rule.match] ?? 0) > now) {
+      const secs = Math.ceil(((supply.cooldowns[rule.match] ?? 0) - now) / 1000);
+      waiting.push(`${rule.match} (${secs}s cooldown)`);
+      continue;
+    }
 
     try {
       if (rule.action === 'mine') {
@@ -301,7 +342,34 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
       // send a miner. Now that the index prunes what drones observe, exhausting a vein empties it
       // properly and this is where the loop would otherwise come to rest permanently. So it
       // dispatches the scan it was only describing.
-      if (!scoutFree) continue;          // no cooldown burned: retry as soon as a scout frees up
+        // NOTHING SURVEYED: SEND SOMEONE TO LOOK UNDERGROUND.
+        //
+        // gather can only revisit coordinates the map already holds, and a surface survey cannot
+        // reach ore at depth -- a scanner sees 8 blocks and iron is fifty below. A material that has
+        // NEVER been seen is not a gathering problem, it is a prospecting one. Without this branch
+        // the loop fell straight through to "wait for a scout" and sat there with three idle miners
+        // and coal at 0/32.
+        if (minerFree && rule.depth !== undefined
+            && ![...queued].some((n) => n.startsWith('shaft-'))) {
+          supply.cooldowns[rule.match] = now + COOLDOWN_MS;
+          const p: any = await callTool('order.prospect', { depth: rule.depth });
+          if (p?.ok !== false) {
+            minerFree = false;
+            supply.dispatched++;
+            supply.lastAction = `prospect for ${rule.match}`;
+            note(`${rule.match}: ${have}/${rule.min}, none known -> prospecting at y=${rule.depth}`);
+            did.push(`prospect ${rule.match}`);
+            continue;
+          }
+          note(`${rule.match}: prospecting refused -- ${p?.error ?? '?'}`);
+        }
+
+        // Say so rather than skipping in silence: "no scout free" and "nothing to do" are
+        // different states and looked identical in the log.
+        if (!scoutFree) {
+          waiting.push(`${rule.match} (no scout free)`);
+          continue;
+        }
       supply.cooldowns[rule.match] = now + COOLDOWN_MS;
       await bridge.call('TaskMan', 'Add', {
         name: `find-${rule.match}`,
@@ -320,6 +388,7 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
   }
 
   if (did.length) return { acted: true, reason: did.join(', ') };
+  if (waiting.length) return { acted: false, reason: `waiting on cooldown: ${waiting.join(', ')}` };
   return { acted: false, reason: 'nothing to dispatch' };
 }
 

@@ -456,7 +456,9 @@ registry.register({
     enabled: z.boolean().optional(),
     match: z.string().min(2).optional().describe('Material to add or adjust.'),
     min: z.number().int().min(0).max(10000).optional(),
-    action: z.enum(['gather', 'lumber', 'craft']).optional(),
+    action: z.enum(['gather', 'lumber', 'craft', 'mine']).optional(),
+    depth: z.number().int().min(-40).max(120).optional()
+      .describe('For ores: what depth to prospect at when none has ever been surveyed.'),
     limit: z.number().int().min(1).max(512).optional(),
     runNow: z.boolean().optional().describe('Run one tick immediately rather than waiting.'),
   }).strict(),
@@ -470,6 +472,7 @@ registry.register({
         if (a.min !== undefined) existing.min = a.min;
         if (a.action) existing.action = a.action;
         if (a.limit !== undefined) existing.limit = a.limit;
+        if (a.depth !== undefined) existing.depth = a.depth;
       } else {
         supply.rules.push({ match: a.match, min: a.min ?? 32,
                             action: a.action ?? 'gather', limit: a.limit } as SupplyRule);
