@@ -613,6 +613,7 @@ function OnSurvey(p_ID, p_Message)
         m_Status = "scanning"
         TaskStart()
         local s_Step, s_Total, s_Scans = s_R * 2, 0, 0
+        local s_Walled = 0
         for row = 1, s_H do
             for col = 1, s_W do
                 if not executing then break end
@@ -637,11 +638,28 @@ function OnSurvey(p_ID, p_Message)
                 s_Total, s_Scans = s_Total + n, s_Scans + 1
                 UploadWorld()
                 if col < s_W then
+                    local s_MovedThisLane = 0
                     for _ = 1, s_Step do
                         if not executing then break end
                         if not stepForward(s_Climb) then break end
+                        s_MovedThisLane = s_MovedThisLane + 1
                     end
-                    settle(s_Drop)   -- follow the ground DOWN too; stepForward only gives back what it climbed
+                    -- A BLOCKED LANE ENDS, it is not retried for ever.
+                    --
+                    -- stepForward climbs an obstacle and gives the height back on the way past. Following it
+                    -- with settle() undid that climb at once, so against a wall the drone rose, was dropped,
+                    -- rose again -- oscillating in place, reporting "scanning", achieving nothing. The settle
+                    -- was mine and it fought the climb. With it gone, a step that cannot be made means this
+                    -- lane is finished; turn onto the next rather than grinding at the wall.
+                    if s_MovedThisLane == 0 then
+                        s_Walled = s_Walled + 1
+                        if s_Walled >= 3 then
+                            trace("survey: walled in after " .. s_Scans .. " scans")
+                            break
+                        end
+                    else
+                        s_Walled = 0
+                    end
                     os.sleep(SCAN_COOLDOWN)
                 end
             end

@@ -72,8 +72,33 @@ function normaliseStatus(reported: unknown, offline: unknown): DroneStatus {
   return REPORTED_STATUS[reported] ?? 'working';
 }
 
+/**
+ * DroneMan answers the whole fleet from ONE receive loop.
+ *
+ * Every fleet.status re-asked it for the drone list, and the map polls fleet.status every three
+ * seconds -- on top of eight drones heartbeating and TaskMan asking on its own tick. The result was
+ * a module that is not broken and simply cannot keep up: calls time out, drones see unanswered
+ * heartbeats and report "DroneMan is slow, staying put", and TaskMan plans against a stale fleet.
+ *
+ * The drone list changes on the order of seconds and is read many times a second, so nearly all of
+ * that traffic was asking a busy machine a question we had just asked. A short cache plus a single
+ * shared in-flight request removes it without making the data meaningfully older.
+ */
+const FLEET_CACHE_MS = 3_000;
+let fleetAt = 0;
+let fleetInflight: Promise<void> | null = null;
+
 async function refreshFleet(): Promise<void> {
   if (!bridge.connected) return;        // offline: serve last-known state rather than erroring
+  if (Date.now() - fleetAt < FLEET_CACHE_MS) return;
+  // One request shared by every concurrent caller: the map's pollers arrive together, and without
+  // this each would start its own round trip to the module already struggling to answer.
+  if (fleetInflight) return fleetInflight;
+  fleetInflight = doRefreshFleet().finally(() => { fleetInflight = null; });
+  return fleetInflight;
+}
+
+async function doRefreshFleet(): Promise<void> {
   try {
     const res: any = await bridge.call('DroneMan', 'GetDrones', {}, { timeoutMs: 5000 });
     const list = res?.drones ?? res?.data?.drones;
@@ -109,6 +134,7 @@ async function refreshFleet(): Promise<void> {
       if (typeof d.lastSeen === 'number' && d.lastSeen > 0) patch.lastSeen = d.lastSeen;
       state.upsertDrone(patch);
     }
+    fleetAt = Date.now();
   } catch (err) {
     // A refresh failure must not take down a read tool; stale data beats no answer. But it must
     // not be silent either -- a swallowed error here reads as "the fleet is empty", which is the
