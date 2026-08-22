@@ -912,14 +912,32 @@ function renderTasks(tasks, env) {
     return;
   }
   el.className = '';
-  const noGeometry = tasks.every((t) => !t.region);
-  el.innerHTML = tasks.map((t) => {
+  // OUTSTANDING WORK FIRST, and only a few finished ones for context.
+  //
+  // The panel is meant to answer "what is the fleet doing" and was answering "everything it has
+  // ever been asked to do". With a long history the single running job was buried under dozens of
+  // completed ones, which reads as a fleet that has stopped working.
+  const live = tasks.filter((t) => (t.progress ?? 0) < 100);
+  const past = tasks.filter((t) => (t.progress ?? 0) >= 100).slice(-6).reverse();
+  const shown = live.concat(past);
+  const hiddenCount = tasks.length - shown.length;
+  const noGeometry = shown.every((t) => !t.region);
+  el.innerHTML = shown.map((t) => {
     const hex = hexOf(VERB_COLOR[t.verb] ?? 0x9aa6b4);
     const where = t.region
       ? `${t.region.min.x},${t.region.min.y},${t.region.min.z} → ${t.region.max.x},${t.region.max.y},${t.region.max.z}`
       : 'region not reported';
     const who = t.assigned ? esc(t.assigned) : 'unassigned';
-    const state = t.paused ? 'paused' : (t.enabled === false ? 'disabled' : (t.assigned ? 'running' : 'queued'));
+    // A FINISHED TASK IS NOT QUEUED WORK.
+    //
+    // progress was never consulted, so every task TaskMan had ever completed kept rendering as
+    // "queued · unassigned" for ever. Forty-seven finished jobs and one running one displayed as
+    // forty-eight things waiting for a drone -- which reads as a fleet that has stopped working,
+    // and sent us hunting a scheduler bug that did not exist.
+    const finished = (t.progress ?? 0) >= 100;
+    const state = finished
+      ? (t.failure ? 'failed' : 'done')
+      : (t.paused ? 'paused' : (t.enabled === false ? 'disabled' : (t.assigned ? 'running' : 'queued')));
     return `<div class="card task" data-id="${t.id}" style="--accent:${hex}">
       <div class="name" style="color:${hex}">${esc(t.verb ?? 'task')} <span class="meta">${esc(t.name)}</span></div>
       <div class="meta">${state} · ${who}${t.role ? ' · ' + esc(t.role) : ''}</div>
