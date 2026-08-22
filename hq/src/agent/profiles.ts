@@ -68,6 +68,7 @@ export const PROFILES: Record<string, AgentProfile> = {
       'world.query',
       'order.issue',
       'order.abort',
+      'task.stop',
       'recover.dispatch',
       'fleet.goto',
       'plan.make',

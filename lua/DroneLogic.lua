@@ -1584,17 +1584,31 @@ function OnHaul(p_ID, p_Message)
 end
 
 function OnAbort()
-    if(not executing) then
-        return false
-    end
-    print("Aborting...")
+    -- ALWAYS CLEAR, even when nothing is running.
+    --
+    -- This used to refuse whenever `executing` was false -- which is precisely the state abort is
+    -- most needed for. A drone can hold a stale status with no job behind it: a body that ended
+    -- abnormally, or a task cancelled server-side that never reached the machine. It then reports
+    -- "working" for ever, TaskMan never offers it anything because it is not idle, and the supply
+    -- loop correctly concludes there is nobody free and does nothing at all.
+    --
+    -- Two drones sat like that and the whole fleet looked like it had stopped working, while every
+    -- component was behaving exactly as designed.
+    local s_Was = executing
+    print("Aborting (was executing: " .. tostring(s_Was) .. ")")
     -- Clear the flag as well as breaking pgps. BreakExec stops a pgps path mid-flight, but the
     -- survey loop is our own and only watches `executing` -- without this an abort would stop the
     -- current move and the lawnmower would calmly carry on to the next cell. This runs on the
     -- server thread, which is precisely why it can interrupt work happening on the drone thread.
     executing = false
     pgps.BreakExec()
-    return true, "Aborted"
+    m_Status = "idle"
+    m_Job = nil
+    pcall(saveResume)
+    -- Say so immediately rather than waiting up to 30s for the next beat: the whole point is to
+    -- get this drone back into the pool.
+    pcall(SendHeartBeat)
+    return true, s_Was and "Aborted" or "was already idle; stale status cleared"
 end
 
 

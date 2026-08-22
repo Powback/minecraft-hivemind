@@ -342,6 +342,31 @@ end
 
 -- Forward a relay command to drones. Same shape as GoTo: the Bridge can only address MODULES, so
 -- anything aimed at a drone has to be relayed by the module that owns the registry.
+-- Tell a drone to STOP.
+--
+-- Cancelling a task in the queue does not reach the drone: it carries on executing whatever it was
+-- given, never returns to idle, and therefore can never be assigned anything again. Two drones sat
+-- "working" on cancelled orders while the supply loop correctly reported there was nobody free --
+-- which from outside looks exactly like autonomy having died.
+function OnStopDrone(p_ID, p_Message)
+    if(p_Message.data.id == nil and p_Message.data.range == nil) then
+        return false, "Missing id/range"
+    end
+    local s_Status, s_Parsed = ParseMessage(p_Message)
+    if(s_Status == false) then return s_Status, s_Parsed end
+
+    local s_Done = {}
+    for _, v in pairs(s_Parsed.data.drones) do
+        local s_Msg = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Abort", {})
+        local s_Res = PowNet.sendAndWaitForResponse(v, s_Msg, PowNet.SERVER_PROTOCOL, 5)
+        s_Done[#s_Done + 1] = {id = v, aborted = (s_Res ~= false and s_Res ~= nil)}
+        -- Believe the drone's own next heartbeat rather than assuming: clearing the registry entry
+        -- here would report idle for a drone that never got the message.
+    end
+    if #s_Done == 0 then return false, "no drone matched" end
+    return true, {stopped = s_Done}
+end
+
 function OnRelayCmd(p_ID, p_Message)
     if(p_Message.data.id == nil and p_Message.data.range == nil) then
         return false, "Missing id/range"
@@ -473,6 +498,11 @@ local m_ServerEvents = {
             drop  = { optional = true },
             climb = { optional = true },
         }
+    },
+    Stop = {
+        func = OnStopDrone,
+        callable = true,
+        params = { id = { optional = true } }
     },
     Relay = {
         func = OnRelayCmd,

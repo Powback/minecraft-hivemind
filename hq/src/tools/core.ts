@@ -1815,6 +1815,67 @@ registry.register({
   },
 });
 
+
+// ── task.stop ──────────────────────────────────────────────────────────────
+//
+// Abandoning work is a first-class operation, not an admin escape hatch.
+//
+// A task that cannot succeed does not politely go away: it holds a drone, gets reclaimed, is
+// re-dispatched, fails again, and starves everything behind it. Three legacy dig tasks jammed the
+// whole fleet this way -- two miners and a scout were permanently "working" on orders that reported
+// "cannot reach site" every time, so the supply loop correctly concluded there was nobody free and
+// did nothing at all. From outside that looks like autonomy having stopped.
+registry.register({
+  name: 'task.stop',
+  summary: 'Abandon a queued or stuck task so its drone is released.',
+  description:
+    'Use when a task keeps failing or predates a change and can never complete. Marks it finished ' +
+    'with a reason rather than deleting it, so the record of what happened survives. Check ' +
+    'fleet.tasks for ids and their failure text first.',
+  params: z.object({
+    id: z.union([z.number().int(), z.array(z.number().int()).max(32)]),
+    reason: z.string().max(200).default('abandoned by operator'),
+  }).strict(),
+  returns: 'Which tasks were stopped.',
+  danger: 'mutate',
+  handler: async (a, ctx) => {
+    const ids = Array.isArray(a.id) ? a.id : [a.id];
+    const out: any[] = [];
+    for (const id of ids) {
+      try {
+        // TaskDone rather than a delete: the queue should remember that this was given up on and
+        // why, because "it vanished" is indistinguishable from "it silently succeeded".
+        // Find who is holding it BEFORE marking it done -- TaskDone clears the assignment, and
+        // the drone still needs telling.
+        let holder: number | undefined;
+        try {
+          const tasks: any = await bridge.call('TaskMan', 'GetTasks', {}, { timeoutMs: 8000 });
+          const list = tasks?.tasks ?? tasks?.data?.tasks ?? [];
+          holder = list.find((t: any) => String(t.id) === String(id))?.assignedTo;
+        } catch { /* best effort; stopping the task still matters */ }
+
+        const res: any = await bridge.call('TaskMan', 'TaskDone',
+          { id, ok: false, reason: a.reason }, { timeoutMs: 8000 });
+
+        // STOP THE DRONE TOO. Cancelling the task in the queue does not reach the machine: it
+        // keeps executing, never goes idle, and can never be given anything again -- which looks
+        // from outside exactly like the fleet having stopped working.
+        let released: any = null;
+        if (typeof holder === 'number') {
+          try {
+            released = await bridge.call('DroneMan', 'Stop', { id: holder }, { timeoutMs: 12000 });
+          } catch (err) { released = (err as Error)?.message ?? String(err); }
+        }
+        out.push({ id, stopped: typeof res !== 'string', drone: holder ?? null, released });
+      } catch (err) {
+        out.push({ id, stopped: false, error: (err as Error)?.message ?? String(err) });
+      }
+    }
+    ctx.log('task.stop', { count: out.length });
+    return { stopped: out };
+  },
+});
+
 // ── recover.dispatch ───────────────────────────────────────────────────────
 registry.register({
   name: 'recover.dispatch',
