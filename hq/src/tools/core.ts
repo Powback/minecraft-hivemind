@@ -575,10 +575,22 @@ async function loadVoxels(): Promise<Record<string, number>> {
   if (voxelCache && Date.now() - voxelCache.at < VOXEL_CACHE_MS) return voxelCache.grid;
   if (voxelInflight) return voxelInflight;
   voxelInflight = (async () => {
-    const res: any = await bridge.call('MapServer', 'LoadWorld', {}, { timeoutMs: 20_000 });
+    // PAGE IT. The survey is ~490KB of JSON and a websocket frame caps far below that, so asking
+    // for the whole thing did not return a trimmed world -- it returned NOTHING, and the map
+    // rendered no terrain at all. There is no reason the viewer cannot have all of it; it just has
+    // to arrive in pieces.
+    //
     // PowNet replies are unwrapped by the Bridge, but SaveWorld-era callers saw a nested `data`,
     // so accept both shapes rather than returning an empty world on a wrapper change.
-    const grid = res?.cachedWorld ?? res?.data?.cachedWorld ?? {};
+    const grid: Record<string, number> = {};
+    let offset: number | undefined = 0;
+    for (let page = 0; page < 200 && offset !== undefined; page++) {
+      const res: any = await bridge.call('MapServer', 'LoadWorld', { offset }, { timeoutMs: 20_000 });
+      const chunk = res?.cachedWorld ?? res?.data?.cachedWorld ?? {};
+      Object.assign(grid, chunk);
+      const nxt = res?.next ?? res?.data?.next;
+      offset = typeof nxt === 'number' ? nxt : undefined;
+    }
     voxelCache = { at: Date.now(), grid };
     return grid;
   })().finally(() => { voxelInflight = null; });

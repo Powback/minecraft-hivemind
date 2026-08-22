@@ -69,10 +69,36 @@ function OnSaveWorld(p_ID, p_Message)
     return true, true
 end
 
+-- PAGED. The survey is ~490KB of JSON and a websocket frame caps far below that, so returning it
+-- whole meant the map could render NOTHING -- the reply was refused entirely rather than trimmed.
+-- Paging is the difference between a size limit costing latency and costing the whole feature.
+local WORLD_PAGE = 2000
+
 function OnLoadWorld(p_ID, p_Message)
     -- Registered in m_ServerEvents but never written, so the entry pointed at nil. PowNet prints
     -- "Event registered, but pointing to nothing" and carries on, which is why it went unnoticed.
-    return true, {cachedWorld = PowGPSServer.getCachedWorld()}
+    local d = p_Message and p_Message.data or {}
+    local s_Offset = tonumber(d.offset) or 0
+    local s_Limit  = math.min(tonumber(d.limit) or WORLD_PAGE, WORLD_PAGE)
+    local s_World  = PowGPSServer.getCachedWorld() or {}
+
+    -- Whole map in one reply when the caller does not ask for a page, so anything in-world that
+    -- already depends on this keeps working.
+    if d.offset == nil and d.limit == nil then
+        return true, {cachedWorld = s_World}
+    end
+
+    local s_Page, s_N, s_Sent = {}, 0, 0
+    for key, v in pairs(s_World) do
+        if s_N >= s_Offset and s_Sent < s_Limit then
+            s_Page[key] = v
+            s_Sent = s_Sent + 1
+        end
+        s_N = s_N + 1
+    end
+    local s_Next = s_Offset + s_Sent
+    return true, {cachedWorld = s_Page, count = s_N, offset = s_Offset, sent = s_Sent,
+                  next = (s_Next < s_N) and s_Next or nil}
 end
 
 function OnGetPath(p_ID, p_Message)
