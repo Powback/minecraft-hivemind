@@ -65,6 +65,10 @@ function Init()
         {x = -168, y = 62, z = -70}, {x = -132, y = 56, z = -12},
         {x = -175, y = 84, z = -66}, {x = -158, y = 90, z = -84},
         {x = -80,  y = 30, z = -95}, {x = -108, y = 42, z = -92},
+        -- Southeast, added when the fleet expanded past the previous edge. Coverage follows the
+        -- drones; it is checked against their measured positions, not assumed from the base.
+        {x = -45,  y = 80, z = -100}, {x = -60,  y = 88, z = -105},
+        {x = -38,  y = 70, z = -85},  {x = -55,  y = 92, z = -80},
     }
     DATA["gpsHosts"] = DATA["gpsHosts"] or {}
     for _, h in ipairs(s_Known) do

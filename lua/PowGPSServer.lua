@@ -381,6 +381,9 @@ local function writeLines(p_Name, p_Header, p_Rows)
         if #s_Buf >= 512 then
             s_File.write(table.concat(s_Buf, "\n") .. "\n")
             s_Buf = {}
+            -- Same reason as the read side: a large write must let the module breathe, or CC
+            -- terminates it mid-save and leaves a staging file behind.
+            os.sleep(0)
         end
     end
 
@@ -436,9 +439,16 @@ function load()
                     local t = l:match("^seen=(%d+)$")
                     if t then m_Seen[name] = tonumber(t) end
                 end
+                local s_Row = 0
                 while true do
                     local l = f.readLine()
                     if l == nil then break end
+                    -- YIELD. CC kills a coroutine that runs ten seconds without yielding, and
+                    -- reading 175,000 rows across fifty-two files is comfortably past that:
+                    -- MapServer died on its own map with "Too long without yielding" and
+                    -- crash-looped, taking the whole fleet's pathfinding with it.
+                    s_Row = s_Row + 1
+                    if s_Row % 2000 == 0 then os.sleep(0) end
                     local k, occ, nid = l:match("^(.-)=(%-?[%d.]+),(%d+)$")
                     if k then
                         cachedWorld[k] = tonumber(occ)
@@ -501,7 +511,10 @@ function save()
     -- Group the dirty cells by chunk in one pass. Walking the whole map once per dirty chunk would
     -- reintroduce exactly the cost this change exists to remove.
     local s_Buckets = {}
+    local s_Seen2 = 0
     for k in pairs(cachedWorld) do
+        s_Seen2 = s_Seen2 + 1
+        if s_Seen2 % 5000 == 0 then os.sleep(0) end
         local c = chunkOfKey(k)
         if c and m_Dirty[c] then
             local b = s_Buckets[c]

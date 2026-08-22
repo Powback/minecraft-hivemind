@@ -256,6 +256,34 @@ local function updateListener()
 end
 
 trace("entering parallel")
-parallel.waitForAny(main, clearOldMessages, PowNet.control, renderLoop, updateListener)
+
+-- MAINFRAME MUST NOT EXIT.
+--
+-- Every one of these five is a `while true` loop, so parallel.waitForAny returning means one of
+-- them ended anyway -- and the startup's pcall recorded ok=true, err=nil, so it returned NORMALLY
+-- rather than throwing. Whatever the reason, the consequence is out of all proportion: the
+-- bootloader reboots, MainFrame broadcasts INIT on the way back up, and INIT stands down every
+-- module in the fleet. DroneMan, TaskMan, MapServer, StorageMan and DockingMan all restart
+-- together, drones lose their registry entries and are marked offline, and in-flight work is lost.
+-- It ran 448 seconds and did this, repeatedly, which is a large part of why the fleet kept
+-- collapsing for no visible reason.
+--
+-- So: name whichever loop ended, and restart the set instead of the computer. A restarted loop
+-- costs nothing; a restarted MainFrame costs the whole fleet.
+local function named(p_Name, p_Fn)
+    return function()
+        p_Fn()
+        trace("LOOP ENDED: " .. p_Name .. " returned on its own -- restarting the loop set")
+    end
+end
+
+while true do
+    local ok, err = pcall(parallel.waitForAny,
+        named("main", main), named("clearOldMessages", clearOldMessages),
+        named("PowNet.control", PowNet.control), named("renderLoop", renderLoop),
+        named("updateListener", updateListener))
+    if not ok then trace("loop set threw: " .. tostring(err)) end
+    os.sleep(1)
+end
 
 rednet.unhost(PowNet.SERVER_PROTOCOL)

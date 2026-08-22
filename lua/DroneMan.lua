@@ -659,12 +659,21 @@ local function Coverage()
 
                     -- Keep the loader's own altitude. The chunk is loaded as a column, so there is
                     -- nothing to gain by descending and a great deal to lose.
+                    -- FIRE AND FORGET. SendToDrone waits for a reply, and a drone answers GoTo
+                    -- only once the whole move is finished -- which can be minutes. DroneMan is
+                    -- single-threaded and already serving thirteen heartbeats, TaskMan's fleet
+                    -- polls and HQ's status polls from one receive loop; parking a coroutine on a
+                    -- multi-minute round trip is how it stopped answering Status at all and every
+                    -- drone was marked offline while running perfectly well.
+                    --
+                    -- Nothing here needs the answer: if the loader does not go, the next sweep in
+                    -- thirty seconds notices it is still in the wrong chunk and asks again.
                     PowNet.Send(s_Best.id,
                         PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Abort", {}),
                         PowNet.SERVER_PROTOCOL)
                     os.sleep(0.2)
-                    PowNet.SendToDrone(s_Best.id, PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "GoTo",
-                        {pos = {x = s_Tx, y = s_Best.pos.y, z = s_Tz}}))
+                    PowNet.Send(s_Best.id, PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "GoTo",
+                        {pos = {x = s_Tx, y = s_Best.pos.y, z = s_Tz}}), PowNet.DRONE_PROTOCOL)
                     print(("coverage: %s -> chunk %d,%d (%d drone(s) working there)")
                         :format(tostring(s_Best.name), want.cx, want.cz, want.n))
 
