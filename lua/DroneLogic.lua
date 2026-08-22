@@ -108,6 +108,12 @@ function Init()
     SendHeartBeat()
 end
 
+-- Forward-declared, because SendHeartBeat above needs it and `local function trace` further down
+-- would create a second, unrelated local. Calling it before then crashed every scout in the fleet
+-- with "attempt to call global 'trace' (a nil value)" -- they rebooted every sixty seconds, which
+-- is why their survey failures kept repeating and the fix logged nothing.
+local trace
+
 function SendHeartBeat()
     -- Read the position, do not re-derive it. This used to call setLocationFromGPS, which steps
     -- the turtle forward and back to work out its heading -- acceptable once during Init, and the
@@ -184,11 +190,18 @@ function SendHeartBeat()
     -- A crash recorded by the bootloader is reported to the fleet, once, on the way back up.
     -- Otherwise a drone that dies on its first line every three seconds shows as "idle" for ever,
     -- because the last heartbeat DroneMan received was the healthy one before it broke.
+    -- Read the crash record ONCE, report it, then clear it.
+    --
+    -- The bootloader only deletes it on a clean exit, and a healthy drone does not exit -- so a
+    -- record from a crash that was fixed hours ago sat on disk looking current, and every check
+    -- reported a working fleet as broken. Having survived long enough to send a heartbeat is the
+    -- evidence that the crash is over.
     if m_LastCrash == nil then
         m_LastCrash = false
         if fs.exists("/last-run.txt") then
             local h = fs.open("/last-run.txt", "r")
             if h then m_LastCrash = (h.readAll() or ""):gsub("%s+$", "") h.close() end
+            pcall(fs.delete, "/last-run.txt")
         end
     end
 
@@ -270,7 +283,7 @@ end
 -- 8MB computer_space_limit and then killed the module with "Out of space" -- a diagnostic that
 -- destroys the thing it is meant to explain.
 local TRACE_LIMIT = 32 * 1024
-local function trace(p_What)
+trace = function(p_What)
     pcall(function()
         if fs.exists("/drone.log") and fs.getSize("/drone.log") > TRACE_LIMIT then
             fs.delete("/drone.log")
@@ -699,6 +712,15 @@ function OnSurvey(p_ID, p_Message)
     -- the scanner reaches 8 blocks and the ore is fifty below. Sending the scout down a shaft a
     -- miner has already cut is the whole point of pairing them.
     if d.pos and d.pos.x then
+        -- MARK THE JOB AS RUNNING BEFORE THE TRAVEL, not after it.
+        --
+        -- TaskStart was only called once the scanning began, so `executing` was false for the whole
+        -- flight to the site -- which is most of the job. Two things then went wrong at once: the
+        -- stale-status guard saw a "moving" label with nothing executing and helpfully cleared it to
+        -- idle, so a scout in mid-flight advertised itself as available; and TaskMan, seeing an idle
+        -- drone holding a task, reclaimed and reassigned it. The scout was doing exactly what it was
+        -- told and was continuously interrupted for looking like it wasn't.
+        TaskStart()
         m_Status = "moving"
         -- An omitted Y means "come across at whatever height you are already at", which is both
         -- reachable and close to the ground the scan actually wants. settle() drops to the surface
@@ -709,7 +731,24 @@ function OnSurvey(p_ID, p_Message)
             local _, cy = pgps.getCachedPosition()
             s_Ty = cy
         end
-        if pgps.moveTo(tonumber(d.pos.x), s_Ty, tonumber(d.pos.z)) == false then
+
+        -- moveTo, then FLY. Travelling at the drone's own altitude is right when it is in the open
+        -- and wrong when it is underground: the destination at y=49 is solid rock, there is no path
+        -- to it, and a scout carries a scanner instead of a pickaxe so it cannot make one. Scouts
+        -- descend into shafts to do their job, so this is the normal case, not the exception --
+        -- three of them failed the same survey over and over ("could not reach -113,nil,-24"), were
+        -- reclaimed after ninety seconds, reassigned, and failed it again.
+        --
+        -- flyTo is greedy and climbs over what it cannot go through, which is exactly what is needed
+        -- to get out of a hole and across to somewhere else. GoTo has had this fallback for a while;
+        -- the survey never did.
+        local s_At = pgps.moveTo(tonumber(d.pos.x), s_Ty, tonumber(d.pos.z))
+        if s_At == false then
+            trace("survey: no mapped route to the start -- flying")
+            s_At = pgps.flyTo(tonumber(d.pos.x), s_Ty, tonumber(d.pos.z))
+        end
+        if s_At == false then
+            TaskEnd()
             m_Status = "idle"
             trace("Survey FAILED: could not reach " .. tostring(d.pos.x) .. "," ..
                   tostring(d.pos.y) .. "," .. tostring(d.pos.z))

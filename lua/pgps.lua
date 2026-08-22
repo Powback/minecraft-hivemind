@@ -323,7 +323,15 @@ end
 --
 
 function detectAll()
+    -- OBSERVATIONS NEED A POSITION TO BE ABOUT. Without one there is nothing to record and every
+    -- index built here is a concatenation with nil, which kills the drone outright -- detectAll is
+    -- called after EVERY move and turn, so an unknown position turns into a crash loop rather than
+    -- a missed reading. Skipping is correct and lossless: the next move with a known position
+    -- re-observes the same cells.
+    if cachedX == nil or cachedY == nil or cachedZ == nil then return end
     local F, U, D = deltas[cachedDir], deltas[Up], deltas[Down]
+    -- Heading unknown: still record what is above, below and underfoot, just not what is ahead --
+    -- "ahead" is meaningless without a direction, and deltas[nil] is nil.
     local block, idx
 
     -- Every write is mirrored into the pending delta so it can be shipped to MapServer. Without
@@ -332,12 +340,14 @@ function detectAll()
     cachedWorld[idx] = 0
     noteObservation(idx, 0)
 
-    block = 0
-    if turtle.detect()      then block = 1 end
-    idx = (cachedX + F[1])..":"..(cachedY + F[2])..":"..(cachedZ + F[3])
-    cachedWorld[idx] = block
-    cachedWorldDetail[idx] = {turtle.inspect()}
-    noteObservation(idx, block, cachedWorldDetail[idx])
+    if F then
+        block = 0
+        if turtle.detect()      then block = 1 end
+        idx = (cachedX + F[1])..":"..(cachedY + F[2])..":"..(cachedZ + F[3])
+        cachedWorld[idx] = block
+        cachedWorldDetail[idx] = {turtle.inspect()}
+        noteObservation(idx, block, cachedWorldDetail[idx])
+    end
 
     block = 0
     if turtle.detectUp()    then block = 1 end
@@ -754,6 +764,11 @@ end
 --
 
 function turnLeft()
+    -- A turn with no known heading is arithmetic on nil, and it killed the drone --
+    -- miners crash-looped on "attempt to perform arithmetic on upvalue 'cachedDir'".
+    -- Turning is still useful without a heading (it is how one is derived), so do the
+    -- turn and leave the cache unknown rather than throwing.
+    if cachedDir == nil then turtle.turnLeft() detectAll() return true end
     cachedDir = (cachedDir + 1) % 4
     turtle.turnLeft()
     detectAll()
@@ -768,6 +783,11 @@ end
 --
 
 function turnRight()
+    -- A turn with no known heading is arithmetic on nil, and it killed the drone --
+    -- miners crash-looped on "attempt to perform arithmetic on upvalue 'cachedDir'".
+    -- Turning is still useful without a heading (it is how one is derived), so do the
+    -- turn and leave the cache unknown rather than throwing.
+    if cachedDir == nil then turtle.turnRight() detectAll() return true end
     cachedDir = (cachedDir + 3) % 4
     turtle.turnRight()
     detectAll()
@@ -784,6 +804,19 @@ end
 
 function turnTo(_targetDir)
     --print(string.format("target dir: {0}\ncachedDir: {1}", _targetDir, cachedDir))
+    -- Work out which way we face BEFORE doing arithmetic with it. turnTo is reached from digTo,
+    -- the mine loop and the survey, and every one of those crashed the drone outright when the
+    -- heading was unknown -- "attempt to perform arithmetic on upvalue 'cachedDir'". Deriving the
+    -- heading is exactly what ensureHeading is for, and it can now dig or rise out of a box to do
+    -- it; if even that fails, turning blind still beats dying.
+    if cachedDir == nil then
+        ensureHeading()
+        if cachedDir == nil then
+            turtle.turnLeft()
+            return false, "no heading"
+        end
+    end
+    if _targetDir == nil then return false, "no target heading" end
     if _targetDir == cachedDir then
         return true
     elseif ((_targetDir - cachedDir + 4) % 4) == 1 then--moveTo caused exception
@@ -939,6 +972,11 @@ end
 -- Greedy and dumb on purpose. Altitude first, because open sky is the cheap axis and getting to
 -- the target height usually removes the horizontal obstacles too.
 function flyTo(_tx, _ty, _tz, _maxSteps)
+    -- Same guard digTo carries. An omitted axis means "stay where you are on it", not "fly to nil":
+    -- unguarded, the first comparison is `cachedY < nil` and the drone dies with "attempt to compare
+    -- nil with number". The survey passes a nil Y deliberately, so this is a normal call shape.
+    if cachedX == nil then return false, "no position fix" end
+    _tx, _ty, _tz = _tx or cachedX, _ty or cachedY, _tz or cachedZ
     local s_Max = _maxSteps or 512
     local s_Steps = 0
     while cachedX ~= _tx or cachedY ~= _ty or cachedZ ~= _tz do
