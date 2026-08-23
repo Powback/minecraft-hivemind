@@ -104,6 +104,12 @@ export class Bridge {
     switch (msg.type) {
       case 'HELLO':
         this.log(`hello from ${msg.bridge} (computer #${msg.computerId})`);
+        // Fire the reconnect hooks. Without this they were registered and never called -- the
+        // settlement push looked wired, logged nothing at all, and MapServer went on serving an
+        // old constellation and old bounds while every drone stranded on them.
+        for (const fn of this.connectHooks) {
+          try { void fn(); } catch { /* a hook must never break the handshake */ }
+        }
         break;
       case 'PING':
         this.send({ v: PROTOCOL_VERSION, type: 'PONG', t: msg.t });

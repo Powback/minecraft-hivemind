@@ -35,12 +35,29 @@ export const settlement: Settlement = {
     y: Number(process.env.HIVE_BASE_Y ?? 63),
     z: Number(process.env.HIVE_BASE_Z ?? 64),
   },
-  reach: Number(process.env.HIVE_REACH ?? 96),
+  // MEASURED, NOT CHOSEN. The bounds were 96 while four-host GPS coverage was 32 -- so the fleet was
+  // authorised to work in an area NINE TIMES larger than it could navigate in, and every drone sent
+  // to the edge stranded with "outside coverage: no gps coverage" while nothing had actually failed.
+  // 68 is the radius at which all four nearest hosts of the 16-host constellation are still audible,
+  // less a margin so a drone stops before losing its fix rather than after.
+  reach: Number(process.env.HIVE_REACH ?? 68),
   gpsHosts: [
-    { x: -478, y: 78, z: 90 },
-    { x: -464, y: 93, z: 83 },
-    { x: -504, y: 82, z: 58 },
-    { x: -465, y: 82, z: 40 },
+    { x: -546, y: 70, z: -2 },
+    { x: -546, y: 83, z: 42 },
+    { x: -546, y: 96, z: 86 },
+    { x: -546, y: 78, z: 130 },
+    { x: -502, y: 91, z: -2 },
+    { x: -502, y: 73, z: 42 },
+    { x: -502, y: 86, z: 86 },
+    { x: -502, y: 99, z: 130 },
+    { x: -458, y: 81, z: -2 },
+    { x: -458, y: 94, z: 42 },
+    { x: -458, y: 76, z: 86 },
+    { x: -458, y: 89, z: 130 },
+    { x: -414, y: 71, z: -2 },
+    { x: -414, y: 84, z: 42 },
+    { x: -414, y: 97, z: 86 },
+    { x: -414, y: 79, z: 130 },
   ],
 };
 

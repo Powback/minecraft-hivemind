@@ -54,17 +54,28 @@ rc() { docker compose exec -T mc rcon-cli "$1" 2>&1 | tr -d '\r' | sed 's/\x1b\[
 # one convenient point: worst case 53.8 blocks, ten blocks of margin, triple product 25,656. All four
 # sit outside r=20 so they never collide with the building or its terraces.
 HOSTS=(
-  "-478 78 90"
-  "-464 93 83"
-  "-504 82 58"
-  "-465 82 40"
+  "-546 70 -2"
+  "-546 83 42"
+  "-546 96 86"
+  "-546 78 130"
+  "-502 91 -2"
+  "-502 73 42"
+  "-502 86 86"
+  "-502 99 130"
+  "-458 81 -2"
+  "-458 94 42"
+  "-458 76 86"
+  "-458 89 130"
+  "-414 71 -2"
+  "-414 84 42"
+  "-414 97 86"
+  "-414 79 130"
 )
 
 # Anything left from a previous constellation, so re-running this does not leave stale hosts
 # answering with positions that are no longer where they are.
 OLD=(
-  "-520 130 24" "-440 136 24" "-520 142 104" "-440 148 104"
-  "-512 88 32" "-512 76 32" "-448 92 32" "-512 96 96" "-448 100 96"
+  "-520 130 24" "-440 136 24" "-520 142 104" "-440 148 104" "-512 88 32" "-512 76 32" "-448 92 32" "-512 96 96" "-448 100 96" "-478 78 90" "-464 93 83" "-504 82 58" "-465 82 40"
 )
 
 echo "== keeping the constellation loaded"
