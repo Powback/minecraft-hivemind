@@ -109,6 +109,7 @@ export const LEVELS: Level[] = [
   { index:  4, name: 'press',    purpose: 'Pressing and shaping: sheets and rods.',                                      gatedOn: ['brass_ingot'] },
   { index:  5, name: 'assemble', purpose: 'Mechanical crafters. Where components become machines.',                      gatedOn: ['brass_ingot'] },
   { index:  6, name: 'logic',    purpose: 'AE2: digital storage and autocrafting. The top of the tree, so the top floor.', gatedOn: ['redstone', 'certus_quartz'] },
+  { index:  7, name: 'cap',      purpose: 'Mast base, wireless hub and GPS. No bays -- height is the point: modem range scales with altitude, and nine drones are out of contact right now.', gatedOn: [] },
 ];
 
 const dist = (dx: number, dz: number) => Math.sqrt(dx * dx + dz * dz);
@@ -148,11 +149,112 @@ export function sectorOf(dx: number, dz: number, sectors: number): number {
   return Math.floor((norm / (Math.PI * 2)) * sectors) % sectors;
 }
 
-/** The cells a given bay owns on a floor: the annulus between the walkway and the wall. */
+/**
+ * The cells a given bay owns: a fixed-depth band hugging the inside of the service wall.
+ *
+ * BAYS ARE ALWAYS AGAINST THE WALL, AND NOT FOR TIDINESS. The chutes and power shafts run up the
+ * wall cavity, so a bay that is not touching it cannot be piped to. Fixed depth is what keeps every
+ * bay the same size as the tower tapers -- and one bay being the same as every other is the entire
+ * reason this building is round.
+ *
+ * Whatever is left between the gallery and the bays is open concourse: wide at the base, nothing at
+ * the top. That is where the ground floor gets its lobby, and it costs nothing to leave empty.
+ */
+export const BAY_DEPTH = 5;
+
 export function bayCells(spec: TowerSpec, sector: number): Array<{ dx: number; dz: number }> {
-  return discCells(spec.radius - spec.serviceDepth - 1)
-    .filter((c) => dist(c.dx, c.dz) > spec.walkRadius)
+  const outer = spec.radius - spec.serviceDepth - 1;
+  const inner = Math.max(spec.walkRadius, outer - BAY_DEPTH);
+  return discCells(outer)
+    .filter((c) => dist(c.dx, c.dz) > inner)
     .filter((c) => sectorOf(c.dx, c.dz, spec.sectors) === sector);
+}
+
+/**
+ * THE TAPER.
+ *
+ * A band is a run of levels sharing one radius. Stepping in as the tower rises is not decoration:
+ * throughput falls with height. A tonne of ore arrives at the bottom and a handful of processors
+ * leaves at the top, so the bottom needs many bays and the top needs few.
+ *
+ * Sector count falls WITH the radius, chosen so bay width stays near constant -- circumference over
+ * sectors is about 10 blocks in every band. Keeping the count fixed while shrinking the radius would
+ * squeeze the bays until modules stopped fitting, which is the failure the cylinder exists to avoid.
+ *
+ * The atrium, the gallery and the service cavity never taper. Drones need the same shaft at every
+ * height, the stair has to stay continuous, and the chutes have to run the full rise.
+ *
+ * Each step-in leaves a ring of the band below exposed. Those are terraces, and they come free.
+ */
+export interface TowerBand {
+  name: string;
+  /** Inclusive level range this band covers. */
+  from: number;
+  to: number;
+  radius: number;
+  sectors: number;
+}
+
+/**
+ * r=14 IS THE FLOOR, AND IT IS ARITHMETIC RATHER THAN TASTE.
+ *
+ * A bay needs the atrium (4) plus both gallery lanes (2) plus its own depth (5) plus the service
+ * cavity (2) plus the wall. That is fourteen. Taper below it and the bays are the first thing
+ * squeezed -- a first attempt at r=11 produced 15-cell bays against 41 at the base, which is exactly
+ * the "every module needs a variant per band" failure the round plan exists to prevent.
+ *
+ * So the working floors step 20 -> 17 -> 14 and stop. The cap above them is genuinely narrow because
+ * it holds no bays at all: it is the mast base and an observation deck, and the ring of roof each
+ * step-in leaves exposed below it is a terrace.
+ */
+export const BANDS: TowerBand[] = [
+  { name: 'plinth', from: -3, to: -1, radius: 20, sectors: 12 },
+  { name: 'base',   from:  0, to:  1, radius: 20, sectors: 12 },
+  { name: 'mid',    from:  2, to:  3, radius: 17, sectors: 10 },
+  { name: 'upper',  from:  4, to:  6, radius: 14, sectors:  8 },
+  { name: 'cap',    from:  7, to:  7, radius: 11, sectors:  0 },
+];
+
+export function bandFor(level: number): TowerBand {
+  return BANDS.find((b) => level >= b.from && level <= b.to) ?? BANDS[BANDS.length - 1]!;
+}
+
+/** The spec to build a given level with: the shared shape, resized to that level's band. */
+export function specForLevel(level: number, base: TowerSpec = TOWER): TowerSpec {
+  const b = bandFor(level);
+  return { ...base, radius: b.radius, sectors: b.sectors };
+}
+
+/**
+ * A vertical cross-section, so the taper can be looked at before it is built.
+ *
+ * The plan view checks one floor. It cannot show that the stair stays continuous through a step-in,
+ * or that a band change does not strand a bay over open air -- which is exactly the kind of mistake
+ * that is obvious in a picture and invisible in a list of coordinates.
+ */
+export function section(base: TowerSpec = TOWER): string {
+  const widest = Math.max(...BANDS.map((b) => b.radius));
+  const levels = [...BANDS].sort((a, b) => b.to - a.to);
+  const rows: string[] = [];
+  for (const band of levels) {
+    for (let lv = band.to; lv >= band.from; lv--) {
+      const spec = specForLevel(lv, base);
+      const lvl = LEVELS.find((l) => l.index === lv);
+      for (let dy = base.floorHeight - 1; dy >= 0; dy--) {
+        let row = '';
+        for (let dx = -widest; dx <= widest; dx++) {
+          const r = Math.abs(dx);
+          if (r > spec.radius) row += ' ';
+          else if (r > spec.radius - spec.serviceDepth - 1) row += dy === 0 ? '=' : '=';
+          else if (r <= spec.atriumRadius) row += dy === 0 ? ' ' : ' ';
+          else if (r <= spec.walkRadius) row += dy === 0 ? '.' : ' ';
+          else row += dy === 0 ? '-' : ' ';
+        }
+        rows.push(row + (dy === 0 ? `  ${lv >= 0 ? '+' : ''}${lv} ${lvl?.name ?? ''}` : ''));
+      }
+    }
+  }
+  return rows.join('\n');
 }
 
 /**
@@ -221,7 +323,8 @@ export function headingFrom(
 export function towerFloor(
   spec: TowerSpec,
   floorIndex: number,
-  mats: { slab: string; wall: string; stair: string; window: string; shaft: string },
+  mats: { slab: string; wall: string; stair: string; window: string; shaft: string;
+          barrel: string; pipe: string },
 ): BlueprintBlock[] {
   const out: BlueprintBlock[] = [];
   const y0 = 0;
@@ -270,6 +373,84 @@ export function towerFloor(
   }
 
   out.push(...spiralSteps(spec, floorIndex, mats.stair));
+  // The one thing standing inside the atrium. Everything else in there stays empty on purpose.
+  // Only the ground floor gets the draw point; every other level is unbroken pipe.
+  out.push(...coreColumn(spec, { pipe: mats.pipe, barrel: mats.barrel },
+                         { drawPoint: floorIndex === 0 }));
+  return out;
+}
+
+/**
+ * THE CORE COLUMN AND ITS FOUR DOCKS.
+ *
+ * DockingMan already lays docks out in a plus: GetXYZFromSlot puts slot % 4 at pos +/- 1 in x or z,
+ * and GetSlotHeading turns each drone to face INWARD at the column. So all four docked drones are
+ * face-adjacent to the same block, which is the point of the pattern -- one inventory feeds four
+ * drones, and the drone's own refuel routine already reaches it: it tries suckDown, then suckUp,
+ * then suck, and the last of those is the column.
+ *
+ * So the column has to BE an inventory at every dock level, not decoration. A barrel rather than a
+ * chest: chests need a free block above to open and this one has a column sitting on it.
+ *
+ * The column is also the only structure inside the atrium. Everything else in there is deliberately
+ * empty so drones can fly, and the plus is what lets docking cost a 3x3 footprint in the middle of a
+ * nine-radius open shaft rather than a ring of berths around the edge.
+ *
+ * Stocking it is a loader's job today -- fly coal to the barrel. "Fuel from the centre column" ends
+ * up automatic once the wall chutes exist and can push up into it, which is an upgrade to this, not
+ * a change of shape.
+ */
+export interface DockSlot {
+  dx: number; dz: number; dy: number;
+  /** Which way the drone faces once docked: inward, at the column. */
+  heading: Heading;
+}
+
+/** The four arms of the plus at a given height, in DockingMan's slot order. */
+export function dockSlots(dy: number): DockSlot[] {
+  return [
+    { dx: 0, dz: -1, dy, heading: 'south' },   // north arm, looking back at the column
+    { dx: -1, dz: 0, dy, heading: 'east' },
+    { dx: 0, dz: 1, dy, heading: 'north' },
+    { dx: 1, dz: 0, dy, heading: 'west' },
+  ];
+}
+
+/**
+ * The column itself: ONE PIPE, TOP TO BOTTOM, WITH NO STORAGE ON THE WAY DOWN.
+ *
+ * An earlier version put a barrel at every floor's dock level so each floor had its own buffer.
+ * That is ten inventories to keep stocked, ten places for items to sit and be forgotten, and ten
+ * things to reason about when something goes missing. A single unbroken chute run does the same job:
+ * anything a floor finishes goes into the pipe and lands in storage at the bottom.
+ *
+ * SO THE PIPE IS THE DOWN LINE AND THE DRONES ARE THE UP LINE.
+ *
+ * That split falls out of the physics rather than being imposed. Down is gravity and costs nothing
+ * and works today. Up needs an encased fan, which needs rotational power, which needs andesite alloy
+ * the fleet has not made -- while drones already fly and already carry. When the fan does get built
+ * it is an upgrade to this exact column, not a redesign.
+ *
+ * One draw point, at ground level, rather than one per floor: a drone needing fuel flies down the
+ * atrium, which is a few seconds through open air, and the ground floor is where it was going anyway.
+ * A barrel rather than a chest -- a chest needs a free block above to open, and this one has a pipe
+ * sitting on it.
+ *
+ * One docking tower is registered per floor, not one tall tower for the building. DockingMan derives
+ * a slot's height as floor(slot / 4), so a single tall tower would put docks at every y including
+ * those filled by floor slabs. A tower per floor puts all four slots at the one open height.
+ */
+export function coreColumn(
+  spec: TowerSpec,
+  mats: { pipe: string; barrel: string },
+  opts: { drawPoint?: boolean; dockDy?: number } = {},
+): BlueprintBlock[] {
+  const dockDy = opts.dockDy ?? 1;
+  const out: BlueprintBlock[] = [];
+  for (let dy = 0; dy < spec.floorHeight; dy++) {
+    const isDraw = opts.drawPoint === true && dy === dockDy;
+    out.push({ dx: 0, dy, dz: 0, item: isDraw ? mats.barrel : mats.pipe });
+  }
   return out;
 }
 
