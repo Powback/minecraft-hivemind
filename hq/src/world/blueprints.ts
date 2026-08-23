@@ -15,6 +15,18 @@
 export interface BlueprintBlock {
   dx: number; dy: number; dz: number;
   item: string;
+  /**
+   * Which way the DRONE must face while placing this block -- not the direction the block ends up
+   * pointing, which varies by block type.
+   *
+   * Minecraft takes a directional block's orientation from whoever placed it, and the builder never
+   * set one, so every stair, furnace and funnel the fleet has ever placed came out facing wherever
+   * the drone happened to be looking. Invisible on a planked pad; the difference between a machine
+   * and an ornament in a factory, and between a staircase and a pile of steps.
+   *
+   * Omitted for blocks that do not care, which is most of them.
+   */
+  heading?: 'north' | 'west' | 'south' | 'east';
 }
 
 export interface Blueprint {

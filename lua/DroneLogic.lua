@@ -9,6 +9,9 @@ local executing = false
 -- then die with "attempt to call a nil value" instead of reporting. Same trap as m_DroneEvents
 -- below, and as pgps.mayStep before it.
 local reportTask
+-- Blueprint headings arrive as names because a blueprint is data that a human reads and edits.
+-- pgps numbers them: North=0, West=1, South=2, East=3.
+local HEADINGS = {north = 0, west = 1, south = 2, east = 3}
 
 print("I AM ALIVE!")
 
@@ -1965,8 +1968,21 @@ function OnBuild(p_ID, p_Message)
             end
         end
 
-        -- 2. Place. The drone stands ABOVE each target and places downwards, which is the one
-        --    placement that needs no knowledge of which way it is facing.
+        -- 2. Place. The drone stands ABOVE each target and places downwards.
+        --
+        -- IT NOW TURNS FIRST, WHEN THE BLOCK CARES.
+        --
+        -- "the one placement that needs no knowledge of which way it is facing" was true of the
+        -- placement and false of the RESULT: Minecraft takes a directional block's orientation from
+        -- whoever placed it, so every stair, furnace, funnel and chute this fleet has ever built came
+        -- out pointing wherever the drone happened to be looking when it arrived. For a planked pad
+        -- that is invisible. For a factory it is the difference between a machine and an ornament,
+        -- and for a staircase it is the difference between stairs and a pile of steps.
+        --
+        -- b.heading is the direction the DRONE must face while placing -- not the direction the block
+        -- ends up pointing, which varies by block type. Saying it the drone's way keeps the one thing
+        -- the drone can actually guarantee in the blueprint, and leaves the per-block convention with
+        -- the blueprint, which is where it can be written down and checked.
         local s_Placed, s_Skipped = 0, 0
         for _, b in ipairs(s_Blocks) do
             if not executing then break end
@@ -1989,7 +2005,8 @@ function OnBuild(p_ID, p_Message)
                     end
                 elseif not selectItem(b.item) then
                     error("ran out of " .. tostring(b.item) .. " partway through", 0)
-                elseif turtle.placeDown() then
+                elseif (b.heading == nil or pgps.turnTo(HEADINGS[b.heading]) ~= false)
+                        and turtle.placeDown() then
                     s_Placed = s_Placed + 1
                     pgps.noteObservation(bx .. ":" .. by .. ":" .. bz, 1, {true, {name = b.item}})
                 else
