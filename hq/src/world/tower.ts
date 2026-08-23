@@ -349,6 +349,8 @@ export function towerFloor(
   }
   for (let dy = y0; dy < spec.floorHeight; dy++) {
     for (const c of wall) {
+      // The notch is the doorway: no wall across it at any height, on any floor.
+      if (inNotch(c.dx, c.dz)) continue;
       // One slit per bay, at eye height, on the cell nearest that sector's mid-angle. Computed
       // against the ring rather than by an angular tolerance: a fixed tolerance produces a
       // different number of windows at every radius, and this produced 81 of them for 8 bays.
@@ -368,6 +370,7 @@ export function towerFloor(
   // what a floor needs piped to it depends on what ends up in its bays.
   for (let dy = y0; dy < spec.floorHeight; dy++) {
     for (const c of ringCells(spec.radius - spec.serviceDepth)) {
+      if (inNotch(c.dx, c.dz)) continue;
       out.push({ dx: c.dx, dy, dz: c.dz, item: mats.wall });
     }
   }
@@ -377,6 +380,73 @@ export function towerFloor(
   // Only the ground floor gets the draw point; every other level is unbroken pipe.
   out.push(...coreColumn(spec, { pipe: mats.pipe, barrel: mats.barrel },
                          { drawPoint: floorIndex === 0 }));
+  return out;
+}
+
+/**
+ * THE FLIGHT NOTCH.
+ *
+ * Drones need to get in at the level they are going to. Entering only at the roof and dropping down
+ * the atrium works, but climbing is the expensive direction -- a drone bringing ore to level 2 would
+ * burn the fuel to reach y+70 first and then give the height straight back.
+ *
+ * A separate arch on every floor is the obvious answer and the wrong one. Bays hug the outer wall at
+ * a fixed depth, so any opening has to cut clean through the bay ring, and that sector can then hold
+ * no module. Twelve arches is twelve lost bays scattered around the building, and at the crown --
+ * eight bays -- it is an eighth of the tower's working space gone to doorways.
+ *
+ * One notch instead: a single vertical channel through the bay ring, the full height of the tower,
+ * on one bearing. It costs ONE bay per floor rather than one per floor per opening, it gives every
+ * level its own entry, and because it is defined by ANGLE rather than by sector index it stays
+ * aligned through bands that have twelve, ten and eight sectors.
+ *
+ * It also gives the building a front. A plain drum has no orientation and nothing to read at a
+ * glance; a recess running the full height tells you which way the tower faces from a distance, and
+ * lines the terraces up underneath it.
+ */
+export const NOTCH_BEARING = 0;              // due north
+export const NOTCH_HALF_ARC = Math.PI / 14;  // about 13 degrees each side: two blocks wide at r=14
+
+/** Is this cell inside the flight notch -- open air rather than wall, bay or concourse? */
+export function inNotch(dx: number, dz: number): boolean {
+  const a = Math.atan2(dx, -dz);
+  let d = a - NOTCH_BEARING;
+  while (d > Math.PI) d -= Math.PI * 2;
+  while (d < -Math.PI) d += Math.PI * 2;
+  return Math.abs(d) <= NOTCH_HALF_ARC;
+}
+
+/** A bay is unusable if the notch passes through it, so it is never offered to the allocator. */
+export function bayIsFlightPath(spec: TowerSpec, sector: number): boolean {
+  return bayCells(spec, sector).some((c) => inNotch(c.dx, c.dz));
+}
+
+/**
+ * The terrace left exposed where the tower steps in.
+ *
+ * Free geometry -- the roof of the wider band below is already there -- so this is a floor surface
+ * and a parapet, nothing more. Where a terrace meets the notch it widens into the landing deck for
+ * that band: the one place a drone can set down outside the building, which matters for loads too
+ * awkward to hand through an arch, and for a drone that needs to stop without entering.
+ */
+export function terraceRing(
+  lower: TowerSpec,
+  upper: TowerSpec,
+  mats: { deck: string; parapet: string },
+): BlueprintBlock[] {
+  const out: BlueprintBlock[] = [];
+  if (upper.radius >= lower.radius) return out;
+  for (const c of discCells(lower.radius)) {
+    const d = Math.sqrt(c.dx * c.dx + c.dz * c.dz);
+    if (d <= upper.radius) continue;
+    out.push({ dx: c.dx, dy: 0, dz: c.dz, item: mats.deck });
+  }
+  // Parapet on the outer edge only, and not across the notch -- a rail there would be a fence
+  // across the doorway.
+  for (const c of ringCells(lower.radius)) {
+    if (inNotch(c.dx, c.dz)) continue;
+    out.push({ dx: c.dx, dy: 1, dz: c.dz, item: mats.parapet });
+  }
   return out;
 }
 

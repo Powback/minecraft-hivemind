@@ -89,22 +89,80 @@ function GetSlotPosition(p_Tower, p_Slot)
     print(s_SlotHeading)
 end
 
-function GetFreeSlot( )
-    for k,v in pairs(DATA["towers"]) do
-        if(v.freeSlot + 1 <= v.slots) then
-            return {tower = k, slot = v.freeSlot}
+-- OCCUPANCY IS THE OCCUPANTS TABLE, NOT A COUNTER.
+--
+-- freeSlot was a number that only ever went up. RegisterSlot incremented it, nothing ever decremented
+-- it, and there is no release path anywhere in this module -- so slots were handed out in sequence
+-- and never returned. A tower went permanently full while standing physically empty, and every drone
+-- reboot burned another slot, which on a day of fleet-wide restarts is most of them. The occupants
+-- table was written on every allocation and then never consulted for one.
+--
+-- So ask the table. A slot is free if nobody is recorded in it; the count of used slots is however
+-- many entries it holds. freeSlot survives only as a display number.
+local function slotTaken(p_Tower, p_Slot)
+    local t = DATA["towers"][p_Tower]
+    return t ~= nil and t.occupants ~= nil and t.occupants[tostring(p_Slot)] ~= nil
+end
+
+local function slotDistance(p_Tower, p_Slot, p_Pos)
+    if p_Pos == nil then return 0 end
+    local s = GetXYZFromSlot(p_Tower, p_Slot)
+    local dx, dy, dz = (s.x - (p_Pos.x or 0)), (s.y - (p_Pos.y or 0)), (s.z - (p_Pos.z or 0))
+    return dx * dx + dy * dy + dz * dz
+end
+
+-- NEAREST FREE SLOT, NOT THE NEXT ONE IN SEQUENCE.
+--
+-- The tower is one column of docks running its whole height, so "the next slot" can be seventy
+-- blocks below the drone asking for it. A drone finishing on the top floor should dock on the top
+-- floor. Distance is squared and left that way -- it is only ever compared, never read.
+function GetFreeSlot(p_Pos)
+    local s_Best, s_BestD = nil, nil
+    for k, v in pairs(DATA["towers"]) do
+        for slot = 0, (v.slots or 0) - 1 do
+            if not slotTaken(k, slot) then
+                local d = slotDistance(k, slot, p_Pos)
+                if s_BestD == nil or d < s_BestD then
+                    s_Best, s_BestD = {tower = k, slot = slot}, d
+                end
+            end
         end
     end
+    return s_Best
 end
 
 function RegisterSlot( p_Id, p_Tower, p_Slot )
     DATA["towers"][p_Tower].occupants[tostring(p_Slot)] = tostring(p_Id)
-    DATA["towers"][p_Tower].freeSlot = DATA["towers"][p_Tower].freeSlot + 1
+    local s_Used = 0
+    for _ in pairs(DATA["towers"][p_Tower].occupants) do s_Used = s_Used + 1 end
+    DATA["towers"][p_Tower].freeSlot = s_Used
+end
+
+-- Give the slot back. Without this nothing ever did.
+function ReleaseSlot( p_Id )
+    local s_Held = DATA["occupants"][p_Id]
+    if s_Held == nil then return false end
+    local t = DATA["towers"][s_Held.tower]
+    if t and t.occupants then
+        t.occupants[tostring(s_Held.slot)] = nil
+        local s_Used = 0
+        for _ in pairs(t.occupants) do s_Used = s_Used + 1 end
+        t.freeSlot = s_Used
+    end
+    DATA["occupants"][p_Id] = nil
+    PowNet.MarkDirty()
+    return true
 end
 
 function OnAllocateDocking(p_Id, p_Message)
     local s_Id = p_Message.data.id
-    local s_Slot = GetFreeSlot()
+    -- Already holding one: hand back the same slot rather than consuming another. A drone asks
+    -- again after every reboot, and with 23 drones restarting repeatedly that is what emptied the
+    -- tower of slots without a single drone actually parking.
+    if DATA["occupants"][s_Id] ~= nil then
+        return true, DATA["occupants"][s_Id]
+    end
+    local s_Slot = GetFreeSlot(p_Message.data.pos)
     if(s_Slot == nil) then
         print("No registered docking stations")
         return false, "No registered docking stations"
@@ -122,6 +180,17 @@ function OnAllocateDocking(p_Id, p_Message)
     print(s_Response)
     -- Ignore the response, we just want to wait for it
     return true, DATA["occupants"][s_Id]
+end
+
+function OnFreeDocking(p_ID, p_Message)
+    local s_Id = p_Message.data and p_Message.data.id
+    if s_Id == nil then return false, "Missing id" end
+    if ReleaseSlot(s_Id) then
+        return true, {id = s_Id, released = true}
+    end
+    -- Not an error worth failing on: a drone that never docked asking to undock is harmless, and
+    -- refusing would make the caller retry something that is already true.
+    return true, {id = s_Id, released = false, message = "was not holding a slot"}
 end
 
 function OnListDockingTowers(p_Id, p_Message)
@@ -281,6 +350,17 @@ local m_ServerEvents = {
             }
         },
         func = OnAllocateDocking
+    },
+    -- The other half of AllocateDocking, which never existed. A drone leaving its dock had no way to
+    -- say so, so the slot stayed occupied forever and the tower filled up with drones that were not
+    -- there.
+    FreeDocking = {
+        callable = true,
+        params = {
+            id = {
+            },
+        },
+        func = OnFreeDocking
     },
     GetDroneInfo = {
         callable = false,

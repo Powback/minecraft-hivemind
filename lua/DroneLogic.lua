@@ -13,6 +13,19 @@ local reportTask
 -- pgps numbers them: North=0, West=1, South=2, East=3.
 local HEADINGS = {north = 0, west = 1, south = 2, east = 3}
 
+-- A DOCK IS BORROWED, NOT OWNED.
+--
+-- Docking used to be a home berth: DroneMan allocated a slot the first time a drone registered, the
+-- drone flew to it once at boot, and it held that slot for the rest of its life. Nothing ever gave
+-- one back -- DockingMan had no release path at all -- so slots were consumed in sequence and never
+-- returned, and a tower went permanently full while standing physically empty. Every reboot burned
+-- another, which on a day of fleet-wide restarts is most of them.
+--
+-- Reserved on the way in, released on the way out. That turns one berth per drone into a pool, so
+-- the tower needs as many slots as drones docked at once rather than drones in existence -- and it
+-- means the slot a drone gets is near where it actually is, instead of wherever it first booted.
+local m_Docked = false
+
 print("I AM ALIVE!")
 
 function TaskStart()
@@ -105,6 +118,7 @@ function Init()
 
         if(s_Response.go) then
             print("Docking!")
+            m_Docked = true
             print(s_Response.go.x)
             print(s_Response.go.y)
             print(s_Response.go.z)
@@ -728,6 +742,57 @@ end
 -- failed left its task at zero progress for ever: the queue reclaimed it, handed it straight back
 -- to the only scout, the scout failed again, and round it went. From outside the queue looked full
 -- and the fleet looked idle -- which is exactly what it was, in a loop.
+-- Give the slot back. Called when the drone leaves to work, which is the moment it stops occupying
+-- the berth -- not when it feels like it, and not never, which is what happened before.
+local function undock()
+    if not m_Docked then return end
+    m_Docked = false
+    pcall(function()
+        PowNet.SendToServer("DockingMan", PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "FreeDocking",
+            {id = tostring(os.getComputerLabel() or os.getComputerID())}))
+    end)
+    trace("undocked -- slot released")
+end
+
+-- Take a slot, nearest to wherever we are now, and go and sit in it facing the column so the refuel
+-- routine's turtle.suck() reaches the fuel inside.
+local function dockNow()
+    local cx, cy, cz = pgps.getCachedPosition()
+    local s_Res = PowNet.sendAndWaitForResponse("DockingMan",
+        PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "AllocateDocking",
+            {id = tostring(os.getComputerLabel() or os.getComputerID()),
+             pos = (cx ~= nil) and {x = cx, y = cy, z = cz} or nil}),
+        PowNet.SERVER_PROTOCOL, 5)
+    if type(s_Res) ~= "table" or s_Res.pos == nil then
+        trace("dock refused: " .. tostring(type(s_Res) == "table" and s_Res.message or s_Res))
+        return false, "no slot"
+    end
+    m_Status = "docking"
+    if pgps.moveTo(s_Res.pos.x, s_Res.pos.y, s_Res.pos.z) == false then
+        if pgps.flyTo(s_Res.pos.x, s_Res.pos.y, s_Res.pos.z) == false then
+            -- Could not get there, so do not hold a berth we are not standing in.
+            m_Docked = true ; undock()
+            m_Status = "idle"
+            return false, "could not reach the dock"
+        end
+    end
+    if s_Res.heading ~= nil then pgps.turnTo(s_Res.heading) end
+    m_Docked = true
+    trace(("docked at %s,%s,%s"):format(tostring(s_Res.pos.x), tostring(s_Res.pos.y), tostring(s_Res.pos.z)))
+    return true, {pos = s_Res.pos}
+end
+
+function OnDock(p_ID, p_Message)
+    local ok, res = dockNow()
+    if not ok then return false, res end
+    -- Refuel while we are here. Sitting in a berth facing an inventory full of coal and not taking
+    -- any is the whole reason the plus pattern exists.
+    pcall(TryRefuel)
+    m_Status = "docking"
+    SendHeartBeat()
+    return true, res
+end
+
 reportTask = function(p_Data, p_Ok, p_Reason, p_Result)
     if p_Data == nil or p_Data.taskId == nil then return end
     pcall(function()
@@ -1098,6 +1163,8 @@ function RunJob(p_Name, p_Data, p_Opts, p_Body)
     trace(("JOB %s start %s"):format(p_Name, textutils.serialiseJSON and
         (pcall(textutils.serialiseJSON, d) and textutils.serialiseJSON(d) or "?") or "?"))
     m_Job = {verb = p_Name, data = d}
+    -- Leaving the berth is exactly here: a job has been accepted and the drone is about to move.
+    undock()
     saveResume()
     m_Status = o.status or "working"
     TaskStart()
@@ -2159,6 +2226,11 @@ m_DroneEvents = {
     },
     Gather = {
         func = OnGather,
+    },
+    -- Ask for a berth and go and sit in it. The counterpart is not a verb: undocking happens by
+    -- itself the moment the drone takes a job, because that is when it stops occupying the slot.
+    Dock = {
+        func = OnDock,
     }
 }
 

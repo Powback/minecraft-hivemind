@@ -66,7 +66,10 @@ function RegisterDrone(p_ID, p_Pos, p_Heading, p_Role)
     }
     DATA["ids"][p_ID] = s_DroneID
 
-    local s_Message = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "AllocateDocking", {id = s_DroneID})
+    -- Send the position. DockingMan now hands out the NEAREST free slot rather than the next one in
+    -- sequence, and it cannot do that without knowing where the asker is.
+    local s_Message = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "AllocateDocking",
+                                        {id = s_DroneID, pos = p_Pos})
     local s_Response = PowNet.sendAndWaitForResponse("DockingMan", s_Message)
     if(not s_Response) then
         print("Failed to get docking")
