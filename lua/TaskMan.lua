@@ -434,9 +434,39 @@ end
 --
 -- assignedTo is the drone id. `assigned` is a comma-joined list of NAMES, which is fine for a
 -- monitor line and useless for joining against the fleet registry.
+-- ANSWER WITHIN A FRAME, OR DO NOT ANSWER AT ALL.
+--
+-- This returned every task, whole, including v.work. That was fine at twenty tasks and fatal at
+-- three hundred: the reply reached 63,792 bytes against a 61,440-byte websocket frame limit, the
+-- call failed outright, and HQ lost the task list entirely. "fleet.tasks failed" reads exactly like
+-- "the queue is empty" from outside -- which is the opposite of what was wrong. The queue was
+-- overflowing, because the supply loop creates work faster than the fleet retires it.
+--
+-- Live work comes first, and finished tasks are a tail. A caller wanting more can page with offset.
+-- Forty, not 120. Each entry carries v.work whole -- the dig region, the survey bounds, the gather
+-- target list -- which averages about 530 bytes, so even a capped 120 came to 63,795 bytes and
+-- failed against the same 61,440-byte frame limit as the uncapped reply did. The cap has to be set
+-- against the BYTES, not the count.
+local GETTASKS_MAX = 40
+
 function OnGetTasks(p_ID, p_Message)
-    local s_List = {}
+    local d = p_Message and p_Message.data or {}
+    local s_Offset = tonumber(d.offset) or 0
+    local s_Limit  = math.min(tonumber(d.limit) or GETTASKS_MAX, GETTASKS_MAX)
+
+    -- Split first so a long backlog of finished tasks can never crowd out the live ones.
+    local s_Live, s_Done, s_Total = {}, {}, 0
     for k,v in pairs(DATA["tasks"]) do
+        s_Total = s_Total + 1
+        if (v.progress or 0) < 100 then s_Live[#s_Live + 1] = v else s_Done[#s_Done + 1] = v end
+    end
+    local s_Ordered = {}
+    for _, v in ipairs(s_Live) do s_Ordered[#s_Ordered + 1] = v end
+    for _, v in ipairs(s_Done) do s_Ordered[#s_Ordered + 1] = v end
+
+    local s_List = {}
+    for i = s_Offset + 1, math.min(s_Offset + s_Limit, #s_Ordered) do
+        local v = s_Ordered[i]
         s_List[#s_List + 1] = {
             id = v.id, name = v.name, progress = v.progress,
             enabled = v.enabled, paused = v.paused,
@@ -449,7 +479,9 @@ function OnGetTasks(p_ID, p_Message)
             work = v.work,
         }
     end
-    return true, {tasks = s_List, count = #s_List}
+    local s_Next = s_Offset + #s_List
+    return true, {tasks = s_List, count = #s_List, total = s_Total, live = #s_Live,
+                  offset = s_Offset, next = (s_Next < #s_Ordered) and s_Next or nil}
 end
 
 -- THE LOOP.

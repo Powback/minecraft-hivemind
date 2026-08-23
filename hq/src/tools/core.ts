@@ -858,7 +858,31 @@ registry.register({
     const all = raw.map(describeTask);
     const live = all.filter((t: any) => (t.progress ?? 0) < 100);
     const done = all.filter((t: any) => (t.progress ?? 0) >= 100).slice(-10);
-    return { count: all.length, live: live.length, tasks: [...live, ...done] };
+    // CAP THE LIVE LIST. Returning every live task was fine at 22 of them and fatal at 300: the
+    // reply hit 63,792 bytes against a 61,440-byte websocket frame limit and the whole call failed,
+    // so the map page and every status check lost the task list entirely -- and "fleet.tasks failed"
+    // reads exactly like "the queue is empty", which is the opposite of the truth. The queue was
+    // overflowing because the supply loop creates work faster than the fleet retires it.
+    //
+    // Assigned tasks come first: what the fleet is doing right now is the part worth seeing, and the
+    // backlog is a number, not a list.
+    const LIVE_CAP = 60;
+    const ordered = [...live].sort((a: any, b: any) => (b.assigned ? 1 : 0) - (a.assigned ? 1 : 0));
+    const shown = ordered.slice(0, LIVE_CAP);
+    // REPORT TASKMAN'S TOTALS, NOT THIS PAGE'S.
+    //
+    // TaskMan caps its reply at 40 tasks to stay inside the websocket frame, so counting the array
+    // that arrives says "40 live" whether the real backlog is 40 or 400 -- a page described as the
+    // whole queue, which is the same failure that made the map read 16,000 blocks and call it done.
+    const total = typeof res?.total === 'number' ? res.total : all.length;
+    const liveTotal = typeof res?.live === 'number' ? res.live : live.length;
+    return {
+      count: total,
+      live: liveTotal,
+      assigned: live.filter((t: any) => t.assigned).length,
+      backlog: liveTotal > shown.length ? liveTotal - shown.length : 0,
+      tasks: [...shown, ...done],
+    };
   },
 });
 
