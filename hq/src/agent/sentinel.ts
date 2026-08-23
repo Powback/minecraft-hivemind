@@ -308,12 +308,33 @@ const PROBES: Array<{ name: string; work: () => Promise<unknown> }> = [
   { name: 'DroneMan',   work: () => bridge.call('DroneMan', 'GetDrones', {}, { timeoutMs: 6000 }) },
   { name: 'TaskMan',    work: () => bridge.call('TaskMan', 'GetTasks', { limit: 1 }, { timeoutMs: 6000 }) },
   { name: 'MapServer',  work: () => bridge.call('MapServer', 'BlockAt', { offset: 0, limit: 1 }, { timeoutMs: 8000 }) },
-  { name: 'StorageMan', work: () => bridge.call('StorageMan', 'Stock', {}, { timeoutMs: 6000 }) },
-  { name: 'DockingMan', work: () => bridge.call('DockingMan', 'ListDockingTowers', {}, { timeoutMs: 6000 }) },
+  // GetStock, not Stock; GetDroneInfo, not ListDockingTowers. Both were wrong, and both produced a
+  // confident WEDGE against a perfectly healthy module -- because an unknown endpoint used to draw
+  // no reply at all, which looks exactly like a wedge. PowNet answers "no such endpoint" now, but
+  // the probe should still ask for something real: a monitor that has to be right about method names
+  // to avoid crying wolf is a monitor that will cry wolf.
+  { name: 'StorageMan', work: () => bridge.call('StorageMan', 'stock', {}, { timeoutMs: 8000 }) },
+  { name: 'DockingMan', work: () => bridge.call('DockingMan', 'GetDroneInfo', { id: '1' }, { timeoutMs: 6000 }) },
 ];
 
 const ok = async (p: Promise<unknown>): Promise<boolean> => {
   try { await p; return true; } catch { return false; }
+};
+
+/**
+ * Lua tables arrive as arrays OR as objects, and which one you get depends on the data.
+ *
+ * A Lua table with holes, or with non-sequential keys, serialises to a JSON object -- so DroneMan's
+ * drone list is an array when the ids happen to be 1..n and a dict the moment they are not. Calling
+ * .map on the result threw, observe() bailed, and the tick returned early WITHOUT reconciling the
+ * ledger. The sentinel then went on serving a stale incident with complete confidence while being
+ * broken itself, which is precisely the failure it exists to catch. It could not see, and it said
+ * nothing about not being able to see.
+ */
+const toArray = <T,>(v: unknown): T[] => {
+  if (Array.isArray(v)) return v as T[];
+  if (v && typeof v === 'object') return Object.values(v as Record<string, T>);
+  return [];
 };
 
 export async function observe(): Promise<Observation | null> {
@@ -326,13 +347,13 @@ export async function observe(): Promise<Observation | null> {
   })));
 
   const fleet: any = await bridge.call('DroneMan', 'GetDrones', {}, { timeoutMs: 6000 }).catch(() => null);
-  const drones = (fleet?.drones ?? fleet?.data?.drones ?? []).map((d: any) => ({
+  const drones = toArray<any>(fleet?.drones ?? fleet?.data?.drones).map((d: any) => ({
     name: String(d.name ?? d.droneID ?? d.id),
     role: d.role, status: d.status, pos: d.pos,
   }));
 
   const tk: any = await bridge.call('TaskMan', 'GetTasks', {}, { timeoutMs: 8000 }).catch(() => null);
-  const rawTasks = tk?.tasks ?? tk?.data?.tasks ?? [];
+  const rawTasks = toArray<any>(tk?.tasks ?? tk?.data?.tasks);
   const tasks = rawTasks.map((t: any) => ({
     id: t.id,
     assigned: t.assigned ?? null,
@@ -364,13 +385,21 @@ export async function observe(): Promise<Observation | null> {
   };
 }
 
-export const sentinel = { ledger: new Ledger(), lastRun: 0, lastError: null as string | null };
+export const sentinel = {
+  ledger: new Ledger(),
+  lastRun: 0,
+  lastError: null as string | null,
+  // The raw observation the detectors were handed. Without this, diagnosing a detector means
+  // guessing at what it saw -- which is the exact failure mode this whole file exists to end.
+  lastObservation: null as Observation | null,
+};
 
 export async function runSentinelTick(): Promise<{ opened: number; open: number }> {
   sentinel.lastRun = Date.now();
   try {
     const o = await observe();
     if (!o) return { opened: 0, open: sentinel.ledger.counts().open };
+    sentinel.lastObservation = o;
     const found = detect(o, sentinel.ledger.reads());
     const opened = await sentinel.ledger.reconcile(found, o.at);
     for (const inc of opened) {
@@ -379,7 +408,18 @@ export async function runSentinelTick(): Promise<{ opened: number; open: number 
     sentinel.lastError = null;
     return { opened: opened.length, open: sentinel.ledger.counts().open };
   } catch (err) {
+    // A MONITOR THAT CANNOT SEE MUST SAY SO.
+    //
+    // This used to swallow the error and return, leaving every open incident open and every closed
+    // one unreported -- so a broken sentinel looked exactly like a healthy system with one stubborn
+    // fault. Blindness is now itself an incident, which means the one number that matters cannot be
+    // quietly flattered by the observer falling over.
     sentinel.lastError = String(err);
+    await sentinel.ledger.reconcile(
+      [{ key: 'blind', kind: 'sentinel-cannot-observe', severity: 'lie',
+         detail: `the sentinel failed to gather an observation: ${String(err).slice(0, 160)}` }],
+      Date.now(),
+    );
     return { opened: 0, open: sentinel.ledger.counts().open };
   }
 }

@@ -538,7 +538,20 @@ function main()
                         s_Result, s_Response = m_ServerEvents[serverMessage.dataKey].func(serverID, serverMessage)
                     end
                 else
-                    print("Unknown drone message handle")
+                    -- ANSWER "NO SUCH ENDPOINT" INSTEAD OF SAYING NOTHING.
+                    --
+                    -- This printed to a terminal nobody reads and fell through with s_Result still
+                    -- nil, so no reply was sent -- which on the wire is indistinguishable from a
+                    -- module that is wedged. A caller with a typo and a caller talking to a dead
+                    -- module get identical silence, and the only way to tell them apart is to
+                    -- already know the answer.
+                    --
+                    -- It cost real time today: a liveness probe asked StorageMan for "Stock" when
+                    -- the endpoint is "GetStock", got silence, and reported a healthy module as
+                    -- found-and-then-silent. The monitoring manufactured the exact fault it exists
+                    -- to detect. The drone path below already answered properly; this one did not.
+                    print("Unknown message handle: " .. tostring(serverMessage.dataKey))
+                    s_Result, s_Response = false, "no such endpoint: " .. tostring(serverMessage.dataKey)
                 end
                 if(s_Result ~= nil) then
                     serverMessage.status = s_Result

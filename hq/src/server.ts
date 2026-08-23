@@ -124,6 +124,7 @@ const server = createServer(async (req, res) => {
         open: sentinel.ledger.openIncidents(),
         lastRun: sentinel.lastRun,
         lastError: sentinel.lastError,
+        observation: sentinel.lastObservation,
       });
     }
 
