@@ -32,6 +32,7 @@ import { createHash } from 'node:crypto';
 import { join, relative, extname } from 'node:path';
 import { registry } from './tools/registry.js';
 import { startSupplyLoop } from './agent/supply.js';
+import { startSentinel, sentinel, runSentinelTick } from './agent/sentinel.js';
 import './tools/core.js';                 // side-effect: registers the core tools
 import { buildBrief } from './tools/core.js';
 import { getProfile, permits } from './agent/profiles.js';
@@ -114,6 +115,18 @@ const server = createServer(async (req, res) => {
   };
 
   try {
+    // Two numbers nobody has ever had for this system: how long it runs before something breaks,
+    // and how often it fixes itself. Everything else here is detail.
+    if (url.pathname === '/health/incidents') {
+      if (url.searchParams.get('now') === '1') await runSentinelTick();
+      return send(200, {
+        metrics: sentinel.ledger.metrics(),
+        open: sentinel.ledger.openIncidents(),
+        lastRun: sentinel.lastRun,
+        lastError: sentinel.lastError,
+      });
+    }
+
     if (url.pathname === '/health') {
       return send(200, { ok: true, bridge: bridge.status(), tools: registry.list().length });
     }
@@ -303,5 +316,8 @@ server.listen(PORT, '0.0.0.0', () => {
   log(`HQ listening on :${PORT}`);
   log(`  tools registered: ${registry.list().length}`);
   startSupplyLoop();
+  // The part that reads the system's own output. Nothing did, which is why every outage so far has
+  // needed a person to spot a contradiction in a log.
+  startSentinel();
   log(`  lua tree: ${LUA_DIR}`);
 });

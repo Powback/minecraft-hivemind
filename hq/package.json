@@ -8,7 +8,7 @@
     "build": "tsc -p .",
     "start": "node dist/server.js",
     "typecheck": "tsc -p . --noEmit",
-    "test": "node scripts/ensure-esbuild-platforms.mjs && tsx src/tools/core.test.ts && vitest run src/world",
+    "test": "node scripts/ensure-esbuild-platforms.mjs && tsx src/tools/core.test.ts && vitest run",
     "fix:platforms": "node scripts/ensure-esbuild-platforms.mjs"
   },
   "dependencies": {
