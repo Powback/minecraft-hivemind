@@ -805,7 +805,16 @@ registry.register({
   handler: async () => {
     if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
     const res: any = await bridge.call('TaskMan', 'GetTasks', {}, { timeoutMs: 8000 });
-    const raw = res?.tasks ?? res?.data?.tasks ?? [];
+    // AN EMPTY LUA TABLE IS `{}`, WHICH IS AN OBJECT HERE, NOT AN ARRAY.
+    //
+    // textutils/JSON cannot tell an empty Lua list from an empty Lua map, so a fleet with nothing
+    // queued came back as `{}` and `.map` threw "raw.map is not a function" -- the queue read as
+    // BROKEN precisely when it was simply empty. The same happens for a sparse task table, which
+    // TaskMan's is: keys are task ids, so any gap makes it serialise as an object.
+    const rawAny = res?.tasks ?? res?.data?.tasks ?? [];
+    const raw: any[] = Array.isArray(rawAny)
+      ? rawAny
+      : (rawAny && typeof rawAny === 'object' ? Object.values(rawAny) : []);
     // LIVE WORK FIRST, and only a handful of finished ones.
     //
     // Returning every task ever created meant 149 entries of which 22 were live, so the answer to
