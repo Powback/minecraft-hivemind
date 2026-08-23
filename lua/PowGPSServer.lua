@@ -464,7 +464,18 @@ function load()
                     local t = s_Head:match("seen=(%d+)")
                     if t then m_Seen[name] = tonumber(t) end
 
+                    -- Yield inside the ROW loop, not just once per file.
+                    --
+                    -- Yielding per file looked sufficient -- 72 files, 72 yields -- but a single
+                    -- chunk holds a few thousand rows and the whole load is 230,000 table writes.
+                    -- CC aborts any coroutine that runs ten seconds without yielding, and that
+                    -- abort surfaces wherever execution happens to be: MapServer died at 19.9s
+                    -- with "peripheral.lua:259: Too long without yielding", which reads like a
+                    -- monitor fault and is actually the map loader starving the scheduler.
+                    local s_Row = 0
                     for k, occ, nid in s_Rows:gmatch("([^\n=]+)=([^,\n]+),(%d+)") do
+                        s_Row = s_Row + 1
+                        if s_Row % 500 == 0 then os.sleep(0) end
                         cachedWorld[k] = tonumber(occ)
                         local id = tonumber(nid)
                         if id and id > 0 and m_Names[id] then

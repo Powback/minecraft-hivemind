@@ -2368,7 +2368,31 @@ local function refixLoop()
     end
 end
 
+-- DRONES NO LONGER HOST GPS.
+--
+-- A relay publishes its position to every drone in range, so a relay with a bad fix does not make
+-- one bad reading -- it makes every listener's position wrong, and every observation those
+-- listeners record is then filed at the wrong coordinates. D10 logged the whole failure in three
+-- lines: it computed a fix of -55,117,-91 while standing at -34,84,-39, refused to host it,
+-- computed another, and hosted -56,126,-88 anyway. Fifty blocks out, offered to the fleet as fact.
+--
+-- The corroboration check was meant to prevent exactly this and cannot: it compares the fix against
+-- the drone's own cached position, which was itself derived from GPS, so once the constellation is
+-- polluted the check agrees with the pollution. It is a feedback loop, not a guard.
+--
+-- This existed when there were four GPS hosts and drones ranged far past them. There are now
+-- twenty-two static hosts covering the whole working volume, placed against measured drone
+-- positions -- so relaying buys nothing and risks the fleet's entire coordinate system.
+local RELAY_DISABLED = true
+
 local function gpsRelay()
+    if RELAY_DISABLED then
+        -- Close the channel if a previous version left it open, then stand down.
+        local s_M = peripheral.find("modem")
+        if s_M then pcall(s_M.close, gps.CHANNEL_GPS) end
+        m_Hosting, m_HostPos = false, nil
+        while true do os.sleep(300) end
+    end
     while true do
         os.sleep(10)
 

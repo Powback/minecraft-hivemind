@@ -77,7 +77,19 @@ function rebuild(world)
     local h, air, n = {}, {}, 0
     local minx, maxx, minz, maxz, miny, maxy
 
+    -- YIELD. This runs a string.match over EVERY cell in the map to build a height field for a
+    -- monitor that shows perhaps a thousand of them. At 237,000 cells that is far past the ten
+    -- seconds CC allows a coroutine to run without yielding, and the abort surfaces wherever
+    -- execution happens to be -- in this case the monitor write that follows, reported as
+    -- "peripheral.lua:259: Too long without yielding". It reads like a display fault and is
+    -- actually the renderer starving the scheduler; MapServer died on it at 19.9s every boot,
+    -- after loading its map perfectly, so it hosted its name, resolved for every caller, and
+    -- answered nothing.
+    local s_Seen = 0
+
     for idx, v in pairs(world) do
+        s_Seen = s_Seen + 1
+        if s_Seen % 2000 == 0 then os.sleep(0) end
         -- `%-` not `-`: a bare - is Lua's lazy quantifier, so "(-?%d+)" silently matches nothing
         -- for negative coordinates, which is most of this world.
         local sx, sy, sz = string.match(idx, "^(%-?%d+):(%-?%d+):(%-?%d+)$")

@@ -97,9 +97,19 @@ function Lookup(p_Name)
     return s_ID
 end
 
---- Drop a cached id after a failed exchange, so the next send re-discovers it.
+--- Note a failed exchange. Deliberately does NOT drop the cached id.
+---
+--- Dropping it meant every failed call bought a fresh rednet.lookup, and rednet.lookup is a
+--- network-wide broadcast that waits two seconds for replies. While a module is DOWN every call
+--- against it fails, so twenty-three drones each generated a continuous stream of broadcasts
+--- looking for something that was not there -- and that traffic is what stalled the drones
+--- themselves, mid-job, with their coroutines waiting on a saturated channel. One module being
+--- unavailable took the whole fleet down with it.
+---
+--- The TTL above already re-resolves every sixty seconds, which is all that a module genuinely
+--- moving would need. Failure is not evidence that an id is wrong; it is usually evidence that the
+--- module is busy or restarting, and the id will be correct again shortly.
 function Forget(p_Name)
-    if type(p_Name) == "string" then m_Hosts[p_Name] = nil else m_Hosts = {} end
 end
 
 function Connect(p_Module)
