@@ -81,6 +81,12 @@ export const PROFILES: Record<string, AgentProfile> = {
       'factory.attach',
       'factory.list',
       'blueprints.list',
+      // Berthing. A drone with nowhere to dock has nowhere to refuel, and a drone that cannot
+      // refuel eventually strands somewhere that needs a miner sent to dig it out -- so this is
+      // fleet-keeping, not construction.
+      'dock.list',
+      'dock.add',
+      'dock.remove',
       'rescue.party',
       'rescue.relay',
       'storage.pickup',

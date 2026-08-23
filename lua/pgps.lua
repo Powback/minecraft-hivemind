@@ -1359,10 +1359,22 @@ function setLocationFromGPS()
         end
 
         if cachedDir == nil then
-            print("Could not determine direction")
+            -- KEEP THE POSITION. HEADING IS THE OTHER HALF OF THE JOB.
+            --
+            -- This returned a bare `false`, so a drone that knew exactly where it was but could not
+            -- work out which way it faced threw the position away too. The caller does
+            -- `x, y, z = pgps.setLocationFromGPS()`, so x became FALSE -- not nil, which matters,
+            -- because every guard downstream tests `== nil` and false sails straight through them.
+            -- The drone then registered with no position, reported itself stuck, and sat there with
+            -- a working GPS fix it had already discarded.
+            --
+            -- Heading is recoverable later: ensureHeading retries on every move, and a drone that
+            -- knows where it is can be dispatched, rescued and drawn on the map meanwhile. Position
+            -- and heading fail independently and should be returned independently.
+            print("position established but heading unknown -- will re-derive on the next move")
             if isLama then--TODO: put lama direction
             else
-                return false
+                return cachedX, cachedY, cachedZ, nil
             end
         end
 

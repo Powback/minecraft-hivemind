@@ -201,7 +201,18 @@ function SendHeartBeat()
             -- hour while the actual fault was that nothing ever retried.
             s_Report, s_Why = "blocked", "no position fix (re-fix attempted and failed)"
         elseif pd == nil then
-            s_Report, s_Why = "blocked", "heading unknown -- boxed in, cannot step to derive it"
+            -- AN UNKNOWN HEADING IS NOT A BLOCKED DRONE, AND CALLING IT ONE IS A DEADLOCK.
+            --
+            -- Heading is derived by stepping one block and re-reading GPS, so a drone can only learn
+            -- which way it faces by MOVING. Reporting "blocked" marks it stranded, a stranded drone
+            -- is never given work, a drone with no work never moves -- and so it never derives the
+            -- heading that would have cleared the report. Three freshly placed drones sat in exactly
+            -- this loop, in open air, with a working GPS fix and full fuel.
+            --
+            -- It is worth SAYING, because a drone that does not know its heading will refuse a
+            -- precise move and that is worth knowing when one behaves oddly. But it stays idle --
+            -- which means dispatchable -- and the first order it accepts fixes it.
+            s_Why = "heading not yet derived; will re-establish on the next move"
         elseif not pgps.mayStep(px, py, pz) then
             -- Standing somewhere it is not allowed to be, which is the one that stranded D3, D7
             -- and D8. boundsReason names which constraint refused.

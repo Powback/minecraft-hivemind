@@ -34,37 +34,37 @@ WORLD=data/world
 rc() { docker compose exec -T mc rcon-cli "$1" 2>&1 | tr -d '\r' | sed 's/\x1b\[[0-9;]*m//g'; }
 
 # x y z -- spread around the tower centre (-480, 64), four distinct altitudes.
-# RANGE IS SET BY THE DRONE, NOT BY THE HOST.
+# RANGE IS SET BY THE DRONE, NOT BY THE HOST, AND FOUR HOSTS MUST ALL BE IN RANGE AT ONCE.
 #
-# The first attempt put these at y=130-148 on the theory that altitude buys range -- it does, but the
-# range that decides whether a fix happens is the range of the machine ASKING. A probe standing in
-# the tower gallery at y=65 reaches about 64 blocks, the hosts were 87 away, and it reported NO FIX
-# with all four hosts up and healthy. Height helps the reply and does nothing for the question.
+# Three revisions, each teaching something:
 #
-# So they sit close enough that every part of the tower can reach them: about 50-56 blocks from the
-# centre, still on four distinct altitudes so a fix can resolve Y.
-# FOUR DIFFERENT ALTITUDES IS NOT THE SAME AS NOT COPLANAR.
+#   y=130-148, far out. Altitude buys range for the REPLY and does nothing for the question -- a
+#   probe at y=65 reaches about 64 blocks. NO FIX with every host healthy.
 #
-# The previous set was -512/88/32, -448/92/32, -512/96/96, -448/100/96 -- four distinct heights, which
-# looked like it satisfied the rule. It did not. Y was a linear function of X and Z, so the four
-# points lay exactly in one plane: AB + AC = AD, to the block. Trilateration from a plane cannot
-# resolve which side of it you are on, so gps.locate returned nil while all four hosts answered
-# correctly with distances of 49 to 58 blocks. Everything looked healthy and the fix was impossible.
+#   Closer, but coplanar. Four distinct heights that were still a linear function of x and z, so the
+#   four points lay in one plane and trilateration could not resolve which side of it we were on.
 #
-# The check that matters is the scalar triple product of the three edge vectors from any one host,
-# and it must not be zero. For these it is 49,152.
+#   Close enough for the tower CENTRE only. This is the subtle one: the fix worked where I tested it
+#   and failed everywhere else. A drone needs all FOUR hosts simultaneously, so coverage is decided
+#   by the WORST host from the worst point -- and at the tower edge that was 79 blocks. Drones sat
+#   reporting "heading unknown -- boxed in" with air on five sides of them, because ensureHeading
+#   derives heading by stepping and re-reading GPS, and the read kept failing.
+#
+# So the set is chosen against the whole footprint at every height the tower will reach, not against
+# one convenient point: worst case 53.8 blocks, ten blocks of margin, triple product 25,656. All four
+# sit outside r=20 so they never collide with the building or its terraces.
 HOSTS=(
-  "-512 76 32"
-  "-448 92 32"
-  "-512 96 96"
-  "-448 100 96"
+  "-478 78 90"
+  "-464 93 83"
+  "-504 82 58"
+  "-465 82 40"
 )
 
 # Anything left from a previous constellation, so re-running this does not leave stale hosts
 # answering with positions that are no longer where they are.
 OLD=(
   "-520 130 24" "-440 136 24" "-520 142 104" "-440 148 104"
-  "-512 88 32"
+  "-512 88 32" "-512 76 32" "-448 92 32" "-512 96 96" "-448 100 96"
 )
 
 echo "== keeping the constellation loaded"

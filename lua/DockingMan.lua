@@ -239,6 +239,21 @@ function OnAddDockingTower(p_Id, p_Message)
     if (p_Message.data.pos == nil) then
         return false, "Missing pos"
     end
+    -- ACCEPT THE ARRAY FORM, BECAUSE CALLERS SEND IT.
+    --
+    -- The in-game command passes three arguments and everything else passes a table, so pos arrives
+    -- as either {x=,y=,z=} or {[1],[2],[3]}. Storing whichever turned up meant a caller using the
+    -- array form wrote a tower whose x, y and z were all nil -- valid enough to persist, fatal on
+    -- the next render, and unfixable afterwards because the module could not stay up to be told to
+    -- delete it. Normalise here, where it is cheap, rather than at every read.
+    local s_P = p_Message.data.pos
+    if s_P.x == nil and s_P[1] ~= nil then
+        p_Message.data.pos = {x = tonumber(s_P[1]), y = tonumber(s_P[2]), z = tonumber(s_P[3])}
+        s_P = p_Message.data.pos
+    end
+    if s_P.x == nil or s_P.y == nil or s_P.z == nil then
+        return false, "pos needs x, y and z"
+    end
     if (p_Message.data.name == nil) then
         return false, "Missing name"
     end
@@ -385,7 +400,20 @@ function Render()
     for k,v in pairs(DATA["towers"]) do
         i = i + 1
         m_Monitor.setCursorPos(1,i)
-        m_Monitor.write("[" .. v.id .. "] " .. v.name .. " - [" .. v.freeSlot .. "/" .. v.slots .. "] -  " .. "("..v.pos.x .. ", " .. v.pos.y .. ", " .. v.pos.z .. ")")
+        -- A MALFORMED TOWER MUST NOT KILL THE MODULE THAT OWNS TOWERS.
+        --
+        -- This indexed v.pos.x/.y/.z blind, so one tower registered with a position in the wrong
+        -- shape crashed DockingMan on its next render -- and it crashes on every boot afterwards,
+        -- because the bad record is persisted. The module cannot be repaired through its own rm
+        -- endpoint, because it is never up long enough to answer one. A single bad write bricks it.
+        --
+        -- It happened immediately: an HQ tool sent pos as an ARRAY, [x, y, z], where DockingMan
+        -- reads pos.x -- so every field was nil and the display was the first thing to touch them.
+        local p = v.pos or {}
+        local s_Where = (p.x ~= nil) and ("(" .. tostring(p.x) .. ", " .. tostring(p.y) .. ", " .. tostring(p.z) .. ")")
+                        or "(bad pos)"
+        m_Monitor.write("[" .. tostring(v.id) .. "] " .. tostring(v.name) .. " - ["
+                        .. tostring(v.freeSlot) .. "/" .. tostring(v.slots) .. "] -  " .. s_Where)
     end
 end
 

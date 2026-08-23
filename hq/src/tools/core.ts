@@ -1131,6 +1131,66 @@ registry.register({
   },
 });
 
+// ── dock.list / dock.add ───────────────────────────────────────────────────
+registry.register({
+  name: 'dock.list',
+  summary: 'Docking towers and who is berthed in them.',
+  description:
+    'A docking tower is a column with four berths per level in a plus around a central inventory, ' +
+    'so all four drones in a level face the same block and can draw fuel from it. Slots are ' +
+    'reserved on docking and released on undocking.',
+  params: z.object({}).strict(),
+  returns: 'Towers with position, slot count, and current occupants.',
+  danger: 'read',
+  handler: async () => {
+    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    return await bridge.call('DockingMan', 'ls', {}, { timeoutMs: 8000 });
+  },
+});
+
+registry.register({
+  name: 'dock.add',
+  summary: 'Register a docking tower at a position.',
+  description:
+    'Until one exists, drones have nowhere to park and nowhere to refuel -- and a drone that ' +
+    'cannot refuel eventually strands somewhere that needs a miner sent to dig it out. The ' +
+    'position is the CENTRAL COLUMN, not a berth: DockingMan places slot % 4 at pos +/- 1 in x or ' +
+    'z and turns each drone inward to face it, and height comes from floor(slot / 4). So the ' +
+    'position wants to be an inventory with open air on four sides at every level it serves.',
+  params: z.object({
+    name: z.string().describe('Human label for the tower.'),
+    x: z.number(), y: z.number(), z: z.number(),
+    height: z.number().default(4).describe('Levels of four berths each, counting up from y.'),
+  }).strict(),
+  returns: 'The registered tower.',
+  danger: 'mutate',
+  bounds: 'Registers the tower in DockingMan. It does not build anything -- the blocks must already be there.',
+  handler: async (a) => {
+    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    return await bridge.call(
+      'DockingMan', 'add',
+      { name: a.name, pos: [a.x, a.y, a.z], height: a.height },
+      { timeoutMs: 8000 },
+    );
+  },
+});
+
+registry.register({
+  name: 'dock.remove',
+  summary: 'Unregister a docking tower.',
+  description:
+    'Needed more often than it sounds: a tower registered with a bad position cannot be fixed in ' +
+    'place, only deleted and re-made.',
+  params: z.object({ id: z.string().describe('Tower id from dock.list.') }).strict(),
+  returns: 'Confirmation from DockingMan.',
+  danger: 'mutate',
+  bounds: 'Drones berthed in it lose their slot record; they re-allocate on the next dock.',
+  handler: async (a) => {
+    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    return await bridge.call('DockingMan', 'rm', { id: a.id }, { timeoutMs: 8000 });
+  },
+});
+
 // ── storage.smelt ──────────────────────────────────────────────────────────
 registry.register({
   name: 'storage.smelt',
