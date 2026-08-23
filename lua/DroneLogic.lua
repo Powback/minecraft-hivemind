@@ -560,7 +560,15 @@ end
 -- After booting: pick the job back up. The file lives in the computer's own directory, which
 -- survives reboots, so it does not depend on any server being reachable at the wrong moment.
 local RESUME_FILE = "/resume.txt"
+-- Open sky over this world: the survey bounds top out at y=127 and the terrain surface sits around
+-- y=70-90, so a drone at this height has clear air in every direction to cross under its own power.
+local CRUISE_Y = 110
 m_Job = nil          -- {verb, data} for whatever is currently running
+-- Forward declaration. resumeJob above dispatches through this table, and the table itself is
+-- defined near the bottom of the file once every handler exists. Without the declaration here the
+-- name in resumeJob would compile to a GLOBAL lookup and read nil -- the same scoping trap that
+-- made pgps.mayStep refuse every direction for every stranded drone.
+local m_DroneEvents
 
 local function saveResume()
     if m_Job == nil then
@@ -597,12 +605,26 @@ local function resumeJob()
     if s_Job == nil then return end
     print("resuming " .. tostring(s_Job.verb))
     os.sleep(5)                 -- let the servers finish coming up before talking to them
-    if s_Job.verb == "Survey" then
-        pcall(OnSurvey, 0, {data = s_Job.data})
-    elseif s_Job.verb == "Scan" then
-        pcall(OnScan, 0, {data = s_Job.data})
-    elseif s_Job.verb == "Dig" then
-        pcall(OnDig, 0, {data = s_Job.data})
+    -- DISPATCH THROUGH THE HANDLER TABLE, NOT AN IF-CHAIN.
+    --
+    -- This listed Survey, Scan and Dig. The drone accepts fourteen verbs, so Mine, Gather, Haul,
+    -- Craft, Build, Lumber, Relay, GoTo and Rescue were all saved to the resume file on stand-down
+    -- and then silently thrown away on the way back up -- no error, no log line, just a drone that
+    -- woke with nothing to do.
+    --
+    -- That is not a rare path. MainFrame broadcasts INIT on every boot and every module reload, and
+    -- INIT is a fleet-wide stand-down: ALL 23 drones save a resume and reboot. So one MainFrame
+    -- restart quietly cancelled most of the fleet's work, which is what "why is everything idle"
+    -- has been. D21's log is the whole story repeated verbatim: "status updating left behind with
+    -- no job running -- clearing to idle".
+    --
+    -- Reading the verb out of m_DroneEvents means resume can never fall behind the handler list
+    -- again, because there is no second list to keep in sync.
+    local s_Entry = m_DroneEvents and m_DroneEvents[s_Job.verb]
+    if s_Entry and s_Entry.func then
+        pcall(s_Entry.func, 0, {data = s_Job.data})
+    else
+        trace(("resume: no handler for verb %s -- dropping the job"):format(tostring(s_Job.verb)))
     end
 end
 
@@ -750,6 +772,27 @@ function OnSurvey(p_ID, p_Message)
         if s_At == false then
             trace("survey: no mapped route to the start -- flying")
             s_At = pgps.flyTo(tonumber(d.pos.x), s_Ty, tonumber(d.pos.z))
+        end
+        -- LAST RESORT: CLIMB OUT AND CROSS OVER THE TOP.
+        --
+        -- Travelling at the drone's own altitude fails whenever the straight line between here and
+        -- there runs through a hill -- flyTo climbs over obstacles it meets, but it cannot climb out
+        -- of a shaft and back down into another one, and a scout carries a scanner instead of a
+        -- pickaxe so it cannot cut through. This was the fleet's single biggest source of wasted
+        -- work: "Survey FAILED: could not reach" three times per task, then the task given up, then
+        -- the supply loop building the same task again.
+        --
+        -- A miner would dig. A scout goes over the top: up to open sky, across, and settle() drops it
+        -- onto the surface on arrival. CRUISE_Y sits above the highest terrain in the surveyed
+        -- world (bounds max out at y=127) while staying inside the build limit.
+        if s_At == false then
+            local _, s_Cy = pgps.getCachedPosition()
+            if s_Cy == nil or s_Cy < CRUISE_Y then
+                trace(("survey: boxed in at y=%s -- climbing to %d to cross"):format(tostring(s_Cy), CRUISE_Y))
+                if pgps.flyTo(nil, CRUISE_Y, nil) ~= false then
+                    s_At = pgps.flyTo(tonumber(d.pos.x), CRUISE_Y, tonumber(d.pos.z))
+                end
+            end
         end
         if s_At == false then
             TaskEnd()
@@ -2022,7 +2065,7 @@ end
 
 
 
-local m_DroneEvents = {
+m_DroneEvents = {
     Reboot = {
         func = OnReboot,
     },

@@ -185,19 +185,28 @@ end
 --
 -- A drone with no known position sorts last rather than being excluded: it can still take work, it
 -- is just the worst candidate for work with a location.
-local function pickDrone(p_Role, p_Pos)
+-- p_Avoid is the drone that last failed this task. It stays eligible -- a fleet of one must retry --
+-- but only once nobody else can take it, so a task with three attempts spends them on three
+-- different drones instead of three times on the same one.
+local function pickDrone(p_Role, p_Pos, p_Avoid)
     local s_Busy, s_Best, s_BestD = nil, nil, nil
+    local s_Fallback = nil
     for _, d in ipairs(fleet()) do
         if (d.role or "miner") == p_Role then
             if d.status == "idle" and not committed(d.id) then
-                local s_D = distTo(d, p_Pos)
-                if s_BestD == nil or s_D < s_BestD then s_Best, s_BestD = d, s_D end
+                if p_Avoid ~= nil and d.id == p_Avoid then
+                    s_Fallback = s_Fallback or d
+                else
+                    local s_D = distTo(d, p_Pos)
+                    if s_BestD == nil or s_D < s_BestD then s_Best, s_BestD = d, s_D end
+                end
             else
                 s_Busy = s_Busy or d
             end
         end
     end
     if s_Best then return s_Best end
+    if s_Fallback then return s_Fallback end
     return nil, s_Busy
 end
 
@@ -281,7 +290,7 @@ function OnStartTask(p_ID, p_Message)
     end
 
     local s_Where = workPos(s_Task)
-    local s_Drone, s_Busy = pickDrone(s_Role, s_Where)
+    local s_Drone, s_Busy = pickDrone(s_Role, s_Where, s_Task.lastFailedBy)
 
     -- PLACING A BLOCK NEEDS NO SPECIAL HARDWARE.
     --
@@ -546,7 +555,23 @@ function Tick()
                                 -- So a stuck drone must STAY stuck for a full reclaim window before
                                 -- its work is taken. Genuinely wedged drones still lose the task;
                                 -- drones having a bad second keep it.
-                                if d.status == "stuck" or d.status == "blocked" or d.status == "lost" then
+                                -- IDLE COUNTS AS STALLED. A drone holding a task and reporting
+                                -- "idle" is not working on it -- it has dropped the job and is
+                                -- sitting still -- but idle was not in this list, and the else
+                                -- branch below actively cleared the timer every pass. So the task
+                                -- was held forever by a drone that would never finish it.
+                                --
+                                -- The log had been saying so for hours: 61 lines of
+                                -- "reclaim? task N held by X: idle", every one of them a decision
+                                -- to do nothing. Five scouts sat idle holding assignments while 58
+                                -- tasks waited unassigned and ten drones had nothing to do.
+                                --
+                                -- It goes through the same sustained window as stuck rather than
+                                -- freeing immediately, because a drone does report idle for a
+                                -- moment between the legs of a job, and reclaiming on that made
+                                -- drones start over from scratch repeatedly.
+                                if d.status == "stuck" or d.status == "blocked"
+                                        or d.status == "lost" or d.status == "idle" then
                                     v.stuckSince = v.stuckSince or os.epoch("utc")
                                     if (os.epoch("utc") - v.stuckSince) > RECLAIM_AFTER_MS then
                                         s_Free = true
@@ -569,7 +594,7 @@ function Tick()
                         Log(("reclaim? task %s held by %s: %s"):format(
                             tostring(v.id), tostring(v.assignedTo), s_Saw))
                         if s_Idle then
-                            print("reclaiming task " .. tostring(v.id) .. " -- never started")
+                            Log("reclaiming task " .. tostring(v.id) .. " from " .. tostring(v.assignedTo) .. " -- never started")
                             v.assigned, v.assignedTo, v.assignedAt = nil, nil, nil
                             PowNet.MarkDirty()
                         end
@@ -709,13 +734,22 @@ function OnTaskDone(p_ID, p_Message)
             -- Out of attempts: this one really is finished, unsuccessfully, and says why.
             s_Task.progress   = 100
             s_Task.finishedAt = os.epoch("utc")
-            print(("task %s GIVING UP after %d attempts: %s")
+            Log(("task %s GIVING UP after %d attempts: %s")
                 :format(tostring(d.id), s_Task.attempts, s_Reason))
         else
             -- Back in the queue for someone else. Progress deliberately untouched.
-            print(("task %s failed (%s) -- requeued, attempt %d")
+            Log(("task %s failed (%s) -- requeued, attempt %d")
                 :format(tostring(d.id), s_Reason, s_Task.attempts))
         end
+        -- REMEMBER WHO COULD NOT DO IT.
+        --
+        -- pickDrone chooses the NEAREST idle drone, and the nearest idle drone to a task that just
+        -- failed is invariably the one that just failed it -- sitting exactly where it gave up. So
+        -- all three attempts were spent on the same drone failing the same way, the task was then
+        -- dropped, the supply loop made another one for the same place, and it went to the same
+        -- drone again. Scouts logged "Survey FAILED: could not reach" for hours while other scouts
+        -- stood idle, and from outside the whole fleet just looked lazy.
+        s_Task.lastFailedBy = s_Task.assignedTo
         s_Task.assigned, s_Task.assignedTo, s_Task.assignedAt = nil, nil, nil
         PowNet.MarkDirty()
         return true, {id = d.id, requeued = s_Task.progress ~= 100}
