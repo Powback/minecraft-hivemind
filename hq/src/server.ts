@@ -74,6 +74,28 @@ async function luaManifest() {
 
 // ── HTTP ───────────────────────────────────────────────────────────────────
 
+/**
+ * Cache for the map-wide queries that are expensive INSIDE MapServer.
+ *
+ * Returns the previous answer while a refresh is in flight, and keeps the last good answer if a
+ * refresh fails -- so a slow MapServer degrades the map's freshness rather than blanking it.
+ */
+const SLOW_TTL_MS = 120_000;
+const slowCache = new Map<string, { at: number; value: unknown; inflight?: Promise<unknown> }>();
+
+async function slowCached(key: string, fn: () => Promise<unknown>): Promise<unknown> {
+  const hit = slowCache.get(key);
+  if (hit && Date.now() - hit.at < SLOW_TTL_MS) return hit.value;
+  if (hit?.inflight) return hit.value;               // refresh already running; serve what we have
+  const entry = hit ?? { at: 0, value: null };
+  entry.inflight = fn()
+    .then((v) => { entry.value = v; entry.at = Date.now(); return v; })
+    .catch(() => entry.value)                        // keep the last good answer
+    .finally(() => { entry.inflight = undefined; });
+  slowCache.set(key, entry);
+  return hit ? entry.value : await entry.inflight;   // first call waits; later ones do not
+}
+
 const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://hq');
   const send = (code: number, body: unknown, type = 'application/json') => {
@@ -218,15 +240,26 @@ const server = createServer(async (req, res) => {
      * not the whole view -- the alternative is a blank page whenever the slowest call blinks.
      */
     if (url.pathname === '/map/state') {
-      const [fleet, tasks, nodes, caves, ore, dirt, stock] = await Promise.all([
+      // SLOW, MAP-WIDE QUERIES ARE CACHED. THE FAST ONES ARE NOT.
+      //
+      // caves and find each walk the entire world inside MapServer -- at 269,000 cells that is the
+      // most expensive thing the module does -- and this endpoint was asking for three of them on
+      // EVERY poll of the map page. MapServer spent its life recomputing answers that change on the
+      // timescale of mining, not of a browser refresh, and had nothing left for pathfinding: the
+      // Bridge logged "call MapServer.FindBlocks FAILED (lookup=111)" continuously, a module found
+      // and then silent.
+      //
+      // Fleet, tasks and stock stay live: they are cheap, they change constantly, and they are what
+      // the page is actually for.
+      const [fleet, tasks, nodes, stock] = await Promise.all([
         mapCall('fleet.status', {}),
         mapCall('fleet.tasks', {}),
         mapCall('hive.nodes', {}),
-        mapCall('world.caves', { min: 4 }),
-        mapCall('world.find', { match: 'ore', limit: 200 }),
-        mapCall('world.find', { match: 'dirt', limit: 200 }),
         mapCall('storage.stock', {}),
       ]);
+      const caves = await slowCached('caves', () => mapCall('world.caves', { min: 4 }));
+      const ore   = await slowCached('ore',   () => mapCall('world.find', { match: 'ore', limit: 200 }));
+      const dirt  = await slowCached('dirt',  () => mapCall('world.find', { match: 'dirt', limit: 200 }));
       return sendCompact(200, {
         at: Date.now(),
         bridge: bridge.status(),

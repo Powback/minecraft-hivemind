@@ -16,14 +16,49 @@ function getData(p_Key)
     end
     return m_Data[p_Key]
 end
+-- SERIALISE FIRST. NEVER TRUNCATE BEFORE THE REPLACEMENT EXISTS.
+--
+-- This opened the destination with "w" -- which truncates immediately -- and only then serialised.
+-- So any failure to serialise left a ZERO BYTE file, and a module whose stored DATA is zero bytes
+-- can never boot again: Connect fetches it, gets nothing, fails, and the bootloader reboots on a
+-- loop forever. That is precisely how TaskMan and MapServer each died for hours, looking like
+-- unrelated faults.
+--
+-- MapServer made it easy to trigger: its DATA had grown to 7.1 MB (a derived block index that never
+-- needed persisting), and serialising that is exactly the operation likely to fail.
+--
+-- Same fix as UpdateModule already carries: produce the new content, check it, write it to a
+-- scratch file, and only then replace the good one.
 function saveData(p_Key)
     if(p_Key == nil or m_Data[p_Key] == nil) then
         print("Attempted to save invalid data")
         return false
     end
-    local file = fs.open("data/" .. p_Key, "w")
-    file.write(textutils.serialize(m_Data[p_Key]))
-    file.close()
+
+    local ok, s_Text = pcall(textutils.serialize, m_Data[p_Key])
+    if not ok or type(s_Text) ~= "string" or #s_Text == 0 then
+        print("refusing to save " .. tostring(p_Key) .. ": serialise failed; keeping the old file")
+        return false
+    end
+
+    local s_Tmp = "data/" .. p_Key .. ".new"
+    local h = fs.open(s_Tmp, "w")
+    if h == nil then
+        print("cannot open " .. s_Tmp)
+        return false
+    end
+    h.write(s_Text)
+    h.close()
+
+    -- Check what actually landed before replacing a working file with it.
+    if not fs.exists(s_Tmp) or fs.getSize(s_Tmp) == 0 then
+        print("refusing to save " .. tostring(p_Key) .. ": staged file is empty")
+        fs.delete(s_Tmp)
+        return false
+    end
+
+    if fs.exists("data/" .. p_Key) then fs.delete("data/" .. p_Key) end
+    fs.move(s_Tmp, "data/" .. p_Key)
     return true
 end
 function saveAllData()

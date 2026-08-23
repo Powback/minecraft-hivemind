@@ -665,7 +665,19 @@ async function loadVoxels(): Promise<Record<string, number>> {
       console.log(`[voxels] partial read (${Object.keys(grid).length} cells); keeping the previous ${Object.keys(voxelCache.grid).length}`);
       return voxelCache.grid;
     }
-    voxelCache = { at: Date.now(), grid };
+    // NEVER CACHE A TRUNCATED READ AT FULL TTL, AND NEVER CACHE AN EMPTY ONE AT ALL.
+    //
+    // A failed page-0 -- MapServer restarting, or busy -- produced an empty grid with no previous
+    // cache to fall back on, and that emptiness was then stored for the full five minutes. The map
+    // page showed no terrain and kept showing none long after MapServer was healthy again, which
+    // read as lost survey data: /map/voxels returned known:0 with cachedAgeMs:103819 while MapServer
+    // held 274,750 cells. Backdating the timestamp makes a partial answer expire in 30s instead of
+    // 300, so the map heals itself on the next poll rather than at the next restart.
+    if (truncated && Object.keys(grid).length === 0) {
+      console.log('[voxels] read returned nothing; not caching, will retry');
+      return grid;
+    }
+    voxelCache = { at: truncated ? Date.now() - (VOXEL_CACHE_MS - 30_000) : Date.now(), grid };
     return grid;
   })().finally(() => { voxelInflight = null; });
   return voxelInflight;
@@ -742,16 +754,38 @@ async function loadBlocks(): Promise<Record<string, string>> {
     // Page through it. MapServer caps each reply so it fits in a websocket frame -- asking for
     // the whole map in one go produced 427KB, which CC:T refuses to send, and the failed send
     // closed the socket and dropped the WHOLE FLEET off HQ every time this ran.
+    // 40 pages of 2000 was a 80,000-entry ceiling on an index that now holds 172,296 named blocks,
+    // so even a healthy read stopped less than halfway and reported no error. The limit exists only
+    // to bound a runaway paginator, so it is set above the largest plausible index rather than at
+    // yesterday's map size.
     const map: Record<string, string> = {};
     let offset: number | undefined = 0;
-    for (let page = 0; page < 40 && offset !== undefined; page++) {
-      const res: any = await bridge.call('MapServer', 'BlockAt', { offset }, { timeoutMs: 8000 });
-      const chunk = res?.blockAt ?? res?.data?.blockAt ?? {};
+    let truncated = false;
+    for (let page = 0; page < 300 && offset !== undefined; page++) {
+      let res: any;
+      try {
+        // A slow page is not a missing one. Eight seconds was tight enough that a busy MapServer
+        // threw here, which -- with no catch -- rejected the whole read and left the map with no
+        // block identities at all.
+        res = await bridge.call('MapServer', 'BlockAt', { offset }, { timeoutMs: 20_000 });
+      } catch {
+        res = null;
+      }
+      const chunk = res?.blockAt ?? res?.data?.blockAt;
+      if (!chunk || typeof chunk !== 'object') { truncated = true; break; }
       Object.assign(map, chunk);
       const nxt = res?.next ?? res?.data?.next;
       offset = typeof nxt === 'number' ? nxt : undefined;
     }
-    blocksCache = { at: Date.now(), map };
+    if (truncated && blocksCache && Object.keys(blocksCache.map).length > Object.keys(map).length) {
+      console.log(`[blocks] partial read (${Object.keys(map).length}); keeping the previous ${Object.keys(blocksCache.map).length}`);
+      return blocksCache.map;
+    }
+    if (truncated && Object.keys(map).length === 0) {
+      console.log('[blocks] read returned nothing; not caching, will retry');
+      return map;
+    }
+    blocksCache = { at: truncated ? Date.now() - (BLOCKS_CACHE_MS - 30_000) : Date.now(), map };
     return map;
   })().finally(() => { blocksInflight = null; });
   return blocksInflight;

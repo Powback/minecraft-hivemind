@@ -105,6 +105,21 @@ function Init()
     Log("boot: ready, indexed " .. tostring(s_N) .. " named blocks")
 end
 
+-- THE BLOCK INDEX IS DERIVED AND MUST NOT LIVE IN DATA.
+--
+-- It used to be m_BlockAt and m_BlockIndex, and DATA is what gets shipped to MainFrame
+-- -- both periodically via MarkDirty/Save and on shutdown. The index for this map is 162,149 named
+-- blocks and serialises to about 7 MB, so MapServer spent its life trying to push seven megabytes
+-- through a rednet message. It answered nothing while doing so, and the write eventually failed and
+-- left a ZERO BYTE DATA file behind, after which it could never boot again.
+--
+-- Nothing about it needs persisting: Init() rebuilds it from the chunk files on disk, which carry
+-- block names through the interned dictionary. That rebuild takes four seconds. Keeping it in
+-- module-local tables costs one boot-time rebuild and removes the whole failure mode.
+local m_BlockAt, m_BlockIndex = {}, {}
+-- Pinned key ordering for BlockAt's paginator; rebuilt whenever a walk starts at offset 0.
+local m_BlockKeys = nil
+
 function OnSaveWorld(p_ID, p_Message)
     -- Was `mergeData(p_Message.data)`, and mergeData is defined nowhere in this codebase -- so
     -- the one endpoint named after saving the world crashed on "attempt to call a nil value" the
@@ -203,17 +218,30 @@ function OnLoadWorld(p_ID, p_Message)
     --
     -- The cache is rebuilt whenever a walk starts from offset 0, so a paged read is consistent and
     -- fresh observations are picked up on the next full pass.
+    --
+    -- IT YIELDS. Building the list is one pass over every cell in the world, and at 269,650 cells
+    -- that pass runs past CC's ten-second limit -- at which point the coroutine is killed, and that
+    -- kill is not catchable. This is exactly what was wrong: MapServer logged
+    -- "LoadWorld: live=269650 keys=269650" ONCE and never logged again, because building the list
+    -- was the last thing it ever did. Every call after that -- Status, BlockAt, FindBlocks,
+    -- FindCaves -- failed against a module that was still resident, still had a modem, and still
+    -- resolved through rednet.lookup. A module found and then silent.
     if s_Offset == 0 or m_PageKeys == nil then
         m_PageKeys = {}
-        for key in pairs(s_World) do m_PageKeys[#m_PageKeys + 1] = key end
+        local s_Since = 0
+        for key in pairs(s_World) do
+            m_PageKeys[#m_PageKeys + 1] = key
+            s_Since = s_Since + 1
+            if s_Since >= 2000 then s_Since = 0 ; os.queueEvent("mapPage") ; os.pullEvent("mapPage") end
+        end
     end
 
-    -- Report what the SERVING path sees. The load logs 230,629 cells and the caller gets zero, so
-    -- one of those two views of cachedWorld is wrong and only the server can say which.
+    -- One number, taken from the list just built. The count used to be its own second walk of all
+    -- 269,650 cells, doubling the cost of the very handler that was being killed for taking too
+    -- long -- and it existed to answer a question ("does the serving path see the same world the
+    -- loader logged?") that it already answered: it does, live and keys were equal.
     if s_Offset == 0 and _G.Log then
-        local s_Live = 0
-        for _ in pairs(s_World) do s_Live = s_Live + 1 end
-        _G.Log(("LoadWorld: live=%d keys=%d"):format(s_Live, #m_PageKeys))
+        _G.Log(("LoadWorld: %d cells"):format(#m_PageKeys))
     end
 
     local s_N = #m_PageKeys
@@ -444,7 +472,7 @@ end
 local INDEX_MAX_POSITIONS = 256   -- per name; ores are few, stone is not worth enumerating
 
 local function idxRemovePos(p_Name, p_Key)
-    local e = DATA["blockIndex"][p_Name]
+    local e = m_BlockIndex[p_Name]
     if e == nil then return end
     e.count = math.max(0, (e.count or 1) - 1)
     if e.at then
@@ -453,31 +481,31 @@ local function idxRemovePos(p_Name, p_Key)
             if q and (q.x .. ":" .. q.y .. ":" .. q.z) == p_Key then table.remove(e.at, i) break end
         end
     end
-    if e.count == 0 and (e.at == nil or #e.at == 0) then DATA["blockIndex"][p_Name] = nil end
+    if e.count == 0 and (e.at == nil or #e.at == 0) then m_BlockIndex[p_Name] = nil end
 end
 
 -- Record what is at a position NOW. p_Name nil means "air / nothing there any more".
 function ObserveBlock(p_Key, p_Name)
-    if DATA["blockIndex"] == nil then DATA["blockIndex"] = {} end
-    if DATA["blockAt"] == nil then DATA["blockAt"] = {} end
+    if m_BlockIndex == nil then m_BlockIndex = {} end
+    if m_BlockAt == nil then m_BlockAt = {} end
 
-    local s_Was = DATA["blockAt"][p_Key]
+    local s_Was = m_BlockAt[p_Key]
     if s_Was == p_Name then return false end          -- nothing changed
     if s_Was then idxRemovePos(s_Was, p_Key) end
 
     if p_Name == nil then
-        DATA["blockAt"][p_Key] = nil
+        m_BlockAt[p_Key] = nil
         return true
     end
 
-    local e = DATA["blockIndex"][p_Name]
-    if e == nil then e = {count = 0, at = {}} DATA["blockIndex"][p_Name] = e end
+    local e = m_BlockIndex[p_Name]
+    if e == nil then e = {count = 0, at = {}} m_BlockIndex[p_Name] = e end
     e.count = (e.count or 0) + 1
     if #e.at < INDEX_MAX_POSITIONS then
         local x, y, z = parseKey(p_Key)
         if x then e.at[#e.at + 1] = {x = x, y = y, z = z} end
     end
-    DATA["blockAt"][p_Key] = p_Name
+    m_BlockAt[p_Key] = p_Name
     return true
 end
 
@@ -489,17 +517,17 @@ end
 -- cannot load, which is the whole reason the index exists. So seed from the samples instead. They
 -- are the positions gather actually digs at, so they are the ones that must be able to go stale.
 function BackfillBlockAt()
-    if DATA["blockAt"] ~= nil then return 0 end       -- already migrated
-    DATA["blockAt"] = {}
+    if m_BlockAt ~= nil then return 0 end       -- already migrated
+    m_BlockAt = {}
     local s_N = 0
     local s_Walked = 0
-    for name, e in pairs(DATA["blockIndex"] or {}) do
+    for name, e in pairs(m_BlockIndex or {}) do
         -- Same reason as IndexNames: this runs at boot over whatever the index has accumulated.
         s_Walked = s_Walked + 1
         if s_Walked % 500 == 0 then os.sleep(0) end
         for _, q in ipairs(e.at or {}) do
             if q and q.x then
-                DATA["blockAt"][q.x .. ":" .. q.y .. ":" .. q.z] = name
+                m_BlockAt[q.x .. ":" .. q.y .. ":" .. q.z] = name
                 s_N = s_N + 1
             end
         end
@@ -537,11 +565,18 @@ end
 -- itself. This is the half that was missing -- scans could add, but nothing could take away.
 function IndexOccupancy(p_World)
     if type(p_World) ~= "table" then return 0 end
-    local s_Changed = 0
+    -- Yields, like every other walk in here. This one normally sees a small delta -- drones send
+    -- takeWorldDelta() now, not their whole map -- but "normally" is doing the work in that
+    -- sentence: a drone that has never reported, or one reconnecting after a long blind dig, hands
+    -- over everything it has seen. That is a request handler walking an unbounded table, which is
+    -- the shape that has killed this module repeatedly.
+    local s_Changed, s_Walk = 0, 0
     for key, v in pairs(p_World) do
-        if v == 0 and DATA["blockAt"] and DATA["blockAt"][key] then
+        if v == 0 and m_BlockAt and m_BlockAt[key] then
             if ObserveBlock(key, nil) then s_Changed = s_Changed + 1 end
         end
+        s_Walk = s_Walk + 1
+        if s_Walk % 2000 == 0 then os.queueEvent("caveStep") os.pullEvent("caveStep") end
     end
     if s_Changed > 0 then PowNet.MarkDirty() end
     return s_Changed
@@ -557,7 +592,7 @@ function OnFindBlocks(p_ID, p_Message)
 
     -- Served from the incremental index, NOT by walking the detail map: that map is over 1.2MB
     -- and does not load on an in-world computer, so scanning it returned zero for every query.
-    local s_Index = DATA["blockIndex"] or {}
+    local s_Index = m_BlockIndex or {}
     local s_Hits, s_Counts, s_Total = {}, {}, 0
     for s_Name, e in pairs(s_Index) do
         if string.find(s_Name, s_Match, 1, true) then
@@ -603,18 +638,36 @@ function OnBlockAt(p_ID, p_Message)
     local d = p_Message.data or {}
     local s_Offset = tonumber(d.offset) or 0
     local s_Limit  = math.min(tonumber(d.limit) or BLOCKAT_PAGE, BLOCKAT_PAGE)
-    local s_At = DATA["blockAt"] or {}
+    local s_At = m_BlockAt or {}
 
-    -- pairs() order is not stable across calls in general, but this table is only mutated by
-    -- observations, so a page walk between polls is close enough for a display. Sorting 1,900 keys
-    -- on every request to guarantee it would cost more than the imprecision is worth.
-    local s_Page, s_N, s_Sent = {}, 0, 0
-    for key, name in pairs(s_At) do
-        if s_N >= s_Offset and s_Sent < s_Limit then
-            s_Page[key] = name
-            s_Sent = s_Sent + 1
+    -- INDEX THE KEYS ONCE, then serve slices -- exactly as LoadWorld does, and for the same reason.
+    -- This walked all 172,296 named blocks on EVERY page to find its 2000, so reading the index end
+    -- to end came to 86 pages x 172,296 = fifteen million iterations, none of them yielding. Page
+    -- nine ran past CC's ten-second limit and was killed, HQ read the dead page as the end of the
+    -- map, and 16,000 identified blocks got cached as though that were all of them. That is the
+    -- "blocks missing from /map" report: not lost survey data, a paginator that could not reach past
+    -- its eighth page.
+    --
+    -- The comment this replaces argued the imprecision of an unstable pairs() order was cheaper than
+    -- sorting "1,900 keys". The table is ninety times that size now, and the cost was never the
+    -- ordering -- it was re-walking the whole index per page. Pinning the order at offset 0 fixes
+    -- both: one walk per full read, and pages that cannot skip or repeat entries while scans arrive.
+    if s_Offset == 0 or m_BlockKeys == nil then
+        m_BlockKeys = {}
+        local s_Since = 0
+        for key in pairs(s_At) do
+            m_BlockKeys[#m_BlockKeys + 1] = key
+            s_Since = s_Since + 1
+            if s_Since >= 2000 then s_Since = 0 ; os.queueEvent("blockPage") ; os.pullEvent("blockPage") end
         end
-        s_N = s_N + 1
+    end
+
+    local s_N = #m_BlockKeys
+    local s_Page, s_Sent = {}, 0
+    for i = s_Offset + 1, math.min(s_Offset + s_Limit, s_N) do
+        local name = s_At[m_BlockKeys[i]]
+        if name then s_Page[m_BlockKeys[i]] = name end
+        s_Sent = s_Sent + 1
     end
 
     local s_Next = s_Offset + s_Sent
@@ -682,9 +735,19 @@ end
 
 local ADJACENT = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}}
 
-function OnFindCaves(p_ID, p_Message)
-    local d = p_Message.data or {}
-    local s_MinSize = tonumber(d.min) or 8
+-- CAVES ARE COMPUTED IN THE BACKGROUND, NOT WHILE A CALLER WAITS.
+--
+-- This is two full walks of the world plus a flood fill, and it yields roughly every 2000 cells --
+-- but a yield in CC costs a whole tick, so at 274,750 cells the yields ALONE are about fourteen
+-- seconds before any actual work. No caller will ever wait that long: world.caves timed out at 60s
+-- and the next call in was refused too, because MapServer was still finishing the fill.
+--
+-- It does not need to be live. Caves change when drones dig, on the timescale of minutes, and every
+-- consumer (the map page, the survey dispatcher) is looking at a picture of the world rather than
+-- steering off it. So it runs on a loop and the handler serves the last answer, instantly.
+local m_Caves, m_CavesAt, m_CavesMin = nil, 0, 8
+
+local function ComputeCaves(s_MinSize)
     local s_World = PowGPSServer.getCachedWorld() or {}
 
     -- Surface height per column, so open air can be told from enclosed air.
@@ -698,7 +761,7 @@ function OnFindCaves(p_ID, p_Message)
     local s_Walk = 0
     for key, v in pairs(s_World) do
         s_Walk = s_Walk + 1
-        if s_Walk % 2000 == 0 then os.sleep(0) end
+        if s_Walk % 2000 == 0 then os.queueEvent("caveStep") os.pullEvent("caveStep") end
         if v == 1 then
             local x, y, z = parseKey(key)
             if x then
@@ -712,7 +775,7 @@ function OnFindCaves(p_ID, p_Message)
     s_Walk = 0
     for key, v in pairs(s_World) do
         s_Walk = s_Walk + 1
-        if s_Walk % 2000 == 0 then os.sleep(0) end
+        if s_Walk % 2000 == 0 then os.queueEvent("caveStep") os.pullEvent("caveStep") end
         if v == 0 and not s_Seen[key] then
             local x0, y0, z0 = parseKey(key)
             local col = x0 and (x0 .. ":" .. z0)
@@ -729,7 +792,7 @@ function OnFindCaves(p_ID, p_Message)
                 local s_Fill = 0
                 while #s_Stack > 0 do
                     s_Fill = s_Fill + 1
-                    if s_Fill % 2000 == 0 then os.sleep(0) end
+                    if s_Fill % 2000 == 0 then os.queueEvent("caveStep") os.pullEvent("caveStep") end
                     local c = table.remove(s_Stack)
                     s_Cells[#s_Cells + 1] = c
                     for _, o in ipairs(ADJACENT) do
@@ -764,8 +827,39 @@ function OnFindCaves(p_ID, p_Message)
         end
     end
     table.sort(s_Caves, function(a, b) return a.size > b.size end)
-    return true, {message = #s_Caves .. " cave pocket(s) of >= " .. s_MinSize .. " cells",
-                  count = #s_Caves, caves = s_Caves}
+    return s_Caves
+end
+
+-- Serve the cache. Never compute here.
+function OnFindCaves(p_ID, p_Message)
+    local d = p_Message.data or {}
+    local s_MinSize = tonumber(d.min) or 8
+    -- A different threshold than the one last computed is worth honouring, but on the NEXT pass --
+    -- the loop picks it up. Answering "here is the map I have" beats answering nothing.
+    m_CavesMin = s_MinSize
+    if m_Caves == nil then
+        return true, {message = "cave scan has not finished its first pass yet",
+                      count = 0, caves = {}, ready = false}
+    end
+    local s_Age = math.floor(os.clock() - m_CavesAt)
+    return true, {message = #m_Caves .. " cave pocket(s) of >= " .. m_CavesMin
+                      .. " cells, scanned " .. s_Age .. "s ago",
+                  count = #m_Caves, caves = m_Caves, ready = true, age = s_Age}
+end
+
+-- Rescan on a slow loop. The first pass runs shortly after boot so the answer is there before
+-- anything asks; after that, once a minute is far more often than caves actually change.
+local function CaveLoop()
+    os.sleep(20)
+    while true do
+        local ok, s_Result = pcall(ComputeCaves, m_CavesMin)
+        if ok then
+            m_Caves, m_CavesAt = s_Result, os.clock()
+        else
+            Log("cave scan failed: " .. tostring(s_Result))
+        end
+        os.sleep(60)
+    end
 end
 
 local m_ServerEvents = {
@@ -852,7 +946,47 @@ end
 
 
 Init()
-PowNet.RegisterEvents(m_ServerEvents, m_DroneEvents, Render)
+
+-- DO NOT PERSIST THE BLOCK INDEX. IT IS DERIVED.
+--
+-- blockAt and blockIndex live in DATA, and DATA is written back to MainFrame over rednet when a
+-- module stands down. They had grown to 7.1 MB -- blockAt alone accounted for 6.8 MB -- so every
+-- shutdown tried to push seven megabytes through a rednet message, and MapServer simply never
+-- finished: it exited cleanly, hung in the write-back, and never reached the reboot. From outside
+-- it looked like a module that had died without a reason, which is exactly what it looked like for
+-- hours.
+--
+-- Neither table needs persisting. Init() rebuilds both from the chunk files on disk, which already
+-- carry block names through the interned dictionary -- that is what "indexed N named blocks" is
+-- reporting. Dropping them before the write-back costs one boot-time rebuild and saves shipping
+-- the entire index across the network every time anything restarts.
+PowNet.SetShutdownHook(function(p_Reason)
+    m_BlockAt, m_BlockIndex = nil, nil
+    print("dropped the derived block index before write-back (" .. tostring(p_Reason) .. ")")
+end)
+
+-- RENDER IS NOT THE POST-MESSAGE HOOK.
+--
+-- The third argument to RegisterEvents is what PowNet.main runs after EVERY message it handles --
+-- and this was Render, which walks all 274,750 cells to build a height field and makes a rednet
+-- round-trip to DroneMan on the way. So MapServer answered exactly one request and then spent
+-- longer than CC's ten-second limit drawing a monitor nobody was looking at, over and over, once
+-- per message. That is the whole of "a module found and then silent": it hosted its name, resolved
+-- for every caller, served the first thing it was asked, and starved from then on. Making RenderLoop
+-- follow-mode-only fixed the timer but left this path untouched, which is why the symptom survived.
+--
+-- Same gate as the loop, plus a floor between redraws: the picture only changes on its own in follow
+-- mode, and no monitor needs redrawing several times a second.
+local m_LastRender = 0
+local function RenderIfWatched()
+    if not MapRender.following() then return end
+    local s_Now = os.clock()
+    if s_Now - m_LastRender < 5 then return end
+    m_LastRender = s_Now
+    pcall(Render)
+end
+
+PowNet.RegisterEvents(m_ServerEvents, m_DroneEvents, RenderIfWatched)
 
 SetStatus("Connected!", colors.green)
 
@@ -867,19 +1001,24 @@ SetStatus("Connected!", colors.green)
 --
 -- The map is a display. It can wait two seconds for the loop below to draw it; the fleet cannot
 -- wait for pathfinding.
+-- RENDER ONLY WHEN SOMEONE IS ACTUALLY WATCHING.
+--
+-- Render walks every cell in the map to build a height field, and calls fleet() -- a rednet round
+-- trip to DroneMan -- on the way. At 259,000 cells that is the most expensive thing this module
+-- does, and it was running on the first pass of this loop whether or not anyone was looking at the
+-- monitor. MapServer resolved for every caller and answered none of them: the Bridge logged
+-- "call MapServer.FindBlocks FAILED (lookup=111)" over and over, a module found and then silent.
+--
+-- The monitor is a nicety. Pathfinding is not. Render now happens only in follow mode, which is
+-- the only time the picture changes on its own, and the map is redrawn on message arrival anyway.
 local function RenderLoop()
-    local s_First = true
     while true do
-        -- First pass immediately after the serving loop is up, then only when following.
-        if s_First or MapRender.following() then
-            s_First = false
-            pcall(Render)
-        end
         os.sleep(2)
+        RenderIfWatched()
     end
 end
 
-parallel.waitForAny(PowNet.main, PowNet.droneMain, PowNet.control, RenderLoop)
+parallel.waitForAny(PowNet.main, PowNet.droneMain, PowNet.control, RenderLoop, CaveLoop)
 PowGPSServer.saveAll()
 print("Unhosting")
 rednet.unhost(PowNet.SERVER_PROTOCOL)
