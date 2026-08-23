@@ -139,7 +139,7 @@ export function allocate(reg: Registry, purpose: Purpose, name?: string): Plot |
     //
     // The keep-out is the tower's footprint plus margin for the terraces, which step outward as the
     // building rises.
-    if (withinKeepOut(cell)) continue;
+    if (withinKeepOut(cell, purpose)) continue;
 
     const padded = {
       min: { x: min.x - STREET, y: min.y, z: min.z - STREET },
@@ -168,7 +168,18 @@ function nextName(reg: Registry, purpose: Purpose): string {
  */
 const KEEP_OUT_RADIUS = Number(process.env.HIVE_KEEPOUT ?? 26);
 
-function withinKeepOut(cell: { x: number; z: number }): boolean {
+function withinKeepOut(cell: { x: number; z: number }, purpose: Purpose): boolean {
+  // THE MINE HEAD BELONGS UNDER THE TOWER. That is the entire design.
+  //
+  // The shaft beneath the settlement is three things at once: the excavation for the basement
+  // levels, the quarry that supplies the 20,000 cobblestone the building is made of, and the only
+  // route to the redstone that gates everything above the fifth floor. Pushing it out to the
+  // surface ring -- which the keep-out did, indiscriminately -- turned the centrepiece of the plan
+  // into a random hole in a field 30 blocks away, and left the ground under the tower untouched.
+  //
+  // Surface structures still keep clear of the building and its terraces. Digging underneath it is
+  // the point.
+  if (purpose === 'mine_head') return false;
   const dx = cell.x * CELL;
   const dz = cell.z * CELL;
   return Math.sqrt(dx * dx + dz * dz) < KEEP_OUT_RADIUS;

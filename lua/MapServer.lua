@@ -569,10 +569,23 @@ function IndexNames(p_Detail)
     for key, info in pairs(p_Detail) do
         s_Seen = s_Seen + 1
         if s_Seen % 2000 == 0 then os.sleep(0) end
+        -- THE SHAPE EVERY MOVING DRONE ACTUALLY SENDS WAS THE ONE SHAPE THIS DID NOT ACCEPT.
+        --
+        -- pgps.detectAll records `{turtle.inspect()}`, which is {true, {name = "..."}} -- a plain
+        -- array. This read info.data[2].name and info.name, so that shape matched neither and every
+        -- name observed while travelling was dropped without a word. The map ended up with 33,432
+        -- occupancy cells and TEN names: the fleet was reporting what it saw and the server was
+        -- discarding the useful half.
+        --
+        -- Downstream that is most of what the map is for. world.find could never locate ore, the
+        -- supply loop concluded "none known" for every material and fell back to blind prospecting,
+        -- and the operator view showed terrain with no idea what any of it was made of.
         local s_Name
         if type(info) == "table" then
             local s_Data = info.data
             if type(s_Data) == "table" and type(s_Data[2]) == "table" then s_Name = s_Data[2].name end
+            -- {ok, block} straight from turtle.inspect
+            if not s_Name and info[1] == true and type(info[2]) == "table" then s_Name = info[2].name end
             s_Name = s_Name or info.name
         end
         if s_Name and ObserveBlock(key, s_Name) then s_Changed = s_Changed + 1 end
