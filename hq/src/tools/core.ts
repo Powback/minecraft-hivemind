@@ -480,6 +480,31 @@ registry.register({
 });
 
 registry.register({
+  name: 'world.bounds',
+  summary: 'Read or set the region drones are allowed to move in.',
+  description:
+    'pgps refuses any step that leaves these bounds, and it is right to: stepping into an unloaded ' +
+    'chunk is how a drone stops ticking and is lost. Which makes wrong bounds indistinguishable ' +
+    'from a paralysed fleet -- every drone reports "outside coverage: unloaded chunk" and will not ' +
+    'move, while nothing has actually failed. They must match the force-loaded region.',
+  params: z.object({
+    minx: z.number().optional(), maxx: z.number().optional(),
+    miny: z.number().optional(), maxy: z.number().optional(),
+    minz: z.number().optional(), maxz: z.number().optional(),
+  }).strict(),
+  returns: 'The bounds in force. With no arguments, reads them.',
+  danger: 'mutate',
+  bounds: 'Setting these wider than the force-loaded region will strand drones outside it.',
+  handler: async (a) => {
+    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    if (a.minx === undefined) {
+      return await bridge.call('MapServer', 'GetBounds', {}, { timeoutMs: 8000 });
+    }
+    return await bridge.call('MapServer', 'bounds', a, { timeoutMs: 8000 });
+  },
+});
+
+registry.register({
   name: 'supply.tick',
   summary: 'Run one supply pass now and report exactly what it decided.',
   description:

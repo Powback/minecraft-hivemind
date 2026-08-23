@@ -88,6 +88,7 @@ export const PROFILES: Record<string, AgentProfile> = {
       'dock.add',
       'dock.remove',
       'supply.tick',
+      'world.bounds',
       'rescue.party',
       'rescue.relay',
       'storage.pickup',

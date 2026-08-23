@@ -24,6 +24,7 @@ import { join, dirname } from 'node:path';
 import { bridge } from '../bridge/ws.js';
 import { registry } from '../tools/registry.js';
 import { luaList } from '../lua-table.js';
+import { settlement } from '../world/settlement.js';
 
 export interface SupplyRule {
   /** The BLOCK to go and mine, e.g. "coal_ore". */
@@ -204,13 +205,10 @@ export const supply: SupplyState = loadSupply();
  * HIVE_BASE_X / HIVE_BASE_Z override it; the default is the tower's centre, and the region is
  * derived from the base rather than written out separately, so the two cannot drift apart.
  */
-const BASE = {
-  x: Number(process.env.HIVE_BASE_X ?? -480),
-  z: Number(process.env.HIVE_BASE_Z ?? 64),
-};
+const BASE = settlement.base;
 const TILE = 24;
 /** How far out the fleet is allowed to work, as a radius from base. */
-const REACH = Number(process.env.HIVE_REACH ?? 96);
+const REACH = settlement.reach;
 const REGION = {
   minX: BASE.x - REACH, maxX: BASE.x + REACH,
   minZ: BASE.z - REACH, maxZ: BASE.z + REACH,

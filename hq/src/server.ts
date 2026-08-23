@@ -33,6 +33,7 @@ import { join, relative, extname } from 'node:path';
 import { registry } from './tools/registry.js';
 import { startSupplyLoop } from './agent/supply.js';
 import { startSentinel, sentinel, runSentinelTick } from './agent/sentinel.js';
+import { pushSettlement } from './world/settlement.js';
 import './tools/core.js';                 // side-effect: registers the core tools
 import { buildBrief } from './tools/core.js';
 import { getProfile, permits } from './agent/profiles.js';
@@ -316,6 +317,21 @@ bridge.attach(server, '/bridge');
 server.listen(PORT, '0.0.0.0', () => {
   log(`HQ listening on :${PORT}`);
   log(`  tools registered: ${registry.list().length}`);
+  // TELL THE WORLD WHERE IT IS, ON EVERY CONNECT.
+  //
+  // MapServer restarts independently of HQ, and a module that comes back holding a stale idea of the
+  // settlement paralyses every drone that asks it -- pgps refuses to leave coverage, so wrong bounds
+  // read exactly like a dead fleet while nothing has failed. Pushing on connect rather than once at
+  // boot means the two cannot stay out of step for longer than a reconnection.
+  bridge.onConnect(async () => {
+    try {
+      const r = await pushSettlement((m, meth, args, opts) => bridge.call(m, meth, args as any, opts as any));
+      console.log(`[settlement] pushed to MapServer: bounds=${r.bounds} gpsHosts=${r.hosts}`);
+    } catch (err) {
+      console.log(`[settlement] could not push: ${String(err).slice(0, 120)}`);
+    }
+  });
+
   startSupplyLoop();
   // The part that reads the system's own output. Nothing did, which is why every outage so far has
   // needed a person to spot a contradiction in a log.

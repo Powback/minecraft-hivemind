@@ -27,9 +27,25 @@ function Init()
     PowGPSServer.loadAll()
     Log("boot: map loaded")
     if DATA["bounds"] == nil then
-        -- Matches the force-loaded region. Deliberately a little inside it, so a drone stops
-        -- before the edge rather than exactly on it.
-        DATA["bounds"] = {minx = -180, maxx = -25, miny = 0, maxy = 200, minz = -110, maxz = 15}
+        -- THE THIRD PLACE THE OLD WORLD WAS HARDCODED.
+        --
+        -- This defaulted to the previous settlement's force-loaded region, so a fresh world came up
+        -- with every drone hundreds of blocks OUTSIDE the bounds it had never been told about.
+        -- pgps.mayStep refuses to leave coverage -- correctly, because stepping into an unloaded
+        -- chunk is how a drone stops ticking and is lost -- so all three reported "outside coverage:
+        -- unloaded chunk" and would not move. Nothing had failed. The map simply described somewhere
+        -- else, and every component downstream believed it.
+        --
+        -- Derived from the settlement now, and settable through the bounds endpoint. BASE is the one
+        -- fact that changes when a world is re-founded, and it should appear once.
+        local s_Bx, s_By, s_Bz = -480, 63, 64
+        local s_Reach = 96
+        DATA["bounds"] = {minx = s_Bx - s_Reach, maxx = s_Bx + s_Reach,
+                          miny = -64,            maxy = 200,
+                          minz = s_Bz - s_Reach, maxz = s_Bz + s_Reach}
+        Log(("boot: no bounds stored -- defaulting to %d..%d x %d..%d around the settlement")
+            :format(DATA["bounds"].minx, DATA["bounds"].maxx,
+                    DATA["bounds"].minz, DATA["bounds"].maxz))
     end
     -- TWO CONSTELLATIONS, AND THIS MERGES RATHER THAN ONLY INITIALISING.
     --
@@ -42,40 +58,44 @@ function Init()
     -- saved state. Every existing deployment would have kept the old four-host list for ever and
     -- the new satellites would have been invisible to the coverage check -- physically present,
     -- answering pings, and still refused as "no coverage".
+    -- THE CONSTELLATION IS NOT A CONSTANT. IT WAS TWENTY-TWO OF THEM.
+    --
+    -- This held the previous settlement's 22 hosts and MERGED them in on every boot, so a brand-new
+    -- world inherited a phantom constellation hundreds of blocks away. Coverage is computed from
+    -- these, so every drone in the real world sat outside GPS coverage and refused to move, while
+    -- MapServer reported a healthy 22-host network that did not exist.
+    --
+    -- The bootstrap default is the constellation bootstrap/gps.sh actually places. Anything else
+    -- arrives through the gpshost endpoint, which is how a host built by the fleet registers itself.
     local s_Known = {
-        -- The original surface constellation, deliberately non-coplanar.
-        {x = -92, y = 95, z = -52}, {x = -78, y = 95, z = -52},
-        {x = -92, y = 95, z = -38}, {x = -85, y = 99, z = -45},
-        -- EIGHTEEN HOSTS, PLACED WHERE THE FLEET ACTUALLY IS.
-        --
-        -- Coverage was chased in the wrong direction for a long time. Hosts were added ring by
-        -- ring, then a 40-host lattice, then a searched 60-host one -- and the fleet got WORSE at
-        -- every step, ending with twelve of fourteen drones unable to fix their position while
-        -- sitting inside nominally perfect coverage.
-        --
-        -- Two things were wrong. gps.locate broadcasts and collects every reply inside its timeout,
-        -- so sixty-four hosts answering at once overflows the event queue and the replies it needed
-        -- are among those dropped -- GPS in CC:T does not scale with host count, and past a point
-        -- more hosts is strictly worse. And the geometry was never the real problem: the drones had
-        -- simply WANDERED, three of them past the edge of the force-loaded region entirely, so no
-        -- constellation centred on the base was ever going to reach them.
-        --
-        -- So this was placed against measured drone positions rather than a model of where they
-        -- ought to be, and checked: every drone in the fleet hears at least four. Spread in Y
-        -- because four hosts on a plane cannot resolve altitude.
-        {x = -105, y = 28, z = -70}, {x = -70,  y = 22, z = -66},
-        {x = -100, y = 40, z = -25}, {x = -62,  y = 34, z = -30},
-        {x = -85,  y = 46, z = -55}, {x = -125, y = 30, z = -45},
-        {x = -150, y = 72, z = -60}, {x = -145, y = 44, z = -30},
-        {x = -168, y = 62, z = -70}, {x = -132, y = 56, z = -12},
-        {x = -175, y = 84, z = -66}, {x = -158, y = 90, z = -84},
-        {x = -80,  y = 30, z = -95}, {x = -108, y = 42, z = -92},
-        -- Southeast, added when the fleet expanded past the previous edge. Coverage follows the
-        -- drones; it is checked against their measured positions, not assumed from the base.
-        {x = -45,  y = 80, z = -100}, {x = -60,  y = 88, z = -105},
-        {x = -38,  y = 70, z = -85},  {x = -55,  y = 92, z = -80},
+        {x = -478, y = 78,  z = 90},
+        {x = -464, y = 93,  z = 83},
+        {x = -504, y = 82,  z = 58},
+        {x = -465, y = 82,  z = 40},
     }
     DATA["gpsHosts"] = DATA["gpsHosts"] or {}
+
+    -- A HOST OUTSIDE THE OPERATING REGION BELONGS TO A DIFFERENT SETTLEMENT.
+    --
+    -- It cannot serve this one -- it is far past modem range by definition -- so keeping it does
+    -- nothing but inflate the host count and make coverage look better than it is. Dropping them
+    -- means a re-founded settlement heals itself on the next boot instead of inheriting ghosts.
+    local s_B = DATA["bounds"]
+    if s_B then
+        local s_Keep, s_Dropped = {}, 0
+        for _, e in ipairs(DATA["gpsHosts"]) do
+            if e.x >= s_B.minx and e.x <= s_B.maxx and e.z >= s_B.minz and e.z <= s_B.maxz then
+                s_Keep[#s_Keep + 1] = e
+            else
+                s_Dropped = s_Dropped + 1
+            end
+        end
+        if s_Dropped > 0 then
+            Log(("boot: dropped %d gps host(s) outside the operating region"):format(s_Dropped))
+        end
+        DATA["gpsHosts"] = s_Keep
+    end
+
     for _, h in ipairs(s_Known) do
         local s_Have = false
         for _, e in ipairs(DATA["gpsHosts"]) do

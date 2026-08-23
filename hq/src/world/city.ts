@@ -13,6 +13,7 @@
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { newRegistry, type Registry, type Plot } from './plots.js';
+import { settlement } from './settlement.js';
 import type { Factory } from './factories.js';
 
 const STATE_DIR = process.env.STATE_DIR ?? '/state';
@@ -36,13 +37,9 @@ const FILE = join(STATE_DIR, 'city.json');
  * One definition, environment-overridable, with the bounds derived from it so the two cannot drift.
  * Same fix as the supply loop's BASE, and the second place the same mistake was hiding.
  */
-const ORIGIN = {
-  x: Number(process.env.HIVE_BASE_X ?? -480),
-  y: Number(process.env.HIVE_BASE_Y ?? 63),
-  z: Number(process.env.HIVE_BASE_Z ?? 64),
-};
+const ORIGIN = settlement.base;
 /** How far from origin a plot may be sited. Must stay inside the force-loaded chunks. */
-const REACH = Number(process.env.HIVE_REACH ?? 96);
+const REACH = settlement.reach;
 const BOUNDS = {
   min: { x: ORIGIN.x - REACH, y: -64, z: ORIGIN.z - REACH },
   max: { x: ORIGIN.x + REACH, y: 200, z: ORIGIN.z + REACH },

@@ -49,6 +49,8 @@ interface Pending {
 
 export class Bridge {
   private ws?: WebSocket;
+  /** Run after every HELLO, so a reconnect re-asserts whatever HQ owns over there. */
+  private connectHooks: Array<() => void | Promise<void>> = [];
   private pending = new Map<string, Pending>();
   private seq = 0;
   /** Buffered while disconnected; bounded, oldest dropped first. */
@@ -191,6 +193,17 @@ export class Bridge {
     const queued = this.outbox.splice(0);
     for (const e of queued) this.send(e);
     if (queued.length) this.log(`flushed ${queued.length} buffered frames`);
+  }
+
+  /**
+   * Register work to run whenever the in-world bridge (re)connects.
+   *
+   * Not "once at boot": the modules on the other side restart independently of HQ, so anything HQ
+   * pushed once goes quietly stale the first time something over there reboots.
+   */
+  onConnect(fn: () => void | Promise<void>): void {
+    this.connectHooks.push(fn);
+    if (this.connected) void fn();   // already up -- run now rather than waiting for a drop
   }
 
   status() {
