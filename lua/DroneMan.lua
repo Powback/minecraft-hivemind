@@ -71,13 +71,25 @@ function RegisterDrone(p_ID, p_Pos, p_Heading, p_Role)
     local s_Message = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "AllocateDocking",
                                         {id = s_DroneID, pos = p_Pos})
     local s_Response = PowNet.sendAndWaitForResponse("DockingMan", s_Message)
-    if(not s_Response) then
-        print("Failed to get docking")
-        return false, "Failed to get docking"
-    end
-    if(type(s_Response) ~= "table") then
-        print("wtf")
-        return false, s_Response
+    -- A DRONE WITHOUT A BERTH IS STILL A DRONE.
+    --
+    -- This refused the whole registration when docking could not be allocated, and the drone reads
+    -- that as "failed to call home" and returns -- so it never enters its loops, never sends a
+    -- heartbeat, and never appears in the fleet. A running turtle that nothing knows exists, whose
+    -- only symptom is a drone count that stays at zero.
+    --
+    -- In a fresh world that is guaranteed. No docking tower has been built yet, so the FIRST drone
+    -- can never register, so nothing can ever build the tower that would have let it register. The
+    -- fleet could not be started at all, and it failed silently.
+    --
+    -- Registration and berthing are separate concerns: somewhere to park is a convenience, being
+    -- known is what makes a drone dispatchable, rescuable and visible. DroneLogic already takes this
+    -- view about GPS -- it registers without a position rather than vanishing -- and this is the same
+    -- judgement about docks.
+    if (not s_Response) or (type(s_Response) ~= "table") then
+        print("registered " .. s_DroneName .. " with no dock")
+        PowNet.MarkDirty()
+        return true, {name = s_DroneName}
     end
     -- Kept so a retry can be answered identically without asking DockingMan for a second slot.
     DATA["drones"][s_DroneID].dock = {pos = s_Response.pos, heading = s_Response.heading}
@@ -561,7 +573,20 @@ function Render()
         if s_Fuel == nil then
             s_Fuel = "?"
         end
-        m_Monitor.write("[" .. s_Turtle.name .. "] | " .. s_Turtle.status .." | " .. s_Fuel .. " - (" .. s_Turtle.pos.x .. ", " .. s_Turtle.pos.y .. ", " .. s_Turtle.pos.z ..")")
+        -- A DRONE WITH NO POSITION MUST NOT KILL THE MODULE THAT TRACKS DRONES.
+        --
+        -- pos is nil for exactly the drones that most need tracking: one that registered before it
+        -- had a GPS fix, one underground, one that has just been placed. This indexed it blind, so
+        -- the first such drone crashed DroneMan on its next render -- and DroneMan crashing means
+        -- every drone loses its registry, so they all re-register, so it crashes again. One
+        -- positionless turtle took down the whole fleet's bookkeeping in a loop.
+        --
+        -- The status line is a convenience. Knowing where a drone ISN'T is still worth printing.
+        local p = s_Turtle.pos
+        local s_Where = p and ("(" .. tostring(p.x) .. ", " .. tostring(p.y) .. ", " .. tostring(p.z) .. ")")
+                          or "(no fix)"
+        m_Monitor.write("[" .. tostring(s_Turtle.name) .. "] | " .. tostring(s_Turtle.status)
+                        .. " | " .. s_Fuel .. " - " .. s_Where)
 
     end
 end
