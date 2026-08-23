@@ -680,14 +680,25 @@ function OnRegionKnown(p_ID, p_Message)
                   newestMs = s_Newest}
 end
 
+local ADJACENT = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}}
+
 function OnFindCaves(p_ID, p_Message)
     local d = p_Message.data or {}
     local s_MinSize = tonumber(d.min) or 8
     local s_World = PowGPSServer.getCachedWorld() or {}
 
     -- Surface height per column, so open air can be told from enclosed air.
+    --
+    -- YIELD. This walks the entire map twice -- once here, once for the flood fill below -- and at
+    -- 237,000 cells each pass is far past the ten seconds CC allows without yielding. So cave
+    -- detection did not merely return nothing: it aborted MapServer every time anything asked.
+    -- world.caves has been answering "no response" since the map got large, which is why nothing
+    -- has ever dispatched a cave survey and why the scouts had nothing to spelunk.
     local s_Top = {}
+    local s_Walk = 0
     for key, v in pairs(s_World) do
+        s_Walk = s_Walk + 1
+        if s_Walk % 2000 == 0 then os.sleep(0) end
         if v == 1 then
             local x, y, z = parseKey(key)
             if x then
@@ -698,7 +709,10 @@ function OnFindCaves(p_ID, p_Message)
     end
 
     local s_Seen, s_Caves = {}, {}
+    s_Walk = 0
     for key, v in pairs(s_World) do
+        s_Walk = s_Walk + 1
+        if s_Walk % 2000 == 0 then os.sleep(0) end
         if v == 0 and not s_Seen[key] then
             local x0, y0, z0 = parseKey(key)
             local col = x0 and (x0 .. ":" .. z0)
@@ -706,11 +720,19 @@ function OnFindCaves(p_ID, p_Message)
                 -- flood fill this pocket
                 local s_Stack, s_Cells = {{x0, y0, z0}}, {}
                 s_Seen[key] = true
+                -- Yield here too, and hoist the neighbour table out of the loop.
+                --
+                -- A single connected air pocket can be tens of thousands of cells -- the fleet has
+                -- mined kilometres of tunnel, and tunnels are one enormous connected pocket. So
+                -- this loop, not just the two walks above, is what blew the ten-second budget.
+                -- Rebuilding a six-element table on every iteration was pure waste on top.
+                local s_Fill = 0
                 while #s_Stack > 0 do
+                    s_Fill = s_Fill + 1
+                    if s_Fill % 2000 == 0 then os.sleep(0) end
                     local c = table.remove(s_Stack)
                     s_Cells[#s_Cells + 1] = c
-                    local s_Adj = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}}
-                    for _, o in ipairs(s_Adj) do
+                    for _, o in ipairs(ADJACENT) do
                         local nx, ny, nz = c[1]+o[1], c[2]+o[2], c[3]+o[3]
                         local nk = nx .. ":" .. ny .. ":" .. nz
                         if s_World[nk] == 0 and not s_Seen[nk] then

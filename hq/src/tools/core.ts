@@ -1048,7 +1048,12 @@ registry.register({
   danger: 'read',
   handler: async (a) => {
     if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
-    return await bridge.call('MapServer', 'FindCaves', a, { timeoutMs: 15000 });
+    // SIXTY SECONDS. Cave detection walks the entire map twice plus a flood fill, and now that
+    // those loops yield (they must -- unyielded they aborted MapServer outright) each yield costs a
+    // tick. At 237,000 cells that is legitimately half a minute of wall clock, not a hang. A 15s
+    // budget turned a slow-but-correct answer into "no response from MapServer.FindCaves", which is
+    // why nothing has ever dispatched a cave survey.
+    return await bridge.call('MapServer', 'FindCaves', a, { timeoutMs: 60000 });
   },
 });
 
