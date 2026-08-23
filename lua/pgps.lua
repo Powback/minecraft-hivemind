@@ -616,7 +616,7 @@ function ensureHeading()
     -- also the only kind of drone that can bury itself in the first place.
     if turtle.dig then
         for _ = 1, 4 do
-            if turtle.detect() then turtle.dig() end
+            digGuarded(turtle.dig, turtle.detect, turtle.inspect)
             if probe() then return true end
             turtle.turnLeft()
         end
@@ -1057,10 +1057,48 @@ end
 -- call; the cap stops a drone under a gravel column from digging for ever.
 local DIG_RETRY = 12
 
+-- NEVER BREAK THE SETTLEMENT, OR EACH OTHER.
+--
+-- digTo carves a corridor with raw turtle.dig, and D1 was standing in one. A miner tunnelled through
+-- a fellow drone, which dropped as an item, and then a haul carried it to storage -- so the fleet
+-- mined one of its own members and filed it. D1 read as "lost" and was in a chest, with its pickaxe,
+-- its modem and 19,651 fuel still attached.
+--
+-- DroneLogic's digHard already refused protected blocks. pgps did not, and pgps is the layer that
+-- actually digs during travel, which is where a drone is most likely to meet another one. The guard
+-- belongs here, at the bottom, not only in the caller that happened to have it.
+--
+-- Anything computercraft: covers every turtle, computer, modem, drive and cable; the rest is the
+-- infrastructure a settlement would be sad to lose to a passing tunnel.
+local PROTECT = {
+    ["minecraft:chest"] = true, ["minecraft:trapped_chest"] = true, ["minecraft:barrel"] = true,
+    ["minecraft:furnace"] = true, ["minecraft:blast_furnace"] = true, ["minecraft:smoker"] = true,
+    ["minecraft:hopper"] = true, ["minecraft:dropper"] = true, ["minecraft:dispenser"] = true,
+}
+
+function isProtectedBlock(p_Name)
+    if p_Name == nil then return false end
+    if PROTECT[p_Name] then return true end
+    return string.sub(p_Name, 1, 14) == "computercraft:"
+end
+
+-- Dig, unless what is there is ours. Returns false and the block name when it refuses, so a caller
+-- can route around rather than retry into the same wall.
+local function digGuarded(p_Dig, p_Detect, p_Inspect)
+    if not p_Detect() then return true end
+    local s_Ok, s_Blk = p_Inspect()
+    if s_Ok and s_Blk and isProtectedBlock(s_Blk.name) then
+        print("refusing to dig " .. tostring(s_Blk.name))
+        return false, s_Blk.name
+    end
+    return p_Dig()
+end
+
 local function clearAhead()
     local s_Tries = 0
     while turtle.detect() do
-        if not turtle.dig() then return false end       -- bedrock, or nothing that can be broken
+        -- Guarded: bedrock, or something of ours that must not be broken.
+        if not digGuarded(turtle.dig, turtle.detect, turtle.inspect) then return false end
         s_Tries = s_Tries + 1
         if s_Tries > DIG_RETRY then return false end
         os.sleep(0.05)                                   -- let falling blocks settle before retrying
@@ -1099,17 +1137,18 @@ function digTo(_tx, _ty, _tz, _maxSteps)
             if not mayStep(cachedX + s_Dx, cachedY + s_Dy, cachedZ + s_Dz) then goto continue end
 
             if s_Dy > 0 then
-                if turtle.detectUp() then turtle.digUp() end
+                if not digGuarded(turtle.digUp, turtle.detectUp, turtle.inspectUp) then return false, "blocked by protected block above" end
                 s_Moved = up()
             elseif s_Dy < 0 then
-                if turtle.detectDown() then turtle.digDown() end
+                if not digGuarded(turtle.digDown, turtle.detectDown, turtle.inspectDown) then return false, "blocked by protected block below" end
                 s_Moved = down()
             else
                 turnTo(s_Dx ~= 0 and (s_Dx > 0 and East or West) or (s_Dz > 0 and South or North))
                 if clearAhead() then
                     s_Moved = forward()
                     -- Head room, so what we leave behind is a corridor and not a crawlspace.
-                    if s_Moved and turtle.detectUp() then turtle.digUp() end
+                    -- Head room. Not worth breaking anything of ours for, so this one just skips.
+                    if s_Moved then digGuarded(turtle.digUp, turtle.detectUp, turtle.inspectUp) end
                 end
             end
             ::continue::
