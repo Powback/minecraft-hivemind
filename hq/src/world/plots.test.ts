@@ -10,12 +10,19 @@ const ok = (p: Plot | { error: string }): Plot => {
 };
 
 describe('allocate', () => {
-  it('places the first plot at the origin and names it by purpose', () => {
+  it('keeps the first plot OFF the origin, because the origin is the tower', () => {
+    // This used to assert the first plot lands exactly on the origin, which was true and became
+    // wrong: the origin is the tower's centre column. Allocating there sited a mine head inside the
+    // building and dispatched a miner to sink a shaft through its own floor -- which it could not
+    // even reach, the target being one block beneath it and made of the slab it stood on.
     const reg = fresh();
     const p = ok(allocate(reg, 'docks'));
     expect(p.name).toBe('docks-01');
-    expect(p.min).toEqual({ x: -85, y: 81, z: -44 });
     expect(p.status).toBe('planned');
+
+    const dx = p.min.x - (-85);
+    const dz = p.min.z - (-44);
+    expect(Math.sqrt(dx * dx + dz * dz)).toBeGreaterThanOrEqual(26);
   });
 
   it('never allocates two plots that touch', () => {

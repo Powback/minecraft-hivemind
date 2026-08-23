@@ -130,6 +130,17 @@ export function allocate(reg: Registry, purpose: Purpose, name?: string): Plot |
     // out of the loaded world -- which is exactly how D3 was lost.
     if (!contains(reg.bounds, { min, max })) continue;
 
+    // AND IT MUST NOT SIT ON THE TOWER.
+    //
+    // The spiral starts at the origin, and the origin IS the tower's centre column -- so the first
+    // mine head allocated was inside the building, and a miner was dispatched to sink a shaft
+    // through its own floor. It could not even reach it: the target was one block beneath the drone
+    // and made of the slab it was standing on.
+    //
+    // The keep-out is the tower's footprint plus margin for the terraces, which step outward as the
+    // building rises.
+    if (withinKeepOut(cell)) continue;
+
     const padded = {
       min: { x: min.x - STREET, y: min.y, z: min.z - STREET },
       max: { x: max.x + STREET, y: max.y, z: max.z + STREET },
@@ -149,6 +160,18 @@ export function allocate(reg: Registry, purpose: Purpose, name?: string): Plot |
 function nextName(reg: Registry, purpose: Purpose): string {
   const n = reg.plots.filter((p) => p.purpose === purpose).length + 1;
   return `${purpose}-${String(n).padStart(2, '0')}`;
+}
+
+/**
+ * The settlement's own footprint, which nothing may be sited on. Radius 20 for the tower wall plus
+ * margin, so plots never collide with the building or the terraces it grows.
+ */
+const KEEP_OUT_RADIUS = Number(process.env.HIVE_KEEPOUT ?? 26);
+
+function withinKeepOut(cell: { x: number; z: number }): boolean {
+  const dx = cell.x * CELL;
+  const dz = cell.z * CELL;
+  return Math.sqrt(dx * dx + dz * dz) < KEEP_OUT_RADIUS;
 }
 
 /** Grid cells ordered by ring distance from the origin: (0,0), then the ring around it, and so on. */

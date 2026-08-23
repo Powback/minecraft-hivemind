@@ -1123,6 +1123,7 @@ function digTo(_tx, _ty, _tz, _maxSteps)
         -- and the expensive one when you are digging, because every block of vertical shaft is a
         -- block that has to come out. Level tunnels are also what makes the result walkable.
         local s_Moved = false
+        local s_Protected = false
         for _, s_Axis in ipairs({ "x", "z", "y" }) do
             if s_Moved then break end
             local s_Dx, s_Dy, s_Dz = 0, 0, 0
@@ -1136,14 +1137,24 @@ function digTo(_tx, _ty, _tz, _maxSteps)
             -- the wall down -- which would quietly mine a hole through the boundary every time.
             if not mayStep(cachedX + s_Dx, cachedY + s_Dy, cachedZ + s_Dz) then goto continue end
 
+            -- A PROTECTED BLOCK BLOCKS THIS AXIS, NOT THE WHOLE JOURNEY.
+            --
+            -- Returning here abandoned the entire dig the moment one direction was occupied by
+            -- something of ours -- and since drones are mobile and frequently stacked, that is
+            -- common. Two of them ended up one above the other, each refusing to dig the other and
+            -- each treating that as total failure, so neither moved again. Before the guard existed
+            -- they would have mined through each other; the fix for destruction should not be
+            -- gridlock. Skipping to the next axis lets a drone go round.
             if s_Dy > 0 then
-                if not digGuarded(turtle.digUp, turtle.detectUp, turtle.inspectUp) then return false, "blocked by protected block above" end
+                if not digGuarded(turtle.digUp, turtle.detectUp, turtle.inspectUp) then s_Protected = true goto continue end
                 s_Moved = up()
             elseif s_Dy < 0 then
-                if not digGuarded(turtle.digDown, turtle.detectDown, turtle.inspectDown) then return false, "blocked by protected block below" end
+                if not digGuarded(turtle.digDown, turtle.detectDown, turtle.inspectDown) then s_Protected = true goto continue end
                 s_Moved = down()
             else
                 turnTo(s_Dx ~= 0 and (s_Dx > 0 and East or West) or (s_Dz > 0 and South or North))
+                -- Same again for the horizontal case: refused means try elsewhere, not give up.
+                if not digGuarded(turtle.dig, turtle.detect, turtle.inspect) then s_Protected = true goto continue end
                 if clearAhead() then
                     s_Moved = forward()
                     -- Head room, so what we leave behind is a corridor and not a crawlspace.
@@ -1154,9 +1165,35 @@ function digTo(_tx, _ty, _tz, _maxSteps)
             ::continue::
         end
 
+        -- BLOCKED BY ONE OF OUR OWN: GO ROUND IT.
+        --
+        -- Skipping the axis is not enough when the axis is the only one with any distance left to
+        -- cover. A miner directly above another drone has dx=0 and dz=0 -- its whole remaining
+        -- journey is straight down, the drone below is protected and must not be dug, and so it
+        -- wedges instantly with a clear column beneath the obstruction. That is exactly what
+        -- happened: D3 at y=66, D1 idle at y=65, and a shaft head two blocks below that.
+        --
+        -- One lateral step is enough to break it. From beside the obstruction the next iteration has
+        -- an x or z delta again and carries on normally, which also means two drones cannot livelock
+        -- politely waiting for each other.
+        if not s_Moved and s_Protected then
+            for _, s_Dir in ipairs({East, West, North, South}) do
+                local D = deltas[s_Dir]
+                if mayStep(cachedX + D[1], cachedY, cachedZ + D[3]) then
+                    turnTo(s_Dir)
+                    if digGuarded(turtle.dig, turtle.detect, turtle.inspect) and forward() then
+                        s_Moved = true
+                        break
+                    end
+                end
+            end
+            if s_Moved then goto stepped end
+        end
+
         if not s_Moved then
             return false, "digTo is wedged at " .. cachedX .. "," .. cachedY .. "," .. cachedZ
         end
+        ::stepped::
     end
     return true
 end

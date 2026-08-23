@@ -1914,6 +1914,27 @@ function OnMine(p_ID, p_Message)
                 tostring(sx), tostring(sy), tostring(sz),
                 tostring(d.pos.x), tostring(d.pos.y), tostring(d.pos.z)))
             local s_At, s_Why = pgps.moveTo(tonumber(d.pos.x), tonumber(d.pos.y), tonumber(d.pos.z))
+            -- A MINER THAT CANNOT WALK TO ITS OWN SHAFT SHOULD DIG TO IT.
+            --
+            -- This gave up the moment moveTo could not find a mapped route, which on a barely
+            -- surveyed world is most of the time -- the map is built BY going places, so requiring a
+            -- known route before travelling is circular. GoTo and Survey both learned the
+            -- moveTo -> flyTo -> digTo chain; the mine job never did, so miners threw
+            -- "could not reach the shaft head" seven blocks from it while carrying a pickaxe.
+            -- DIG BEFORE FLYING. The order matters, and the other way round wastes minutes.
+            --
+            -- A shaft head is a point in the GROUND, so the destination is solid by definition and
+            -- flyTo cannot enter it -- it wanders up to 512 steps looking for a way into a block
+            -- that has no way in, and only then gives up. A miner is carrying the tool that solves
+            -- this. Scouts keep flyTo first because they cannot dig at all.
+            if s_At == false and turtle.dig then
+                trace("mine: no mapped route (" .. tostring(s_Why) .. ") -- digging a path")
+                s_At, s_Why = pgps.digTo(tonumber(d.pos.x), tonumber(d.pos.y), tonumber(d.pos.z))
+            end
+            if s_At == false then
+                trace("mine: cannot dig there either (" .. tostring(s_Why) .. ") -- flying")
+                s_At, s_Why = pgps.flyTo(tonumber(d.pos.x), tonumber(d.pos.y), tonumber(d.pos.z))
+            end
             if s_At == false then
                 trace("mine: could not reach shaft head -- " .. tostring(s_Why))
                 error("could not reach the shaft head: " .. tostring(s_Why), 0)
