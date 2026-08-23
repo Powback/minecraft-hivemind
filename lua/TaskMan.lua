@@ -582,16 +582,39 @@ local function rescueNeeded()
     --
     -- Capped, because rescues are miner work and miners are also the only thing that mines. Three at
     -- a time keeps the fleet digging its way out of a bad patch without stopping everything else.
-    local s_Live = 0
+    -- TRAPPED MINERS GET THEIR OWN BUDGET.
+    --
+    -- A single cap does not work here. Three scout rescues fill it, and then the two stranded miners
+    -- -- the only drones that can perform a rescue at all -- can never be queued for one, so the
+    -- fleet's digging capacity only ever falls. Ordering the candidates does not help either: the
+    -- slots are already held. Miners therefore have a separate allowance, because freeing one adds
+    -- a rescuer and freeing a scout does not.
+    local s_LiveMiner, s_LiveOther = 0, 0
     for _, v in pairs(DATA["tasks"] or {}) do
-        if v.work and v.work.rescue and (v.progress or 0) < 100 and v.enabled ~= false then
-            s_Live = s_Live + 1
+        local w = v.work and v.work.rescue
+        if w and (v.progress or 0) < 100 and v.enabled ~= false then
+            if w.role == "miner" then s_LiveMiner = s_LiveMiner + 1
+            else s_LiveOther = s_LiveOther + 1 end
         end
     end
 
-    local s_Made = 0
+    -- Miners first, so their allowance is spent on them before anything else is considered.
+    local s_Order = {}
     for _, d in ipairs(fleet()) do
-        if s_Live + s_Made >= 3 then break end
+        if (d.role or "miner") == "miner" then s_Order[#s_Order + 1] = d end
+    end
+    for _, d in ipairs(fleet()) do
+        if (d.role or "miner") ~= "miner" then s_Order[#s_Order + 1] = d end
+    end
+
+    local s_Made = 0
+    for _, d in ipairs(s_Order) do
+        local s_IsMiner = (d.role or "miner") == "miner"
+        if s_IsMiner then
+            if s_LiveMiner >= 2 then goto continue end
+        else
+            if s_LiveOther >= 3 then goto continue end
+        end
         local s_Trapped = RESCUE_STATES[tostring(d.status)] or d.offline
         -- STRANDED MINERS GET RESCUED TOO.
         --
@@ -610,17 +633,19 @@ local function rescueNeeded()
             DATA["tasks"][s_TaskID] = {
                 id = s_TaskID,
                 name = "rescue-" .. tostring(d.name),
-                work = {rescue = {id = d.id, drone = d.name,
+                work = {rescue = {id = d.id, drone = d.name, role = (d.role or "miner"),
                                   pos = {x = d.pos.x, y = d.pos.y, z = d.pos.z}}},
                 progress = 0, enabled = true, paused = false,
             }
             s_Pending[tostring(d.id)] = true
             s_Made = s_Made + 1
+            if s_IsMiner then s_LiveMiner = s_LiveMiner + 1 else s_LiveOther = s_LiveOther + 1 end
             Log(("rescue queued for %s (%s%s) at %s,%s,%s"):format(
                 tostring(d.name), tostring(d.status),
                 (d.offline and tostring(d.status) ~= "offline") and ", offline" or "",
                 tostring(d.pos.x), tostring(d.pos.y), tostring(d.pos.z)))
         end
+        ::continue::
     end
     if s_Made > 0 then PowNet.MarkDirty() end
     return s_Made
@@ -632,17 +657,33 @@ end
 -- placed (s_NoDrone), so a rescue could sit behind an unplaceable mining task indefinitely. A drone
 -- that cannot move is burning fuel it cannot replace, so this gets its own pass and its own budget.
 local function placeRescues()
-    local s_Placed = 0
+    -- TRAPPED MINERS FIRST.
+    --
+    -- Only a miner can perform a rescue, so every stranded miner is both a drone that needs freeing
+    -- and a rescuer the fleet has lost -- and with five miners in a fleet of twenty-three, two of
+    -- them stuck underground is most of the digging capacity gone. Freeing those first is what stops
+    -- this deadlocking: each one recovered can go and get the next.
+    local s_Mine, s_Rest = {}, {}
     for _, v in pairs(DATA["tasks"] or {}) do
         if v.work and v.work.rescue and v.assigned == nil
                 and (v.progress or 0) < 100 and v.enabled ~= false then
-            local s_Ok = OnStartTask(0, {data = {id = v.id}})
-            if s_Ok then
+            if v.work.rescue.role == "miner" then s_Mine[#s_Mine + 1] = v
+            else s_Rest[#s_Rest + 1] = v end
+        end
+    end
+
+    local s_Placed, s_Tried = 0, 0
+    for _, list in ipairs({s_Mine, s_Rest}) do
+        for _, v in ipairs(list) do
+            -- Try the next one rather than giving up on the whole set. A rescue can fail to place
+            -- for a reason specific to it, and stopping there would leave every rescue behind it
+            -- unplaced for reasons that had nothing to do with them.
+            if OnStartTask(0, {data = {id = v.id}}) then
                 s_Placed = s_Placed + 1
-                if s_Placed >= 2 then break end
-            else
-                break     -- no miner free; the rest can wait for the next tick
+                if s_Placed >= 2 then return s_Placed end
             end
+            s_Tried = s_Tried + 1
+            if s_Tried >= 4 then return s_Placed end   -- no free miner; the rest wait a tick
         end
     end
     return s_Placed
