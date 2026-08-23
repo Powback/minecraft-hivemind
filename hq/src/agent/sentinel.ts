@@ -295,6 +295,7 @@ function humanise(ms: number): string {
  * ------------------------------------------------------------------------- */
 
 import { bridge } from '../bridge/ws.js';
+import { luaList } from '../lua-table.js';
 
 /**
  * Probe every module TWICE, in two different ways, and keep both answers.
@@ -331,11 +332,7 @@ const ok = async (p: Promise<unknown>): Promise<boolean> => {
  * broken itself, which is precisely the failure it exists to catch. It could not see, and it said
  * nothing about not being able to see.
  */
-const toArray = <T,>(v: unknown): T[] => {
-  if (Array.isArray(v)) return v as T[];
-  if (v && typeof v === 'object') return Object.values(v as Record<string, T>);
-  return [];
-};
+const toArray = <T,>(v: unknown): T[] => luaList<T>(v) ?? [];
 
 export async function observe(): Promise<Observation | null> {
   if (!bridge.connected) return null;

@@ -23,6 +23,7 @@ import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { bridge } from '../bridge/ws.js';
 import { registry } from '../tools/registry.js';
+import { luaList } from '../lua-table.js';
 
 export interface SupplyRule {
   /** The BLOCK to go and mine, e.g. "coal_ore". */
@@ -192,9 +193,28 @@ export const supply: SupplyState = loadSupply();
  * cleverer heuristic that chases ore concentrations tends to circle the same promising area and
  * leave the rest of the world dark.
  */
-const BASE = { x: -85, z: -44 };
+/**
+ * WHERE THE SETTLEMENT IS. NOT A CONSTANT -- IT MOVED, AND THIS DID NOT.
+ *
+ * These were the previous world's coordinates, left behind when the settlement was re-founded 400
+ * blocks away. Every survey the loop dispatched aimed at ground the fleet could not reach and would
+ * not have been chunk-loaded if it had, so the map stayed at zero known blocks while the loop
+ * reported itself healthy. A hardcoded home is a bug waiting for the first time home changes.
+ *
+ * HIVE_BASE_X / HIVE_BASE_Z override it; the default is the tower's centre, and the region is
+ * derived from the base rather than written out separately, so the two cannot drift apart.
+ */
+const BASE = {
+  x: Number(process.env.HIVE_BASE_X ?? -480),
+  z: Number(process.env.HIVE_BASE_Z ?? 64),
+};
 const TILE = 24;
-const REGION = { minX: -155, maxX: -25, minZ: -105, maxZ: 15 };
+/** How far out the fleet is allowed to work, as a radius from base. */
+const REACH = Number(process.env.HIVE_REACH ?? 96);
+const REGION = {
+  minX: BASE.x - REACH, maxX: BASE.x + REACH,
+  minZ: BASE.z - REACH, maxZ: BASE.z + REACH,
+};
 
 type Pt = { x: number; y: number; z: number };
 function frontier(): { min: Pt; max: Pt } | null {
@@ -270,7 +290,11 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
     return { acted: false, reason: 'no idle miner, scout or crafter' };
 
   const stock: any = await bridge.call('StorageMan', 'stock', {}, { timeoutMs: 8000 });
-  const detail = stock?.detail ?? stock?.data?.detail ?? [];
+  // Same shape trap as the task queue: an empty stock detail arrives as {} and .filter is not a
+  // function on it, so the very first supply pass in a new world threw before it could decide
+  // anything. Empty stock is the NORMAL state of a settlement that has not mined yet -- it is the
+  // condition the loop exists to resolve, so it must be the one case it handles cleanly.
+  const detail = luaList<any>(stock?.detail ?? stock?.data?.detail) ?? [];
   const held = (m: string) =>
     detail.filter((d: any) => typeof d.name === 'string' && d.name.includes(m))
           .reduce((n: number, d: any) => n + (d.count ?? 0), 0);
@@ -288,7 +312,10 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
   const queued = new Set<string>();
   try {
     const res: any = await bridge.call('TaskMan', 'GetTasks', {}, { timeoutMs: 15000 });
-    const list = res?.tasks ?? res?.data?.tasks;
+    // luaList, not Array.isArray. An EMPTY task queue serialises to {} rather than [], so the
+    // array check classed it unreadable -- and the loop then refused to dispatch, which kept the
+    // queue empty, which kept it refusing. On a fresh world nothing could ever start.
+    const list = luaList<any>(res?.tasks ?? res?.data?.tasks);
     // A REFUSAL COMES BACK AS A VALUE, NOT AN EXCEPTION.
     //
     // PowNet puts an error in the same field a success uses, so a failed GetTasks arrives as a
@@ -296,7 +323,7 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
     // empty with no error raised anywhere. Dedup silently switched itself off and the queue filled
     // with nine copies of the same two surveys. An empty result and an unreadable one look
     // identical and mean opposite things, so they must be told apart explicitly.
-    if (!Array.isArray(list)) {
+    if (list === null) {
       return { acted: false, reason: `cannot read the task queue (${typeof res === 'string' ? res : typeof res}); not dispatching blind` };
     }
     for (const t of list) {

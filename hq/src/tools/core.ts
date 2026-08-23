@@ -480,6 +480,25 @@ registry.register({
 });
 
 registry.register({
+  name: 'supply.tick',
+  summary: 'Run one supply pass now and report exactly what it decided.',
+  description:
+    'The loop runs on a timer and reports through supply.status, which shows the RESULT of past ' +
+    'passes and not the reasoning of the current one. When the fleet is idle and the queue is ' +
+    'empty, the useful question is "what did the loop conclude, and why did it stop there" -- and ' +
+    'until now the only way to answer it was to read container logs.',
+  params: z.object({}).strict(),
+  returns: 'acted plus the reason it acted or did not.',
+  danger: 'mutate',
+  bounds: 'May dispatch work, exactly as the timed pass would.',
+  handler: async () => {
+    const r = await runSupplyTick();
+    return { ...r, state: { frontier: supply.frontier, dispatched: supply.dispatched,
+                            lastAction: supply.lastAction, notes: supply.log.slice(-6) } };
+  },
+});
+
+registry.register({
   name: 'supply.set',
   summary: 'Turn the supply loop on or off, or change a material target.',
   description:
