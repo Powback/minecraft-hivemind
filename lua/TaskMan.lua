@@ -14,7 +14,11 @@ local function monitor()
     if m and m.write then return m end
     return PowNet.Monitor()
 end
-print(os.loadAPI("ServerTasks/dig"))
+-- dig.lua, with the extension. os.loadAPI strips .lua when it names the API, so this still binds
+-- as `dig` -- and asking for the real filename removes a hidden deploy step: the old world only
+-- worked because something renamed dig.lua to dig on the way in, and a fresh deploy of the repo as
+-- it stands died with "Failed to load API dig due to File not found".
+print(os.loadAPI("ServerTasks/dig.lua"))
 Log("Starting...")
 
 function Init()

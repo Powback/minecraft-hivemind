@@ -271,6 +271,7 @@ end
 --
 -- Searches, tolerates having no monitor, and falls back to the terminal so a module without a
 -- screen still runs instead of crashing.
+local m_TermShim
 function Monitor(p_PreferredSide)
     if p_PreferredSide then
         local ok, s_Type = pcall(peripheral.getType, p_PreferredSide)
@@ -281,7 +282,23 @@ function Monitor(p_PreferredSide)
     end
     local ok, m = pcall(peripheral.find, "monitor")
     if ok and m then return m end
-    return term
+    -- NO MONITOR IS NOT A REASON FOR A MODULE TO DIE.
+    --
+    -- Falling back to `term` looked safe and was not: term has no setTextScale, so DroneMan and
+    -- DockingMan both died on their first render with "attempt to call field 'setTextScale' (a nil
+    -- value)". Their guard -- `local m = monitor() if not m then return end` -- never fired, because
+    -- term is perfectly truthy. Two modules that route drones and allocate docks were killed by not
+    -- having a screen to draw on.
+    --
+    -- So the fallback answers the whole monitor interface: everything term can do, plus a no-op for
+    -- the handful of methods only a real monitor has. A module with no monitor now prints to its own
+    -- terminal and keeps working.
+    if not m_TermShim then
+        m_TermShim = setmetatable(
+            {setTextScale = function() end, getTextScale = function() return 1 end},
+            {__index = term})
+    end
+    return m_TermShim
 end
 
 function RegisterEvents( p_ServerEvents, p_DroneEvents, p_Update )
