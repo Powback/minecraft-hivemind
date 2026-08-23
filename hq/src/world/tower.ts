@@ -112,6 +112,85 @@ export const LEVELS: Level[] = [
   { index:  7, name: 'cap',      purpose: 'Mast base, wireless hub and GPS. No bays -- height is the point: modem range scales with altitude, and nine drones are out of contact right now.', gatedOn: [] },
 ];
 
+/**
+ * WHAT THE TOWER IS MADE OF, AND WHY IT IS NOT WOOD.
+ *
+ * The first costing used oak planks for the floor slabs and came to 480 planks PER FLOOR. That is
+ * absurd on its own terms -- it is a hundred and twenty logs a floor, from a fleet with no forestry
+ * -- and it is worse than absurd in a desert, where there are no trees at all. Planks were never a
+ * decision, they were a placeholder that survived into a cost estimate.
+ *
+ * Cobblestone is the correct answer and it is not a compromise: it is the ONE material the fleet
+ * already produces in bulk, as a by-product of every shaft it digs. A tower built of what mining
+ * throws away costs nothing but the mining that was happening anyway.
+ *
+ * The palettes are a tier ladder, and the ladder is the same one the floors encode -- you build the
+ * plinth out of what you have, and reface it later out of what the smelters upstairs have started
+ * producing. Nothing here needs an item the fleet cannot obtain, which is the rule blueprints are
+ * supposed to obey and the plank version quietly broke.
+ *
+ * pipe is deliberately nullable. A Create chute needs andesite alloy, a hopper needs five iron
+ * apiece, and a dropper column needs redstone -- of which the fleet has found exactly none. So at
+ * tier 0 there is no pipe: the core column is solid, the drones carry everything both ways, and the
+ * chute becomes an upgrade dropped into a shaft that is already the right shape.
+ */
+export interface Palette {
+  name: string;
+  slab: string;
+  wall: string;
+  stair: string;
+  window: string;
+  shaft: string;
+  barrel: string;
+  /** null until the fleet can make one. The column is solid in the meantime. */
+  pipe: string | null;
+  /** Plain-language precondition, checked before this palette is offered. */
+  needs: string;
+}
+
+const MC = 'minecraft:';
+
+export const PALETTES: Record<string, Palette> = {
+  // Tier 0. Everything here falls out of a mining shaft. Glass needs sand, which a desert has more
+  // of than anywhere else -- the one way the current site is an advantage.
+  cobble: {
+    name: 'cobble',
+    slab: MC + 'cobblestone',
+    wall: MC + 'cobblestone',
+    stair: MC + 'cobblestone_stairs',
+    window: MC + 'glass',
+    shaft: MC + 'cobblestone_wall',
+    barrel: MC + 'barrel',
+    pipe: null,
+    needs: 'nothing -- mining produces all of it',
+  },
+  // Tier 1. Same shapes, smelted. Cobble -> stone -> stone bricks, so the only new input is furnace
+  // time and coal, and the fleet has located 576 coal.
+  brick: {
+    name: 'brick',
+    slab: MC + 'stone_bricks',
+    wall: MC + 'stone_bricks',
+    stair: MC + 'stone_brick_stairs',
+    window: MC + 'glass_pane',
+    shaft: MC + 'stone_brick_wall',
+    barrel: MC + 'barrel',
+    pipe: null,
+    needs: 'a furnace bank and coal',
+  },
+  // Tier 2. Once Create exists the column becomes a real pipe and the facing work starts paying off.
+  create: {
+    name: 'create',
+    slab: MC + 'stone_bricks',
+    wall: MC + 'stone_bricks',
+    stair: MC + 'stone_brick_stairs',
+    window: MC + 'glass_pane',
+    shaft: MC + 'stone_brick_wall',
+    barrel: MC + 'barrel',
+    pipe: 'create:chute',
+    needs: 'andesite alloy, for the chute',
+  },
+};
+
 const dist = (dx: number, dz: number) => Math.sqrt(dx * dx + dz * dz);
 
 /** Cells whose distance from the centre rounds to exactly r: a one-block-thick circle. */
@@ -323,8 +402,7 @@ export function headingFrom(
 export function towerFloor(
   spec: TowerSpec,
   floorIndex: number,
-  mats: { slab: string; wall: string; stair: string; window: string; shaft: string;
-          barrel: string; pipe: string },
+  mats: Palette,
 ): BlueprintBlock[] {
   const out: BlueprintBlock[] = [];
   const y0 = 0;
@@ -378,7 +456,7 @@ export function towerFloor(
   out.push(...spiralSteps(spec, floorIndex, mats.stair));
   // The one thing standing inside the atrium. Everything else in there stays empty on purpose.
   // Only the ground floor gets the draw point; every other level is unbroken pipe.
-  out.push(...coreColumn(spec, { pipe: mats.pipe, barrel: mats.barrel },
+  out.push(...coreColumn(spec, { pipe: mats.pipe, barrel: mats.barrel, solid: mats.wall },
                          { drawPoint: floorIndex === 0 }));
   return out;
 }
@@ -512,14 +590,15 @@ export function dockSlots(dy: number): DockSlot[] {
  */
 export function coreColumn(
   spec: TowerSpec,
-  mats: { pipe: string; barrel: string },
+  mats: { pipe: string | null; barrel: string; solid: string },
   opts: { drawPoint?: boolean; dockDy?: number } = {},
 ): BlueprintBlock[] {
   const dockDy = opts.dockDy ?? 1;
   const out: BlueprintBlock[] = [];
   for (let dy = 0; dy < spec.floorHeight; dy++) {
     const isDraw = opts.drawPoint === true && dy === dockDy;
-    out.push({ dx: 0, dy, dz: 0, item: isDraw ? mats.barrel : mats.pipe });
+    // No pipe yet: a solid column, still the right shape for a chute to be dropped into later.
+    out.push({ dx: 0, dy, dz: 0, item: isDraw ? mats.barrel : (mats.pipe ?? mats.solid) });
   }
   return out;
 }
