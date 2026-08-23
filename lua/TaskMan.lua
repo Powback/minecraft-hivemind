@@ -114,6 +114,9 @@ end
 -- What kind of drone does this work need? Digging needs a tool; surveying needs a scanner.
 function RoleForWork(p_Work)
     if p_Work == nil then return "miner" end
+    -- Digging someone out is miner work by definition: a scout carries a geo scanner where a
+    -- pickaxe would go, so the drone that is trapped is precisely the one that cannot free itself.
+    if p_Work["rescue"] then return "miner" end
     if p_Work["survey"] or p_Work["scan"] then return "scout" end
     -- Crafting needs a crafting-table upgrade, which is a different turtle entirely: turtle.craft
     -- simply does not exist on a miner, so routing a craft to one wastes the trip and fails at the
@@ -151,6 +154,7 @@ local function workPos(p_Task)
     if w.mine and w.mine.pos then return w.mine.pos end
     if w.build and w.build.origin then return w.build.origin end
     if w.gather and w.gather.pos then return w.gather.pos end
+    if w.rescue and w.rescue.pos then return w.rescue.pos end
     if w.survey then
         if w.survey.pos then return w.survey.pos end
         if w.survey.min and w.survey.max then
@@ -377,6 +381,16 @@ function OnStartTask(p_ID, p_Message)
         -- Targeted collection: the survey already knows where these blocks are.
         local w = s_Task.work.gather
         s_Verb, s_Payload = "Gather", {targets = w.targets, match = w.match, limit = w.limit, taskId = s_Task.id}
+    elseif s_Task.work.rescue then
+        -- A RESCUE IS A GoTo. THAT IS THE WHOLE TRICK.
+        --
+        -- OnGoTo already falls back moveTo -> flyTo -> digTo, and digTo carves a two-high walkable
+        -- tunnel. So a miner told to go and stand where a trapped scout is standing will cut its way
+        -- there through whatever is in between -- and the tunnel it leaves behind is the way out.
+        -- Nothing new has to know how to dig; the rescue is just a destination that happens to have
+        -- a drone sitting at it.
+        local w = s_Task.work.rescue
+        s_Verb, s_Payload = "GoTo", {pos = w.pos, taskId = s_Task.id}
     elseif s_Task.work.lumber then
         -- Wood gates chests, planks and sticks, and therefore every factory the fleet might
         -- build. Nothing else produces it.
@@ -527,10 +541,119 @@ local function pruneFinished()
     end
 end
 
+-- SEND A MINER TO DIG THE TRAPPED ONES OUT.
+--
+-- A scout that reports "could not reach" is usually not lost -- it is walled in. It went down a
+-- shaft to scan, the shaft it came down is no longer walkable, and it carries a geo scanner where a
+-- pickaxe would go. So it fails, is reclaimed, is reassigned, and fails again, forever, while its
+-- fuel burns; three of them did exactly this for hours. Drones have been sending Distress to
+-- DroneMan the whole time and nothing has ever read it.
+--
+-- The rescue itself is just a destination (see the GoTo dispatch above). This pass is only the
+-- bookkeeping: who needs one, and has someone already been sent.
+local RESCUE_STATES = {stuck = true, stranded = true, lost = true, blocked = true}
+
+local function rescueNeeded()
+    -- One live rescue per drone. Without this the pass creates a fresh task every fifteen seconds
+    -- for a drone that stays stuck -- which it will, right up until the miner arrives.
+    local s_Pending = {}
+    for _, v in pairs(DATA["tasks"] or {}) do
+        local w = v.work and v.work.rescue
+        if w and (v.progress or 0) < 100 and v.enabled ~= false then
+            s_Pending[tostring(w.id)] = true
+        end
+    end
+
+    -- No miner, no rescue. Queuing work that nothing in the fleet can perform just grows a backlog
+    -- and hides the real problem, which in that case is "the fleet has no miner".
+    local s_HasMiner = false
+    for _, d in ipairs(fleet()) do
+        if (d.role or "miner") == "miner" and not d.offline then s_HasMiner = true break end
+    end
+    if not s_HasMiner then return 0 end
+
+    -- OFFLINE COUNTS TOO.
+    --
+    -- A drone that has stopped answering is not necessarily gone: the commonest way to go quiet here
+    -- is to be somewhere a modem cannot reach out of, which is the same hole a rescue is for. We
+    -- still know where it was, and a tunnel to that spot is strictly better than leaving it there.
+    -- The climb-out order at the end will not reach it while it is silent, which costs nothing --
+    -- the tunnel is the part that matters, and the drone rejoins on its own once it can talk again.
+    --
+    -- Capped, because rescues are miner work and miners are also the only thing that mines. Three at
+    -- a time keeps the fleet digging its way out of a bad patch without stopping everything else.
+    local s_Live = 0
+    for _, v in pairs(DATA["tasks"] or {}) do
+        if v.work and v.work.rescue and (v.progress or 0) < 100 and v.enabled ~= false then
+            s_Live = s_Live + 1
+        end
+    end
+
+    local s_Made = 0
+    for _, d in ipairs(fleet()) do
+        if s_Live + s_Made >= 3 then break end
+        local s_Trapped = RESCUE_STATES[tostring(d.status)] or d.offline
+        -- STRANDED MINERS GET RESCUED TOO.
+        --
+        -- This skipped them on the theory that a miner can dig itself out. It can, right up until it
+        -- cannot -- out of fuel, wedged, or with no position fix to steer by -- and then it sits
+        -- there exactly as helplessly as a scout does, with the added cost that it is one of the few
+        -- drones that could have freed anyone else. D1 and D5 were both stranded underground while
+        -- the pass that exists to unstick drones deliberately looked past them.
+        --
+        -- There is no risk of a drone being sent to rescue itself: pickDrone only ever chooses a
+        -- drone whose status is "idle", and a drone that needs rescuing is by definition not.
+        if s_Trapped and d.pos and d.pos.x and d.pos.y and d.pos.z
+                and not s_Pending[tostring(d.id)] then
+            local s_TaskID = DATA["lastTask"]
+            DATA["lastTask"] = DATA["lastTask"] + 1
+            DATA["tasks"][s_TaskID] = {
+                id = s_TaskID,
+                name = "rescue-" .. tostring(d.name),
+                work = {rescue = {id = d.id, drone = d.name,
+                                  pos = {x = d.pos.x, y = d.pos.y, z = d.pos.z}}},
+                progress = 0, enabled = true, paused = false,
+            }
+            s_Pending[tostring(d.id)] = true
+            s_Made = s_Made + 1
+            Log(("rescue queued for %s (%s%s) at %s,%s,%s"):format(
+                tostring(d.name), tostring(d.status),
+                (d.offline and tostring(d.status) ~= "offline") and ", offline" or "",
+                tostring(d.pos.x), tostring(d.pos.y), tostring(d.pos.z)))
+        end
+    end
+    if s_Made > 0 then PowNet.MarkDirty() end
+    return s_Made
+end
+
+-- Place rescues BEFORE anything else.
+--
+-- The general placement pass gives up on a whole role the moment one task of that role cannot be
+-- placed (s_NoDrone), so a rescue could sit behind an unplaceable mining task indefinitely. A drone
+-- that cannot move is burning fuel it cannot replace, so this gets its own pass and its own budget.
+local function placeRescues()
+    local s_Placed = 0
+    for _, v in pairs(DATA["tasks"] or {}) do
+        if v.work and v.work.rescue and v.assigned == nil
+                and (v.progress or 0) < 100 and v.enabled ~= false then
+            local s_Ok = OnStartTask(0, {data = {id = v.id}})
+            if s_Ok then
+                s_Placed = s_Placed + 1
+                if s_Placed >= 2 then break end
+            else
+                break     -- no miner free; the rest can wait for the next tick
+            end
+        end
+    end
+    return s_Placed
+end
+
 function Tick()
     while true do
         os.sleep(TICK_SECONDS)
         pcall(pruneFinished)
+        pcall(rescueNeeded)
+        pcall(placeRescues)
         local s_Ok, s_Err = pcall(function()
             local s_NoDrone, s_Started = {}, 0
             for k,v in pairs(DATA["tasks"]) do
@@ -739,6 +862,24 @@ function OnTaskDone(p_ID, p_Message)
         s_Task.progress = 100
         s_Task.result   = d.result
         s_Task.failure  = nil
+        -- THE TUNNEL IS NOT THE RESCUE. GETTING THE DRONE TO USE IT IS.
+        --
+        -- The miner has arrived, so there is now a walkable two-high tunnel from the surface to
+        -- wherever the trapped drone is standing. But that drone is still sitting in "stuck" with a
+        -- distress flag set, and a drone in distress is never picked for work -- so without this it
+        -- would sit in a corridor it could now walk out of, indefinitely.
+        --
+        -- OnRescue is the existing self-rescue handler: it climbs, clears the distress and returns
+        -- the drone to idle, which is exactly the right sequence now that there is somewhere to
+        -- climb to.
+        local s_R = s_Task.work and s_Task.work.rescue
+        if s_R and s_R.id then
+            Log(("rescue reached %s -- telling it to climb out"):format(tostring(s_R.drone)))
+            pcall(function()
+                PowNet.SendToDrone(s_R.id,
+                    PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Rescue", {up = 8}))
+            end)
+        end
     else
         -- A FAILURE IS NOT A COMPLETION.
         --

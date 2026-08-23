@@ -3,6 +3,12 @@ os.loadAPI("pgps")
 local x,y,z
 local m_Status = "idle"
 local executing = false
+-- Forward declaration. reportTask is defined much further down, but OnGoTo -- which sits above it --
+-- has to call it now that a rescue is dispatched as a GoTo. Declared the obvious way, the name in
+-- OnGoTo would compile to a GLOBAL lookup and be nil at call time, so the drone would arrive and
+-- then die with "attempt to call a nil value" instead of reporting. Same trap as m_DroneEvents
+-- below, and as pgps.mayStep before it.
+local reportTask
 
 print("I AM ALIVE!")
 
@@ -341,9 +347,19 @@ function OnGoTo(p_ID, p_Message)
     TaskEnd()
     m_Status = "idle"
 
+    -- REPORT BACK WHEN THIS IS A TASK.
+    --
+    -- GoTo never told TaskMan anything. That was harmless while GoTo was only ever a manual "go
+    -- stand over there", and became a real fault the moment a rescue was dispatched as one: D13 dug
+    -- through solid rock to D3's exact position, arrived, and went idle -- while the task stayed at
+    -- 0%, still assigned, holding one of the three rescue slots against every other trapped drone
+    -- in the fleet. The work was done and nothing knew it.
+    --
+    -- reportTask is a no-op when there is no taskId, so a hand-typed GoTo is unaffected.
     if(s_Status == false) then
         trace("GoTo FAILED: " .. tostring(s_Message))
         Distress("GoTo failed", tostring(s_Message))
+        reportTask(d, false, tostring(s_Message or "could not reach position"))
         return false, tostring(s_Message or "could not reach position")
     end
 
@@ -353,7 +369,9 @@ function OnGoTo(p_ID, p_Message)
         m_Status = "idle"
     end
     trace("GoTo done")
-    return true, {arrived = {x = d.pos.x, y = d.pos.y, z = d.pos.z}}
+    local s_Arrived = {x = d.pos.x, y = d.pos.y, z = d.pos.z}
+    reportTask(d, true, nil, {arrived = s_Arrived})
+    return true, {arrived = s_Arrived}
 end
 
 
@@ -707,7 +725,7 @@ end
 -- failed left its task at zero progress for ever: the queue reclaimed it, handed it straight back
 -- to the only scout, the scout failed again, and round it went. From outside the queue looked full
 -- and the fleet looked idle -- which is exactly what it was, in a loop.
-local function reportTask(p_Data, p_Ok, p_Reason, p_Result)
+reportTask = function(p_Data, p_Ok, p_Reason, p_Result)
     if p_Data == nil or p_Data.taskId == nil then return end
     pcall(function()
         PowNet.SendToServer("TaskMan", PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "TaskDone",
@@ -791,6 +809,16 @@ function OnSurvey(p_ID, p_Message)
                 trace(("survey: boxed in at y=%s -- climbing to %d to cross"):format(tostring(s_Cy), CRUISE_Y))
                 if pgps.flyTo(nil, CRUISE_Y, nil) ~= false then
                     s_At = pgps.flyTo(tonumber(d.pos.x), CRUISE_Y, tonumber(d.pos.z))
+                else
+                    -- WALLED IN, WHICH IS A DIFFERENT PROBLEM FROM AN UNREACHABLE TARGET.
+                    --
+                    -- Failing to reach the survey start can mean the destination is bad. Failing to
+                    -- climb straight up out of where we are standing cannot: it means there is rock
+                    -- overhead and this drone has no pickaxe. That is worth waking someone for, and
+                    -- it is the difference between "give this task to another scout" and "send a
+                    -- miner". Distress puts the drone into "stuck", which is what TaskMan's rescue
+                    -- pass looks for.
+                    Distress("walled in", "cannot climb out to cross; needs a miner to dig through")
                 end
             end
         end
