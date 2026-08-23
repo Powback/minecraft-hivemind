@@ -505,6 +505,33 @@ registry.register({
 });
 
 registry.register({
+  name: 'storage.deposit',
+  summary: 'Register a chest that drones may unload into.',
+  description:
+    'Until one exists a miner fills its inventory and has nowhere to put anything, so the material ' +
+    'economy never starts -- and everything above ground level depends on materials accumulating. ' +
+    'Depositing needs NO wired network: the drone flies to one block above the position and drops ' +
+    'down into it. The network is only needed for StorageMan to INDEX what is inside, which is a ' +
+    'separate and much fussier problem, because activating a wired modem is block-entity state that ' +
+    'no command can create.',
+  params: z.object({
+    x: z.number(), y: z.number(), z: z.number(),
+    peripheral: z.string().optional().describe('Network name, if the chest is also wired.'),
+  }).strict(),
+  returns: 'Confirmation, with the registered position.',
+  danger: 'mutate',
+  bounds: 'Registers a position. It does not place a chest -- one has to be there already.',
+  handler: async (a) => {
+    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    return await bridge.call(
+      'StorageMan', 'deposit',
+      { pos: { x: a.x, y: a.y, z: a.z }, peripheral: a.peripheral },
+      { timeoutMs: 8000 },
+    );
+  },
+});
+
+registry.register({
   name: 'supply.tick',
   summary: 'Run one supply pass now and report exactly what it decided.',
   description:
