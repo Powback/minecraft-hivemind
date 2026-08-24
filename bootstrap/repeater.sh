@@ -25,7 +25,17 @@ cd /Users/macback/Projects/minecraft-create121
 
 REPO=/Users/macback/Projects/HiveMind
 WORLD=data/world
-X=-480; Y=112; Z=64          # above the tower centre, where the mast will eventually stand
+# HEIGHT IS A TRADE-OFF, NOT A MAXIMUM.
+#
+# Altitude increases a modem's own range, so the instinct is to put the repeater as high as possible.
+# But a drone is only heard if the DRONE can reach the repeater, and a drone at ground level has the
+# short low-altitude range -- so every block of extra height is a block of distance spent before any
+# horizontal reach at all. At y=112 a ground drone at the region edge is 83 blocks away and silent,
+# which is exactly how D3 went quiet at x=-412 twice.
+#
+# y=85 is the height at which BOTH a ground drone and one cruising at y=110 stay inside 64 blocks
+# across a reach of 56. Measured, not picked.
+X=-480; Y=85; Z=64
 
 rc() { docker compose exec -T mc rcon-cli "$1" </dev/null 2>&1 | tr -d '\r' | sed 's/\x1b\[[0-9;]*m//g'; }
 state() { rc "computercraft dump" | grep -E "^#$1 " | awk -F'|' '{gsub(/ /,"",$2);print $2}'; }

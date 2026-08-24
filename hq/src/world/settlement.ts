@@ -38,9 +38,12 @@ export const settlement: Settlement = {
   // MEASURED, NOT CHOSEN. The bounds were 96 while four-host GPS coverage was 32 -- so the fleet was
   // authorised to work in an area NINE TIMES larger than it could navigate in, and every drone sent
   // to the edge stranded with "outside coverage: no gps coverage" while nothing had actually failed.
-  // 68 is the radius at which all four nearest hosts of the 16-host constellation are still audible,
-  // less a margin so a drone stops before losing its fix rather than after.
-  reach: Number(process.env.HIVE_REACH ?? 68),
+  // Two limits, and the tighter one wins. GPS coverage allows 68. RADIO does not: every module sits
+  // in the tower, a drone must reach the mast repeater to be heard at all, and 56 is the radius at
+  // which both a ground drone and one cruising at y=110 stay inside modem range of it. A drone
+  // beyond that is not lost -- it is working perfectly and cannot tell anyone, which reads as lost
+  // and is worse.
+  reach: Number(process.env.HIVE_REACH ?? 56),
   gpsHosts: [
     { x: -546, y: 70, z: -2 },
     { x: -546, y: 83, z: 42 },

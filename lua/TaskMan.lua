@@ -300,6 +300,18 @@ function OnStartTask(p_ID, p_Message)
     local s_Where = workPos(s_Task)
     local s_Drone, s_Busy = pickDrone(s_Role, s_Where, s_Task.lastFailedBy)
 
+    -- A DRONE MUST NOT BE SENT TO RESCUE ITSELF.
+    --
+    -- The earlier reasoning was that pickDrone only ever picks an idle drone and a drone needing
+    -- rescue is not idle -- which is true at any instant and false over time. A stranded drone
+    -- oscillates: it reports idle between failed attempts, gets picked in that window, and is
+    -- dispatched to its own coordinates. D3 was sent to -412,109,39 twice, which is where it already
+    -- was, so it "arrived" instantly, achieved nothing, and remained stranded outside the region.
+    if s_Drone ~= nil and s_Task.work and s_Task.work.rescue
+       and s_Drone.id == s_Task.work.rescue.id then
+        return false, "the only free " .. s_Role .. " is the drone that needs rescuing"
+    end
+
     -- PLACING A BLOCK NEEDS NO SPECIAL HARDWARE.
     --
     -- Digging needs a pickaxe and scanning needs a geo scanner, so those jobs genuinely belong to

@@ -373,6 +373,15 @@ function OnGoTo(p_ID, p_Message)
     m_Status = "moving"
     TaskStart()
     trace(("GoTo %s,%s,%s -> %s,%s,%s"):format(cx, cy, cz, tostring(d.pos.x), tostring(d.pos.y), tostring(d.pos.z)))
+    -- The third travel path, and the one I forgot. Survey and Mine check the destination; GoTo did
+    -- not -- and GoTo is what a rescue is dispatched as, so an out-of-region rescue target sent the
+    -- rescuer out of region too.
+    local s_Reach, s_ReachWhy = reachableTarget(tonumber(d.pos.x), tonumber(d.pos.y), tonumber(d.pos.z))
+    if not s_Reach then
+        trace("GoTo REFUSED: " .. tostring(s_ReachWhy))
+        reportTask(d, false, s_ReachWhy)
+        return false, s_ReachWhy
+    end
     local s_Status, s_Message = pgps.moveTo(tonumber(d.pos.x), tonumber(d.pos.y), tonumber(d.pos.z))
     if s_Status == false then
         -- Fall back to flying it directly. A recall is most needed exactly where the map is
@@ -2637,11 +2646,45 @@ local function climbForFix()
     return false
 end
 
+-- WALK HOME IF YOU END UP OUTSIDE.
+--
+-- Movement only happens while a job is running, and a drone outside the operating region is never
+-- given a job -- so nothing ever moved it back. D3 sat at x=-412, twelve blocks past the edge,
+-- heartbeating perfectly, holding a valid position, for an hour. Every individual part was working:
+-- it knew where it was, it could be heard, it simply had no reason to move and no way to be given
+-- one.
+--
+-- mayStep already permits steps that reduce the distance outside; this is the thing that decides to
+-- take them.
+local function returnToRegion()
+    local px, py, pz = pgps.getCachedPosition()
+    if px == nil then return false end
+    local s_B = pgps.getBounds()
+    local s_C = s_B and s_B.chunks
+    if type(s_C) ~= "table" or #s_C == 0 then return false end
+
+    -- Nearest point inside the first region, clamped per axis.
+    local r = s_C[1]
+    local tx = math.max(r.minx + 2, math.min(r.maxx - 2, px))
+    local tz = math.max(r.minz + 2, math.min(r.maxz - 2, pz))
+    if tx == px and tz == pz then return false end          -- already inside
+
+    trace(("outside the region at %d,%d,%d -- returning to %d,%d"):format(px, py, pz, tx, tz))
+    m_Status = "moving"
+    local ok = pgps.moveTo(tx, py, tz)
+    if ok == false then ok = pgps.flyTo(tx, py, tz) end
+    if ok == false and turtle.dig then ok = pgps.digTo(tx, py, tz) end
+    m_Status = "idle"
+    if ok ~= false then trace("back inside the region") return true end
+    trace("could not get back inside the region")
+    return false
+end
+
 local function refixLoop()
     local s_Failures = 0
     while true do
         os.sleep(REFIX_EVERY)
-        local px, _, _, pd = pgps.getCachedPosition()
+        local px, py, pz, pd = pgps.getCachedPosition()
         if px == nil and not executing then
             if pgps.verifyPosition() then
                 trace("re-acquired a position after losing it")
@@ -2655,6 +2698,10 @@ local function refixLoop()
                     if climbForFix() then s_Failures = 0 end
                 end
             end
+        elseif px ~= nil and not executing and not pgps.mayStep(px, py, pz) then
+            -- Standing somewhere it is not allowed to be. Walk back before anything else.
+            s_Failures = 0
+            returnToRegion()
         elseif px ~= nil and pd == nil and not executing then
             s_Failures = 0
             -- Heading recovery, moved off the heartbeat: it steps the turtle, can rise, and can

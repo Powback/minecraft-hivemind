@@ -204,8 +204,16 @@ function mayStep(x, y, z)
     --
     -- The chunk bound stays hard either way. Stepping out of a loaded chunk is how a drone stops
     -- ticking and is never seen again.
-    if not inAny(m_Chunks, x, y, z) then return false, "unloaded chunk" end
-    if positionVerified() then return true end
+    -- Inside the loaded chunks but out of GPS: fine, as long as we still know where we are.
+    if inAny(m_Chunks, x, y, z) and positionVerified() then return true end
+
+    -- OUTSIDE THE REGION, THE ONLY LEGAL MOVE IS BACK TOWARD IT.
+    --
+    -- Returning a flat false here meant a drone that ended up outside could never move again --
+    -- every step refused, including the ones leading home. D3 sat at x=-412, twelve blocks past the
+    -- edge, heartbeating perfectly and completely immobile. Getting out of bounds must not be a
+    -- one-way door; the check below already knows how to walk a drone back, and it needs to be
+    -- reachable.
 
     -- getCachedPosition(), NOT cachedX.
     --
@@ -238,8 +246,25 @@ function mayStep(x, y, z)
         return s_Best or 0
     end
 
-    local s_Now  = distanceOutside(m_Chunks, cx, cy, cz) + gpsMiss(cx, cy, cz)
-    local s_Next = distanceOutside(m_Chunks, x, y, z)    + gpsMiss(x, y, z)
+    -- BEING OUTSIDE THE REGION IS THE PRIMARY VIOLATION, AND IT DECIDES ALONE.
+    --
+    -- These two terms were summed, so GPS proximity could veto a step that was clearly heading home.
+    -- D3 was stranded twelve blocks outside the region and parked directly above a host: moving
+    -- toward the boundary took it AWAY from that host, the gps term grew faster than the chunk term
+    -- shrank, and every step home was refused. It managed two blocks in an hour.
+    --
+    -- If we are outside the chunk region, only that matters -- a drone in an unloaded chunk stops
+    -- ticking, which is worse than any amount of dead reckoning. GPS proximity only decides the
+    -- tie-break once we are inside.
+    local s_OutNow  = distanceOutside(m_Chunks, cx, cy, cz)
+    local s_OutNext = distanceOutside(m_Chunks, x, y, z)
+    if s_OutNow > 0 then
+        if s_OutNext < s_OutNow then return true end
+        return false, "outside the region, and that step does not head back"
+    end
+
+    local s_Now  = s_OutNow  + gpsMiss(cx, cy, cz)
+    local s_Next = s_OutNext + gpsMiss(x, y, z)
     if s_Next < s_Now then return true end
     return false, "out of bounds"
 end
@@ -1267,13 +1292,17 @@ function moveTo(_targetX, _targetY, _targetZ, _targetDir, changeDir, discover)
     end
 
     local s_Legs, s_Leg, s_NoProgress = 0, MOVE_LEG_MIN, 0
-    local s_Best = remaining()
+    local s_Best = remaining() or math.huge
 
     while cachedX ~= _targetX or cachedY ~= _targetY or cachedZ ~= _targetZ do
         s_Legs = s_Legs + 1
         if s_Legs > 96 then return false, "gave up after " .. s_Legs .. " legs" end
 
+        -- remaining() returns nil once the fix is gone, and every use of it is a comparison --
+        -- which is how "attempt to compare nil with number" replaced the arithmetic crash it was
+        -- meant to fix. Losing the fix part-way is an ordinary outcome and gets an ordinary return.
         local s_Before = remaining()
+        if s_Before == nil then return false, "lost the position fix part-way" end
         if s_Before <= s_Leg then
             local s_Ok, s_Why = moveLeg(_targetX, _targetY, _targetZ, _targetDir, changeDir, discover)
             if s_Ok then return true end
