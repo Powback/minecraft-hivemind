@@ -324,8 +324,17 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
     if (list === null) {
       return { acted: false, reason: `cannot read the task queue (${typeof res === 'string' ? res : typeof res}); not dispatching blind` };
     }
-    for (const t of list) {
-      if ((t?.progress ?? 0) < 100 && typeof t?.name === 'string') queued.add(t.name);
+    // Prefer the COMPLETE name list over the paged task objects. TaskMan caps the task array to
+    // stay inside the websocket frame, so counting names from that page under-reports duplicates and
+    // the loop cheerfully adds another copy of work already outstanding -- nine find-iron_ore among
+    // 159 live tasks with two assigned. The cap was mine and so was the regression.
+    const names = luaList<string>(res?.liveNames ?? res?.data?.liveNames);
+    if (names && names.length) {
+      for (const n of names) if (typeof n === 'string') queued.add(n);
+    } else {
+      for (const t of list) {
+        if ((t?.progress ?? 0) < 100 && typeof t?.name === 'string') queued.add(t.name);
+      }
     }
   } catch {
     // NOT KNOWING what is queued is a reason to WAIT, not to proceed.

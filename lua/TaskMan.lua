@@ -509,8 +509,24 @@ function OnGetTasks(p_ID, p_Message)
             work = v.work,
         }
     end
+    -- EVERY LIVE NAME, ALWAYS, EVEN THOUGH THE TASK LIST IS PAGED.
+    --
+    -- The supply loop dedups against the names it can see, and capping this reply at 40 tasks meant
+    -- it could only see a page -- so a shortage that already had eight outstanding searches looked
+    -- untouched and got a ninth. The queue reached 159 live tasks with 2 assigned, nine copies of
+    -- find-iron_ore among them, and the fleet spent its time being handed work it had already been
+    -- handed. The cap was mine, and so was the regression.
+    --
+    -- Names are short. All 159 of them cost about three kilobytes, nowhere near the frame limit,
+    -- and they are the one thing a caller needs in full to avoid asking twice.
+    local s_Names = {}
+    for _, v in ipairs(s_Live) do
+        if type(v.name) == "string" then s_Names[#s_Names + 1] = v.name end
+    end
+
     local s_Next = s_Offset + #s_List
     return true, {tasks = s_List, count = #s_List, total = s_Total, live = #s_Live,
+                  liveNames = s_Names,
                   offset = s_Offset, next = (s_Next < #s_Ordered) and s_Next or nil}
 end
 
@@ -705,10 +721,42 @@ local function placeRescues()
     return s_Placed
 end
 
+-- COLLAPSE DUPLICATE WORK.
+--
+-- Two identical unassigned tasks are not twice the work, they are the same work queued twice -- and
+-- a queue full of them starves everything else, because the placement pass walks tasks in arbitrary
+-- order and keeps finding another copy of a job it cannot place. The queue reached 158 live with two
+-- assigned: nine copies of find-iron_ore, eight of find-copper_ore, and one scout.
+--
+-- Dedup at the source stops it happening again; this clears what is already there. Only UNASSIGNED
+-- duplicates are dropped -- one already given to a drone is real work in progress, and the drone
+-- holding it would report against a task that had vanished.
+local function dedupeQueue()
+    local s_Seen, s_Dropped = {}, 0
+    for k, v in pairs(DATA["tasks"] or {}) do
+        local s_Name = v.name
+        if type(s_Name) == "string" and (v.progress or 0) < 100 and v.enabled ~= false then
+            if v.assigned ~= nil then
+                s_Seen[s_Name] = true             -- the assigned copy is the one that survives
+            elseif s_Seen[s_Name] then
+                DATA["tasks"][k] = nil
+                s_Dropped = s_Dropped + 1
+            else
+                s_Seen[s_Name] = true
+            end
+        end
+    end
+    if s_Dropped > 0 then
+        Log(("dropped %d duplicate task(s) already queued under the same name"):format(s_Dropped))
+        PowNet.MarkDirty()
+    end
+end
+
 function Tick()
     while true do
         os.sleep(TICK_SECONDS)
         pcall(pruneFinished)
+        pcall(dedupeQueue)
         pcall(rescueNeeded)
         pcall(placeRescues)
         local s_Ok, s_Err = pcall(function()
