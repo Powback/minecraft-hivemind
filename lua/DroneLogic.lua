@@ -2097,6 +2097,15 @@ function OnMine(p_ID, p_Message)
         end
 
         UploadWorld()
+        -- UNLOAD BEFORE REPORTING DONE.
+        --
+        -- The job only deposited when the inventory was nearly full, so a shaft that ended with
+        -- fifteen slots of stone simply kept it: D3 finished holding roughly 200 cobblestone while
+        -- storage sat unchanged at 47 items, and the fleet looked unproductive while carrying the
+        -- proof that it was not. Whatever was cut belongs in the chest before the drone takes its
+        -- next order.
+        if FreeSlots() < 16 then pcall(Deposit) end
+
         return {message = ("cut %d tunnel blocks at y=%d, took %d ore")
                     :format(s_Steps, s_Depth, s_Got),
                 got = s_Got, steps = s_Steps, depth = s_Depth}

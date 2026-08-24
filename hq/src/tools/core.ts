@@ -1658,7 +1658,24 @@ registry.register({
     // the settlement does not end up pockmarked with holes nobody meant to leave.
     let plot = a.plot
       ? city.plots.find((p) => p.name === a.plot)
-      : city.plots.find((p) => p.purpose === 'mine_head' && p.status !== 'active');
+      // NEAREST TO THE SETTLEMENT, NOT FIRST IN THE LIST.
+      //
+      // "first non-active" meant the centre shaft got marked active on its first attempt, failed,
+      // and was never chosen again -- so every later prospect picked a plot further out and the
+      // ground directly under the tower stayed untouched. That shaft is the point of the design: it
+      // is the basement excavation, the cobblestone quarry, and the only route to the redstone that
+      // gates everything above the fifth floor.
+      //
+      // Preferring the nearest plot makes the centre the default. Active ones are still eligible if
+      // nothing else is free -- a shaft can always be deepened, and refusing to reuse one is how the
+      // fleet ends up with a field of abandoned holes.
+      : (() => {
+          const heads = city.plots.filter((p) => p.purpose === 'mine_head');
+          const d = (p: typeof heads[number]) =>
+            Math.hypot(p.min.x - city.origin.x, p.min.z - city.origin.z);
+          const free = heads.filter((p) => p.status !== 'active').sort((x, y) => d(x) - d(y));
+          return free[0] ?? heads.sort((x, y) => d(x) - d(y))[0];
+        })();
     if (!plot) {
       const r = allocate(city, 'mine_head');
       if ('error' in r) throw new ToolError(r.error, 'Free ground or widen the operating bounds.');
