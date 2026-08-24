@@ -205,7 +205,17 @@ function mayStep(x, y, z)
     -- The chunk bound stays hard either way. Stepping out of a loaded chunk is how a drone stops
     -- ticking and is never seen again.
     -- Inside the loaded chunks but out of GPS: fine, as long as we still know where we are.
-    if inAny(m_Chunks, x, y, z) and positionVerified() then return true end
+    --
+    -- KNOWN, not RECENTLY VERIFIED. positionVerified() is false once a fix is 60 seconds old, and
+    -- underground a fix can never be refreshed -- so a miner got about a minute of digging and then
+    -- froze. That is precisely the "bore blocked on line 2 step 2" pattern, repeating on every line:
+    -- the shaft sinks, the clock runs out, and every horizontal step is refused from then on.
+    --
+    -- The age limit guards against drift from displacement the drone did not notice, which is a real
+    -- but slow risk. Being unable to mine at all is not slow. pgps tracks position through every
+    -- move, and re-verifies the moment coverage returns, so a known position inside the loaded
+    -- region is good enough to keep working on.
+    if inAny(m_Chunks, x, y, z) and cachedX ~= nil then return true end
 
     -- OUTSIDE THE REGION, THE ONLY LEGAL MOVE IS BACK TOWARD IT.
     --
