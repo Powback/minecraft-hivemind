@@ -540,6 +540,7 @@ end
 -- doing and (via DroneMan) who is free. It runs as a fourth branch of the module's parallel set.
 local TICK_SECONDS = 15
 local RECLAIM_AFTER_MS = 90 * 1000
+local m_OrphanSince = {}
 
 -- How many tasks to start in one pass. Small on purpose: assigning is expensive (a liveness ping
 -- per candidate) and the tick comes round every 15 seconds anyway, so there is no need to place the
@@ -638,6 +639,43 @@ local function rescueNeeded()
     for _, d in ipairs(fleet()) do
         if (d.role or "miner") ~= "miner" then s_Order[#s_Order + 1] = d end
     end
+
+    -- CANCEL A RESCUE THE MOMENT IT IS NOT NEEDED.
+    --
+    -- Distress is a flicker, not a state: a drone reports blocked, a rescue is queued, and two ticks
+    -- later it has recovered by itself -- but the rescue outlives it. Rescues are placed BEFORE all
+    -- other work by design, so stale ones crowd out everything real: two of the fleet's three
+    -- assigned tasks were rescues for drones that were both working perfectly at the time.
+    --
+    -- A rescue that has already reached its target is not cancelled -- it is finished, and its
+    -- completion is what tells the rescued drone to climb out.
+    local s_Healthy, s_Cancelled = {}, 0
+    for _, d in ipairs(fleet()) do
+        if not (RESCUE_STATES[tostring(d.status)] or d.offline) then s_Healthy[tostring(d.id)] = true end
+    end
+    for k, v in pairs(DATA["tasks"] or {}) do
+        local w = v.work and v.work.rescue
+        if w and (v.progress or 0) < 100 and s_Healthy[tostring(w.id)] then
+            -- TELL THE DRONE, NOT JUST THE QUEUE.
+            --
+            -- Deleting the task alone leaves the rescuer flying to a rescue that no longer exists:
+            -- it stays "working", holds no task anyone can see, and pickDrone skips it for ever
+            -- because it only chooses idle drones. Both miners were in exactly that state -- busy
+            -- with cancelled work, invisible to the scheduler, while four miner tasks sat
+            -- unassigned. Cancelling work has to reach whoever is doing it.
+            if v.assignedTo then
+                pcall(function()
+                    PowNet.sendAndWaitForResponse(v.assignedTo,
+                        PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Abort", {}),
+                        PowNet.SERVER_PROTOCOL, 3)
+                end)
+            end
+            Log(("rescue for %s cancelled -- it recovered on its own"):format(tostring(w.drone)))
+            DATA["tasks"][k] = nil
+            s_Cancelled = s_Cancelled + 1
+        end
+    end
+    if s_Cancelled > 0 then PowNet.MarkDirty() end
 
     local s_Made = 0
     for _, d in ipairs(s_Order) do
@@ -752,11 +790,51 @@ local function dedupeQueue()
     end
 end
 
+-- A DRONE BUSY WITH NOTHING IS THE MIRROR OF A TASK HELD BY NOBODY.
+--
+-- The reclaim pass walks TASKS and asks who holds them, so it can only ever find a task with a bad
+-- drone. It cannot see the opposite: a drone still executing work whose task no longer exists.
+-- That happens whenever a task is deleted out from under a drone -- a cancelled rescue, a pruned
+-- duplicate -- and the result is a drone that reports "working" for ever, holds nothing anyone can
+-- see, and is skipped by pickDrone permanently, because pickDrone only chooses idle drones. Both
+-- miners sat like that while four miner tasks went unassigned.
+--
+-- Aborting is safe: if it really were mid-job the task would still exist and it would not be here.
+local function freeOrphanedDrones()
+    local s_Held = {}
+    for _, v in pairs(DATA["tasks"] or {}) do
+        if v.assignedTo ~= nil and (v.progress or 0) < 100 then s_Held[tostring(v.assignedTo)] = true end
+    end
+    for _, d in ipairs(fleet()) do
+        local s_Busy = d.status ~= nil and d.status ~= "idle" and d.status ~= "offline"
+        if s_Busy and not d.offline and not s_Held[tostring(d.id)] then
+            m_OrphanSince = m_OrphanSince or {}
+            local s_Key = tostring(d.id)
+            m_OrphanSince[s_Key] = m_OrphanSince[s_Key] or os.epoch("utc")
+            -- Sustained, not momentary: there is a real window between a drone accepting work and
+            -- the assignment being recorded, and aborting inside it would cancel live work.
+            if (os.epoch("utc") - m_OrphanSince[s_Key]) > 60000 then
+                Log(("%s is %s with no task -- aborting so it can be given work")
+                    :format(tostring(d.name), tostring(d.status)))
+                pcall(function()
+                    PowNet.sendAndWaitForResponse(d.id,
+                        PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Abort", {}),
+                        PowNet.SERVER_PROTOCOL, 3)
+                end)
+                m_OrphanSince[s_Key] = nil
+            end
+        elseif m_OrphanSince then
+            m_OrphanSince[tostring(d.id)] = nil
+        end
+    end
+end
+
 function Tick()
     while true do
         os.sleep(TICK_SECONDS)
         pcall(pruneFinished)
         pcall(dedupeQueue)
+        pcall(freeOrphanedDrones)
         pcall(rescueNeeded)
         pcall(placeRescues)
         local s_Ok, s_Err = pcall(function()
