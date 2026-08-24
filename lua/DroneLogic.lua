@@ -1196,7 +1196,42 @@ function Deposit()
     return true
 end
 
+-- REFUEL WHILE WORKING, NOT ONLY WHEN IDLE.
+--
+-- TryRefuel ran only when a drone was idle AND not executing, so a miner burned steadily to zero
+-- mid-shaft and never touched the coal it was carrying -- D1 reached fuel 0 holding a gather job for
+-- coal ore. At zero it cannot move, cannot reach the dock where the fuel is, and cannot be rescued
+-- except by another drone digging to it.
+--
+-- This runs on every bore step, which is the natural place: it is already the per-step housekeeping
+-- hook, and a miner is exactly the drone most likely to be carrying something burnable.
+
+-- COME HOME WHILE YOU STILL CAN.
+--
+-- Refuelling mid-job only helps if the drone is CARRYING something burnable, and a miner that has
+-- deposited its coal is not. D1 hit fuel 0 twice: at zero it cannot move, cannot reach the barrel
+-- that has the fuel in it, and cannot be recovered except by another drone digging to it. Running
+-- out is not an emergency to survive, it is one to avoid.
+--
+-- So there is a floor. Below it the drone stops working and docks -- while it still has the fuel to
+-- get there -- and the dock is where the coal is. Returning early costs a trip; running dry costs
+-- the drone.
+local FUEL_TOPUP  = 2000
+local FUEL_RESERVE = 600
+
 local function depositIfFull()
+    local s_Fuel = turtle.getFuelLevel()
+    if s_Fuel ~= "unlimited" then
+        if s_Fuel < FUEL_TOPUP then pcall(TryRefuel) end
+        s_Fuel = turtle.getFuelLevel()
+        if s_Fuel ~= "unlimited" and s_Fuel < FUEL_RESERVE then
+            trace(("fuel down to %d -- breaking off to dock before it runs out"):format(s_Fuel))
+            pcall(Deposit)
+            local ok = dockNow()
+            if ok then pcall(TryRefuel) end
+            return false            -- end this job; the next assignment starts fuelled
+        end
+    end
     if FreeSlots() > 1 then return true end
     return Deposit()
 end
@@ -1947,13 +1982,20 @@ function OnMine(p_ID, p_Message)
         -- stepping in. That is two digs per block instead of one, and digs are FREE -- they cost
         -- time, not fuel -- while the move is what actually costs. So headroom is nearly free, and
         -- a one-high tunnel nobody can walk through is a worse artefact for the same fuel.
+        -- SAY WHICH HALF FAILED.
+        --
+        -- This returned a bare nil whether the DIG failed or the MOVE failed, and those want
+        -- opposite fixes -- one is bedrock or something protected, the other is a refused step. The
+        -- log said "bore blocked on line 2 step 2" for hours without ever saying blocked BY WHAT.
         local function boreForward()
             local s_Ore = 0
             s_Ore = s_Ore + workFace(turtle.inspect,   DigForward, 0, 0, 0)
-            if not DigForward() then return nil end
+            local s_Dug, s_DigWhy = DigForward()
+            if not s_Dug then return nil, "dig: " .. tostring(s_DigWhy or "refused") end
             s_Ore = s_Ore + workFace(turtle.inspectUp, DigUp,      0, 1, 0)
             DigUp()                                   -- headroom, whether or not it held ore
-            if not pgps.forward() then return nil end
+            local s_Moved, s_MoveWhy = pgps.forward()
+            if not s_Moved then return nil, "move: " .. tostring(s_MoveWhy or "refused") end
             -- Now standing in the new block: clear the head-height block ahead of us too, so the
             -- corridor stays two high the whole way rather than only where it happened to be air.
             s_Ore = s_Ore + workFace(turtle.inspectUp, DigUp, 0, 1, 0)
@@ -2024,9 +2066,10 @@ function OnMine(p_ID, p_Message)
                 if not executing then break end
                 if not depositIfFull() then break end
 
-                local s_Ore = boreForward()
+                local s_Ore, s_BoreWhy = boreForward()
                 if s_Ore == nil then
-                    trace(("mine: bore blocked on line %d step %d"):format(line, step))
+                    trace(("mine: bore blocked on line %d step %d -- %s")
+                        :format(line, step, tostring(s_BoreWhy)))
                     break
                 end
                 s_Got = s_Got + s_Ore

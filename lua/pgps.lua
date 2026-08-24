@@ -548,6 +548,21 @@ function requireFix()
         m_MovesSinceFix = 1
         return true
     end
+
+    -- DEAD RECKONING IS ALLOWED IMMEDIATELY, NOT AFTER THREE REFUSALS.
+    --
+    -- mayStep learned this and forward() has its own gate that did not: requireFix refused three
+    -- times before conceding, and a bore breaks on the FIRST refusal. So every branch line died at
+    -- step 1 or 2 with "move: position unverified" -- underground, where a fix can never be
+    -- refreshed, that refusal is guaranteed and permanent.
+    --
+    -- A known position is enough to keep moving on. The counter still runs, so refixLoop can decide
+    -- to surface and re-acquire; it just no longer stops the drone working while it does.
+    if cachedX ~= nil then
+        m_MovesSinceFix = 0
+        return true
+    end
+
     m_NoFixStops = m_NoFixStops + 1
 
     -- DO NOT FREEZE FOREVER.
@@ -615,6 +630,52 @@ end
 -- That is not a degraded state, it is a fatal one: deltas[nil] is nil, so the very next line of
 -- forward() indexed nil and THREW. The error killed moveTo, which killed the GoTo, and the drone
 -- sat reporting "moving" while standing perfectly still. Two of them did, for an hour.
+-- DEFINED ABOVE ITS FIRST USE, WHICH IS THE ONLY PLACE IT CAN LIVE.
+--
+-- This sat next to clearAhead at line 1144, four hundred lines BELOW the call in ensureHeading. A
+-- local is only in scope after its definition, so that call compiled to a global lookup and read
+-- nil: "attempt to call global 'digGuarded'". Every Gather job died on it the moment a drone had to
+-- dig its way anywhere -- and the guard that was supposed to stop drones mining each other silently
+-- was not protecting that path at all.
+--
+-- Fourth time today this exact trap has bitten: mayStep, m_DroneEvents, reportTask, and now this.
+-- NEVER BREAK THE SETTLEMENT, OR EACH OTHER.
+--
+-- digTo carves a corridor with raw turtle.dig, and D1 was standing in one. A miner tunnelled through
+-- a fellow drone, which dropped as an item, and then a haul carried it to storage -- so the fleet
+-- mined one of its own members and filed it. D1 read as "lost" and was in a chest, with its pickaxe,
+-- its modem and 19,651 fuel still attached.
+--
+-- DroneLogic's digHard already refused protected blocks. pgps did not, and pgps is the layer that
+-- actually digs during travel, which is where a drone is most likely to meet another one. The guard
+-- belongs here, at the bottom, not only in the caller that happened to have it.
+--
+-- Anything computercraft: covers every turtle, computer, modem, drive and cable; the rest is the
+-- infrastructure a settlement would be sad to lose to a passing tunnel.
+local PROTECT = {
+    ["minecraft:chest"] = true, ["minecraft:trapped_chest"] = true, ["minecraft:barrel"] = true,
+    ["minecraft:furnace"] = true, ["minecraft:blast_furnace"] = true, ["minecraft:smoker"] = true,
+    ["minecraft:hopper"] = true, ["minecraft:dropper"] = true, ["minecraft:dispenser"] = true,
+}
+
+function isProtectedBlock(p_Name)
+    if p_Name == nil then return false end
+    if PROTECT[p_Name] then return true end
+    return string.sub(p_Name, 1, 14) == "computercraft:"
+end
+
+-- Dig, unless what is there is ours. Returns false and the block name when it refuses, so a caller
+-- can route around rather than retry into the same wall.
+local function digGuarded(p_Dig, p_Detect, p_Inspect)
+    if not p_Detect() then return true end
+    local s_Ok, s_Blk = p_Inspect()
+    if s_Ok and s_Blk and isProtectedBlock(s_Blk.name) then
+        print("refusing to dig " .. tostring(s_Blk.name))
+        return false, s_Blk.name
+    end
+    return p_Dig()
+end
+
 function ensureHeading()
     if cachedDir ~= nil then return true end
     if cachedX == nil then return false, "no position, so no way to deduce heading" end
@@ -714,6 +775,7 @@ function forward()
         cachedX, cachedY, cachedZ = x, y, z
         breadcrumb()
         detectAll()
+        savePose()
         return true
     else
         -- Something stopped us: record it and put it in the DELTA, not just the local cache.
@@ -760,6 +822,7 @@ function back()
         cachedX, cachedY, cachedZ = x, y, z
         breadcrumb()
         detectAll()
+        savePose()
         return true
     else
         cachedWorld[idx_pos] = 0.5
@@ -787,6 +850,7 @@ function up()
         cachedX, cachedY, cachedZ = x, y, z
         breadcrumb()
         detectAll()
+        savePose()
         return true
     else
         cachedWorld[idx_pos] = (turtle.detectUp() and 1 or 0.5)
@@ -814,6 +878,7 @@ function down()
         cachedX, cachedY, cachedZ = x, y, z
         breadcrumb()
         detectAll()
+        savePose()
         return true
     else
         detectAll()
@@ -838,6 +903,7 @@ function turnLeft()
     cachedDir = (cachedDir + 1) % 4
     turtle.turnLeft()
     detectAll()
+    savePose(true)   -- heading changed: worth writing immediately
     return true
 end
 
@@ -857,6 +923,7 @@ function turnRight()
     cachedDir = (cachedDir + 3) % 4
     turtle.turnRight()
     detectAll()
+    savePose(true)   -- heading changed: worth writing immediately
     return true
 end
 
@@ -1114,42 +1181,6 @@ end
 -- call; the cap stops a drone under a gravel column from digging for ever.
 local DIG_RETRY = 12
 
--- NEVER BREAK THE SETTLEMENT, OR EACH OTHER.
---
--- digTo carves a corridor with raw turtle.dig, and D1 was standing in one. A miner tunnelled through
--- a fellow drone, which dropped as an item, and then a haul carried it to storage -- so the fleet
--- mined one of its own members and filed it. D1 read as "lost" and was in a chest, with its pickaxe,
--- its modem and 19,651 fuel still attached.
---
--- DroneLogic's digHard already refused protected blocks. pgps did not, and pgps is the layer that
--- actually digs during travel, which is where a drone is most likely to meet another one. The guard
--- belongs here, at the bottom, not only in the caller that happened to have it.
---
--- Anything computercraft: covers every turtle, computer, modem, drive and cable; the rest is the
--- infrastructure a settlement would be sad to lose to a passing tunnel.
-local PROTECT = {
-    ["minecraft:chest"] = true, ["minecraft:trapped_chest"] = true, ["minecraft:barrel"] = true,
-    ["minecraft:furnace"] = true, ["minecraft:blast_furnace"] = true, ["minecraft:smoker"] = true,
-    ["minecraft:hopper"] = true, ["minecraft:dropper"] = true, ["minecraft:dispenser"] = true,
-}
-
-function isProtectedBlock(p_Name)
-    if p_Name == nil then return false end
-    if PROTECT[p_Name] then return true end
-    return string.sub(p_Name, 1, 14) == "computercraft:"
-end
-
--- Dig, unless what is there is ours. Returns false and the block name when it refuses, so a caller
--- can route around rather than retry into the same wall.
-local function digGuarded(p_Dig, p_Detect, p_Inspect)
-    if not p_Detect() then return true end
-    local s_Ok, s_Blk = p_Inspect()
-    if s_Ok and s_Blk and isProtectedBlock(s_Blk.name) then
-        print("refusing to dig " .. tostring(s_Blk.name))
-        return false, s_Blk.name
-    end
-    return p_Dig()
-end
 
 local function clearAhead()
     local s_Tries = 0
@@ -1430,6 +1461,48 @@ end
 -- return: current X, Y, Z and direction of the turtle (or false if it failed)
 --
 
+-- REMEMBER WHERE WE WERE FACING, BECAUSE UNDERGROUND IT CANNOT BE REDERIVED.
+--
+-- Heading is worked out by stepping one block and comparing GPS readings, so below ground it cannot
+-- be worked out at all. A drone that reboots down a shaft -- which happens on every code deploy --
+-- comes up with no heading and cannot move: "bore blocked on line 1 step 1 -- move: could not
+-- determine heading". Position has the same problem and the climb-for-fix loop solves it by
+-- surfacing, which costs the whole descent.
+--
+-- Neither needs rederiving if they were never forgotten. pgps already tracks both through every move
+-- and turn; writing them down makes that survive a reboot. Throttled, because a file write per step
+-- is a real cost and the pose only has to be good enough to resume from -- a stale entry is
+-- corrected by the first GPS fix the drone gets.
+local POSE_FILE = "/pgps-pose.txt"
+local m_PoseDirty = 0
+
+function savePose(p_Force)
+    if cachedX == nil or cachedDir == nil then return end
+    m_PoseDirty = m_PoseDirty + 1
+    if not p_Force and m_PoseDirty < 8 then return end
+    m_PoseDirty = 0
+    local h = fs.open(POSE_FILE, "w")
+    if not h then return end
+    h.write(("%d %d %d %d"):format(cachedX, cachedY, cachedZ, cachedDir))
+    h.close()
+end
+
+function loadPose()
+    if not fs.exists(POSE_FILE) then return false end
+    local h = fs.open(POSE_FILE, "r")
+    if not h then return false end
+    local s_Line = h.readLine()
+    h.close()
+    if type(s_Line) ~= "string" then return false end
+    local x, y, z, d = s_Line:match("(-?%d+) (-?%d+) (-?%d+) (%d+)")
+    if x == nil then return false end
+    cachedX, cachedY, cachedZ = tonumber(x), tonumber(y), tonumber(z)
+    cachedDir = tonumber(d)
+    print(("restored pose %d,%d,%d facing %s"):format(cachedX, cachedY, cachedZ,
+        tostring(shortNames[cachedDir])))
+    return true
+end
+
 function setLocationFromGPS()
     if startGPS() then
         -- get the current position
@@ -1446,10 +1519,26 @@ function setLocationFromGPS()
         -- modules on every pass, so it looked like a perfectly healthy machine that simply never
         -- registered. D3 sat in that loop for hours and nothing anywhere said "no GPS".
         if cachedX == nil then
+            -- Underground, or out of coverage. If we wrote a pose down before, resume from it
+            -- rather than declaring ourselves lost -- it is exactly the situation it exists for.
+            if loadPose() then
+                print("no GPS fix -- resuming from the saved pose")
+                return cachedX, cachedY, cachedZ, cachedDir
+            end
             print("no GPS fix -- cannot establish position")
             return nil, nil, nil
         end
 
+        -- DO NOT THROW AWAY A HEADING YOU MIGHT NOT BE ABLE TO REBUILD.
+        --
+        -- This cleared cachedDir and then tried to re-derive it by stepping and comparing GPS
+        -- readings -- which underground cannot work, because there is no GPS to compare. So a drone
+        -- that already KNEW which way it was facing came out of this not knowing, and then could not
+        -- move at all: "bore blocked on line 1 step 1 -- move: could not determine heading".
+        --
+        -- Keep the old value and put it back if the derivation fails. Deriving is an improvement,
+        -- not a prerequisite, and pgps tracks heading through every turn anyway.
+        local s_PrevDir = cachedDir
         local d = cachedDir or nil
         cachedDir = nil
 
@@ -1501,6 +1590,11 @@ function setLocationFromGPS()
                 tries = tries + 1
                 turtle.turnLeft()
             end
+        end
+
+        if cachedDir == nil and s_PrevDir ~= nil then
+            cachedDir = s_PrevDir
+            print("could not re-derive heading -- keeping the one we had")
         end
 
         if cachedDir == nil then
