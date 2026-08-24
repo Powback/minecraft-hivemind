@@ -25,6 +25,7 @@ local HEADINGS = {north = 0, west = 1, south = 2, east = 3}
 -- the tower needs as many slots as drones docked at once rather than drones in existence -- and it
 -- means the slot a drone gets is near where it actually is, instead of wherever it first booted.
 local m_Docked = false
+local m_DockingSince = nil
 
 print("I AM ALIVE!")
 
@@ -171,6 +172,24 @@ function SendHeartBeat()
     --
     -- `executing` is the authority -- it is set and cleared by the job machinery itself -- so when
     -- nothing is executing, the drone is idle by definition, whatever the last label happened to be.
+    -- DOCKING IS NOT EXEMPT FROM THE SWEEP, IT JUST GETS LONGER.
+    --
+    -- Excluding "docking" outright meant a drone whose dock attempt failed silently stayed
+    -- "docking" for ever -- and a docking drone is never picked for work, so it was retired without
+    -- anyone deciding to retire it. D1 finished its mine job, logged "JOB Mine done", and sat in
+    -- docking with nothing running. The state is legitimately long-lived, so it gets a grace
+    -- period rather than an exemption.
+    if m_Status == "docking" and not executing then
+        m_DockingSince = m_DockingSince or os.clock()
+        if (os.clock() - m_DockingSince) > 90 then
+            trace("docking for 90s with no job running -- clearing to idle")
+            m_Status = "idle"
+            m_DockingSince = nil
+        end
+    elseif m_Status ~= "docking" then
+        m_DockingSince = nil
+    end
+
     if not executing and m_Status ~= "idle" and m_Status ~= "docking" then
         trace(("status %s left behind with no job running -- clearing to idle"):format(tostring(m_Status)))
         m_Status = "idle"
@@ -804,6 +823,27 @@ function OnDock(p_ID, p_Message)
     return true, res
 end
 
+-- REFUSE AN IMPOSSIBLE DESTINATION BEFORE SETTING OFF, NOT AFTER.
+--
+-- A survey task left over from the previous world still pointed at -35,50,-90. D2 accepted it and
+-- flew toward it until it reached the edge of the operating region, then sat at the boundary 76
+-- blocks from the modules -- out of radio range, unable to report, reading as lost. The task was
+-- impossible the moment it was handed over, and nothing checked.
+--
+-- Checking costs one comparison and turns a lost drone into a failed task, which TaskMan already
+-- knows how to retire: three attempts and it gives up.
+local function reachableTarget(x, y, z)
+    if x == nil or z == nil then return true end          -- an omitted axis means "wherever I am"
+    local s_B = pgps.getBounds()
+    local s_C = s_B and s_B.chunks
+    if type(s_C) ~= "table" then return true end          -- no bounds known: do not invent a refusal
+    for _, r in ipairs(s_C) do
+        if x >= r.minx and x <= r.maxx and z >= r.minz and z <= r.maxz then return true end
+    end
+    return false, ("target %s,%s,%s is outside the operating region"):format(
+        tostring(x), tostring(y), tostring(z))
+end
+
 reportTask = function(p_Data, p_Ok, p_Reason, p_Result)
     if p_Data == nil or p_Data.taskId == nil then return end
     pcall(function()
@@ -865,6 +905,14 @@ function OnSurvey(p_ID, p_Message)
         -- flyTo is greedy and climbs over what it cannot go through, which is exactly what is needed
         -- to get out of a hole and across to somewhere else. GoTo has had this fallback for a while;
         -- the survey never did.
+        local s_Reach, s_ReachWhy = reachableTarget(tonumber(d.pos.x), s_Ty, tonumber(d.pos.z))
+        if not s_Reach then
+            TaskEnd()
+            m_Status = "idle"
+            trace("survey: " .. tostring(s_ReachWhy))
+            reportTask(d, false, s_ReachWhy)
+            return false, s_ReachWhy
+        end
         local s_At = pgps.moveTo(tonumber(d.pos.x), s_Ty, tonumber(d.pos.z))
         if s_At == false then
             trace("survey: no mapped route to the start -- flying")
@@ -1913,6 +1961,11 @@ function OnMine(p_ID, p_Message)
             trace(("mine: travelling %s,%s,%s -> %s,%s,%s"):format(
                 tostring(sx), tostring(sy), tostring(sz),
                 tostring(d.pos.x), tostring(d.pos.y), tostring(d.pos.z)))
+            local s_Reach, s_ReachWhy = reachableTarget(tonumber(d.pos.x), tonumber(d.pos.y), tonumber(d.pos.z))
+            if not s_Reach then
+                trace("mine: " .. tostring(s_ReachWhy))
+                error(tostring(s_ReachWhy), 0)
+            end
             local s_At, s_Why = pgps.moveTo(tonumber(d.pos.x), tonumber(d.pos.y), tonumber(d.pos.z))
             -- A MINER THAT CANNOT WALK TO ITS OWN SHAFT SHOULD DIG TO IT.
             --
@@ -2545,17 +2598,70 @@ end
 -- would otherwise spend its entire life in gps.locate.
 local REFIX_EVERY = 45
 
+-- A LOST DRONE MUST CLIMB, NOT JUST ASK AGAIN.
+--
+-- This retried gps.locate on a timer and never moved. Underground that can only ever fail: every
+-- host is above the surface, and no amount of asking from y=48 reaches four of them. So a drone that
+-- lost its fix down a shaft -- or simply REBOOTED down one, which happens on every code deploy --
+-- sat re-asking for ever, reporting "no position fix (re-fix attempted and failed)" and unable to
+-- move at all, because every movement path needs a position first.
+--
+-- Digging out is the answer, and the drone is usually holding the tool for it. Climb a block at a
+-- time and ask again after each. Raw turtle calls rather than pgps ones on purpose: pgps movement
+-- wants a known position, which is precisely what is missing.
+local RECOVERY_CLIMB = 80
+
+local function climbForFix()
+    for i = 1, RECOVERY_CLIMB do
+        if turtle.detectUp() then
+            local ok, blk = turtle.inspectUp()
+            if ok and blk and pgps.isProtectedBlock(blk.name) then
+                trace("refix: something of ours overhead -- not digging through it")
+                return false
+            end
+            if not turtle.digUp() then
+                trace(("refix: blocked overhead after %d blocks"):format(i - 1))
+                return false
+            end
+        end
+        if not turtle.up() then
+            trace(("refix: could not rise after %d blocks"):format(i - 1))
+            return false
+        end
+        if pgps.verifyPosition() then
+            trace(("refix: regained a position after climbing %d"):format(i))
+            return true
+        end
+    end
+    trace(("refix: climbed %d and still no fix"):format(RECOVERY_CLIMB))
+    return false
+end
+
 local function refixLoop()
+    local s_Failures = 0
     while true do
         os.sleep(REFIX_EVERY)
         local px, _, _, pd = pgps.getCachedPosition()
         if px == nil and not executing then
-            local ok = pgps.verifyPosition()
-            if ok then trace("re-acquired a position after losing it") end
+            if pgps.verifyPosition() then
+                trace("re-acquired a position after losing it")
+                s_Failures = 0
+            else
+                s_Failures = s_Failures + 1
+                -- Two quiet retries first. A fix blinks out near the edge of coverage, and
+                -- tunnelling upward through a floor to fix that would be worse than the problem.
+                if s_Failures >= 3 then
+                    trace("no fix after 3 tries -- climbing to find the sky")
+                    if climbForFix() then s_Failures = 0 end
+                end
+            end
         elseif px ~= nil and pd == nil and not executing then
+            s_Failures = 0
             -- Heading recovery, moved off the heartbeat: it steps the turtle, can rise, and can
             -- dig, so it belongs on a thread where taking a minute costs nothing.
             if pgps.ensureHeading() then trace("re-established heading") end
+        else
+            s_Failures = 0
         end
     end
 end

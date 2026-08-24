@@ -187,6 +187,26 @@ end
 function mayStep(x, y, z)
     if inBounds(x, y, z) then return true end
 
+    -- GPS COVERAGE GATES RE-FIXING, NOT MOVING.
+    --
+    -- inBounds requires both loaded chunks AND four audible GPS hosts, and the hosts are all above
+    -- ground -- so every step DOWNWARD out of coverage was refused. A miner could dig the block in
+    -- front of it and then not move into the hole: "bore blocked on line 1 step 5", four lines in a
+    -- row, and the shaft finished having produced almost nothing. The fleet could not mine
+    -- underground at all, which is the one thing the shaft exists for, since redstone, gold and
+    -- diamond are all below y=16 and GPS reaches none of it.
+    --
+    -- Losing the fix underground is normal and expected. What matters is whether the drone still
+    -- KNOWS where it is: pgps tracks position through every move, so with a verified position dead
+    -- reckoning is sound and descending is safe. Without one, the drone is genuinely lost and must
+    -- head back toward coverage rather than deeper -- which is the behaviour below, now correctly
+    -- reserved for that case.
+    --
+    -- The chunk bound stays hard either way. Stepping out of a loaded chunk is how a drone stops
+    -- ticking and is never seen again.
+    if not inAny(m_Chunks, x, y, z) then return false, "unloaded chunk" end
+    if positionVerified() then return true end
+
     -- getCachedPosition(), NOT cachedX.
     --
     -- `local cachedX, cachedY, cachedZ, cachedDir` is declared BELOW this function, so the name
@@ -915,11 +935,13 @@ local function moveLeg(_targetX, _targetY, _targetZ, _targetDir, changeDir, disc
     changeDir = changeDir or false
     local s_Replans, s_Stalls, s_LastDist = 0, 0, nil
     while cachedX ~= _targetX or cachedY ~= _targetY or cachedZ ~= _targetZ do
+        if cachedX == nil then return false, "lost the position fix part-way" end
         s_Replans = s_Replans + 1
         if s_Replans > MOVE_MAX_REPLANS then
             print("moveTo: giving up after " .. s_Replans .. " replans")
             return false, "unreachable"
         end
+        if cachedX == nil then return false, "lost the position fix part-way" end
         local s_Dist = math.abs(cachedX - _targetX)
                      + math.abs(cachedY - _targetY)
                      + math.abs(cachedZ - _targetZ)
@@ -1233,6 +1255,14 @@ function moveTo(_targetX, _targetY, _targetZ, _targetDir, changeDir, discover)
     end
 
     local function remaining()
+        -- LOSING THE FIX MID-JOURNEY IS ROUTINE, NOT A CRASH.
+        --
+        -- The nil check at the top of moveTo only covers the moment it is called. cachedX can go
+        -- nil part-way -- descending out of GPS coverage does exactly that -- and this then did
+        -- arithmetic on nil and threw. A gather job holding 32 located copper targets died on
+        -- "attempt to perform arithmetic on upvalue 'cachedX' (a nil value)", which reads like a
+        -- corrupted drone rather than what it is: an expected loss of signal, unhandled.
+        if cachedX == nil or cachedY == nil or cachedZ == nil then return nil end
         return math.abs(_targetX - cachedX) + math.abs(_targetY - cachedY) + math.abs(_targetZ - cachedZ)
     end
 
