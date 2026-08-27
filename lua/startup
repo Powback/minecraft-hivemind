@@ -101,6 +101,39 @@ end
 
 
 SetStatus("Connecting...")
+
+-- NAME THE MISSING RADIO. "COULD NOT REACH MAINFRAME" IS A SYMPTOM, NOT A DIAGNOSIS.
+--
+-- DockingMan sat in the retry-and-reboot loop below for a full DAY. Every diagnostic said it was
+-- healthy: `computercraft dump` reported On, every file was present and parsed, `track` showed it
+-- executing, InitServer() returned success, and it wrote no FATAL.txt. The one thing wrong with it
+-- was invisible from inside the game and from outside it: the wireless modem above the computer
+-- was missing, alone among the seven modules in the row.
+--
+-- InitServer() succeeded anyway, which is what made this so expensive -- the WIRED modem opens
+-- rednet perfectly well, so every check for "is rednet up" passed. But a wired modem only reaches
+-- computers on its own cable, MainFrame is not on that cable, and rednet.lookup broadcasts into a
+-- network that physically cannot carry the question. Hours went into modem archaeology, and the
+-- answer was that there was no modem to do archaeology on.
+--
+-- So: rednet being open is not the same as being able to REACH anyone. Say which kind we have.
+local s_Wireless = false
+for _, s_Side in ipairs(peripheral.getNames()) do
+    if peripheral.getType(s_Side) == "modem" then
+        local ok, wireless = pcall(peripheral.call, s_Side, "isWireless")
+        if ok and wireless then s_Wireless = true end
+    end
+end
+if not s_Wireless then
+    Log("NO WIRELESS MODEM -- this module can only talk over its cable, and MainFrame is not on it. "
+        .. "Place a wireless modem on the computer; a wired one is not a substitute.", colors.red)
+    local h = fs.open("/NO-RADIO.txt", "w")
+    if h then
+        h.write("rednet is open on a WIRED modem only. rednet.lookup cannot reach MAINFRAME.\n")
+        h.close()
+    end
+end
+
 -- _G, for the same reason as Log above: every module reads DATA as a global, and a plain
 -- assignment here lands in startup's own environment where shell.run cannot see it. DroneMan's
 -- Init() indexes DATA["lastDrone"] and dies on nil before it ever hosts.
