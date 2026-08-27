@@ -88,7 +88,37 @@ Functions:
 -- print() too, because the screen is still worth having when you are standing there.
 local TRACE_LIMIT = 96 * 1024
 local m_TraceLines = 0
+-- SAME RATE LIMIT AS DroneLogic's trace(), AND FOR THE SAME REASON.
+--
+-- These two write to the SAME file, /drone.log, so collapsing repeats in one of them only fixes
+-- half the noise -- and the half left uncovered was 17% of every log on its own:
+-- "MOVE REFUSED: Out of fuel", written once per attempted step by a drone that cannot move. The log
+-- wraps at TRACE_LIMIT, so those copies were evicting the lines that explain how the drone got
+-- there. Two writers, one file, one rule.
+local PT_WINDOW = 60      -- seconds a message stays suppressed after being written
+local PT_KEYS   = 64      -- cap the table; a drone must not leak memory through its logger
+local m_PtAt, m_PtN, m_PtCount = {}, {}, 0
+
+local function ptRepeat(p_Text)
+    local s_Now, s_Last = os.clock(), m_PtAt[p_Text]
+    if s_Last ~= nil and (s_Now - s_Last) < PT_WINDOW then
+        m_PtN[p_Text] = (m_PtN[p_Text] or 0) + 1
+        return nil
+    end
+    if m_PtCount >= PT_KEYS then m_PtAt, m_PtN, m_PtCount = {}, {}, 0 end
+    if m_PtAt[p_Text] == nil then m_PtCount = m_PtCount + 1 end
+    m_PtAt[p_Text] = s_Now
+    local s_N = m_PtN[p_Text]
+    m_PtN[p_Text] = nil
+    if s_N and s_N > 0 then
+        return ("%s  [x%d more in the last %ds]"):format(p_Text, s_N, PT_WINDOW)
+    end
+    return p_Text
+end
+
 function ptrace(p_Text)
+    p_Text = ptRepeat(tostring(p_Text))
+    if p_Text == nil then return end
     local s_Line = ("%s pgps: %s"):format(tostring(os.clock()), tostring(p_Text))
     print(p_Text)
     m_TraceLines = m_TraceLines + 1
