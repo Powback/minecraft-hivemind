@@ -1217,6 +1217,12 @@ function ensureHeading(p_Force)
                         local F = deltas[cachedDir]
                         cachedX, cachedY, cachedZ = cachedX + F[1], cachedY + F[2], cachedZ + F[3]
                     end
+                    -- Re-anchor, for the reason spelled out in setLocation. This site is the worst
+                    -- of the four: the steps above are deliberately raw, so nothing recorded them
+                    -- as intent, and adopting the position without moving the anchor books the
+                    -- whole un-returned step as drift. Drift is what calls this probe. It fed
+                    -- itself -- a failed probe guaranteed the next one.
+                    resetAudit(cachedX, cachedY, cachedZ)
                     savePose()
                 end
                 cachedDir = dirFromStep(nx, nz) or cachedDir
@@ -1998,6 +2004,27 @@ function setHeading(p_Dir)
 end
 
 function setLocation(x, y, z, d)
+    -- AN ASSERTION IS NOT A MOVE, AND THE AUDIT MUST BE TOLD.
+    --
+    -- The audit measures "displacement we believe we made SINCE THE LAST FIX" against what GPS
+    -- later says we actually made. setLocation teleports the cache and left both anchors alone, so
+    -- every subsequent comparison ran from a position the drone no longer claimed. The mesh writes
+    -- here every time a drone is out of GPS range -- a trilaterated fix good to about ten blocks --
+    -- and ten blocks of unaccounted jump is far more than the audit's tolerance.
+    --
+    -- The result was in every long-range log, hundreds of times: "audit matched (-17,-5,1) yet the
+    -- fix moved us 5 -- both cannot be right". Both WERE right. The heading was fine and the step
+    -- accounting was fine; the anchor they were measured from had been moved out from under them.
+    --
+    -- It did not stop at a confusing line. That phantom drift is what trips "drift is too big for
+    -- dead reckoning -- re-checking the heading", which steps the turtle forward and back to re-
+    -- derive a heading that was never wrong. Out of range that fired continuously: the fuel went on
+    -- probe moves provoked by our own bookkeeping, and a blocked or interrupted probe left the
+    -- drone worse off than before it started.
+    --
+    -- Reset the anchor to what we are now asserting. m_LastFix is deliberately NOT set: a mesh
+    -- position is not a verified one, and must not open the gate on map observations.
+    resetAudit(x, y, z)
     cachedX, cachedY, cachedZ = x, y, z
     if d == 0 then
         d = "north"
@@ -2107,6 +2134,10 @@ function loadPose()
     if x == nil then return false end
     cachedX, cachedY, cachedZ = tonumber(x), tonumber(y), tonumber(z)
     cachedDir = tonumber(d)
+    -- Same rule as setLocation: this asserts a position rather than moving to one, so the audit
+    -- anchor starts here. A restored pose with a stale anchor would charge the drone for a journey
+    -- taken before the reboot.
+    resetAudit(cachedX, cachedY, cachedZ)
     ptrace(("restored pose %d,%d,%d facing %s"):format(cachedX, cachedY, cachedZ,
         tostring(shortNames[cachedDir])))
     return true
@@ -2119,6 +2150,10 @@ function setLocationFromGPS()
         -- Integer block coordinates -- see the note in verifyPosition.
         if cachedX then
             cachedX, cachedY, cachedZ = math.floor(cachedX), math.floor(cachedY), math.floor(cachedZ)
+            -- Anchor here, BEFORE the two probe steps below. Those steps call notePlannedStep, so
+            -- the intent they record is measured from this fix -- which is the whole point of the
+            -- audit. Leaving the previous anchor in place made the probe itself look like drift.
+            resetAudit(cachedX, cachedY, cachedZ)
         end
 
         -- NO FIX IS AN ANSWER, NOT A CRASH.

@@ -722,3 +722,66 @@ describe('lua hygiene: heading-to-offset maps use the canonical compass', () => 
     expect(offenders).toEqual([]);
   });
 });
+
+/**
+ * ASSERTING A POSITION IS NOT THE SAME AS MOVING TO ONE.
+ *
+ * The heading audit works by comparing two records: the displacement the drone BELIEVES it made
+ * since its last fix, and the displacement GPS says it actually made. Both are measured from an
+ * anchor -- `m_FixAtX/Y/Z` -- and `resetAudit()` is the only thing that moves that anchor.
+ *
+ * So any function that teleports the cache without resetting the anchor leaves every later
+ * comparison measured from a position the drone no longer claims. `setLocation` did exactly that,
+ * and the mesh calls it every time a drone is out of GPS range with a trilaterated fix good to
+ * about ten blocks.
+ *
+ * The damage was not the confusing log line, though there were hundreds of those
+ * ("audit matched (-17,-5,1) yet the fix moved us 5 -- both cannot be right" -- both WERE right).
+ * It was that the phantom drift trips "drift is too big for dead reckoning -- re-checking the
+ * heading", which steps the turtle forward and back to re-derive a heading that was never wrong.
+ * Out of range that ran continuously: fuel spent on probe moves provoked by our own bookkeeping,
+ * on drones that were already too far out to afford them.
+ *
+ * `verifyPosition` had it right from the start -- it audits, writes, then resets. The rule exists
+ * because three sibling functions wrote the same cache and only one of them remembered.
+ */
+describe('lua hygiene: a position assertion must re-anchor the audit', () => {
+  it('every writer of the position cache resets the audit anchor', () => {
+    const src = read('pgps.lua');
+    const lines = src.split('\n');
+    const raw = lines;
+
+    // Walk the file tracking which top-level function each line belongs to.
+    const offenders: string[] = [];
+    let fnName: string | null = null;
+    let fnStart = 0;
+    const bodies = new Map<string, { start: number; lines: number[] }>();
+    lines.forEach((l, i) => {
+      const m = /^\s*(?:local\s+)?function\s+([A-Za-z_][\w.]*)/.exec(l);
+      if (m) {
+        fnName = m[1];
+        fnStart = i;
+        bodies.set(fnName, { start: fnStart, lines: [] });
+      }
+      if (fnName) bodies.get(fnName)!.lines.push(i);
+    });
+
+    for (const [name, body] of bodies) {
+      const text = body.lines.map((i) => lines[i]).join('\n');
+      const stripped = code(text).join('\n');
+      // Does this function assign the position cache wholesale?
+      if (!/cachedX\s*,\s*cachedY\s*,\s*cachedZ\s*=/.test(stripped)) continue;
+      // Movement is exempt: it reports intent through notePlannedStep instead, which is what the
+      // audit is measuring. Those are steps, not assertions.
+      if (/notePlannedStep/.test(stripped)) continue;
+      if (/resetAudit/.test(stripped)) continue;
+      const at = body.lines.find((i) => /cachedX\s*,\s*cachedY\s*,\s*cachedZ\s*=/.test(lines[i]))!;
+      if (exempt(raw, at, 6)) continue;
+      offenders.push(
+        `pgps.lua:${at + 1} ${name}() writes the position cache without resetAudit() -- ` +
+          `the heading audit will measure from an anchor that is no longer where the drone claims to be`,
+      );
+    }
+    expect(offenders).toEqual([]);
+  });
+});

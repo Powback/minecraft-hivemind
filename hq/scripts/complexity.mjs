@@ -49,9 +49,27 @@ function scanTs() {
  * skipping and letting the Lua half go unchecked in silence.
  */
 function scanLua() {
-  const bin = ['luacheck', path.join(process.env.HOME ?? '', '.luarocks/bin/luacheck')].find(
-    (b) => b === 'luacheck' || existsSync(b),
-  );
+  // PICK ONE THAT RUNS, NOT ONE THAT EXISTS.
+  //
+  // This used to be `.find(b => b === 'luacheck' || existsSync(b))`, whose first clause is true for
+  // the first candidate every time -- so the ~/.luarocks fallback was unreachable and the choice was
+  // always the bare name on PATH.
+  //
+  // That went unnoticed until Homebrew moved the default `lua` to 5.5, which luacheck cannot parse
+  // ("attempt to assign to const variable 'field_name'"). The PATH copy started throwing, the
+  // fallback that would have covered it could not be selected, and the whole Lua half of the gate
+  // went down -- reported as "luacheck not found" while a working 5.4 luacheck sat in ~/.luarocks.
+  //
+  // A linter chosen by name can be the wrong build. Ask each candidate to run.
+  const bin = [path.join(process.env.HOME ?? '', '.luarocks/bin/luacheck'), 'luacheck'].find((b) => {
+    if (b !== 'luacheck' && !existsSync(b)) return false;
+    try {
+      run(b, ['--version'], { stdio: ['ignore', 'pipe', 'ignore'] });
+      return true;
+    } catch {
+      return false;
+    }
+  });
   let out;
   try {
     out = run(bin, ['--max-cyclomatic-complexity', String(MAX_COMPLEXITY), '--no-color', '--codes',
