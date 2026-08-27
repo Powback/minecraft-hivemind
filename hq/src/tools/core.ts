@@ -93,6 +93,14 @@ const FLEET_CACHE_MS = 3_000;
 let fleetAt = 0;
 let fleetInflight: Promise<void> | null = null;
 
+/**
+ * A plain object of numbers, or undefined. Extracted because doRefreshFleet is a long patch of
+ * field-by-field coercions and each inline `x && typeof x === 'object' ? ... : undefined` costs it
+ * two branches against the complexity gate.
+ */
+const asRecord = (v: unknown): Record<string, number> | undefined =>
+  v && typeof v === 'object' ? (v as Record<string, number>) : undefined;
+
 async function refreshFleet(): Promise<void> {
   if (!bridge.connected) return;        // offline: serve last-known state rather than erroring
   if (Date.now() - fleetAt < FLEET_CACHE_MS) return;
@@ -122,7 +130,7 @@ async function doRefreshFleet(): Promise<void> {
         // the object of the verb; the drone has always known and simply never said.
         detail: typeof d.detail === 'string' ? d.detail : undefined,
         // Stock the fleet cannot see is stock the fleet does not have.
-        carrying: d.inv && typeof d.inv === 'object' ? d.inv as Record<string, number> : undefined,
+        carrying: asRecord(d.inv),
         // WHAT CODE THE DRONE IS RUNNING.
         //
         // There are FOUR hand-maintained field lists between a drone and this object: the heartbeat
@@ -135,7 +143,7 @@ async function doRefreshFleet(): Promise<void> {
         // It exists because fourteen of twenty computers ran a stale pgps for hours and nothing
         // said so: the drift bug the update had fixed came back on exactly the machines that never
         // received it, and it took md5-ing files on the host by hand to see it.
-        build: d.build && typeof d.build === 'object' ? d.build as Record<string, number> : undefined,
+        build: asRecord(d.build),
         // The drone's own words for why it stopped. HQ used to drop this, so a drone that had
         // explicitly reported "stuck at -70,88,12 -- no progress over 4 legs" surfaced as the
         // generic "has gone quiet" -- which describes a drone that said NOTHING, the opposite of
