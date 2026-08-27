@@ -24,7 +24,7 @@ import { join, dirname } from 'node:path';
 import { bridge } from '../bridge/ws.js';
 import { registry } from '../tools/registry.js';
 import { luaList } from '../lua-table.js';
-import { settlement } from '../world/settlement.js';
+import { settlement, withinReach } from '../world/settlement.js';
 
 export interface SupplyRule {
   /** The BLOCK to go and mine, e.g. "coal_ore". */
@@ -614,6 +614,18 @@ if (ctx.scoutFree) {
       // PERCENT, NOT COVERAGE. `coverage` is a 0-1 fraction and this compares against 60, so
       // the guard could never pass even at 100% mapped -- every cave re-dispatched a survey on
       // every tick for ever. Same mistake at the scout-support guard below.
+      // THE CAVE INDEX OUTLIVED THE REGION IT WAS BUILT IN.
+      //
+      // world.caves reads the block index, which still holds pockets found when the operating area
+      // was a larger square. The drone is sent to c.min, and six of these sat in the queue targeting
+      // points 75-78 blocks out against a reach of 56 -- permanently "could not reach the survey
+      // start", re-dispatched for ever, each attempt spending a scout and its fuel on a trip that
+      // could not finish. Two of the six had been retrying since task #2919.
+      //
+      // settlement.ts states the rule and place.ts obeys it; this path simply never asked. Check
+      // the point the drone is actually sent to, not the cave's centre.
+      if (!withinReach(c.min)) continue;
+
       const q: any = await callTool('world.query', box);
       if ((q?.data?.percent ?? 0) >= 60) continue;      // already read this one
 
