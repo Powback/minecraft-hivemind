@@ -38,15 +38,35 @@ describe('cave surveys stay inside the operating circle', () => {
     expect(withinReach({ x: base.x + r, z: base.z + r })).toBe(false);     // the corner
   });
 
-  it('the guard is actually applied where caves are queued', async () => {
-    const src = await import('node:fs').then((fs) =>
-      fs.readFileSync(new URL('../src/agent/supply.ts', import.meta.url), 'utf8'));
-    const fn = src.slice(src.indexOf('async function surveyCaves'));
-    const body = fn.slice(0, fn.indexOf('\n}\n'));
-    // It must consult the guard BEFORE it adds the task -- checking afterwards costs the dispatch.
-    const guardAt = body.indexOf('withinReach');
-    const addAt = body.indexOf("'Add'");
-    expect(guardAt, 'surveyCaves does not call withinReach at all').toBeGreaterThan(-1);
-    expect(guardAt).toBeLessThan(addAt);
+  /**
+   * THIS CALLS THE REAL DECISION, not a re-implementation of it and not a grep over the source.
+   * caveCandidates was extracted from surveyCaves precisely so this could import it.
+   */
+  it('filters the exact caves that were stuck in the queue', async () => {
+    const { caveCandidates } = await import('../src/agent/supply.js');
+    const near = { min: { x: base.x + 6, y: 40, z: base.z + 6 }, max: { x: base.x + 10, y: 44, z: base.z + 10 } };
+    const far  = { min: { x: -530, y: 10, z: 4 }, max: { x: -520, y: 20, z: 14 } };
+    const got = caveCandidates([far, near, { min: null, max: null }]);
+    expect(got.map((g) => g.cave)).toEqual([near]);
+  });
+
+  it('pads the box outward -- a scan centred in a pocket reads air', async () => {
+    const { caveCandidates } = await import('../src/agent/supply.js');
+    const c = { min: { x: base.x, y: 30, z: base.z }, max: { x: base.x + 2, y: 32, z: base.z + 2 } };
+    const [{ box }] = caveCandidates([c]);
+    expect(box.min).toEqual({ x: base.x - 4, y: 26, z: base.z - 4 });
+    expect(box.max).toEqual({ x: base.x + 6, y: 36, z: base.z + 6 });
+  });
+
+  it('never pads y below bedrock', async () => {
+    const { caveCandidates } = await import('../src/agent/supply.js');
+    const c = { min: { x: base.x, y: 2, z: base.z }, max: { x: base.x + 1, y: 4, z: base.z + 1 } };
+    const [{ box }] = caveCandidates([c]);
+    expect(box.min.y).toBe(0);
+  });
+
+  it('survives a null list rather than throwing inside the supply tick', async () => {
+    const { caveCandidates } = await import('../src/agent/supply.js');
+    expect(caveCandidates(null as any)).toEqual([]);
   });
 });

@@ -588,64 +588,84 @@ try {
  * scan sees far more than the same scan in solid rock. world.caves had been finding them for a
  * long time and absolutely nothing consumed the result.
  */
+/**
+ * Pad a cave's bounding box outward.
+ *
+ * A scan centred inside an open pocket mostly reads air. The interesting part of a cave is the rock
+ * AROUND it, which is where the exposed ore actually sits.
+ */
+function padCaveBox(c: any) {
+  return {
+    min: { x: c.min.x - 4, y: Math.max(0, c.min.y - 4), z: c.min.z - 4 },
+    max: { x: c.max.x + 4, y: c.max.y + 4, z: c.max.z + 4 },
+  };
+}
+
+/**
+ * WHICH CAVES ARE WORTH SENDING A SCOUT TO. Pure, so the rule can be tested without a world.
+ *
+ * THE CAVE INDEX OUTLIVED THE REGION IT WAS BUILT IN. world.caves reads the block index, which
+ * still holds pockets found when the operating area was a larger square. The drone is sent to
+ * `cave.min`, and six of these sat in the queue targeting points 75-78 blocks out against a reach
+ * of 56 -- permanently "could not reach the survey start", re-dispatched for ever, each attempt
+ * spending a scout and its fuel on a trip that could not finish. Two had been retrying since task
+ * #2919, and the newest was #4756: an open tap, not old debris.
+ *
+ * settlement.ts states the rule and place.ts obeys it; this path simply never asked. Check the
+ * point the drone is actually SENT to, not the cave's centre -- a cave can straddle the boundary.
+ */
+export function caveCandidates(list: any[]): Array<{ cave: any; box: ReturnType<typeof padCaveBox> }> {
+  const out: Array<{ cave: any; box: ReturnType<typeof padCaveBox> }> = [];
+  for (const c of list ?? []) {
+    if (!c?.min || !c?.max) continue;
+    if (!withinReach(c.min)) continue;
+    out.push({ cave: c, box: padCaveBox(c) });
+  }
+  return out;
+}
+
+async function dispatchCaveSurvey(ctx: SupplyCtx, c: any, box: any, pct: number): Promise<void> {
+  await bridge.call('TaskMan', 'Add', {
+    name: `cave-${c.min.x},${c.min.y},${c.min.z}`,
+    priority: 2,
+    work: { survey: { kind: 'scout', radius: 8, min: box.min, max: box.max } },
+  }, { timeoutMs: 8000 });
+  ctx.scoutFree = false;
+  supply.dispatched++;
+  supply.lastAction = `cave survey at ${c.min.x},${c.min.y},${c.min.z}`;
+  note(`cave of ${c.size ?? '?'} cells at ${c.min.x},${c.min.y},${c.min.z} is ${pct}% mapped -> scout dispatched`);
+  ctx.did.push('cave survey');
+}
+
+/**
+ * EXPLORE THE CAVES. Nobody was.
+ *
+ * world.caves has found them for a long time -- open pockets with an entrance, complete with their
+ * bounding boxes -- and absolutely nothing consumed that. Every cave survey so far was dispatched
+ * by hand. Meanwhile the exploration spiral sent scouts to tile solid rock in a fixed pattern,
+ * which is the least informative ground there is.
+ *
+ * A cave is the best possible place to send a scanner: the ore is already EXPOSED, so a single scan
+ * sphere reads far more usable material than the same sphere buried in stone, and a miner sent
+ * afterwards can reach it without cutting a shaft to get there.
+ */
 async function surveyCaves(ctx: SupplyCtx): Promise<void> {
-// EXPLORE THE CAVES. Nobody was.
-//
-// world.caves has found them for a long time -- open pockets with an entrance, complete with
-// their bounding boxes -- and absolutely nothing consumed that. Every cave survey so far was
-// dispatched by hand. Meanwhile the exploration spiral sent scouts to tile solid rock in a
-// fixed pattern, which is the least informative ground there is.
-//
-// A cave is the best possible place to send a scanner: the ore is already EXPOSED, so a single
-// scan sphere reads far more usable material than the same sphere buried in stone, and a miner
-// sent afterwards can reach it without cutting a shaft to get there.
-if (ctx.scoutFree) {
+  if (!ctx.scoutFree) return;
   try {
     const caves: any = await callTool('world.caves', { min: 8 });
-    const list = (caves?.data?.caves ?? []) as any[];
-    for (const c of list) {
-      if (!c?.min || !c?.max) continue;
-      // Pad outward: a scan centred inside an open pocket mostly reads air. The interesting
-      // part of a cave is the rock around it, which is where the exposed ore actually sits.
-      const box = {
-        min: { x: c.min.x - 4, y: Math.max(0, c.min.y - 4), z: c.min.z - 4 },
-        max: { x: c.max.x + 4, y: c.max.y + 4, z: c.max.z + 4 },
-      };
-      // PERCENT, NOT COVERAGE. `coverage` is a 0-1 fraction and this compares against 60, so
-      // the guard could never pass even at 100% mapped -- every cave re-dispatched a survey on
-      // every tick for ever. Same mistake at the scout-support guard below.
-      // THE CAVE INDEX OUTLIVED THE REGION IT WAS BUILT IN.
-      //
-      // world.caves reads the block index, which still holds pockets found when the operating area
-      // was a larger square. The drone is sent to c.min, and six of these sat in the queue targeting
-      // points 75-78 blocks out against a reach of 56 -- permanently "could not reach the survey
-      // start", re-dispatched for ever, each attempt spending a scout and its fuel on a trip that
-      // could not finish. Two of the six had been retrying since task #2919.
-      //
-      // settlement.ts states the rule and place.ts obeys it; this path simply never asked. Check
-      // the point the drone is actually sent to, not the cave's centre.
-      if (!withinReach(c.min)) continue;
-
+    for (const { cave, box } of caveCandidates(caves?.data?.caves ?? [])) {
+      // PERCENT, NOT COVERAGE. `coverage` is a 0-1 fraction and this compares against 60, so the
+      // guard could never pass even at 100% mapped -- every cave re-dispatched a survey on every
+      // tick for ever. Same mistake at the scout-support guard below.
       const q: any = await callTool('world.query', box);
-      if ((q?.data?.percent ?? 0) >= 60) continue;      // already read this one
-
-      await bridge.call('TaskMan', 'Add', {
-        name: `cave-${c.min.x},${c.min.y},${c.min.z}`,
-        priority: 2,
-        work: { survey: { kind: 'scout', radius: 8, min: box.min, max: box.max } },
-      }, { timeoutMs: 8000 });
-      ctx.scoutFree = false;
-      supply.dispatched++;
-      supply.lastAction = `cave survey at ${c.min.x},${c.min.y},${c.min.z}`;
-      note(`cave of ${c.size ?? '?'} cells at ${c.min.x},${c.min.y},${c.min.z} is `
-         + `${q?.data?.percent ?? 0}% mapped → scout dispatched`);
-      ctx.did.push('cave survey');
+      const pct = q?.data?.percent ?? 0;
+      if (pct >= 60) continue;                          // already read this one
+      await dispatchCaveSurvey(ctx, cave, box, pct);
       break;                                            // one per tick
     }
   } catch (err) {
     note(`cave survey: ${(err as Error)?.message ?? err}`);
   }
-}
 }
 
 /**

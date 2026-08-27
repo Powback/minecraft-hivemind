@@ -1,7 +1,7 @@
 {
   "note": "Cyclomatic-complexity debt. This file may only ever SHRINK -- see test/complexity.test.ts.",
   "max": 15,
-  "total": 78,
+  "total": 77,
   "files": {
     "lua/DroneLogic.lua": {
       "cc": [
@@ -146,15 +146,13 @@
         33,
         22,
         21,
-        21,
         21
       ],
       "names": [
         "runSupplyTick",
         "buildQueuedSet",
         "replanShortfalls",
-        "topUpQueue",
-        "surveyCaves"
+        "topUpQueue"
       ]
     },
     "hq/src/tools/core.ts": {
