@@ -302,10 +302,27 @@ export type SupplyCtx = {
  */
 export function ruleSkipReason(
   rule: SupplyRule,
-  gate: { fuelCritical: boolean; have: number; cooldownUntil: number; now: number },
-): { kind: 'fuel' | 'satisfied' | 'cooldown'; message?: string } | null {
+  gate: { fuelCritical: boolean; have: number; cooldownUntil: number; now: number; storageFull?: boolean },
+): { kind: 'fuel' | 'satisfied' | 'cooldown' | 'full'; message?: string } | null {
   // Coal, charcoal or anything else that burns; everything else waits until the fleet can move.
   if (gate.fuelCritical && !/coal/.test(rule.match)) return { kind: 'fuel' };
+
+  // DO NOT MINE INTO A WAREHOUSE WITH NO ROOM IN IT.
+  //
+  // Storage sat at 0 free slots across 7 chests and 13,856 items, and the loop kept dispatching
+  // gathers anyway -- including for DIRT, which has a rule of its own. The drones did exactly as
+  // told: filled up, flew home, failed to deposit because there was no slot, retried, and ran dry
+  // holding the load. Measured over one window: 221 coal burned, ZERO items deposited.
+  //
+  // Two of the fleet's drones were found stranded at 0 fuel carrying 170 and 274 items of dirt,
+  // gravel and cobblestone respectively -- one of them the fleet's ONLY crafter, which is what
+  // builds the chests that would have made room. The loop was starving the cure to feed the disease.
+  //
+  // Fuel is exempt: coal is burned, not shelved, so it is worth fetching with every slot full --
+  // and it is what a drone needs to reach a chest at all. Everything else waits for room.
+  if (gate.storageFull && !/coal/.test(rule.match)) {
+    return { kind: 'full', message: `${rule.match} (storage has no free slot)` };
+  }
   if (gate.have >= rule.min) return { kind: 'satisfied' };
   // Say when a cooldown is the reason. Skipping silently makes "waiting a few minutes" look exactly
   // like "nothing to do", which is how idle drones and an empty log get read as a broken scheduler
@@ -815,6 +832,21 @@ async function observedFreeSlots(): Promise<number | null> {
   return chests.reduce((n: number, c: any) => n + (Number(c.free) || 0), 0);
 }
 
+/**
+ * Is there anywhere to PUT what a gather brings back?
+ *
+ * An UNKNOWN is not a FULL. If StorageMan cannot be asked, `observedFreeSlots` returns null, and
+ * halting the fleet on a failed status call would turn one unreachable module into a total work
+ * stoppage -- the same class of bug as counting lost drones' fuel as available. So an unreadable
+ * warehouse falls through to the old behaviour and the fleet keeps working.
+ */
+async function storageHasNoRoom(): Promise<boolean> {
+  const free = await observedFreeSlots();
+  if (free === null || free > 0) return false;
+  note('storage has no free slot -- gathering only fuel until there is room');
+  return true;
+}
+
 async function expandStorageIfFull(
   live: any[], queued: Set<string>,
 ): Promise<{ acted: boolean; reason: string } | null> {
@@ -959,11 +991,13 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
     minerFree, scoutFree, crafterFree,
     idleCrafter, held,
   };
+  const storageFull = await storageHasNoRoom();
+
   for (const rule of supply.rules) {
     if (!ctx.minerFree && !ctx.scoutFree && !ctx.crafterFree) break;
     const have = held(stockKey(rule));
     const skip = ruleSkipReason(rule, {
-      fuelCritical, have, now,
+      fuelCritical, have, now, storageFull,
       cooldownUntil: supply.cooldowns[rule.match] ?? 0,
     });
     if (skip) {
