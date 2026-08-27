@@ -1237,6 +1237,25 @@ local function placeRescues()
         if s_Tried >= 4 then break end
     end
 
+-- Does this task, if left alone, end the fuel shortage? Used to keep it safe from preemption.
+local function producesFuel(p_Name)
+    local s = tostring(p_Name or "")
+    return s:find("coal") ~= nil or s:find("charcoal") ~= nil
+end
+
+-- May this task be interrupted so its drone can go and relieve a dry one?
+--
+-- The whole condition lives here rather than inline so the preempt loop stays inside the
+-- complexity gate, and so the rule can be read in one place: it must be THIS drone's task, still
+-- unfinished, not itself a rescue -- and not the coal gather, because relief with no coal in
+-- storage fails and requeues, and preempting the gather means it can never succeed.
+local function preemptable(p_Task, p_DroneId)
+    if p_Task.assignedTo ~= p_DroneId then return false end
+    if (p_Task.progress or 0) >= 100 then return false end
+    if p_Task.work and p_Task.work.rescue then return false end
+    return not producesFuel(p_Task.name)
+end
+
     -- A DRY DRONE OUTRANKS A GATHER. PREEMPT FOR IT.
     --
     -- Placement only ever considers IDLE drones, and a busy fleet is never idle at the instant this
@@ -1278,10 +1297,7 @@ local function placeRescues()
                         -- A dry drone still outranks an ordinary gather -- that is why this preempt
                         -- exists and it is right. It does not outrank the only task that can end
                         -- the shortage for everybody, including itself.
-                        local s_Name = tostring(t.name or "")
-                        local s_MakesFuel = s_Name:find("coal") ~= nil or s_Name:find("charcoal") ~= nil
-                        if t.assignedTo == d.id and (t.progress or 0) < 100
-                                and not (t.work and t.work.rescue) and not s_MakesFuel then
+                        if preemptable(t, d.id) then
                             Log(("preempting %s on %s -- %s is out of fuel and needs relief")
                                 :format(tostring(t.name), tostring(d.name), tostring(s_Wanted.work.rescue.drone)))
                             pcall(function()
