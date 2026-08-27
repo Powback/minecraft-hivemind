@@ -94,6 +94,21 @@ the distribution disk, through half a dozen fleet-wide deploys that silently ski
 in the target's own copy. And when the fix is *for* unreachable agents, push it to them directly —
 the ordinary channel is by definition the one that does not work for them.
 
+## 3d. A correction loop must not fight a move in progress
+
+Peer trilateration ran on the beacon loop — every eight seconds — and wrote straight into the
+position cache. A drone climbing to find GPS was therefore reset to wherever the mesh last saw it,
+repeatedly, for as long as it kept trying.
+
+The log line that gave it away: **`rose 129 block(s) to y=22`**. It really did climb a hundred and
+twenty-nine blocks. The beacon loop kept putting it back, and it spent the fuel again on the next
+attempt.
+
+A derived position is worth having when the agent is lost and actively harmful while it is busy
+getting itself un-lost. Two guards: **not while a job owns movement**, and **not more often than the
+estimate is actually worth** — a fix good to ten blocks re-adopted every eight seconds is strictly
+worse than the dead reckoning it overwrites.
+
 ## 4. A wrong fact is worse than no fact
 
 Observations are keyed by the drone's *believed* position. An unverified drone teaches the map

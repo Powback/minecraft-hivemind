@@ -5467,6 +5467,12 @@ function HomeXYZ()
     return -480, 64, 64
 end
 
+-- How often a peer-derived position may be adopted. A trilaterated fix is good to roughly ten
+-- blocks, so taking one every beacon is no more accurate than dead reckoning between them -- and it
+-- overwrites a climb in progress. See peerBeacon.
+local PEER_FIX_EVERY = 60
+local m_PeerFixAt    = nil
+
 local PEER_CHANNEL   = 65100     -- distinct from GPS and rednet's own channels
 local PEER_BEACON_S  = 8         -- how often to announce ourselves
 -- How far a peer-derived position may miss its own anchors before it is thrown away.
@@ -5746,9 +5752,24 @@ local function peerBeacon()
         -- while their beacons were being relayed home by the very peers that could have fixed them.
         --
         -- Unverified is the condition to act on, not absent.
-        if not s_Fix then
+        -- DO NOT FIGHT A MOVE IN PROGRESS.
+        --
+        -- This runs every PEER_BEACON_S and writes straight into the position cache, so a drone that
+        -- is climbing gets reset to where the mesh last saw it -- every eight seconds, for ever.
+        -- Caught in the log: "rose 129 block(s) to y=22". It really did climb a hundred and
+        -- twenty-nine blocks; the beacon loop kept putting it back, and it burned the fuel again on
+        -- the next attempt. A peer fix is worth having when the drone is LOST, and actively harmful
+        -- while it is busy getting itself un-lost.
+        --
+        -- Two guards. Not while a job owns movement, and not more than once a minute -- a
+        -- trilaterated position is good to about ten blocks, so re-adopting it constantly buys
+        -- nothing and costs the dead reckoning that is more accurate between fixes.
+        local s_Now = os.clock()
+        if not s_Fix and not executing
+           and (m_PeerFixAt == nil or (s_Now - m_PeerFixAt) > PEER_FIX_EVERY) then
             local tx, ty, tz, terr = TrilaterateFromPeers()
             if tx then
+                m_PeerFixAt = s_Now
                 trace(("mesh: no GPS fix -- the fleet places us at %d,%d,%d (anchors agree to %d)")
                     :format(tx, ty, tz, math.floor(terr or 0)))
                 pcall(pgps.setLocation, tx, ty, tz, nil)
