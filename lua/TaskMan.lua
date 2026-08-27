@@ -1261,8 +1261,27 @@ local function placeRescues()
                 local f = tonumber(d.fuel)
                 if (f == nil or f >= RELIEF_FUEL_FLOOR) and not d.offline and d.status ~= "idle" then
                     for _, t in pairs(DATA["tasks"] or {}) do
+                        -- NEVER PREEMPT THE WORK THAT PRODUCES THE FUEL.
+                        --
+                        -- Relief needs coal in storage to deliver. When storage is empty the relief
+                        -- FAILS -- "no fuel to deliver: storage had nothing burnable" -- requeues,
+                        -- and preempts again on the next pass. If the task it keeps preempting is
+                        -- the coal gather, the settlement can never restock, and this loop is what
+                        -- stops it: it needs coal to get coal.
+                        --
+                        -- Seen in TaskMan's own log, over and over:
+                        --   task 5274 failed (no fuel to deliver: storage had nothing burnable)
+                        --   preempting gather:oak_log on D16 -- D3 is out of fuel and needs relief
+                        --   dispatch Relieve -> D16 (task 5274)
+                        -- while storage coal sat at 0 and four drones sat dry.
+                        --
+                        -- A dry drone still outranks an ordinary gather -- that is why this preempt
+                        -- exists and it is right. It does not outrank the only task that can end
+                        -- the shortage for everybody, including itself.
+                        local s_Name = tostring(t.name or "")
+                        local s_MakesFuel = s_Name:find("coal") ~= nil or s_Name:find("charcoal") ~= nil
                         if t.assignedTo == d.id and (t.progress or 0) < 100
-                                and not (t.work and t.work.rescue) then
+                                and not (t.work and t.work.rescue) and not s_MakesFuel then
                             Log(("preempting %s on %s -- %s is out of fuel and needs relief")
                                 :format(tostring(t.name), tostring(d.name), tostring(s_Wanted.work.rescue.drone)))
                             pcall(function()
