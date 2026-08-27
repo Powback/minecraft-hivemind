@@ -204,6 +204,27 @@ export class HiveState {
   }
 
   /**
+   * Forget a drone entirely. THE HALF OF fleet.retire THAT DID NOT EXIST.
+   *
+   * fleet.retire called DroneMan.RetireDrone, which correctly deleted the drone from the in-world
+   * registry -- and HQ kept its own Map, which had upsertDrone and no way to remove anything. So
+   * the tool returned ok:true, the drone stayed in fleet.status for ever, and every consumer went
+   * on planning around it. Retiring five destroyed drones reported five successes and changed
+   * nothing.
+   *
+   * That was written down in CLAUDE.md as a known trap -- "fleet.retire (HQ still listed the
+   * drone)" -- and left unfixed, which is how it cost the fleet again: those five kept generating
+   * rescues aimed at their last known positions, and rescues preempt real work, so a handful of
+   * casualties occupied the drones that still functioned.
+   *
+   * Returns whether anything was actually removed, so the caller can report the effect rather than
+   * the attempt.
+   */
+  retireDrone(id: number): boolean {
+    return this.drones.delete(id);
+  }
+
+  /**
    * How long a drone may claim to be working while nothing about it changes.
    *
    * Generous on purpose. Legitimate work has long quiet stretches -- a miner boring a shaft moves

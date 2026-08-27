@@ -6094,7 +6094,23 @@ local REFIX_EVERY = 45
 -- Digging out is the answer, and the drone is usually holding the tool for it. Climb a block at a
 -- time and ask again after each. Raw turtle calls rather than pgps ones on purpose: pgps movement
 -- wants a known position, which is precisely what is missing.
-local RECOVERY_CLIMB = 80
+-- EIGHTY BLOCKS WAS NEVER A SEARCH, IT WAS A FLIGHT.
+--
+-- Reported from the world, three drones at once: "D3 is 13 blocks above the surveyed ground",
+-- "D14 is 22 blocks above", "D17 is 63 blocks above -- climbing, not surveying?". That is exactly
+-- what it was: a fix-recovery climb with an eighty-block budget, spending a fuel per block and
+-- leaving the ground it was supposed to be working.
+--
+-- The absolute ceiling added earlier (SKY_FIX_CEILING) does not catch this, because a drone
+-- starting at y=70 can rise sixty-three blocks and still sit under 140. The binding limit has to be
+-- how far it climbs, not how high it ends up.
+--
+-- Twenty-four is chosen from the constellation, not by feel: the GPS hosts sit at y=70..99, and a
+-- drone that cannot hear four of them after rising twenty-four blocks is not going to hear them at
+-- eighty -- it is out of RANGE, not under a ceiling, and more altitude cannot fix range. Past that
+-- point the climb stops being a search and becomes the reason the drone is stranded: it is further
+-- from home, higher than the region it may work in, and burning the fuel it needs to get back.
+local RECOVERY_CLIMB = 24
 
 local function climbForFix()
     for i = 1, RECOVERY_CLIMB do

@@ -2849,8 +2849,14 @@ registry.register({
     if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
     const r: any = await bridge.call('DroneMan', 'RetireDrone', { id: a.id }, { timeoutMs: 8000 });
     if (typeof r === 'string') throw new ToolError(`DroneMan refused: ${r}`, 'Check fleet.status for the id.');
-    ctx.log('fleet.retire', { id: a.id, reason: a.reason });
-    return { ...r, reason: a.reason };
+    // AND FROM HQ'S OWN ROSTER. DroneMan's registry is not the list fleet.status reads.
+    //
+    // This call used to stop at the line above, so the in-world registry forgot the drone and HQ
+    // did not -- ok:true, and the drone still in every subsequent fleet.status. Retiring five
+    // destroyed drones reported five successes and removed none of them.
+    const forgotten = state.retireDrone(a.id);
+    ctx.log('fleet.retire', { id: a.id, reason: a.reason, forgottenByHQ: forgotten });
+    return { ...r, reason: a.reason, forgottenByHQ: forgotten };
   },
 });
 
