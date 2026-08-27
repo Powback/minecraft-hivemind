@@ -85,6 +85,30 @@ own trigger does not converge** — look for that shape whenever a recovery path
 Generally: when a value is both a *measurement* and a *trigger*, every unaccounted write to it
 becomes a spurious action, not just a spurious number.
 
+### The other half: a move the position layer did not make is still a move
+
+Fixing all five writers was not enough, because the next offender was not a write at all — it was
+**movement nobody recorded**. The recovery climb drives the turtle with raw `turtle.up()`, up to
+tens of blocks, and told the position layer nothing.
+
+It *looked* covered: it calls `verifyPosition()` after every block. That call fails every single
+time — **having no fix is precisely why the drone is climbing**. So the entire ascent stayed
+invisible and surfaced later as drift the audit could not explain.
+
+Going raw is sometimes correct: the heading probe cannot use the normal `forward()` because
+`forward()` applies the heading being tested, and the climb runs in the one state `forward()`
+refuses to move in. The mistake is going raw *silently*. Give those callers a way to say what they
+did (`noteExternalStep(dx,dy,dz)`) and require them to use it.
+
+Two rules worth stealing:
+
+- **A recovery path runs in the failure state.** Any check it relies on is a check that is currently
+  failing. Do not let "it calls verify afterwards" stand in for recording the action.
+- **A guard that accepts a call which only works on success is not a guard.** The first version of
+  this lint accepted a following `verifyPosition(true)` as proof the step was accounted for, and so
+  passed straight over the very site it was written for. Deleting the fix and watching the lint stay
+  green is how that was caught — which is the whole argument for testing that a rule *fails*.
+
 ## 3. Probes that move the turtle are a last resort
 
 Deriving heading by stepping out, reading GPS, and stepping back is the obvious approach and it is a
@@ -333,6 +357,7 @@ The fix is the cheap part. Rules that earned their place here:
 - nothing writes map state behind the verified-position gate
 - primitives are called with the shapes they document
 - every writer of the position cache re-anchors the audit
+- every raw turtle move outside the position layer reports the step
 
 Verify the rule **fails when it should** before trusting it. Re-introduce the exact bug and watch it
 break the build. A lint that never fires is worse than none.
