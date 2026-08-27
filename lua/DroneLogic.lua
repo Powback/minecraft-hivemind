@@ -241,6 +241,32 @@ local function fileStamp(p_Path)
     return (s_Sum * 8191 + s_Len) % 16777213
 end
 
+-- "UNREGISTERED" IS AN ANSWER, NOT A MISS.
+--
+-- DroneMan replies "unregistered" when it holds no record of us. Init() handles that at BOOT --
+-- drop the label, register again -- but a drone already RUNNING when DroneMan loses its registry
+-- never re-checks. It heartbeats into a rejection, counts each one as a missed link, and goes lost
+-- permanently while powered on, in range, and working.
+--
+-- Measured: replacing DroneMan's computer gave it an empty registry (its state restores from
+-- MainFrame's VFS), and six of eleven drones were orphaned for over ten minutes -- every one
+-- powered ON with the mast repeater up. Nothing but a reboot would ever have recovered them.
+--
+-- Init()'s comment describes this exact failure ("a wiped DroneMan, or a restored backup leaves
+-- drones holding names nobody recognises: they skip registration forever") and the fix was wired
+-- only into the boot path. This is where a RUNNING drone finds out.
+--
+-- Reboot rather than re-register inline: Init() owns registration and does it correctly, and a
+-- reboot re-pulls modules too. Split out to keep SendHeartBeat inside the complexity gate.
+local function reregisterIfDisowned(p_Reply)
+    if p_Reply ~= "unregistered" then return false end
+    trace("DroneMan does not know me -- dropping my name and rebooting to re-register")
+    pcall(os.setComputerLabel, nil)
+    os.sleep(1)
+    os.reboot()
+    return true
+end
+
 function SendHeartBeat()
     -- Read the position, do not re-derive it. This used to call setLocationFromGPS, which steps
     -- the turtle forward and back to work out its heading -- acceptable once during Init, and the
@@ -432,6 +458,31 @@ function SendHeartBeat()
     -- precisely the moment it is already behind. Link loss is decided by LINK_LOST_AFTER consecutive
     -- misses, not by a single one, so nothing downstream needs the retries either.
     local s_Reply = PowNet.sendAndWaitForResponse("DroneMan", s_Message, PowNet.SERVER_PROTOCOL, 2, 1)
+
+    -- "UNREGISTERED" IS AN ANSWER, NOT A MISS.
+    --
+    -- DroneMan replies "unregistered" when it has no record of us. Init() already handles that at
+    -- BOOT -- drop the label, register again -- but a drone that is already RUNNING when DroneMan
+    -- loses its registry never re-checks. It keeps heartbeating into a rejection, counts each one
+    -- as a missed link, and goes lost permanently while sitting powered on, in range, and working.
+    --
+    -- That is not hypothetical: replacing DroneMan's computer gave it an empty registry (its state
+    -- restores from MainFrame's VFS), and six of eleven drones were orphaned for over ten minutes,
+    -- every one of them powered ON with the mast repeater up. Nothing would ever have recovered
+    -- them but a reboot.
+    --
+    -- The comment in Init() describes this exact failure -- "a wiped DroneMan, or a restored backup
+    -- leaves drones holding names nobody recognises: they skip registration forever" -- and the fix
+    -- was only ever wired into the boot path. It belongs here too, because this is where a running
+    -- drone finds out.
+    --
+    -- Rebooting rather than re-registering inline: Init() owns registration and does it correctly,
+    -- and a reboot also re-pulls modules. The current job is already on disk -- saveResume() runs
+    -- when a job STARTS, not here: it is declared far below this function, so calling it would pass
+    -- nil to pcall and silently do nothing. That is the local-declared-below trap this codebase has
+    -- been bitten by nine times, and the hygiene lint caught it in this very edit.
+    reregisterIfDisowned(s_Reply)
+
     if s_Reply ~= false and s_Reply ~= nil then return true end
 
     -- THE TOWER CANNOT HEAR US. TRY THE FLEET.
