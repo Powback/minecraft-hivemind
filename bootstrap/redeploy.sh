@@ -45,6 +45,11 @@ for name in $TARGETS; do
   [ -z "$id" ] && { echo "  $name: no recorded id, skipping"; continue; }
   d="$WORLD/computercraft/computer/$id"
   cp "$REPO/lua/PowNet" "$d/PowNet" 2>/dev/null || true
+  # The BOOTLOADER too. This copied PowNet and the module but never startup, so every fix to the
+  # boot path shipped to MainFrame's disk and reached no module that was already placed -- they run
+  # whatever startup they were built with. DockingMan spent a day in a silent connect-retry loop
+  # that a bootloader fix would have made legible, and the fix could not reach it.
+  cp "$REPO/lua/startup" "$d/startup" 2>/dev/null || true
   [ -f "$REPO/lua/$name.lua" ] && cp "$REPO/lua/$name.lua" "$d/$name.lua"
   [ -d "$REPO/lua/ServerTasks" ] && { rm -rf "$d/ServerTasks"; cp -R "$REPO/lua/ServerTasks" "$d/ServerTasks"; }
   if [ "$name" = "MapServer" ]; then

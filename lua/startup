@@ -113,9 +113,18 @@ _G.DATA = nil
 PowNet.WaitForService("MAINFRAME", 120)
 s_Connected, _G.DATA = PowNet.Connect()
 
+-- Log, NOT SetStatus. SetStatus paints the monitor and prints to a terminal nobody can read from
+-- outside the game; Log also writes the file. A module that cannot reach MainFrame retries ten
+-- times, reboots, and does it again for ever -- roughly every 160 seconds -- and every word of that
+-- went to a screen. DockingMan sat in this loop for a full day: `computercraft dump` said On,
+-- every file was present and parsed, `track` showed it executing, and it wrote NOTHING. Hours went
+-- into modem archaeology and file diffs before the loop itself was even a suspect.
+--
+-- A bootloader that cannot start must say why somewhere durable, or it is indistinguishable from a
+-- computer that is simply idle.
 local s_Tries = 0
 while not s_Connected and s_Tries < 10 do
-    SetStatus("Waiting for MainFrame...", colors.orange)
+    Log(("Waiting for MainFrame... (%d/10)"):format(s_Tries + 1), colors.orange)
     os.sleep(3)
     s_Tries = s_Tries + 1
     s_Connected, _G.DATA = PowNet.Connect()
@@ -124,7 +133,7 @@ end
 if not s_Connected then
     -- Reboot only after genuinely giving up, so the loop is slow and legible rather than a
     -- spin that hides the problem.
-    SetStatus("Offline!", colors.red)
+    Log("Offline! could not reach MainFrame -- rebooting to try again", colors.red)
     os.sleep(10)
     os.reboot()
 end
@@ -141,9 +150,23 @@ if(s_Label == "MapServer") then
 end
 
 
+-- SAY WHICH FILE, BEFORE FETCHING IT.
+--
+-- These three pulls are network calls to MainFrame, and a module that hangs in one of them stops
+-- here for ever: connected, executing, and completely silent, because everything around it reports
+-- through SetStatus (screen only). DockingMan sat exactly here for a day while `computercraft dump`
+-- said On and `track` showed it running -- and there was no way to tell a hung update from a module
+-- that had simply not been asked to do anything.
+--
+-- Naming the file BEFORE the call is the whole point: the last line in the log is then the one that
+-- did not come back.
+Log("update: fetching startup")
 PowNet.UpdateModule("startup")
+Log("update: fetching PowNet")
 PowNet.UpdateModule("PowNet")
+Log("update: fetching " .. tostring(s_Label) .. ".lua")
 PowNet.UpdateModule(s_Label .. ".lua")
+Log("update: done, launching " .. tostring(s_Label))
 SetStatus("Launching!", colors.green)
 -- Record WHY a module stopped. shell.run swallows the error and prints it to a terminal nobody
 -- is looking at, so a module that dies on its first line is indistinguishable from one that ran
