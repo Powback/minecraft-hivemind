@@ -24,7 +24,11 @@ export interface Cell {
   by: number;
 }
 
-export type DroneStatus = 'idle' | 'working' | 'docking' | 'stranded' | 'lost';
+// 'hauling' is SEPARATE from 'docking' on purpose. Both existed as real, different behaviours --
+// carrying cargo to storage, and parking on a berth -- and both were labelled 'docking', so the
+// panel showed "docking - hauling gather zinc_ore" and there was no way to tell which one the
+// drone was actually doing. A status that collapses two behaviours is worse than no status.
+export type DroneStatus = 'idle' | 'working' | 'hauling' | 'docking' | 'stranded' | 'lost';
 
 export interface Drone {
   id: number;
@@ -44,6 +48,34 @@ export interface Drone {
    * the other.
    */
   reported?: string;
+  /**
+   * What the current job actually is, in words -- "craft oak_planks x8", "gather coal_ore".
+   *
+   * `reported` gives the verb; this gives its object. Without it the fleet view can say a crafter
+   * is crafting but not what, so a drone looping on a recipe it can never satisfy looks exactly
+   * like one making steady progress.
+   */
+  detail?: string;
+  /**
+   * When this drone's POSITION last actually changed, and when its cargo last went DOWN.
+   *
+   * Both are observations, not reports, and that is the whole point. Every status in this system is
+   * a drone's own account of itself, and the expensive failures have all been drones whose account
+   * was sincere and wrong: one walked 121 blocks in the wrong direction while logging that it was
+   * closing the gap on home; four sat "assigned" to tasks they were not doing; one reported idle
+   * for five hours from outside the loaded region. None of those could be caught by reading status,
+   * and all of them are obvious the moment you ask "has it moved, and has it delivered anything?".
+   */
+  lastMovedAt?: number;
+  lastDeliveredAt?: number;
+  /**
+   * What this drone is physically holding, name -> count.
+   *
+   * Without it the fleet's own inventory is invisible: sixteen logs inside a miner are, as far as
+   * every planner and every panel is concerned, nowhere at all -- so the crafter fails for want of
+   * wood that is two blocks away.
+   */
+  carrying?: Record<string, number>;
   /** The drone's OWN account of why it stopped. It said this; do not paraphrase it away. */
   stuck?: string;
   /** Error recorded by the bootloader when the drone's program died. Present means crash-looping. */
@@ -149,8 +181,64 @@ export class HiveState {
       name: `drone-${d.id}`, role: 'worker', fuel: 0, status: 'idle',
       ...prev, ...d,
     };
+
+    // WHAT ACTUALLY CHANGED IN THE WORLD, recorded here because here is the only place that sees
+    // the before and the after. Everything downstream reads a snapshot and cannot tell a drone
+    // that is working from one that is merely SAYING so -- which is the failure this whole file
+    // keeps running into. A status is a claim; a position that changed is evidence.
+    const now = Date.now();
+    const moved = prev?.pos && next.pos
+      && (prev.pos.x !== next.pos.x || prev.pos.y !== next.pos.y || prev.pos.z !== next.pos.z);
+    next.lastMovedAt = moved ? now : prev?.lastMovedAt;
+
+    // A DELIVERY IS CARGO GOING DOWN, and it is the only unambiguous evidence of useful work: a
+    // drone can move all day without achieving anything, but items only leave a drone into a chest.
+    const held = (c?: Record<string, number>) =>
+      Object.values(c ?? {}).reduce((n, v) => n + (Number(v) || 0), 0);
+    const before = held(prev?.carrying);
+    const after = held(next.carrying);
+    next.lastDeliveredAt = (prev && after < before) ? now : prev?.lastDeliveredAt;
+
     this.drones.set(d.id, next);
     return next;
+  }
+
+  /**
+   * How long a drone may claim to be working while nothing about it changes.
+   *
+   * Generous on purpose. Legitimate work has long quiet stretches -- a miner boring a shaft moves
+   * one block every few seconds and delivers nothing for the whole descent; a crafter waits on
+   * storage. Six minutes is longer than any of those and far shorter than the FIVE HOURS D6 spent
+   * looking idle from outside the loaded region.
+   */
+  static readonly KARMA_STALL_MS = 6 * 60 * 1000;
+
+  /**
+   * Is this drone actually achieving anything?
+   *
+   * Static and pure so it can be tested without a world. The rule is deliberately narrow: it only
+   * accuses a drone that CLAIMS to be doing something. An idle drone that is not moving is being
+   * honest, and is somebody else's problem (the scheduler's) -- flagging it here would bury the
+   * signal that matters under a dozen drones behaving correctly.
+   *
+   * "Working but not moving and not delivering" is the state every expensive failure tonight was
+   * in, and the only one that reported status could never distinguish from real progress.
+   */
+  static karma(d: Drone, now: number): { healthy: boolean; why?: string } {
+    const claims = d.status === 'working' || d.status === 'hauling' || d.status === 'docking';
+    if (!claims) return { healthy: true };
+    const moved = d.lastMovedAt ?? 0;
+    const gave = d.lastDeliveredAt ?? 0;
+    const quiet = now - Math.max(moved, gave);
+    // Never observed either: we have nothing to judge on, so do not accuse. It becomes judgeable
+    // the moment the drone moves once, and 'lost' already covers a drone that never speaks.
+    if (moved === 0 && gave === 0) return { healthy: true };
+    if (quiet <= HiveState.KARMA_STALL_MS) return { healthy: true };
+    return {
+      healthy: false,
+      why: `reports ${d.reported ?? d.status} but has not moved or delivered for `
+         + `${Math.round(quiet / 60000)} min`,
+    };
   }
 
   /**
@@ -158,7 +246,7 @@ export class HiveState {
    * background job so that state is always self-consistent when read — a drone
    * cannot appear 'working' while having been silent for ten minutes.
    */
-  listDrones(): Array<Drone & { silentMs: number | null }> {
+  listDrones(): Array<Drone & { silentMs: number | null; healthy: boolean; unhealthyWhy?: string }> {
     const now = Date.now();
     return [...this.drones.values()].map((d) => {
       // null, not a number, when there is no timestamp: callers must be forced to decide how to
@@ -172,7 +260,8 @@ export class HiveState {
         : silentMs > STALE_MS.drone * 5 ? 'lost'
         : silentMs > STALE_MS.drone ? 'stranded'
         : d.status;
-      return { ...d, status, silentMs };
+      const k = HiveState.karma({ ...d, status }, now);
+      return { ...d, status, silentMs, healthy: k.healthy, unhealthyWhy: k.why };
     });
   }
 

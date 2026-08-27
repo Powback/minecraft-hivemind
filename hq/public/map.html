@@ -179,6 +179,8 @@
 <div id="side" class="panel">
   <h1>fleet</h1>
   <div id="fleet-list" class="muted">loading…</div>
+  <h2>plan</h2>
+  <div id="plan-list" class="muted">loading…</div>
   <h2>tasks</h2>
   <div id="task-list" class="muted">loading…</div>
   <h2>computers</h2>
@@ -268,10 +270,16 @@ const gTerrain = new THREE.Group();
 const gAir     = new THREE.Group();
 const gCaves   = new THREE.Group();
 const gMats    = new THREE.Group();
+// ORE HALOS GET THEIR OWN GROUP, and it is not an aesthetic choice. They are built by the terrain
+// pass but toggled by the "ore & dirt" checkbox, and those two things are cleared by different
+// functions at different times -- put them in gTerrain and the checkbox cannot hide them (the
+// original bug); put them in gMats and buildMaterials wipes them while buildTerrain leaves stale
+// ones behind. A third group is the only place with the right lifetime.
+const gOre     = new THREE.Group();
 const gTasks   = new THREE.Group();
 const gNodes   = new THREE.Group();
 const gDrones  = new THREE.Group();
-scene.add(gTerrain, gAir, gCaves, gMats, gTasks, gNodes, gDrones);
+scene.add(gTerrain, gAir, gCaves, gMats, gOre, gTasks, gNodes, gDrones);
 gAir.visible = false;
 
 const CUBE = new THREE.BoxGeometry(1, 1, 1);
@@ -487,6 +495,7 @@ let blockTally = new Map();
 function buildTerrain(cells, bounds, blockAt) {
   clearGroup(gTerrain);
   clearGroup(gAir);
+  clearGroup(gOre);   // rebuilt below, alongside the terrain that occludes it
   surfaceAt = new Map();
   blockTally = new Map();
   if (!bounds) return null;
@@ -568,10 +577,11 @@ function buildTerrain(cells, bounds, blockAt) {
  * One InstancedMesh for a whole material class, coloured per instance.
  *
  * `data` is flat groups of six: x, y, z, colour, shade, halo. Ore additionally gets a second,
- * larger, additively-blended shell drawn in the halo colour with depth testing OFF — which is the
- * one thing on this page that lets you see a seam that is entirely inside rock. Additive means it
- * only ever brightens, so overlapping seams read as a stronger glow rather than a flat blob, and
- * with depthWrite off there is no sorting to get wrong.
+ * larger, additively-blended shell drawn in the halo colour, into gOre. Depth testing on that shell
+ * follows the x-ray toggle: ON by default, so a seam inside rock is hidden like anything else
+ * behind rock, and OFF under x-ray, which is what lets you see an entirely buried seam. Additive
+ * means it only ever brightens, so overlapping seams read as a stronger glow rather than a flat
+ * blob, and with depthWrite off there is no sorting to get wrong.
  */
 function addInstances(cls, data) {
   const n = data.length / 6;
@@ -594,9 +604,12 @@ function addInstances(cls, data) {
   gTerrain.add(mesh);
 
   if (cls !== 'ore') return;
+  // DEPTH TEST FOLLOWS THE X-RAY TOGGLE. It was hard off, so ore halos drew straight through solid
+  // rock at all times -- "x-ray rock" was effectively always on for ore, and the map showed seams
+  // no drone could possibly see from outside a hill.
   const halo = new THREE.InstancedMesh(CUBE, new THREE.MeshBasicMaterial({
     transparent: true, opacity: 0.34, blending: THREE.AdditiveBlending,
-    depthWrite: false, depthTest: false,
+    depthWrite: false, depthTest: !$('t-xray').checked,
   }), n);
   for (let i = 0; i < n; i++) {
     const o = i * 6;
@@ -614,21 +627,29 @@ function addInstances(cls, data) {
   // lands wherever the sort happens to put it and flickers as the camera moves.
   halo.renderOrder = 4;
   halo.userData.cls = 'halo';
-  gTerrain.add(halo);
+  // gOre, NOT gTerrain. Living in gTerrain is why the "ore & dirt" checkbox never hid these: that
+  // toggle only reached gMats, so turning ore off removed the small marker cages and left the glow
+  // exactly where it was.
+  gOre.add(halo);
 }
 
 /**
  * X-RAY: make the rock see-through so buried ore is findable.
  *
- * Ore halos ignore depth all the time, so a seam is always at least a hint. X-ray is for when the
- * hint is not enough and you want to see WHERE in the rock it sits — the surrounding terrain drops
- * to a fifth opacity and the ore cores themselves come through. Off by default because a
- * transparent world is the wrong default for "why did the drone stop there".
+ * With it off, ore is occluded by the rock in front of it, like everything else — the honest
+ * picture. Turning it on drops the surrounding terrain to a fifth opacity AND lets the ore halos
+ * through the remaining rock, so a buried seam reads as a glow at its true position. Off by
+ * default because a transparent world is the wrong default for "why did the drone stop there".
  */
 function applyXray(on) {
+  // For ore, x-ray means exactly one thing: whether the rock in front of a halo occludes it.
+  for (const m of gOre.children) {
+    m.material.depthTest = !on;
+    m.material.needsUpdate = true;
+  }
   for (const m of gTerrain.children) {
     const cls = m.userData.cls;
-    if (cls === 'halo' || cls === 'ore' || cls === 'liquid') continue;
+    if (cls === 'ore' || cls === 'liquid') continue;   // halos are in gOre, handled above
     const mat = m.material;
     mat.transparent = !!on;
     mat.opacity = on ? XRAY_OPACITY : 1;
@@ -980,6 +1001,24 @@ const silentText = (d) =>
   d.silentMs == null ? 'never reported' : `silent ${Math.round(d.silentMs / 1000)}s`;
 /** The drone's own word for what it is doing, which fleet.status calls `reported`. */
 const doingOf = (d) => d.reported ?? d.doing ?? null;
+/**
+ * What a drone is holding, heaviest stack first.
+ *
+ * Always returns a sentence, "empty" included, because the row that renders this is always drawn:
+ * a missing row reads as "HQ has no idea" when it actually means "carrying nothing", and those two
+ * want opposite reactions from an operator. Capped at six kinds so a drone back from a mine run
+ * with a full inventory cannot push the rest of the panel off screen.
+ *
+ * Not `shortName` — that also turns underscores into spaces, and these are item ids an operator
+ * pastes back into gather/deposit calls, where `oak log` is not a thing.
+ */
+const carryText = (d) => {
+  const held = Object.entries(d.carrying ?? {}).sort((a, b) => b[1] - a[1]);
+  if (!held.length) return 'empty';
+  const shown = held.slice(0, 6).map(([n, c]) => `${n.replace(/^[a-z0-9_]+:/, '')} ×${c}`);
+  if (held.length > shown.length) shown.push(`+${held.length - shown.length} more`);
+  return shown.join(' · ');
+};
 
 let lastStateAt = 0;
 let lastDrones = [];
@@ -1086,6 +1125,7 @@ async function pollState() {
   buildDrones(drones);
   renderFleet(drones, s.fleet);
   renderTasks(tasks, s.tasks);
+  renderPlan(dataOf(s.plan));
 
   // Computers --------------------------------------------------------------
   const nodesEnv = dataOf(s.nodes);
@@ -1158,13 +1198,26 @@ function renderFleet(drones, env) {
     const anchor = taskAnchors.get(d.name);
     const job = anchor ? `<div class="meta">→ ${esc(anchor.task.verb ?? 'task')} ${esc(anchor.task.name)}</div>` : '';
     const rep = doingOf(d);
-    const doing = rep && rep !== d.status ? `${esc(d.status)} · ${esc(rep)}` : esc(d.status);
+    // The verb, then WHAT it is being applied to. "crafting" for twenty minutes says nothing;
+    // "craft oak_planks x8" says whether it is stuck on the same impossible recipe. The drone has
+    // always known -- it just never sent it until now.
+    // ONE STATUS WORD, NOT TWO. This printed the coarse bucket AND the drone's own word, so a card
+    // read "docking · hauling" above "gather zinc_ore" above "→ gather gather:zinc_ore" -- four
+    // lines describing one activity, two of them apparently disagreeing. The drone's own word is
+    // the specific one and is what a human wants; the bucket exists to drive filtering and colour,
+    // which it still does. It is only worth showing when it carries information the word does not:
+    // that the fleet view considers this drone stranded or lost.
+    const bucket = (d.status === 'stranded' || d.status === 'lost') && rep && rep !== d.status
+      ? `${esc(d.status)} · ` : '';
+    const doing = `${bucket}${esc(rep ?? d.status)}`;
+    const what = d.detail ? `<div class="meta">${esc(d.detail)}</div>` : '';
     const silent = silentText(d);
     const alt = d.aboveGround != null && d.aboveGround > HIGH_ABOVE_GROUND
       ? `<div class="warn">${d.aboveGround} blocks above ground</div>` : '';
-    return `<div class="card drone" data-id="${d.id}" style="--accent:${hex}">
+    return `<div class="card drone" data-id="${d.id}" style="--accent:${hex}" title="carrying: ${esc(carryText(d))}">
       <div class="name" style="color:${hex}">${esc(d.name)} <span class="meta">#${d.id} · ${esc(d.role)}</span></div>
       <div class="meta">${doing} · fuel ${d.fuel.toLocaleString()} · ${silent}</div>
+      ${what}
       <div class="pos">${p}</div>${alt}${job}
       <div class="bar"><i style="width:${pct}%;background:${pct < 10 ? 'var(--bad)' : hex}"></i></div>
     </div>`;
@@ -1176,6 +1229,58 @@ function renderFleet(drones, env) {
       if (d?.pos) flyTo(d.pos);
     });
   }
+}
+
+/**
+ * THE QUEUE IS A TREE, AND THE FLAT LIST COULD NOT ANSWER THE ONLY QUESTION THAT MATTERS.
+ *
+ * order.build queues the crafts it needs and waits on them; those crafts wait on their materials.
+ * Rendered flat, a build blocked on planks -- which are blocked on wood nobody has gathered --
+ * looks exactly like an idle fleet with some queued jobs. "Why is the crafter doing nothing" had
+ * no answer anywhere on this page, while the answer was sitting in dependsOn the whole time.
+ *
+ * Each node says what state it is in and, when it is not moving, what is holding it up.
+ */
+function renderPlan(plan) {
+  const el = $('plan-list');
+  if (!el) return;
+  const tree = plan?.tree;
+  if (!Array.isArray(tree) || !tree.length) {
+    el.className = 'muted';
+    el.textContent = bridgeUp === false ? 'bridge down' : 'nothing queued';
+    return;
+  }
+  el.className = '';
+  const STATE = {
+    running: '#7ee081', queued: '#9aa6b4', blocked: '#e0b84a',
+    failing: '#e06c6c', done: '#5a6673', paused: '#9aa6b4', disabled: '#5a6673',
+  };
+  // Finished leaves are noise once their parent has moved on; keep them only where they explain
+  // something still outstanding.
+  const prune = (n) => {
+    const kids = (n.children || []).map(prune).filter(Boolean);
+    if (n.state === 'done' && !kids.length) return null;
+    return { ...n, children: kids };
+  };
+  const draw = (n, depth) => {
+    const c = STATE[n.state] ?? '#9aa6b4';
+    const pad = depth * 14;
+    const why = n.blockedBy
+      ? `<span class="meta" style="color:${STATE.blocked}"> ← ${esc(n.blockedBy)}</span>` : '';
+    const who = n.assigned ? ` · ${esc(n.assigned)}` : '';
+    const pct = (n.progress ?? 0) > 0 && (n.progress ?? 0) < 100 ? ` · ${n.progress}%` : '';
+    return `<div class="card task" style="--accent:${c};margin-left:${pad}px">
+        <div class="name" style="color:${c}">${esc(n.name)}</div>
+        <div class="meta">${esc(n.state)}${who}${pct}${why}</div>
+      </div>` + (n.children || []).map((k) => draw(k, depth + 1)).join('');
+  };
+  const roots = tree.map(prune).filter(Boolean);
+  const counts = plan.counts || {};
+  el.innerHTML =
+    `<div class="meta">${counts.live ?? 0} live · ${counts.running ?? 0} running · ` +
+    `${counts.blocked ?? 0} blocked · ${counts.failing ?? 0} failing</div>` +
+    (roots.length ? roots.map((n) => draw(n, 0)).join('')
+                  : '<div class="muted">all queued work is finished</div>');
 }
 
 function renderTasks(tasks, env) {
@@ -1293,6 +1398,8 @@ addEventListener('pointermove', (e) => {
       `<div class="row"><span class="v"><b>${esc(d.name)}</b></span><span class="k">#${d.id}</span></div>` +
       `<div class="row"><span class="k">role</span><span class="v">${esc(d.role)}</span></div>` +
       `<div class="row"><span class="k">status</span><span class="v">${esc(d.status)}${doingOf(d) && doingOf(d) !== d.status ? ' · ' + esc(doingOf(d)) : ''}</span></div>` +
+      (d.detail ? `<div class="row"><span class="k">doing</span><span class="v">${esc(d.detail)}</span></div>` : '') +
+      `<div class="row"><span class="k">carrying</span><span class="v">${esc(carryText(d))}</span></div>` +
       `<div class="row"><span class="k">fuel</span><span class="v">${d.fuel.toLocaleString()}</span></div>` +
       `<div class="row"><span class="k">at</span><span class="v">${d.pos.x}, ${d.pos.y}, ${d.pos.z}</span></div>` +
       (d.aboveGround != null ? `<div class="row"><span class="k">above ground</span><span class="v">${d.aboveGround}</span></div>` : '') +
@@ -1318,7 +1425,9 @@ $('t-solid').onchange = (e) => { gTerrain.visible = e.target.checked; };
 $('t-xray').onchange  = (e) => { applyXray(e.target.checked); };
 $('t-air').onchange   = (e) => { gAir.visible = e.target.checked; };
 $('t-caves').onchange = (e) => { gCaves.visible = e.target.checked; };
-$('t-mats').onchange  = (e) => { gMats.visible = e.target.checked; };
+// Both groups: the cages ARE the advisory ore index, and the halos are the same ore drawn as glow.
+// Hiding one and leaving the other is what "I disabled ores and can still see them" was.
+$('t-mats').onchange  = (e) => { gMats.visible = e.target.checked; gOre.visible = e.target.checked; };
 $('t-tasks').onchange = (e) => { gTasks.visible = e.target.checked; };
 $('t-nodes').onchange = (e) => { gNodes.visible = e.target.checked; };
 $('t-labels').onchange = () => {

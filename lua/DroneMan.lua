@@ -127,7 +127,11 @@ function OnHeartbeat(p_ID, p_Message)
     -- leaving a drone marked in trouble forever because it once was.
     if p_Message.data.stuck == nil then
         DATA["drones"][s_ID].stuck = nil
-        DATA["drones"][s_ID].detail = nil
+        -- NOT detail. Two meanings collided on one field: it began life as the distress DETAIL
+        -- ("walled in at -70,88,12") and is now also the job description ("craft oak_planks x8"),
+        -- so clearing the distress wiped the description of a perfectly healthy drone on its very
+        -- next heartbeat -- which is why the panel showed "-" for a drone that was plainly busy.
+        DATA["drones"][s_ID].stuckDetail = nil
     end
 
     return true
@@ -249,9 +253,23 @@ function OnDistress(p_ID, p_Message)
     end
     local d = p_Message.data or {}
     local s_Drone = DATA["drones"][s_ID]
-    s_Drone.stuck  = d.reason or "unknown"
-    s_Drone.detail = d.detail
-    s_Drone.status = "stuck"
+    s_Drone.stuck       = d.reason or "unknown"
+    s_Drone.stuckDetail = d.detail
+    -- What it is carrying. Stock the fleet cannot see is stock the fleet does not have: the crafter
+    -- failed for want of logs that were sitting inside another drone the whole time.
+    if type(d.inv) == "table" then s_Drone.inv = d.inv end
+    -- A FAILED TASK IS NOT A STUCK DRONE.
+    --
+    -- This marked every distress as "stuck", and stuck is what the rescue pass hunts for. A craft
+    -- that could not get its ingredients therefore reported the CRAFTER as stuck: TaskMan queued a
+    -- rescue for a drone sitting on its dock with 19,000 fuel, and pulled the only miner off real
+    -- work to go and dig out a drone that was not buried.
+    --
+    -- mobility=false means "the job failed, I am fine" -- record the reason, leave the status
+    -- alone, and let the drone ask for its next task like anything else.
+    if d.mobility ~= false then
+        s_Drone.status = "stuck"
+    end
     if d.pos then s_Drone.pos = d.pos end
     if d.fuel then s_Drone.fuel = d.fuel end
     print("DISTRESS " .. tostring(s_Drone.name) .. ": " .. tostring(s_Drone.stuck))
@@ -326,7 +344,7 @@ function OnGetDrones(p_ID, p_Message)
         s_List[#s_List + 1] = {
             droneID = v.droneID, name = v.name, id = v.id,
             pos = v.pos, status = v.status, fuel = v.fuel, role = v.role,
-            stuck = v.stuck, detail = v.detail,
+            stuck = v.stuck, stuckDetail = v.stuckDetail, detail = v.detail, inv = v.inv,
             -- offline and lastSeen travel with the drone. Without them a caller can only infer
             -- liveness from `status`, and "offline" then reads as "busy doing something", which
             -- stalled the supply loop on a drone that no longer exists.
@@ -363,6 +381,48 @@ end
 -- given, never returns to idle, and therefore can never be assigned anything again. Two drones sat
 -- "working" on cancelled orders while the supply loop correctly reported there was nobody free --
 -- which from outside looks exactly like autonomy having died.
+-- WRITE OFF A DRONE THAT CANNOT BE RECOVERED.
+--
+-- There was no way to do this, and the absence cost the fleet more than the drone did. A lost
+-- drone keeps its registry entry, so TaskMan keeps seeing a casualty and keeps queuing rescues to
+-- its LAST REPORTED position -- which for a drone that went quiet is exactly the position most
+-- likely to be wrong. D1 drifted outside the operating region and stopped ticking while its record
+-- still read -443,64,66, well inside it; every tick sent the one healthy miner to an empty patch
+-- of ground, and D2 sat at zero fuel waiting for relief that never got a rescuer. One unrecoverable
+-- drone was consuming the entire fleet, indefinitely, and nothing could say "it is gone".
+--
+-- Retiring is deliberately not deletion of the computer: the turtle still exists and may come back.
+-- It is removal from the REGISTRY, so the fleet stops planning around it. If it ever heartbeats
+-- again it registers from scratch, which is exactly the self-healing path Init already has.
+function OnRetireDrone(p_ID, p_Message)
+    local d = p_Message.data or {}
+    local s_Id = d.id
+    if s_Id == nil then return false, "Missing id" end
+
+    -- Match on any of the three things a caller might reasonably have: the registry key, the
+    -- COMPUTER id (which is what fleet.status shows and therefore what a human will type), or the
+    -- name. The registry is keyed by an internal droneID, so id alone missed every time.
+    local s_Key = nil
+    for k, v in pairs(DATA["drones"] or {}) do
+        if tostring(k) == tostring(s_Id)
+                or tostring(v.id) == tostring(s_Id)
+                or tostring(v.name) == tostring(s_Id) then
+            s_Key = k break
+        end
+    end
+    if s_Key == nil then return false, "no such drone: " .. tostring(s_Id) end
+
+    local s_Rec  = DATA["drones"][s_Key]
+    local s_Name = s_Rec.name
+    DATA["drones"][s_Key] = nil
+    -- The reverse index too, or a heartbeat from the retired drone resolves to a record that is no
+    -- longer there and the fleet ends up with a half-forgotten drone.
+    if DATA["ids"] and s_Rec.id ~= nil then DATA["ids"][s_Rec.id] = nil end
+    PowNet.MarkDirty()
+    print("retired " .. tostring(s_Name) .. " -- removed from the registry")
+    return true, {retired = tostring(s_Name), id = tostring(s_Key)}
+end
+
 function OnStopDrone(p_ID, p_Message)
     if(p_Message.data.id == nil and p_Message.data.range == nil) then
         return false, "Missing id/range"
@@ -395,7 +455,17 @@ function OnRelayCmd(p_ID, p_Message)
     local s_Done = {}
     for _, v in pairs(s_Parsed.data.drones) do
         local s_Msg = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Relay", {on = s_On})
-        local s_Res = PowNet.sendAndWaitForResponse(v, s_Msg, PowNet.DRONE_PROTOCOL, 8)
+        -- THREE SECONDS, NOT EIGHT, AND THE REASON IS NOT IMPATIENCE.
+        --
+        -- This module is single-threaded: every second spent blocked in here is a second it is not
+        -- answering heartbeats, GetDrones, or anything else. Eight seconds PER DRONE, sequentially,
+        -- stalls the fleet's registry for up to a minute on a call that is only ever asking "will
+        -- you please act as an anchor" -- and it overran HQ's own patience, so the caller reported
+        -- "no response from DroneMan.Relay" while DroneMan was sitting right there, working.
+        --
+        -- A drone that cannot answer in three seconds is not going to be a useful GPS anchor
+        -- anyway. Failing fast here is strictly better than blocking the registry to find out.
+        local s_Res = PowNet.sendAndWaitForResponse(v, s_Msg, PowNet.DRONE_PROTOCOL, 3)
         s_Done[#s_Done + 1] = {id = v, ok = (s_Res ~= false and s_Res ~= nil), result = s_Res}
     end
     if #s_Done == 0 then return false, "no drone matched" end
@@ -429,10 +499,19 @@ function OnGoTo(p_ID, p_Message)
         PowNet.Send(v, PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Abort", {}), PowNet.SERVER_PROTOCOL)
         os.sleep(0.2)   -- let the abort land before the new order arrives
 
-        local s_Message = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "GoTo",
-            {pos = p_Message.data.pos, heading = p_Message.data.heading})
+        -- The verb is a parameter now, not a constant.
+        --
+        -- Everything that needed to send a drone somewhere had to be a GoTo, so a job that means
+        -- "go there AND do this on arrival" -- handing wood to a blocked crafter, for instance --
+        -- had nowhere to live. The travel half is identical; only the verb and payload differ.
+        local s_Verb = p_Message.data.verb or "GoTo"
+        Log(("dispatch %s -> #%s"):format(s_Verb, tostring(v)))
+        local s_Message = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, s_Verb,
+            {pos = p_Message.data.pos, heading = p_Message.data.heading,
+             drone = p_Message.data.drone, match = p_Message.data.match,
+             deposit = p_Message.data.deposit, code = p_Message.data.code})
         local s_GoToResponse = PowNet.SendToDrone(v, s_Message)
-        print("Sent GoTo to #" .. tostring(v) .. " -> " .. tostring(s_GoToResponse))
+        print("Sent " .. s_Verb .. " to #" .. tostring(v) .. " -> " .. tostring(s_GoToResponse))
         if s_GoToResponse then s_Sent[#s_Sent + 1] = v end
     end
 
@@ -522,6 +601,9 @@ local m_ServerEvents = {
     },
     Stop = {
         func = OnStopDrone,
+    },
+    RetireDrone = {
+        func = OnRetireDrone,
         callable = true,
         params = { id = { optional = true } }
     },
@@ -543,7 +625,21 @@ local m_ServerEvents = {
                 optional = true,
                 length = 2,
                 type = "vec2"
-            }
+            },
+            -- DECLARED, OR SILENTLY DROPPED.
+            --
+            -- The validator only passes through what is described here, so an undeclared field
+            -- simply never reaches the handler -- no error, no log line, the call returns fine and
+            -- the drone is never told. That is what swallowed the MapServer bounds push earlier
+            -- ("bounds=false" and nothing else), and it is what swallowed every Handover and Unload:
+            -- the tool reported success, DroneMan reported success, and D5 sat on twenty-two logs.
+            pos     = { optional = true },
+            heading = { optional = true },
+            verb    = { optional = true },
+            drone   = { optional = true },
+            match   = { optional = true },
+            deposit = { optional = true },
+            code    = { optional = true }
         }
     }
 }

@@ -90,6 +90,10 @@ const COMP = 'computercraft:computer_normal';
 export const RECIPES: Recipe[] = [
   // Wood chain. Everything the fleet can build starts here, which is why a desert base with no
   // trees could not build anything at all.
+  // Oak is written here because a table needs a name, NOT because the fleet requires oak. Every log
+  // species makes its own planks and every planks species makes the same chest, stick and crafting
+  // table -- so the drone matches wood by FAMILY (see SameItem in DroneLogic). Hard-matching oak is
+  // how a fleet standing in a birch forest reports "storage has none of the ingredients".
   { output: P, yields: 4, inputs: { 'minecraft:oak_log': 1 }, station: 'inventory' },
   { output: S, yields: 4, inputs: { [P]: 2 }, station: 'inventory',
     grid: [P, null, null, P, null, null, null, null, null] },

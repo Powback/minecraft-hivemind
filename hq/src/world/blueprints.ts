@@ -43,6 +43,27 @@ const P = 'minecraft:oak_planks';
 const CHEST = 'minecraft:chest';
 const FURNACE = 'minecraft:furnace';
 
+/**
+ * Four bare chests in a row. The cheapest thing that ends a storage jam.
+ *
+ * Every other storage blueprint stands on a planked floor, which is correct for a permanent bay and
+ * useless in the situation this exists for: the settlement ran completely out of slots -- 7 chests,
+ * 0 free -- and could not craft its way out, because planks need logs, logs need a free slot to be
+ * deposited into, and there were none. Storage being full is precisely the state in which you
+ * cannot afford a blueprint that costs anything but the chests themselves.
+ *
+ * A chest needs no floor: turtle.placeDown() puts it in the air quite happily, and a deposit point
+ * is registered by POSITION, so these are usable immediately without a modem, a cable, or the
+ * redstone neither of them can be made without.
+ */
+const chestRow: Blueprint = {
+  name: 'chest-row',
+  purpose: 'storage',
+  summary: 'Four bare chests. No floor, no modems: the cheapest possible storage expansion.',
+  size: { w: 4, h: 1, l: 1 },
+  blocks: [0, 1, 2, 3].map((dx) => ({ dx: dx - 1, dy: 0, dz: 0, item: CHEST })),
+};
+
 /** A 3x3 platform with a chest in the middle: somewhere for miners to drop off without commuting. */
 const fieldCache: Blueprint = {
   name: 'field-cache',
@@ -140,7 +161,7 @@ const storageBay: Blueprint = {
   ],
 };
 
-export const BLUEPRINTS: Blueprint[] = [claimPost, fieldCache, smelterBank, hatchery, storageBay];
+export const BLUEPRINTS: Blueprint[] = [claimPost, chestRow, fieldCache, smelterBank, hatchery, storageBay];
 
 export function blueprint(name: string): Blueprint | undefined {
   return BLUEPRINTS.find((b) => b.name === name);

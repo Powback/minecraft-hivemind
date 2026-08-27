@@ -1,0 +1,261 @@
+{
+  "note": "Cyclomatic-complexity debt. This file may only ever SHRINK -- see test/complexity.test.ts.",
+  "max": 15,
+  "total": 79,
+  "files": {
+    "lua/DroneLogic.lua": {
+      "cc": [
+        83,
+        55,
+        52,
+        45,
+        45,
+        44,
+        36,
+        31,
+        26,
+        22,
+        22,
+        21,
+        21,
+        21,
+        21,
+        20,
+        20,
+        19,
+        18,
+        17,
+        17,
+        16
+      ],
+      "names": [
+        "(anonymous)",
+        "OnSurvey",
+        "(anonymous)",
+        "SendHeartBeat",
+        "(anonymous)",
+        "TakeFromChest",
+        "(anonymous)",
+        "idleDockLoop",
+        "FetchItems",
+        "Init",
+        "(anonymous)",
+        "TravelTo",
+        "RunJobNow",
+        "stageFromChest",
+        "heartbeat",
+        "veinFrom",
+        "gpsRelay",
+        "refixLoop",
+        "harvestAround",
+        "SurfaceForFix",
+        "DescribeJob",
+        "meshForward"
+      ]
+    },
+    "lua/TaskMan.lua": {
+      "cc": [
+        70,
+        50,
+        49,
+        34,
+        34,
+        22,
+        19,
+        18,
+        18,
+        17,
+        16
+      ],
+      "names": [
+        "rescueNeeded",
+        "OnStartTask",
+        "(anonymous)",
+        "placeRescues",
+        "OnTaskDone",
+        "placeBlockers",
+        "freeOrphanedDrones",
+        "workPos",
+        "pickDrone",
+        "releaseStalledAssignments",
+        "blockers"
+      ]
+    },
+    "hq/src/agent/sentinel.ts": {
+      "cc": [
+        47,
+        25
+      ],
+      "names": [
+        "detect",
+        "observe"
+      ]
+    },
+    "lua/MapRender.lua": {
+      "cc": [
+        41,
+        26,
+        22,
+        19
+      ],
+      "names": [
+        "draw",
+        "columnColour",
+        "rebuild",
+        "activeBox"
+      ]
+    },
+    "lua/PowNetRemote.lua": {
+      "cc": [
+        40
+      ],
+      "names": [
+        "RunInstallerOld"
+      ]
+    },
+    "lua/PowGPSServer.lua": {
+      "cc": [
+        38,
+        24,
+        16
+      ],
+      "names": [
+        "a_star",
+        "load",
+        "explore"
+      ]
+    },
+    "lua/pgps.lua": {
+      "cc": [
+        37,
+        29,
+        23,
+        23,
+        21,
+        17
+      ],
+      "names": [
+        "moveLeg",
+        "moveTo",
+        "flyTo",
+        "setLocationFromGPS",
+        "forward",
+        "ensureHeading"
+      ]
+    },
+    "hq/src/agent/supply.ts": {
+      "cc": [
+        33,
+        22,
+        21,
+        21,
+        21
+      ],
+      "names": [
+        "runSupplyTick",
+        "buildQueuedSet",
+        "replanShortfalls",
+        "topUpQueue",
+        "surveyCaves"
+      ]
+    },
+    "hq/src/tools/core.ts": {
+      "cc": [
+        33,
+        30,
+        29,
+        28,
+        25,
+        21,
+        21,
+        21,
+        18,
+        17
+      ],
+      "names": [
+        "describeTask",
+        "handler",
+        "handler",
+        "doRefreshFleet",
+        "handler",
+        "(anonymous)",
+        "(anonymous)",
+        "(anonymous)",
+        "handler",
+        "handler"
+      ]
+    },
+    "lua/MapServer.lua": {
+      "cc": [
+        31,
+        30,
+        16
+      ],
+      "names": [
+        "ComputeCaves",
+        "OnRegionKnown",
+        "Init"
+      ]
+    },
+    "lua/MainFrame.lua": {
+      "cc": [
+        29,
+        19
+      ],
+      "names": [
+        "dashboard",
+        "main"
+      ]
+    },
+    "hq/src/server.ts": {
+      "cc": [
+        28
+      ],
+      "names": [
+        "(anonymous)"
+      ]
+    },
+    "lua/StorageMan.lua": {
+      "cc": [
+        27,
+        26,
+        26,
+        25,
+        23,
+        16
+      ],
+      "names": [
+        "OnBringToFront",
+        "OnProvide",
+        "ServiceFurnaces",
+        "ServiceRoutes",
+        "OnChestContents",
+        "OnWhereIs"
+      ]
+    },
+    "lua/DroneMan.lua": {
+      "cc": [
+        23
+      ],
+      "names": [
+        "(anonymous)"
+      ]
+    },
+    "hq/src/world/tower.ts": {
+      "cc": [
+        18
+      ],
+      "names": [
+        "section"
+      ]
+    },
+    "lua/Bridge.lua": {
+      "cc": [
+        18
+      ],
+      "names": [
+        "socketLoop"
+      ]
+    }
+  }
+}

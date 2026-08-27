@@ -266,11 +266,15 @@ const server = createServer(async (req, res) => {
       //
       // Fleet, tasks and stock stay live: they are cheap, they change constantly, and they are what
       // the page is actually for.
-      const [fleet, tasks, nodes, stock] = await Promise.all([
+      // `plan` alongside `tasks`: the flat list says WHAT is queued, the tree says WHY nothing is
+      // moving. A build waiting on its crafts, which are waiting on wood nobody has gathered, is
+      // indistinguishable from an idle fleet without it.
+      const [fleet, tasks, nodes, stock, plan] = await Promise.all([
         mapCall('fleet.status', {}),
         mapCall('fleet.tasks', {}),
         mapCall('hive.nodes', {}),
         mapCall('storage.stock', {}),
+        mapCall('hive.plan', {}),
       ]);
       const caves = await slowCached('caves', () => mapCall('world.caves', { min: 4 }));
       const ore   = await slowCached('ore',   () => mapCall('world.find', { match: 'ore', limit: 200 }));
@@ -278,7 +282,7 @@ const server = createServer(async (req, res) => {
       return sendCompact(200, {
         at: Date.now(),
         bridge: bridge.status(),
-        fleet, tasks, nodes, caves, ore, dirt, stock,
+        fleet, tasks, nodes, caves, ore, dirt, stock, plan,
       });
     }
 
@@ -326,7 +330,9 @@ server.listen(PORT, '0.0.0.0', () => {
   bridge.onConnect(async () => {
     try {
       const r = await pushSettlement((m, meth, args, opts) => bridge.call(m, meth, args as any, opts as any));
-      console.log(`[settlement] pushed to MapServer: bounds=${r.bounds} gpsHosts=${r.hosts}`);
+      // Against the expected count, not on its own: "15" is only legible next to "of 16".
+      const short = r.failed.length ? ` -- FAILED: ${r.failed.join(' ')}` : '';
+      console.log(`[settlement] pushed to MapServer: bounds=${r.bounds} gpsHosts=${r.hosts}/${r.expected}${short}`);
     } catch (err) {
       console.log(`[settlement] could not push: ${String(err).slice(0, 120)}`);
     }

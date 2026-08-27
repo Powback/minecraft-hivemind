@@ -72,6 +72,39 @@ Functions:
 
 --]]
 
+-- SAY IT SOMEWHERE SOMEBODY CAN READ IT.
+--
+-- Every diagnostic in this file was a bare print(), which in CC goes to the turtle's SCREEN and
+-- nowhere else. This is the module where drones get lost, and its twenty-nine most useful facts --
+-- "position corrected by 90", "heading re-established: E", "moved but could not deduce heading" --
+-- were visible only to somebody standing in the world in front of that specific turtle.
+--
+-- That is not a small inconvenience. A drone whose heading was silently wrong walked a hundred and
+-- twenty-one blocks in the wrong direction while `drone.log` recorded, truthfully and uselessly,
+-- that it was closing the gap. verifyPosition had ALREADY computed and printed the drift each time.
+-- The information existed; it just never left the turtle.
+--
+-- Appends to the same /drone.log DroneLogic writes, prefixed so the source is obvious. Keeps the
+-- print() too, because the screen is still worth having when you are standing there.
+local TRACE_LIMIT = 96 * 1024
+local m_TraceLines = 0
+function ptrace(p_Text)
+    local s_Line = ("%s pgps: %s"):format(tostring(os.clock()), tostring(p_Text))
+    print(p_Text)
+    m_TraceLines = m_TraceLines + 1
+    -- Checked every hundredth line rather than every line: fs.getSize on each write is a syscall in
+    -- the movement hot path, and the log only has to be bounded, not exact.
+    if (m_TraceLines % 100) == 1 then
+        if fs.exists("/drone.log") and fs.getSize("/drone.log") > TRACE_LIMIT then
+            fs.delete("/drone.log")
+        end
+    end
+    -- close() is what persists in CC -- these handles have no flush(). A guarded `if h.flush then`
+    -- once silenced logging fleet-wide because the field simply does not exist.
+    local h = fs.open("/drone.log", "a")
+    if h then h.writeLine(s_Line) h.close() end
+end
+
 -- OPERATING BOUNDS
 --
 -- A turtle that leaves the loaded region does not fail -- it stops ticking, mid-task, and is
@@ -97,7 +130,84 @@ Functions:
 -- y=95 reach roughly 196 blocks; a chunky turtle covers its own chunk, 16. So GPS is the cheap
 -- wide bubble and chunk loading is the expensive island inside it -- which is why this is an
 -- INTERSECTION and not a union. Being in one without the other is useless.
+-- A MOVE THAT FAILS TELLS YOU WHY. DO NOT THROW IT AWAY.
+--
+-- turtle.forward() returns `false, "<reason>"`, and every mover here discarded the second value.
+-- So "Cannot enter protected area" -- a server configuration fault that no amount of retrying can
+-- ever fix -- arrived at the caller as a bare `false`, indistinguishable from a rock. TravelTo then
+-- did what it does for a rock: climbed out, dug through, flew over, re-planned through MapServer.
+-- All five failed identically and silently, and the fleet sat frozen for hours reporting "no mapped
+-- route" while the very first call had said exactly what was wrong.
+--
+-- HARD means no fallback will ever help: the answer is the same from every square, in every
+-- direction, until a human changes something. It must stop the attempt and be reported, loudly.
+-- SOFT is an ordinary obstruction, which is what the fallbacks are actually for.
+local HARD_MOVE_ERRORS = { "protected", "fuel" }
+
+local m_LastMoveError = nil
+-- Seconds between forced re-fixes triggered by a surprising move failure. See forward().
+local REFIX_COOLDOWN = 20
+local m_LastRefixAt = nil
+
+local function classifyMove(p_Err)
+    if type(p_Err) ~= "string" then return nil end
+    local s_Low = p_Err:lower()
+    for _, pat in ipairs(HARD_MOVE_ERRORS) do
+        if s_Low:find(pat, 1, true) then return "hard" end
+    end
+    return "soft"
+end
+
+-- Record the reason and hand it back, so callers can both SEE it and decide on it.
+local function moveFailed(p_Err)
+    local s_Kind = classifyMove(p_Err)
+    if s_Kind == "hard" then
+        m_LastMoveError = p_Err
+        -- Printed as well as returned: a hard error means the drone is going nowhere at all, and
+        -- that deserves to be visible without anyone having to ask the right question first.
+        ptrace("MOVE REFUSED: " .. tostring(p_Err))
+    end
+    return false, p_Err
+end
+
+-- The last unfixable movement refusal, or nil. Cleared by whoever handles it.
+function lastMoveError() return m_LastMoveError end
+function clearMoveError() m_LastMoveError = nil end
+
 local m_Chunks, m_Gps
+
+-- THE RADIO RANGE IS A SPHERE. THE REGION WAS A SQUARE.
+--
+-- Every drone must stay within modem range of the mast, or it cannot reach StorageMan, cannot ask
+-- where to refuel, and starves wherever it happens to be standing. A square region of reach 56
+-- around a mast 22 blocks up puts the EDGES about 60 blocks out -- fine -- and the CORNERS about
+-- 82, which is well past the 64-block range. So the corners were a trap: legal to walk into,
+-- impossible to work from, impossible to call home from.
+--
+-- D2 died in one. It reached -534,69,26, logged "refuel: storage would not give a point" -- nobody
+-- was listening -- and sat at zero fuel repeating that every twenty seconds while the fleet listed
+-- it as lost. D1 was lost the same way, one corner over.
+--
+-- A radius costs a fifth of the area and removes the trap entirely.
+local m_Reach = nil          -- horizontal radius from the settlement centre, if one was given
+local m_Centre = nil
+
+local function withinReach(x, z)
+    if m_Reach == nil or m_Centre == nil then return true end
+    local dx, dz = x - m_Centre.x, z - m_Centre.z
+    return (dx * dx + dz * dz) <= (m_Reach * m_Reach)
+end
+
+-- Exposed because the gather's vein-following needs it: seeds are filtered by the caller, but
+-- following a seam outward is a decision made ON the drone, one block at a time, and it is exactly
+-- how drones walk out of radio coverage without any single step looking wrong.
+function isWithinReach(x, z) return withinReach(x, z) end
+
+-- Where the settlement is. Exposed because the mesh routes messages TOWARD it: each hop picks the
+-- neighbour closer to base, so every node needs the same reference point. It comes from the region
+-- push and survives a reboot in pgps-region.txt, so a drone deep underground still knows which way
+-- home is even with no GPS and no contact.
+function centre() return m_Centre end
 
 local function inAny(p_List, x, y, z)
     if p_List == nil then return true end          -- unspecified means unrestricted
@@ -111,6 +221,38 @@ local function inAny(p_List, x, y, z)
     return false
 end
 
+-- THE REGION MUST SURVIVE A BOOT WITHOUT THE NETWORK.
+--
+-- Bounds arrive from MapServer over rednet, and the drone that most needs them is the one that has
+-- drifted out of radio range -- which is precisely the drone that cannot ask. With no bounds,
+-- inAny() and withinReach() both answer "unrestricted", so mayStep permits everything and the
+-- drone never learns it is outside the region, never walks back, and stays lost. D2 rebooted at
+-- -534,69,26 with a full tank and no idea it was standing somewhere it could not call home from.
+--
+-- Same treatment as the pose: written down when learned, read back at boot.
+local REGION_FILE = "/pgps-region.txt"
+
+local function saveRegion()
+    local h = fs.open(REGION_FILE, "w")
+    if not h then return end
+    h.write(textutils.serialize({reach = m_Reach, centre = m_Centre, chunks = m_Chunks}))
+    h.close()
+end
+
+function loadRegion()
+    if m_Chunks ~= nil or m_Reach ~= nil then return false end   -- the network already told us
+    if not fs.exists(REGION_FILE) then return false end
+    local h = fs.open(REGION_FILE, "r")
+    if not h then return false end
+    local s_Text = h.readAll()
+    h.close()
+    local ok, r = pcall(textutils.unserialize, s_Text)
+    if not ok or type(r) ~= "table" then return false end
+    m_Chunks, m_Reach, m_Centre = r.chunks, r.reach, r.centre
+    ptrace(("restored region from disk: reach %s"):format(tostring(m_Reach)))
+    return true
+end
+
 function setBounds(p_B)
     if p_B == nil then m_Chunks, m_Gps = nil, nil return end
     if p_B.chunks or p_B.gps then
@@ -120,6 +262,8 @@ function setBounds(p_B)
         m_Chunks = p_B.minx and {p_B} or p_B
         m_Gps = nil
     end
+    m_Reach  = tonumber(p_B.reach)
+    m_Centre = p_B.centre
     -- m_Gps is now hosts+radius rather than a list of boxes, so describe whichever arrived.
     local s_Gps = "none"
     if m_Gps and m_Gps.hosts then
@@ -127,7 +271,9 @@ function setBounds(p_B)
     elseif m_Gps then
         s_Gps = ("%d box(es)"):format(#m_Gps)
     end
-    print(("coverage: %d chunk region(s), gps %s"):format(m_Chunks and #m_Chunks or 0, s_Gps))
+    ptrace(("coverage: %d chunk region(s), gps %s, reach %s"):format(
+        m_Chunks and #m_Chunks or 0, s_Gps, m_Reach and tostring(m_Reach) or "unbounded"))
+    pcall(saveRegion)
 end
 
 function getBounds() return {chunks = m_Chunks, gps = m_Gps} end
@@ -172,7 +318,7 @@ local function gpsOk(p_Gps, x, y, z)
 end
 
 function inBounds(x, y, z)
-    return inAny(m_Chunks, x, y, z) and gpsOk(m_Gps, x, y, z)
+    return inAny(m_Chunks, x, y, z) and withinReach(x, z) and gpsOk(m_Gps, x, y, z)
 end
 
 -- May we take this step?
@@ -215,7 +361,22 @@ function mayStep(x, y, z)
     -- but slow risk. Being unable to mine at all is not slow. pgps tracks position through every
     -- move, and re-verifies the moment coverage returns, so a known position inside the loaded
     -- region is good enough to keep working on.
-    if inAny(m_Chunks, x, y, z) and cachedX ~= nil then return true end
+    --
+    -- getCachedPosition(), NOT cachedX -- FOR THE SAME REASON SPELLED OUT SIXTY LINES BELOW.
+    --
+    -- `local cachedX, cachedY, cachedZ, cachedDir` is declared at line 298, and mayStep is defined
+    -- above it, so the bare name `cachedX` here compiled to a GLOBAL lookup that is never assigned.
+    -- It was nil on every call, so this branch -- the one that permits a drone to keep working
+    -- underground on dead reckoning -- never returned true even once.
+    --
+    -- Every horizontal step below the GPS ceiling therefore fell through to the tie-break at the
+    -- bottom, which only allows steps that move CLOSER to a host. The hosts are all above ground,
+    -- so boring a level tunnel always moves away from them: "bore blocked on line 1 step 21 --
+    -- move: out of bounds", then step 1 on every line after. The shaft sank correctly and the grid
+    -- could never be cut. The comment below this one already documents this exact trap for its own
+    -- line; the same mistake was sitting three lines above it, unnoticed, doing far more damage.
+    local kx = getCachedPosition()
+    if inAny(m_Chunks, x, y, z) and withinReach(x, z) and kx ~= nil then return true end
 
     -- OUTSIDE THE REGION, THE ONLY LEGAL MOVE IS BACK TOWARD IT.
     --
@@ -266,8 +427,19 @@ function mayStep(x, y, z)
     -- If we are outside the chunk region, only that matters -- a drone in an unloaded chunk stops
     -- ticking, which is worse than any amount of dead reckoning. GPS proximity only decides the
     -- tie-break once we are inside.
-    local s_OutNow  = distanceOutside(m_Chunks, cx, cy, cz)
-    local s_OutNext = distanceOutside(m_Chunks, x, y, z)
+    -- How far outside we are, counting BOTH the chunk box and the reach circle -- otherwise a drone
+    -- sitting in a corner reads as perfectly in-bounds and never walks back toward the mast.
+    local function outBy(px, py, pz)
+        local d = distanceOutside(m_Chunks, px, py, pz)
+        if m_Reach and m_Centre then
+            local dx, dz = px - m_Centre.x, pz - m_Centre.z
+            local r = math.sqrt(dx * dx + dz * dz) - m_Reach
+            if r > 0 then d = d + r end
+        end
+        return d
+    end
+    local s_OutNow  = outBy(cx, cy, cz)
+    local s_OutNext = outBy(x, y, z)
     if s_OutNow > 0 then
         if s_OutNext < s_OutNow then return true end
         return false, "outside the region, and that step does not head back"
@@ -324,10 +496,52 @@ end
 -- the map, the drone only needs enough to path with.
 local pendingWorld, pendingDetail = {}, {}
 
+-- Observations withheld for want of a fix. Declared HERE, above noteObservation, because a `local`
+-- used above its declaration is a nil GLOBAL lookup in Lua -- silently. It lived below the gate
+-- until now, which is exactly why the gate could not be written at the choke point.
+local m_Suppressed = 0
+
+-- AN OBSERVATION IS ONLY WORTH WHAT ITS COORDINATES ARE WORTH.
+--
+-- Every cell here is keyed by the drone's BELIEVED position plus an offset. If that belief is wrong
+-- the block is real, the reading is honest, and the coordinate is fiction -- so the map learns a
+-- solid block at a place that is empty, and pathfinding routes around a wall that does not exist.
+--
+-- This ran unconditionally, which was survivable only while position was reliable. It is not: a
+-- drone out of GPS range dead-reckons, a drone recovering adopts a peer-trilaterated fix good to
+-- tens of blocks, and SeekCoverage deliberately walks while unverified. All three used to file
+-- observations, and the result is exactly what it sounds like -- slabs of phantom terrain scattered
+-- wherever a lost drone happened to travel.
+--
+-- The rule is simple and there is no good exception: if we cannot say where we are, we do not get
+-- to say what is there. Losing the observations of an unverified drone costs a re-scan later; a
+-- poisoned map costs every routing decision made from it, for as long as it survives on disk.
 function noteObservation(idx, solid, detail)
+    if not positionVerified() then
+        m_Suppressed = m_Suppressed + 1
+        return false
+    end
     pendingWorld[idx] = solid
     if detail ~= nil then pendingDetail[idx] = detail end
+    return true
 end
+
+-- PUT BACK OBSERVATIONS THAT WERE ALREADY VERIFIED WHEN TAKEN.
+--
+-- UploadWorld re-queues its delta when MapServer refuses it, and routing that through
+-- noteObservation would now silently DROP it -- the fix may have lapsed in the seconds since, and
+-- the gate cannot tell a stale reading from a fresh one. These coordinates were checked at the
+-- moment they were recorded; a failed upload is a network problem, not a position problem.
+function requeueObservations(p_World, p_Detail)
+    for k, v in pairs(p_World or {}) do
+        pendingWorld[k] = v
+        if p_Detail and p_Detail[k] ~= nil then pendingDetail[k] = p_Detail[k] end
+    end
+end
+
+-- How many observations were thrown away for want of a fix. Reported so "the map stopped growing"
+-- has a visible reason rather than looking like a broken scanner.
+function droppedObservations() return m_Suppressed end
 
 function takeWorldDelta()
     local w, d, n = pendingWorld, pendingDetail, 0
@@ -336,10 +550,31 @@ function takeWorldDelta()
     return w, d, n
 end
 
--- Directions
+-- DIRECTIONS. THE ORDER IS ANTICLOCKWISE, AND IT IS NOT NEGOTIABLE.
+--
+-- N, W, S, E = 0, 1, 2, 3. Every first-party module must use exactly this, and lua-hygiene fails
+-- the build on any file that spells it differently -- because six copies of this line existed and
+-- they did not all agree. DockingMan had `North, West, East, South = 0, 1, 2, 3`, swapping East and
+-- South, in the module that assigns dock berths and orientations. It was dead code, so it never
+-- fired; it was one reference away from turning every dock approach ninety degrees.
+--
+-- The numbering is arbitrary but the CONSEQUENCE of disagreeing is not: a heading is how pgps turns
+-- "forward" into a change of coordinates, so an off-by-one here does not produce a wrong answer, it
+-- produces a drone that walks the opposite way while its log insists it is heading home. That cost
+-- a night and five stranded drones.
+--
+-- The vendored /lua/libs/lama uses the opposite rotation (north, east, south, west) and is left
+-- alone -- it is upstream code. Nothing may hand it a raw number: convert at the seam, by NAME.
 North, West, South, East, Up, Down = 0, 1, 2, 3, 4, 5
 local shortNames = {[North] = "N", [West] = "W", [South] = "S",
                     [East] = "E", [Up] = "U", [Down] = "D" }
+-- LAMA takes the spelled-out name, not the letter. Kept separate from shortNames because passing
+-- "N" where "north" is expected fails silently -- LAMA simply does not update, and the drone's
+-- persistent position quietly stops tracking reality.
+local longNames  = {[North] = "north", [West] = "west", [South] = "south", [East] = "east"}
+-- Exported name -> number, so callers stop writing their own copy of the mapping. DroneLogic had
+-- one; it happened to agree, which is luck, not design.
+HEADINGS = {north = North, west = West, south = South, east = East}
 local deltas = {[North] = {0, 0, -1}, [West] = {-1, 0, 0}, [South] = {0, 0, 1},
                 [East] = {1, 0, 0}, [Up] = {0, 1, 0}, [Down] = {0, -1, 0}}
 
@@ -366,6 +601,9 @@ end
 --
 
 function printWorld()
+    -- lua-hygiene: allow (a full dump of the world cache is a developer aid typed at the turtle;
+    -- putting thousands of serialised cells into drone.log would evict everything useful within a
+    -- single call, which is the opposite of the point of having the log).
     print(textutils.serialize(cachedWorld))
 end
 
@@ -438,7 +676,6 @@ end
 -- Stale can be corrected by looking again. Wrong cannot.
 local m_LastFix   = nil
 local m_Drift     = 0        -- how far off the last check found us; diagnostics
-local m_Suppressed = 0       -- observations withheld for want of a fix
 local FIX_MAX_AGE = 60       -- seconds
 
 -- How far a drone may travel on belief alone before it has to prove where it is.
@@ -454,14 +691,179 @@ local MOVES_PER_FIX   = 16
 local m_MovesSinceFix = 0
 local m_NoFixStops    = 0
 
-function verifyPosition()
+-- BACK OFF WHEN THERE IS DEMONSTRABLY NO COVERAGE.
+--
+-- gps.locate blocks for its full timeout when nothing answers, and underground nothing ever
+-- answers -- the hosts are all above ground and a fix needs four of them. So every call from below
+-- the surface costs five seconds of doing nothing, and callers in a loop pay it per iteration.
+--
+-- The gather job calls this before every candidate block. With 192 candidates that is sixteen
+-- minutes of a drone standing in a tunnel waiting for a fix it cannot get, per job. D3 spent
+-- twenty-five minutes on one gather and moved a single block; it looked wedged and was in fact
+-- simply queueing for GPS over and over.
+--
+-- After a failed attempt, further attempts are refused cheaply for a while. The drone keeps its
+-- dead-reckoned position, which mayStep already accepts underground, and the moment it climbs back
+-- into coverage the backoff expires and fixes resume.
+local GPS_RETRY_AFTER = 30
+local m_FixFailedAt = nil
+
+-- p_Force skips the backoff. For code that has just DONE something to change the answer -- climbed
+-- out of a shaft, retraced a breadcrumb, walked a leg looking for coverage -- the previous failure
+-- says nothing about the new position, and waiting out the backoff there would be the old bug in
+-- reverse: a drone standing in coverage refusing to look.
+-- Which way did we just step? Compares a fresh GPS reading against the position we held BEFORE the
+-- step, so the caller must not have updated the cache in between.
+--
+-- Its own function because the same four comparisons were written inline in ensureHeading and again
+-- in setLocationFromGPS, and the copies are the reason a heading bug had two places to hide.
+local function dirFromStep(nx, nz)
+    if nx == nil or nz == nil then return nil end
+    if     nz < cachedZ then return North
+    elseif nz > cachedZ then return South
+    elseif nx < cachedX then return West
+    elseif nx > cachedX then return East end
+    return nil
+end
+
+-- WATCH THE HEADING FOR FREE, WHILE THE DRONE IS MOVING ANYWAY.
+--
+-- Heading is the one thing that never self-corrects. A FAILED move is handled -- the cache only
+-- advances when turtle.forward() returned true. A SUCCESSFUL move on a wrong cachedDir is the
+-- problem: it advances the cache by the wrong delta, so belief and reality separate at twice the
+-- distance travelled. D14 ended 118 blocks out in x, which is about fifty-nine blocks flown
+-- backwards while its log reported progress the whole way.
+--
+-- The first fix for this triggered a PROBE -- step out, read GPS, step back -- but only once drift
+-- had already reached four blocks. That is both late and expensive: it costs two moves, needs open
+-- space, and needs the drone to be idle, so it can only run in the recovery path a drifting drone
+-- struggles to reach.
+--
+-- None of that is necessary. Between two fixes the drone recorded what it INTENDED to do, and GPS
+-- says what it ACTUALLY did. If those disagree the heading is wrong -- proven, on the first fix
+-- after the very first bad move, at a cost of nothing. And when the drone happens to have flown
+-- straight without turning, the actual displacement IS the true heading, so it can be corrected
+-- outright rather than merely suspected.
+local m_FixAtX, m_FixAtY, m_FixAtZ = nil, nil, nil   -- where the last fix put us
+local m_IntDX, m_IntDY, m_IntDZ    = 0, 0, 0         -- displacement we believe we made since
+local m_TurnsSinceFix              = 0
+local m_StraightFwd                = 0               -- forward steps, if nothing else happened
+local m_HeadingSuspect             = false
+
+function headingSuspect() return m_HeadingSuspect end
+
+-- Called by every move that advances the cache, and by the turns. Cheap: three adds.
+function notePlannedStep(dx, dy, dz, p_Straight)
+    m_IntDX, m_IntDY, m_IntDZ = m_IntDX + dx, m_IntDY + dy, m_IntDZ + dz
+    if p_Straight then m_StraightFwd = m_StraightFwd + 1 else m_StraightFwd = -1 end
+end
+function noteTurn() m_TurnsSinceFix = m_TurnsSinceFix + 1 m_StraightFwd = -1 end
+
+local function resetAudit(x, y, z)
+    m_FixAtX, m_FixAtY, m_FixAtZ = x, y, z
+    m_IntDX, m_IntDY, m_IntDZ = 0, 0, 0
+    m_TurnsSinceFix, m_StraightFwd = 0, 0
+end
+
+-- MEASURE THE ERROR AS A ROTATION, AND TURN THE CACHE BY IT.
+--
+-- The audit gives two vectors: where we INTENDED to go since the last fix, and where GPS says we
+-- ACTUALLY went. If both point along a single horizontal axis, the angle between them is exactly
+-- how wrong the heading is -- and it can simply be added to cachedDir. No probe, no stepping out
+-- and back, no open space required, no fuel: the drone was flying anyway and the fix was going to
+-- happen anyway.
+--
+-- Measured live, and this is what made it obvious: "wanted 0,-1,-2 got -2,-1,0", "wanted 0,-1,2 got
+-- 2,-1,0", "wanted -1,0,-3 got -3,0,1". The y component matches every time; x and z are rotated a
+-- quarter turn, the same quarter turn, on every drone. That is not drift -- drift is random. It is a
+-- heading that is systematically one step out, which no amount of correcting the POSITION fixes.
+--
+-- The earlier version of this only acted on a run with no turns in it, which almost never happens,
+-- and it asked dirFromStep to compare against cachedX/cachedZ -- the dead-reckoned position, not
+-- the position the run started from. Working out the rotation needs neither.
+local AXIS_INDEX = {}   -- unit vector -> the compass number that points that way
+AXIS_INDEX["0,-1"] = North
+AXIS_INDEX["-1,0"] = West
+AXIS_INDEX["0,1"]  = South
+AXIS_INDEX["1,0"]  = East
+
+-- The compass number a displacement points along, or nil if it is not cleanly along one axis.
+local function axisOf(dx, dz)
+    if (dx == 0) == (dz == 0) then return nil end      -- both zero, or diagonal: no single answer
+    local ux = dx == 0 and 0 or (dx > 0 and 1 or -1)
+    local uz = dz == 0 and 0 or (dz > 0 and 1 or -1)
+    return AXIS_INDEX[ux .. "," .. uz]
+end
+
+local function correctFromTravel(adx, adz)
+    local want = axisOf(m_IntDX, m_IntDZ)
+    local got  = axisOf(adx, adz)
+    if want == nil or got == nil or want == got then return false end
+    if cachedDir == nil then return false end
+    -- Compass numbering is anticlockwise (N,W,S,E = 0,1,2,3), so a difference in index IS the
+    -- rotation, and applying it to cachedDir is the whole correction.
+    local s_Turn = (got - want) % 4
+    local s_New  = (cachedDir + s_Turn) % 4
+    ptrace(("heading was %s, we actually travelled %s -- rotating %d quarter-turn(s) to %s, no probe")
+        :format(tostring(shortNames[cachedDir]), tostring(shortNames[got]),
+                s_Turn, tostring(shortNames[s_New])))
+    cachedDir = s_New
+    savePose(true)
+    m_HeadingSuspect = false
+    return true
+end
+
+-- Compare intent against reality. Returns nothing; corrects or flags as a side effect.
+local function auditHeading(x, y, z)
+    if m_FixAtX == nil then return end
+    local adx, ady, adz = x - m_FixAtX, y - m_FixAtY, z - m_FixAtZ
+    if adx == m_IntDX and ady == m_IntDY and adz == m_IntDZ then
+        m_HeadingSuspect = false
+        -- Deliberately loud while this is being trusted: a MATCH that coincides with a non-zero
+        -- drift would mean the two measurements disagree about what "wrong" means, and that has to
+        -- be visible rather than inferred. Quiet when there was nothing to compare.
+        if m_Drift and m_Drift > 0 then
+            ptrace(("audit matched (%d,%d,%d) yet the fix moved us %d -- both cannot be right")
+                :format(m_IntDX, m_IntDY, m_IntDZ, m_Drift))
+        end
+        return
+    end
+    -- ALL THREE AXES, not just the two that name a heading.
+    --
+    -- The first version compared x and z only, reasoning that up and down say nothing about which
+    -- way the drone faces. True, and it made the check blind to the commonest disagreement there
+    -- is: drones were being corrected by two to six blocks on every scheduled fix and the audit sat
+    -- silent, because the error was VERTICAL. Bookkeeping that is wrong about y is wrong -- it puts
+    -- the drone on the wrong floor, which is how one ends up boring through a chest or surfacing
+    -- inside rock -- and a check that cannot see it is not auditing the bookkeeping, only part of it.
+    --
+    -- The heading INFERENCE below still uses x/z alone, because only those can name a direction.
+    if adx == 0 and ady == 0 and adz == 0 and m_IntDX == 0 and m_IntDY == 0 and m_IntDZ == 0 then
+        return                                        -- stood still: nothing to check
+    end
+
+    m_HeadingSuspect = true
+    if not correctFromTravel(adx, adz) then
+        ptrace(("bookkeeping disagrees with GPS since the last fix: wanted %d,%d,%d got %d,%d,%d")
+            :format(m_IntDX, m_IntDY, m_IntDZ, adx, ady, adz))
+    end
+end
+
+function verifyPosition(p_Force)
+    if not p_Force and m_FixFailedAt and (os.clock() - m_FixFailedAt) < GPS_RETRY_AFTER then
+        return nil, "no gps fix (backing off)"
+    end
     if not startGPS() then return nil, "no modem for gps" end
     -- Five seconds, not two. The hosts are ordinary computers serving the whole fleet, and a
     -- tight timeout turns "busy" into "out of coverage" -- which then freezes the drone, because
     -- movement is gated on having a fix. D3 sat unable to move with all four hosts up and 50-65
     -- blocks away, well inside range.
     local x, y, z = gps.locate(5, false)
-    if x == nil then return nil, "no gps fix" end
+    if x == nil then
+        m_FixFailedAt = os.clock()
+        return nil, "no gps fix"
+    end
+    m_FixFailedAt = nil
     -- A BLOCK COORDINATE IS AN INTEGER. ALWAYS.
     --
     -- gps.locate trilaterates from whatever hosts answered, and the answer is only as round as its
@@ -476,11 +878,15 @@ function verifyPosition()
     if cachedX ~= nil then
         m_Drift = math.abs(x - cachedX) + math.abs(y - cachedY) + math.abs(z - cachedZ)
         if m_Drift > 0 then
-            print(("position corrected by %d: %d,%d,%d -> %d,%d,%d")
+            ptrace(("position corrected by %d: %d,%d,%d -> %d,%d,%d")
                 :format(m_Drift, cachedX, cachedY, cachedZ, x, y, z))
         end
     end
+    -- BEFORE overwriting the cache: the audit needs the position GPS just reported, compared
+    -- against where our own bookkeeping thought we had gone since the previous fix.
+    auditHeading(x, y, z)
     cachedX, cachedY, cachedZ = x, y, z
+    resetAudit(x, y, z)
     m_LastFix = os.clock()
     return true, m_Drift
 end
@@ -576,7 +982,7 @@ function requireFix()
     -- suppressed while unverified (see noteCleared), so it can travel back into coverage without
     -- being trusted to describe what it sees on the way.
     if m_NoFixStops >= NO_FIX_GRACE then
-        print("no GPS after " .. m_NoFixStops .. " tries -- moving on dead reckoning to regain coverage")
+        ptrace("no GPS after " .. m_NoFixStops .. " tries -- moving on dead reckoning to regain coverage")
         m_NoFixStops = 0
         m_MovesSinceFix = 0
         return true
@@ -593,6 +999,50 @@ end
 -- index self-correcting: the drone that removed the block is the one that reports it gone.
 --
 -- Must live below `deltas`, which is a local declared after noteObservation.
+-- THE INVERSE OF noteCleared: a cell we now know we CANNOT pass.
+--
+-- Refusing to mine a protected block recorded nothing at all -- it printed a line and returned
+-- false, leaving the map believing the cell was passable. So the pathfinder planned straight back
+-- through it, the drone refused again, and the pair of them did that indefinitely. "Continuously
+-- pathfinds to the same obstruction" is the exact shape of an observation that was made and thrown
+-- away: the drone learned the truth and told nobody, including itself.
+function noteBlocked(p_Which, p_Name)
+    local d
+    if p_Which == "up"        then d = deltas[Up]
+    elseif p_Which == "down"  then d = deltas[Down]
+    else
+        -- A GUESS AT WHICH WAY WE FACE WRITES A WALL THAT IS NOT THERE.
+        --
+        -- The horizontal cell is derived from cachedDir, so a stale or missing heading records the
+        -- WRONG neighbour as permanently solid -- in the SHARED map, where every drone then plans
+        -- around an obstacle that does not exist. That is strictly worse than recording nothing:
+        -- a missed observation costs one rediscovery, a phantom wall costs every route past it,
+        -- for ever, and looks exactly like the 190 imaginary turtle blocks we spent a day purging.
+        --
+        -- Up and down need no heading and are always safe. Horizontal needs one we have actually
+        -- established, so establish it or say nothing.
+        if cachedDir == nil then
+            local ok = ensureHeading()
+            if not ok then return nil end
+        end
+        if not positionVerified() then return nil end
+        d = deltas[cachedDir]
+    end
+    if d == nil then return nil end
+
+    local idx = (cachedX + d[1])..":"..(cachedY + d[2])..":"..(cachedZ + d[3])
+    local s_Detail = p_Name and {true, {name = p_Name}} or nil
+    -- 3, not 1: "solid AND we are forbidden to break it". A digging drone routes through ordinary
+    -- solid rock quite happily, so recording a chest as merely solid tells the pathfinder nothing
+    -- it will act on. See a_star: 0 air, 1 solid, 2 turtle, 3 forbidden.
+    cachedWorld[idx] = 3
+    if s_Detail then cachedWorldDetail[idx] = s_Detail end
+    -- noteObservation gates and counts this now; it used to be checked here and in noteCleared and
+    -- nowhere else, which is how the scan paths poisoned the map unnoticed.
+    noteObservation(idx, 3, s_Detail)
+    return idx
+end
+
 function noteCleared(p_Which)
     local d
     if p_Which == "up"        then d = deltas[Up]
@@ -605,12 +1055,9 @@ function noteCleared(p_Which)
     -- wrong local cache costs at most a replan.
     cachedWorld[idx] = 0
     cachedWorldDetail[idx] = nil
-    -- Only tell the SERVER while a recent fix agrees on where we are. See the note above.
-    if positionVerified() then
-        noteObservation(idx, 0)
-    else
-        m_Suppressed = m_Suppressed + 1
-    end
+    -- Only tell the SERVER while a recent fix agrees on where we are -- enforced inside
+    -- noteObservation, so every caller gets it and not just the two that remembered.
+    noteObservation(idx, 0)
     return idx
 end
 
@@ -666,35 +1113,115 @@ end
 
 -- Dig, unless what is there is ours. Returns false and the block name when it refuses, so a caller
 -- can route around rather than retry into the same wall.
-local function digGuarded(p_Dig, p_Detect, p_Inspect)
+-- Cells we have refused to dig because the block in them is protected. REMEMBERED, because a
+-- refusal that is not written down is a refusal that will be repeated.
+--
+-- Kept as a fast local guard even though routing now handles this properly: a refusal recorded here
+-- is skipped without a round trip, and it covers the window between meeting a block and the shared
+-- map learning about it. Historically this was the ONLY protection, because digTo was a greedy
+-- axis-walker that consulted no map at all -- D7 spent its life tunnelling at the storage modems,
+-- refusing and re-planning the identical route. digTo is now moveTo with a passability flag, so the
+-- pathfinder simply never routes through a cell recorded as forbidden.
+local m_ProtectedCells = {}
+
+-- CAN THIS TURTLE DIG? `turtle.dig` is a function on every turtle, tool or not -- it just fails with
+-- "No tool to dig with". So every `if turtle.dig then` guard in this codebase is always true, and a
+-- crafter with a modem and a workbench (no room for a pickaxe) ran the full 256-step digTo loop
+-- failing on every step instead of skipping it. Two upgrade slots: if both hold a PERIPHERAL there
+-- is no tool, because tools report no peripheral type.
+function canDig()
+    local l = peripheral.getType("left")
+    local r = peripheral.getType("right")
+    return not (l ~= nil and r ~= nil)
+end
+
+function protectedCell(idx) return m_ProtectedCells[idx] == true end
+
+local function digGuarded(p_Dig, p_Detect, p_Inspect, p_Idx)
     if not p_Detect() then return true end
     local s_Ok, s_Blk = p_Inspect()
     if s_Ok and s_Blk and isProtectedBlock(s_Blk.name) then
-        print("refusing to dig " .. tostring(s_Blk.name))
+        ptrace("refusing to dig " .. tostring(s_Blk.name))
+        if p_Idx then
+            m_ProtectedCells[p_Idx] = true
+            -- Tell the shared map as well, so the other drones never plan through it either -- as 3,
+            -- "forbidden", because a digger treats plain solid as passable.
+            cachedWorld[p_Idx] = 3
+            if positionVerified() then noteObservation(p_Idx, 3, {true, {name = s_Blk.name}}) end
+        end
         return false, s_Blk.name
     end
     return p_Dig()
 end
 
-function ensureHeading()
-    if cachedDir ~= nil then return true end
+
+-- p_Force re-derives a heading we ALREADY have, instead of trusting it.
+--
+-- A WRONG HEADING IS PERMANENT, AND IT IS WORSE THAN A WRONG POSITION.
+--
+-- This returned true the instant cachedDir was set, so a heading, once wrong, was never questioned
+-- again by anything -- and verifyPosition corrects the POSITION only, so GPS could not repair it
+-- either. The two together produce a drone that walks confidently in the wrong direction for ever:
+-- every step updates the cache by the bad heading, so its believed position moves TOWARD home while
+-- the drone moves away from it, and each GPS fix silently resets the position without touching the
+-- cause.
+--
+-- Measured on D11: it believed it was at -480,112,64 -- horizontally exactly home -- while sitting
+-- at -426,112,172, a hundred and twenty-one blocks out, having travelled EAST for the entire
+-- journey home while its log reported the gap closing at every leg.
+--
+-- Re-deriving costs one step out and back and needs a GPS fix to compare against, so callers should
+-- force it just after a confirmed fix. The probe only ever ASSIGNS cachedDir, never clears it, so a
+-- failed re-derivation leaves the old heading in place rather than immobilising the drone.
+function ensureHeading(p_Force)
+    if cachedDir ~= nil and not p_Force then return true end
     if cachedX == nil then return false, "no position, so no way to deduce heading" end
 
     -- Step, look, step back. The only way to learn which way you face is to move and see what
     -- changed -- there is no API for it.
+    -- SAY WHY THE STEP FAILED. This swallowed the reason, and the reason was the whole story: with
+    -- spawn protection covering the settlement every turtle.forward() here returned
+    -- "Cannot enter protected area", all four directions, so the heading could never be derived --
+    -- and a drone with no heading refuses every subsequent move. The fleet reported "boxed in" while
+    -- standing in a scanned-empty 9x9 of open air. One propagated string would have said it outright.
     local function probe()
         for _ = 1, 4 do
-            if turtle.forward() then
-                local nx, _, nz = gps.locate(5, false)
-                turtle.back()
-                if nx ~= nil and nz ~= nil then
-                    if     nz < cachedZ then cachedDir = North
-                    elseif nz > cachedZ then cachedDir = South
-                    elseif nx < cachedX then cachedDir = West
-                    elseif nx > cachedX then cachedDir = East end
+            local s_Ok, s_Err = turtle.forward()
+            if not s_Ok and classifyMove(s_Err) == "hard" then
+                moveFailed(s_Err)
+                return false, s_Err
+            end
+            if s_Ok then
+                local nx, ny, nz = gps.locate(5, false)
+                -- NEVER MOVE WITHOUT RECORDING IT. THIS IS WHERE DRONES GET LOST.
+                --
+                -- The step out and back is deliberately raw -- pgps.forward() needs a heading, which
+                -- is the very thing we are deriving -- so nothing here updates the cached position.
+                -- That is only safe while BOTH moves succeed. `turtle.back()` was unchecked, so any
+                -- time something sat behind the drone it stayed one block forward while believing it
+                -- had not moved at all.
+                --
+                -- One block per occurrence, and this runs every time the heading is unknown, which
+                -- for a drone out of GPS range is constantly. It compounds silently: two drones were
+                -- found 28 and 45 blocks from where their own saved pose said they were, still
+                -- convinced they were inside the region -- so the region-return never fired, the
+                -- walk-home had a false starting point, and every recovery path was reasoning from
+                -- fiction. That drift is not weather; it is this line.
+                --
+                -- If we cannot come back, adopt the position we actually reached.
+                local s_Back = turtle.back()
+                if not s_Back then
+                    if nx ~= nil then
+                        cachedX, cachedY, cachedZ = math.floor(nx), math.floor(ny), math.floor(nz)
+                    elseif cachedDir and cachedX then
+                        local F = deltas[cachedDir]
+                        cachedX, cachedY, cachedZ = cachedX + F[1], cachedY + F[2], cachedZ + F[3]
+                    end
+                    savePose()
                 end
+                cachedDir = dirFromStep(nx, nz) or cachedDir
                 if cachedDir ~= nil then
-                    print("heading re-established: " .. tostring(shortNames[cachedDir]))
+                    ptrace("heading re-established: " .. tostring(shortNames[cachedDir]))
                     return true
                 end
             end
@@ -703,7 +1230,9 @@ function ensureHeading()
         return false
     end
 
-    if probe() then return true end
+    local s_Probed, s_ProbeErr = probe()
+    if s_Probed then return true end
+    if s_ProbeErr then return false, s_ProbeErr end
 
     -- BEING BOXED IN MUST NOT BE TERMINAL.
     --
@@ -718,19 +1247,26 @@ function ensureHeading()
     -- so nothing else has to know this happened.
     local s_Risen = 0
     for _ = 1, 4 do
-        if not turtle.up() then break end
+        local s_Up, s_UpErr = turtle.up()
+        if not s_Up then
+            if classifyMove(s_UpErr) == "hard" then moveFailed(s_UpErr) return false, s_UpErr end
+            break
+        end
         s_Risen = s_Risen + 1
         cachedY = cachedY + 1
         if probe() then
+            -- lua-hygiene: allow (unwinding our own climb -- cachedY is only decremented when the
+            -- step actually happened, so a refusal here cannot corrupt the pose)
             for _ = 1, s_Risen do if turtle.down() then cachedY = cachedY - 1 end end
             return true
         end
     end
+    -- lua-hygiene: allow (unwinding our own climb, as above)
     for _ = 1, s_Risen do if turtle.down() then cachedY = cachedY - 1 end end
 
     -- Still boxed: dig a peephole. Only a drone with a pickaxe can do this, which is fine -- it is
     -- also the only kind of drone that can bury itself in the first place.
-    if turtle.dig then
+    if canDig() then
         for _ = 1, 4 do
             digGuarded(turtle.dig, turtle.detect, turtle.inspect)
             if probe() then return true end
@@ -771,8 +1307,10 @@ function forward()
     local x, y, z = cachedX + D[1], cachedY + D[2], cachedZ + D[3]--adds corisponding delta to direction
     local idx_pos = x..":"..y..":"..z
 
-    if turtle.forward() then
+    local s_Moved, s_MoveErr = turtle.forward()
+    if s_Moved then
         cachedX, cachedY, cachedZ = x, y, z
+        notePlannedStep(D[1], D[2], D[3], true)   -- see auditHeading
         breadcrumb()
         detectAll()
         savePose()
@@ -799,10 +1337,61 @@ function forward()
         --
         -- detect() answers the question honestly. A block is a block; anything else is an entity
         -- standing somewhere passable, and the right record for that cell is air.
+        local s_PriorBelief = cachedWorld[idx_pos]
         local s_Solid = turtle.detect() and 1 or 0
         cachedWorld[idx_pos] = s_Solid
         noteObservation(idx_pos, s_Solid, s_Solid == 1 and cachedWorldDetail[idx_pos] or nil)
-        return false
+
+        -- A BLOCKED MOVE IS ALSO EVIDENCE ABOUT OUR OWN POSITION.
+        --
+        -- If detect() says the cell ahead is EMPTY and the step still failed, the two facts only
+        -- reconcile one way: we are not where we think we are. The fleet froze exactly here -- five
+        -- drones in provably open air (a whole 9x9 slice of the bay scanned as air, one turtle in
+        -- it) reporting forward=false with no reason, while a drone's cached y was one block off
+        -- what the server had. Every route it planned, every neighbour it reasoned about and every
+        -- deposit square it aimed for was computed from a position that was wrong, so it walked
+        -- into things that were not where it thought they were and concluded the world was solid.
+        --
+        -- Re-fixing costs a GPS round trip and only happens on this contradiction, so it cannot run
+        -- hot. Whatever the caller does next is then planned from a position that has been checked.
+        -- Re-fix on ANY surprise, not just an empty cell.
+        --
+        -- Two things contradict our idea of the world: a step into a cell we believe is empty that
+        -- fails, and a step into a cell the MAP called air that turns out solid. Both are equally
+        -- good evidence that the drone is not where it thinks it is -- which is the one error that
+        -- makes every subsequent route, neighbour check and deposit square wrong. Only the first was
+        -- checked; the second is the commoner one underground, where dead reckoning runs longest.
+        --
+        -- A hard refusal is still excluded: it says nothing about position, and re-fixing on it
+        -- would burn a GPS round trip per attempt while getting no closer to the real problem.
+        -- RATE-LIMITED, OR THE CURE IS WORSE THAN THE DISEASE.
+        --
+        -- Forcing a fix on EVERY surprising failure looked cheap and was not: a digging drone fails
+        -- moves constantly, each forced verifyPosition is a blocking five-second gps.locate, and the
+        -- hosts are ordinary computers serving the whole fleet. Six drones doing that in parallel
+        -- saturated GPS, the locates began timing out, requireFix() then refused every subsequent
+        -- move, and the entire fleet reported itself blocked -- stranded, all at once, by the very
+        -- check meant to keep their positions honest.
+        --
+        -- Once every REFIX_COOLDOWN seconds is enough: drift accumulates over many moves, not one.
+        local s_MapSaidAir = (s_PriorBelief == 0)
+        local s_MayRefix = (m_LastRefixAt == nil) or ((os.clock() - m_LastRefixAt) > REFIX_COOLDOWN)
+        if s_MayRefix and classifyMove(s_MoveErr) ~= "hard" and (s_Solid == 0 or s_MapSaidAir) then
+            m_LastRefixAt = os.clock()
+            -- verifyPosition returns (true, drift) or (nil, reason) -- NOT coordinates. Reading it
+            -- as x,y,z formatted a boolean with %d and threw
+            -- "bad argument (number expected, got boolean)" on every failed step into an empty
+            -- cell, which crashed the job, requeued the task and left drones shuffling back and
+            -- forth. The corrected position is read from the cache afterwards, which is where
+            -- verifyPosition actually puts it.
+            local s_Ok, s_Drift = verifyPosition(true)
+            if s_Ok and type(s_Drift) == "number" and s_Drift > 0 then
+                local nx, ny, nz = cachedX, cachedY, cachedZ
+                ptrace(("pose was wrong by %d: corrected to %s,%s,%s")
+                    :format(s_Drift, tostring(nx), tostring(ny), tostring(nz)))
+            end
+        end
+        return moveFailed(s_MoveErr)
     end
 end
 
@@ -818,15 +1407,21 @@ function back()
     local x, y, z = cachedX - D[1], cachedY - D[2], cachedZ - D[3]
     local idx_pos = x..":"..y..":"..z
 
-    if turtle.back() then
+    local s_Moved, s_MoveErr = turtle.back()
+    if s_Moved then
+        -- D, not (x - cachedX): the cache was assigned on the line above, so that difference is
+        -- always zero and back() recorded NO intent while the cache advanced -- the audit then had
+        -- a self-inconsistent picture and could neither trust nor blame it. back() moves opposite
+        -- to the way we face, so the delta is simply -D.
         cachedX, cachedY, cachedZ = x, y, z
+        notePlannedStep(-D[1], -D[2], -D[3], false)
         breadcrumb()
         detectAll()
         savePose()
         return true
     else
         cachedWorld[idx_pos] = 0.5
-        return false
+        return moveFailed(s_MoveErr)
     end
 end
 
@@ -846,15 +1441,17 @@ function up()
     local x, y, z = cachedX + D[1], cachedY + D[2], cachedZ + D[3]
     local idx_pos = x..":"..y..":"..z
 
-    if turtle.up() then
+    local s_Moved, s_MoveErr = turtle.up()
+    if s_Moved then
         cachedX, cachedY, cachedZ = x, y, z
+        notePlannedStep(0, 1, 0, false)     -- vertical: says nothing about facing, but counts
         breadcrumb()
         detectAll()
         savePose()
         return true
     else
         cachedWorld[idx_pos] = (turtle.detectUp() and 1 or 0.5)
-        return false
+        return moveFailed(s_MoveErr)
     end
 end
 
@@ -874,8 +1471,10 @@ function down()
     local x, y, z = cachedX + D[1], cachedY + D[2], cachedZ + D[3]
     local idx_pos = x..":"..y..":"..z
 
-    if turtle.down() then
+    local s_Moved, s_MoveErr = turtle.down()
+    if s_Moved then
         cachedX, cachedY, cachedZ = x, y, z
+        notePlannedStep(0, -1, 0, false)     -- vertical: says nothing about facing, but counts
         breadcrumb()
         detectAll()
         savePose()
@@ -883,7 +1482,7 @@ function down()
     else
         detectAll()
         cachedWorld[idx_pos] = (turtle.detectDown() and 1 or 0.5)
-        return false
+        return moveFailed(s_MoveErr)
     end
 end
 
@@ -901,6 +1500,7 @@ function turnLeft()
     -- turn and leave the cache unknown rather than throwing.
     if cachedDir == nil then turtle.turnLeft() detectAll() return true end
     cachedDir = (cachedDir + 1) % 4
+    noteTurn()          -- the audit can only invert a run that never turned; see auditHeading
     turtle.turnLeft()
     detectAll()
     savePose(true)   -- heading changed: worth writing immediately
@@ -921,6 +1521,7 @@ function turnRight()
     -- turn and leave the cache unknown rather than throwing.
     if cachedDir == nil then turtle.turnRight() detectAll() return true end
     cachedDir = (cachedDir + 3) % 4
+    noteTurn()          -- the audit can only invert a run that never turned; see auditHeading
     turtle.turnRight()
     detectAll()
     savePose(true)   -- heading changed: worth writing immediately
@@ -974,11 +1575,36 @@ function clearWorld()
     detectAll()
 end
 
+-- ABORT WHATEVER MOVEMENT IS RUNNING.
+--
+-- Set by anything that needs the drone to stop travelling RIGHT NOW -- above all the fuel
+-- watchdog, which is useless if it cannot interrupt the flight that is draining the tank. Cleared
+-- by StartExec, which TaskEnd already calls at the end of every task, so a stray break cannot
+-- leave a drone permanently unable to move.
+local breakExec = false
+
 function BreakExec()
     breakExec = true
 end
 function StartExec()
     breakExec = false
+end
+-- Checked by every long-running mover, and SELF-CLEARING.
+--
+-- I made this non-clearing so that one abort could not be swallowed by moveTo while the digTo after
+-- it carried on. That trade was wrong, and it bricked drones: any path that sets the flag and then
+-- fails to clear it -- an error between BreakExec and StartExec, a job that unwinds a different way
+-- -- leaves every mover returning "aborted" instantly, for ever. D3 cut itself thirty blocks up to
+-- open sky and then could not travel one block, because moveTo, digTo and flyTo all refused before
+-- taking a step. A drone that cannot move is a far worse failure than an abort that arrives one
+-- call late, and the fuel watchdog -- the only real user of this -- re-checks every 20 seconds
+-- anyway, so a missed abort costs one cycle and a wedged flag costs the drone.
+local function aborted()
+    if breakExec then
+        breakExec = false
+        return true
+    end
+    return false
 end
 -- moveTo
 --
@@ -1033,14 +1659,18 @@ local MOVE_MAX_STALLS  = 4
 
 -- Path ONE short hop. Renamed from moveTo: this asks MapServer to plan the entire route in a
 -- single a_star, which is fine over a chunk and hopeless over a hundred blocks -- see moveTo below.
-local function moveLeg(_targetX, _targetY, _targetZ, _targetDir, changeDir, discover)
+-- p_Dig: may this leg cut through ordinary rock? The route still comes from the pathfinder either
+-- way -- digging is a PASSABILITY MODE, not a different way of travelling. digTo used to be a
+-- separate greedy axis-walker that consulted no map at all, which is why a drone could walk into the
+-- same chest for ever no matter how many times the fleet recorded it.
+local function moveLeg(_targetX, _targetY, _targetZ, _targetDir, changeDir, discover, p_Dig)
     changeDir = changeDir or false
     local s_Replans, s_Stalls, s_LastDist = 0, 0, nil
     while cachedX ~= _targetX or cachedY ~= _targetY or cachedZ ~= _targetZ do
         if cachedX == nil then return false, "lost the position fix part-way" end
         s_Replans = s_Replans + 1
         if s_Replans > MOVE_MAX_REPLANS then
-            print("moveTo: giving up after " .. s_Replans .. " replans")
+            ptrace("moveTo: giving up after " .. s_Replans .. " replans")
             return false, "unreachable"
         end
         if cachedX == nil then return false, "lost the position fix part-way" end
@@ -1050,7 +1680,7 @@ local function moveLeg(_targetX, _targetY, _targetZ, _targetDir, changeDir, disc
         if s_LastDist ~= nil and s_Dist >= s_LastDist then
             s_Stalls = s_Stalls + 1
             if s_Stalls >= MOVE_MAX_STALLS then
-                print("moveTo: no progress toward " .. _targetX .. "," .. _targetY .. "," .. _targetZ)
+                ptrace("moveTo: no progress toward " .. _targetX .. "," .. _targetY .. "," .. _targetZ)
                 return false, "no progress"
             end
         else
@@ -1058,12 +1688,25 @@ local function moveLeg(_targetX, _targetY, _targetZ, _targetDir, changeDir, disc
         end
         s_LastDist = s_Dist
         --TODO: NETWORK
-        local s_Request = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "GetPath", {cachedX, cachedY, cachedZ, _targetX, _targetY, _targetZ, discover})
+        -- Slot 8 is `priority`, which this caller does not use; slot 9 is the dig mode. Positional
+        -- because that is the shape OnGetPath already reads.
+        local s_Request = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "GetPath",
+            {cachedX, cachedY, cachedZ, _targetX, _targetY, _targetZ, discover, nil, p_Dig and true or nil})
         local s_Response = PowNet.sendAndWaitForResponse("MapServer", s_Request)
         if (not s_Response) then
-            -- Say WHY. A bare `false` here surfaced as "GoTo FAILED: nil", which is the least
-            -- useful thing a failing recall can report.
-            return false, "MapServer did not answer the path request"
+            -- SAY IT OUT LOUD, AND DO NOT KEEP GRINDING.
+            --
+            -- A bare `false` here surfaced as "GoTo FAILED: nil", which is the least useful thing a
+            -- failing recall can report. Worse, the caller treats it as an ordinary blocked leg:
+            -- moveTo widens its horizon and tries again, up to 96 legs, each paying the request
+            -- timeout -- so a MapServer that is merely BUSY turns into a drone that stands in open
+            -- air, silent, for minutes. D3 froze exactly that way with clear air on all six sides,
+            -- and it reads as a wedged drone rather than a starved service.
+            --
+            -- Printing marks it in the drone's own log; the distinct reason lets moveTo give up
+            -- immediately instead of mistaking congestion for terrain.
+            ptrace("pathfinder did not answer -- MapServer may be overloaded")
+            return false, "pathfinder unavailable"
         end
         if(type(s_Response) == "table" and s_Response.message ~= nil) then
             return false, "no path: " .. tostring(s_Response.message)
@@ -1078,26 +1721,46 @@ local function moveLeg(_targetX, _targetY, _targetZ, _targetDir, changeDir, disc
         --]]
         --print(textutils.serialize(table))
         for i, dir in ipairs(path) do
-            if(breakExec) then
-                breakExec = false
-                print("Stopped exec")
+            if aborted() then
+                ptrace("Stopped exec")
                 return false, "aborted"
             end
+            -- The path was planned through cells the router believes are diggable, so meeting rock
+            -- is expected rather than a failure. Cut it and take the step; anything we are NOT
+            -- allowed to break is never on the route in the first place, because the map records it
+            -- as forbidden and a_star will not plan through that at any passability.
             if dir == Up then
                 if not up() then
-                    SavePath()
-                    break
+                    if p_Dig and digGuarded(turtle.digUp, turtle.detectUp, turtle.inspectUp,
+                                            cachedX..":"..(cachedY+1)..":"..cachedZ) and up() then
+                        -- cut through and carried on
+                    else
+                        SavePath()
+                        break
+                    end
                 end
             elseif dir == Down then
                 if not down() then
-                    SavePath()
-                    break
+                    if p_Dig and digGuarded(turtle.digDown, turtle.detectDown, turtle.inspectDown,
+                                            cachedX..":"..(cachedY-1)..":"..cachedZ) and down() then
+                        -- cut through and carried on
+                    else
+                        SavePath()
+                        break
+                    end
                 end
             else
                 turnTo(dir)
                 if not forward() then
-                    SavePath()
-                    break
+                    local D = deltas[cachedDir]
+                    local s_Ahead = D and ((cachedX+D[1])..":"..(cachedY+D[2])..":"..(cachedZ+D[3]))
+                    if p_Dig and digGuarded(turtle.dig, turtle.detect, turtle.inspect, s_Ahead)
+                       and forward() then
+                        -- cut through and carried on
+                    else
+                        SavePath()
+                        break
+                    end
                 end
             end
         end
@@ -1140,6 +1803,11 @@ function flyTo(_tx, _ty, _tz, _maxSteps)
     while cachedX ~= _tx or cachedY ~= _ty or cachedZ ~= _tz do
         s_Steps = s_Steps + 1
         if s_Steps > s_Max then return false, "flyTo gave up after " .. s_Max .. " steps" end
+        -- flyTo never checked this, and flyTo is where the fuel goes. A scout that broke off to
+        -- refuel while climbing to cruising height kept climbing for another 143 seconds, failed
+        -- the survey it had already abandoned, and only then went for fuel -- by which point it had
+        -- none. The watchdog fired correctly at 343 and again at 90; neither could stop the flight.
+        if aborted() then return false, "aborted" end
 
         local s_Moved = false
         if cachedY < _ty then s_Moved = up()
@@ -1194,127 +1862,45 @@ local function clearAhead()
     return true
 end
 
+-- digTo is moveTo with a different PASSABILITY RULE. It is not a different way of travelling.
+--
+-- It used to be a separate greedy axis-walker -- horizontal first, then vertical, consulting no map
+-- at all -- and that single fact caused most of a day's failures: a drone under the storage bay rose
+-- into the chest above it, refused to mine it (correctly), and tried again, for ever, no matter how
+-- many times the fleet had recorded that chest. The map knew. The mover never asked.
+--
+-- Now there is ONE implementation of "get from here to there": plan a route, follow it, replan when
+-- it fails. Digging only changes which cells the planner may route through -- ordinary rock yes,
+-- anything recorded as forbidden never. A new movement rule is a new flag on the planner, not a
+-- fourth copy of the walking loop.
+--
+-- _maxSteps is accepted for compatibility with the old signature and ignored: the leg and replan
+-- limits inside moveTo already bound the work, and they bound it by PROGRESS rather than by digs.
 function digTo(_tx, _ty, _tz, _maxSteps)
     if cachedX == nil then return false, "no position fix" end
-    if not turtle.dig then return false, "no pickaxe: this drone cannot make a path" end
-    -- An omitted axis means "stay where you are on it", not "travel to nil". Left unguarded the
-    -- comparison below is always true and the drone digs until its step budget runs out.
+    if not canDig() then return false, "no pickaxe: this drone cannot make a path" end
     _tx, _ty, _tz = _tx or cachedX, _ty or cachedY, _tz or cachedZ
-    local s_Max = _maxSteps or 256
-    local s_Steps = 0
-
-    while cachedX ~= _tx or cachedY ~= _ty or cachedZ ~= _tz do
-        s_Steps = s_Steps + 1
-        if s_Steps > s_Max then return false, "digTo gave up after " .. s_Max .. " steps" end
-
-        -- Horizontal first, the opposite of flyTo. Altitude is the cheap axis when you are flying
-        -- and the expensive one when you are digging, because every block of vertical shaft is a
-        -- block that has to come out. Level tunnels are also what makes the result walkable.
-        local s_Moved = false
-        local s_Protected = false
-        for _, s_Axis in ipairs({ "x", "z", "y" }) do
-            if s_Moved then break end
-            local s_Dx, s_Dy, s_Dz = 0, 0, 0
-            if s_Axis == "x" and cachedX ~= _tx then s_Dx = cachedX < _tx and 1 or -1
-            elseif s_Axis == "z" and cachedZ ~= _tz then s_Dz = cachedZ < _tz and 1 or -1
-            elseif s_Axis == "y" and cachedY ~= _ty then s_Dy = cachedY < _ty and 1 or -1 end
-            if s_Dx == 0 and s_Dy == 0 and s_Dz == 0 then goto continue end
-
-            -- Check the destination cell BEFORE breaking anything. forward()/up()/down() each
-            -- refuse to leave the loaded region, but they refuse AFTER we would already have dug
-            -- the wall down -- which would quietly mine a hole through the boundary every time.
-            if not mayStep(cachedX + s_Dx, cachedY + s_Dy, cachedZ + s_Dz) then goto continue end
-
-            -- A PROTECTED BLOCK BLOCKS THIS AXIS, NOT THE WHOLE JOURNEY.
-            --
-            -- Returning here abandoned the entire dig the moment one direction was occupied by
-            -- something of ours -- and since drones are mobile and frequently stacked, that is
-            -- common. Two of them ended up one above the other, each refusing to dig the other and
-            -- each treating that as total failure, so neither moved again. Before the guard existed
-            -- they would have mined through each other; the fix for destruction should not be
-            -- gridlock. Skipping to the next axis lets a drone go round.
-            if s_Dy > 0 then
-                if not digGuarded(turtle.digUp, turtle.detectUp, turtle.inspectUp) then s_Protected = true goto continue end
-                s_Moved = up()
-            elseif s_Dy < 0 then
-                if not digGuarded(turtle.digDown, turtle.detectDown, turtle.inspectDown) then s_Protected = true goto continue end
-                s_Moved = down()
-            else
-                turnTo(s_Dx ~= 0 and (s_Dx > 0 and East or West) or (s_Dz > 0 and South or North))
-                -- Same again for the horizontal case: refused means try elsewhere, not give up.
-                if not digGuarded(turtle.dig, turtle.detect, turtle.inspect) then s_Protected = true goto continue end
-                if clearAhead() then
-                    s_Moved = forward()
-                    -- Head room, so what we leave behind is a corridor and not a crawlspace.
-                    -- Head room. Not worth breaking anything of ours for, so this one just skips.
-                    if s_Moved then digGuarded(turtle.digUp, turtle.detectUp, turtle.inspectUp) end
-                end
-            end
-            ::continue::
-        end
-
-        -- BLOCKED BY ONE OF OUR OWN: GO ROUND IT.
-        --
-        -- Skipping the axis is not enough when the axis is the only one with any distance left to
-        -- cover. A miner directly above another drone has dx=0 and dz=0 -- its whole remaining
-        -- journey is straight down, the drone below is protected and must not be dug, and so it
-        -- wedges instantly with a clear column beneath the obstruction. That is exactly what
-        -- happened: D3 at y=66, D1 idle at y=65, and a shaft head two blocks below that.
-        --
-        -- One lateral step is enough to break it. From beside the obstruction the next iteration has
-        -- an x or z delta again and carries on normally, which also means two drones cannot livelock
-        -- politely waiting for each other.
-        if not s_Moved and s_Protected then
-            for _, s_Dir in ipairs({East, West, North, South}) do
-                local D = deltas[s_Dir]
-                if mayStep(cachedX + D[1], cachedY, cachedZ + D[3]) then
-                    turnTo(s_Dir)
-                    if digGuarded(turtle.dig, turtle.detect, turtle.inspect) and forward() then
-                        s_Moved = true
-                        break
-                    end
-                end
-            end
-            if s_Moved then goto stepped end
-        end
-
-        if not s_Moved then
-            return false, "digTo is wedged at " .. cachedX .. "," .. cachedY .. "," .. cachedZ
-        end
-        ::stepped::
-    end
-    return true
+    return moveTo(_tx, _ty, _tz, nil, false, nil, true)
 end
 
-
--- Travel any distance by planning ONE CHUNK AT A TIME.
+-- HOW FAR AHEAD TO PLAN, AND WHEN TO GIVE UP.
 --
--- a_star's cost is superlinear in the distance searched: the open set is scanned linearly on every
--- iteration, and over unmapped ground the frontier expands in three dimensions. A 200-block recall
--- never returned at all -- not because the route did not exist, but because the search could not
--- finish before the caller gave up, and every retry started it again from scratch.
---
--- Sixteen blocks is one chunk, and a chunk-sized search is small enough to answer immediately. The
--- same journey becomes a dozen cheap questions instead of one impossible one, and each leg is
--- planned with the map as it stands AFTER the previous leg -- so what the drone learned on the way
--- is used, rather than committing to a route computed before it set off.
--- Legs start at one chunk and GROW when the drone stops getting closer.
---
--- A fixed short leg is greedy: each hop aims straight at the destination with no view of anything
--- further out, which is exactly the shape that walks into a dead end. A drone in a cave whose exit
--- leads AWAY from the target will keep choosing the deeper passage, because from sixteen blocks up
--- the road that is the better-looking move -- and it cannot backtrack, because backtracking looks
--- like going the wrong way.
+-- a_star over a short horizon is cheap and usually right, but a short horizon is also blind: a drone
+-- in a cave whose exit leads AWAY from the target keeps choosing the deeper passage, because from
+-- sixteen blocks up the road that is the better-looking move -- and it cannot backtrack, because
+-- backtracking looks like going the wrong way.
 --
 -- Widening the horizon is what lets it escape: a_star over a 64-block box CAN see the way out and
--- will happily route backwards to take it. So the horizon is adaptive -- cheap searches while
--- things are going well, expensive ones only when the drone is in trouble, which is the only time
--- they are worth paying for.
+-- will happily route backwards to take it. So the horizon is adaptive -- cheap searches while things
+-- are going well, expensive ones only when the drone is in trouble, which is the only time they are
+-- worth paying for.
 local MOVE_LEG_MIN = 16      -- one chunk
 local MOVE_LEG_MAX = 96      -- wide enough to see out of most dead ends
 local MOVE_STUCK   = 4       -- legs without progress before giving up
 
-function moveTo(_targetX, _targetY, _targetZ, _targetDir, changeDir, discover)
+-- THE one implementation of "get from here to there". p_Dig only changes which cells the PLANNER is
+-- allowed to route through; the travelling itself is identical, which is the entire point.
+function moveTo(_targetX, _targetY, _targetZ, _targetDir, changeDir, discover, p_Dig)
     if cachedX == nil then return false, "no position fix" end
     if _targetX == nil or _targetY == nil or _targetZ == nil then
         return false, "incomplete destination"
@@ -1345,8 +1931,16 @@ function moveTo(_targetX, _targetY, _targetZ, _targetDir, changeDir, discover)
         local s_Before = remaining()
         if s_Before == nil then return false, "lost the position fix part-way" end
         if s_Before <= s_Leg then
-            local s_Ok, s_Why = moveLeg(_targetX, _targetY, _targetZ, _targetDir, changeDir, discover)
+            local s_Ok, s_Why = moveLeg(_targetX, _targetY, _targetZ, _targetDir, changeDir, discover, p_Dig)
             if s_Ok then return true end
+            -- A STARVED PATHFINDER IS NOT A DEAD END, AND WIDENING THE SEARCH CANNOT HELP.
+            --
+            -- Every failure here was treated as terrain: widen the horizon, try again, up to 96
+            -- legs. When the cause is a MapServer too busy to answer, that is 96 timeouts spent
+            -- standing still and saying nothing -- which is what a drone frozen in open air looks
+            -- like from outside. Give up at once and let the caller decide; the fallbacks above
+            -- TravelTo can still fly or dig, and they need no server at all.
+            if s_Why == "pathfinder unavailable" then return false, s_Why end
             -- Even the final hop can be blocked; fall through and let the horizon widen.
             s_Why = s_Why or "blocked"
         else
@@ -1359,7 +1953,7 @@ function moveTo(_targetX, _targetY, _targetZ, _targetDir, changeDir, discover)
             else
                 wy = cachedY + (dy > 0 and math.min(s_Leg, dy) or -math.min(s_Leg, -dy))
             end
-            local s_Ok = moveLeg(wx, wy, wz, nil, false, discover)
+            local s_Ok = moveLeg(wx, wy, wz, nil, false, discover, p_Dig)
             if not s_Ok then
                 -- A waypoint on a straight line can land inside rock, and there is no plan to a
                 -- solid cell. Fly it directly; the next leg replans from wherever that ended up.
@@ -1385,6 +1979,21 @@ function moveTo(_targetX, _targetY, _targetZ, _targetDir, changeDir, discover)
     end
 
     if _targetDir ~= nil and changeDir then turnTo(_targetDir) end
+    return true
+end
+
+-- Correct the heading ALONE, leaving the position untouched.
+--
+-- setLocation() is the only other way in and it demands x/y/z, so a caller that has learned which
+-- way the drone faces but not where it is had no way to record it -- and that is precisely the
+-- situation out of GPS range, where the mesh can settle the heading from range deltas long before
+-- it can pin the position. Heading is also the half that never self-corrects, so it is the half
+-- worth writing down the moment it is known.
+function setHeading(p_Dir)
+    if type(p_Dir) ~= "number" or p_Dir < 0 or p_Dir > 3 then return false end
+    cachedDir = p_Dir
+    savePose(true)            -- forced: this is exactly the fact that must survive a restart
+    ptrace("heading set to " .. tostring(shortNames[p_Dir]) .. " by the mesh")
     return true
 end
 
@@ -1415,7 +2024,7 @@ function setLocation(x, y, z, d)
         d = "east"
         cachedDir = East
     else
-        print("unknown direction")
+        ptrace("unknown direction")
         return false
     end
     if isLama then
@@ -1448,7 +2057,7 @@ function startGPS()
         if modemSide then  -- and we found a modem, open the rednet network
             rednet.open(modemSide)
         else
-            print("No modem found")
+            ptrace("No modem found")
             return false
         end
     end
@@ -1498,7 +2107,7 @@ function loadPose()
     if x == nil then return false end
     cachedX, cachedY, cachedZ = tonumber(x), tonumber(y), tonumber(z)
     cachedDir = tonumber(d)
-    print(("restored pose %d,%d,%d facing %s"):format(cachedX, cachedY, cachedZ,
+    ptrace(("restored pose %d,%d,%d facing %s"):format(cachedX, cachedY, cachedZ,
         tostring(shortNames[cachedDir])))
     return true
 end
@@ -1522,10 +2131,10 @@ function setLocationFromGPS()
             -- Underground, or out of coverage. If we wrote a pose down before, resume from it
             -- rather than declaring ourselves lost -- it is exactly the situation it exists for.
             if loadPose() then
-                print("no GPS fix -- resuming from the saved pose")
+                ptrace("no GPS fix -- resuming from the saved pose")
                 return cachedX, cachedY, cachedZ, cachedDir
             end
-            print("no GPS fix -- cannot establish position")
+            ptrace("no GPS fix -- cannot establish position")
             return nil, nil, nil
         end
 
@@ -1545,40 +2154,47 @@ function setLocationFromGPS()
         -- determine the current direction
         for tries = 0, 3 do  -- try to move in one direction
             if(turtle.getFuelLevel() == 0) then
-                print("Out of fuel")
+                ptrace("Out of fuel")
                 return
             end
-            if turtle.forward() then
-                local newX, _, newZ = gps.locate(4, false) -- get the new position
-                turtle.back()              -- and go back
+            local s_Fwd, s_FwdErr = turtle.forward()
+            if not s_Fwd and classifyMove(s_FwdErr) == "hard" then
+                -- Same lesson as ensureHeading: a refusal that applies everywhere must be named,
+                -- not retried in the other three directions and then reported as "boxed in".
+                moveFailed(s_FwdErr)
+                return cachedX, cachedY, cachedZ
+            end
+            if s_Fwd then
+                local newX, newY, newZ = gps.locate(4, false) -- get the new position
+                -- Checked, for the reason spelled out in ensureHeading: an unchecked back() leaves
+                -- the drone one block from where it believes it is, every time something is behind
+                -- it, and the error accumulates until the drone is tens of blocks adrift and still
+                -- confident. This copy runs at BOOT, so it drifts a fresh block on every restart.
+                local s_Back = turtle.back()
+                if not s_Back then
+                    if newX ~= nil then
+                        cachedX, cachedY, cachedZ = math.floor(newX), math.floor(newY), math.floor(newZ)
+                    end
+                    savePose()
+                end
 
                 -- The fix can vanish between the two calls -- a drone at the edge of coverage gets
                 -- one and not the next. Bail rather than compare against nil.
                 if newX == nil or newZ == nil then
-                    print("lost GPS while establishing heading")
+                    ptrace("lost GPS while establishing heading")
                     return cachedX, cachedY, cachedZ
                 end
 
-                -- deduce the curent direction
-                if newZ < cachedZ then
-                    cachedDir = North
-                    d = "north"
-                elseif newZ > cachedZ then
-                    cachedDir = South
-                    d = "south"
-                elseif newX < cachedX then
-                    cachedDir = West
-                    d = "west"
-                elseif newX > cachedX then
-                    cachedDir = East
-                    d = "east"
-                end
+                -- deduce the current direction -- same four comparisons as ensureHeading, so it is
+                -- the same function now. They had already drifted apart once.
+                cachedDir = dirFromStep(newX, newZ) or cachedDir
+                d = longNames[cachedDir] or d
 
                 -- Cancel out the tries. cachedDir can still be nil here if the drone moved but
                 -- the coordinates did not change in any axis we test, and arithmetic on nil throws
                 -- from inside the one routine every drone runs at boot.
                 if cachedDir == nil then
-                    print("moved but could not deduce heading")
+                    ptrace("moved but could not deduce heading")
                     break
                 end
                 turnTo((cachedDir - tries + 4) % 4)
@@ -1587,14 +2203,19 @@ function setLocationFromGPS()
                 break
 
             else -- try in another direction
-                tries = tries + 1
+                -- No `tries = tries + 1` here. A numeric-for control variable is a fresh local on
+                -- every iteration, so assigning to it does nothing at all in CC's Lua -- and it is
+                -- an outright error under Lua 5.4, which is what any syntax check runs. It read as
+                -- if it drove the loop; it never did. The loop counts 0..3 by itself, and `tries`
+                -- is already the number of left turns taken, which is what line 1599 needs to undo
+                -- them.
                 turtle.turnLeft()
             end
         end
 
         if cachedDir == nil and s_PrevDir ~= nil then
             cachedDir = s_PrevDir
-            print("could not re-derive heading -- keeping the one we had")
+            ptrace("could not re-derive heading -- keeping the one we had")
         end
 
         if cachedDir == nil then
@@ -1610,7 +2231,7 @@ function setLocationFromGPS()
             -- Heading is recoverable later: ensureHeading retries on every move, and a drone that
             -- knows where it is can be dispatched, rescued and drawn on the map meanwhile. Position
             -- and heading fail independently and should be returned independently.
-            print("position established but heading unknown -- will re-derive on the next move")
+            ptrace("position established but heading unknown -- will re-derive on the next move")
             if isLama then--TODO: put lama direction
             else
                 return cachedX, cachedY, cachedZ, nil
@@ -1624,7 +2245,7 @@ function setLocationFromGPS()
         end
         return cachedX, cachedY, cachedZ, cachedDir
     else
-        print("no GPS signal")
+        ptrace("no GPS signal")
         return false
     end
 end
@@ -1648,12 +2269,12 @@ function setLocationFromLAMA()
         elseif d == "west" then
             cachedDir = West
         else
-            print("could not get direction from lama")
+            ptrace("could not get direction from lama")
             return false
         end
         return true
     else
-        print("no lama")
+        ptrace("no lama")
         return false
     end
 end

@@ -67,33 +67,70 @@ function Init()
     --
     -- The bootstrap default is the constellation bootstrap/gps.sh actually places. Anything else
     -- arrives through the gpshost endpoint, which is how a host built by the fleet registers itself.
-    local s_Known = {
-        {x = -478, y = 78,  z = 90},
-        {x = -464, y = 93,  z = 83},
-        {x = -504, y = 82,  z = 58},
-        {x = -465, y = 82,  z = 40},
-    }
+    -- EMPTY, AND THAT IS THE POINT.
+    --
+    -- These four were described as "the constellation bootstrap/gps.sh actually places". They are
+    -- not in the world. Checked block by block: all four positions are empty air, while the sixteen
+    -- hosts HQ pushes from settlement.ts all exist. So this list did the exact thing the comment
+    -- above it warns about -- merged four phantom hosts in on every boot, inflating the count that
+    -- coverage is computed from and making the network look better than it is.
+    --
+    -- Nothing belongs here. A host that exists announces itself through the gpshost endpoint, and
+    -- HQ re-pushes the real constellation on every bridge connect; a hardcoded list can only ever
+    -- describe a world that used to exist.
+    local s_Known = {}
     DATA["gpsHosts"] = DATA["gpsHosts"] or {}
 
-    -- A HOST OUTSIDE THE OPERATING REGION BELONGS TO A DIFFERENT SETTLEMENT.
+    -- A HOST TOO FAR FROM THE OPERATING REGION BELONGS TO A DIFFERENT SETTLEMENT.
     --
-    -- It cannot serve this one -- it is far past modem range by definition -- so keeping it does
-    -- nothing but inflate the host count and make coverage look better than it is. Dropping them
-    -- means a re-founded settlement heals itself on the next boot instead of inheriting ghosts.
+    -- The test used to be "is the host inside the bounds box", and that is the wrong question. A
+    -- constellation is supposed to RING the work area -- hosts on the perimeter give the geometry
+    -- that hosts huddled in the middle cannot -- so the correct hosts are precisely the ones just
+    -- outside. Twelve of the sixteen that bootstrap/gps.sh physically places sit 10 blocks beyond
+    -- the box and were being thrown away on every boot, leaving eight, four of which are clustered
+    -- around the tower and nearly coplanar.
+    --
+    -- What actually disqualifies a host is being unreachable from anywhere in the region. So:
+    -- distance from the BOX, not membership in it. A ghost from a settlement 400 blocks away is
+    -- still hundreds of blocks from the box and still dropped, which is what this check was for.
+    --
+    -- 64 is the flat modem range -- see GPS_HIGH_ALTITUDE_Y below for why it is not larger, and why
+    -- it is written as a literal here rather than calling gpsReach(): gpsReach is a local declared
+    -- further down the file, so a function defined up here cannot see it. That exact scoping trap
+    -- has cost this codebase four separate outages.
     local s_B = DATA["bounds"]
     if s_B then
+        local GPS_RANGE = 64
         local s_Keep, s_Dropped = {}, 0
         for _, e in ipairs(DATA["gpsHosts"]) do
-            if e.x >= s_B.minx and e.x <= s_B.maxx and e.z >= s_B.minz and e.z <= s_B.maxz then
+            local dx = math.max(s_B.minx - e.x, 0, e.x - s_B.maxx)
+            local dy = math.max(s_B.miny - e.y, 0, e.y - s_B.maxy)
+            local dz = math.max(s_B.minz - e.z, 0, e.z - s_B.maxz)
+            if math.sqrt(dx * dx + dy * dy + dz * dz) <= GPS_RANGE then
                 s_Keep[#s_Keep + 1] = e
             else
                 s_Dropped = s_Dropped + 1
             end
         end
         if s_Dropped > 0 then
-            Log(("boot: dropped %d gps host(s) outside the operating region"):format(s_Dropped))
+            Log(("boot: dropped %d gps host(s) out of range of the region"):format(s_Dropped))
         end
         DATA["gpsHosts"] = s_Keep
+    end
+
+    -- Heal a list that already went duplicate. The endpoint no longer creates them, but the saved
+    -- state does not fix itself, and a doubled host count reads as coverage that is not there.
+    do
+        local s_Seen, s_Uniq, s_Dupes = {}, {}, 0
+        for _, e in ipairs(DATA["gpsHosts"]) do
+            local s_Key = ("%d,%d,%d"):format(e.x or 0, e.y or 0, e.z or 0)
+            if s_Seen[s_Key] then s_Dupes = s_Dupes + 1
+            else s_Seen[s_Key] = true; s_Uniq[#s_Uniq + 1] = e end
+        end
+        if s_Dupes > 0 then
+            Log(("boot: dropped %d duplicate gps host(s)"):format(s_Dupes))
+            DATA["gpsHosts"] = s_Uniq
+        end
     end
 
     for _, h in ipairs(s_Known) do
@@ -207,6 +244,8 @@ end
 local WORLD_PAGE = 2000
 m_PageKeys = nil   -- key list for a paged walk; rebuilt when a walk starts
 
+-- Generation the cached key list was built at, and when. See OnLoadWorld.
+
 function OnLoadWorld(p_ID, p_Message)
     -- Registered in m_ServerEvents but never written, so the entry pointed at nil. PowNet prints
     -- "Event registered, but pointing to nothing" and carries on, which is why it went unnoticed.
@@ -246,23 +285,46 @@ function OnLoadWorld(p_ID, p_Message)
     -- was the last thing it ever did. Every call after that -- Status, BlockAt, FindBlocks,
     -- FindCaves -- failed against a module that was still resident, still had a modem, and still
     -- resolved through rednet.lookup. A module found and then silent.
-    if s_Offset == 0 or m_PageKeys == nil then
-        m_PageKeys = {}
-        local s_Since = 0
-        for key in pairs(s_World) do
-            m_PageKeys[#m_PageKeys + 1] = key
-            s_Since = s_Since + 1
-            if s_Since >= 2000 then s_Since = 0 ; os.queueEvent("mapPage") ; os.pullEvent("mapPage") end
-        end
-    end
+    -- REBUILD THE KEY LIST WHEN THE MAP CHANGES, NOT WHEN SOMEBODY ASKS.
+    --
+    -- Rebuilding on every s_Offset == 0 meant a full walk of all 208,625 cells EVERY TIME a client
+    -- started paging -- and the map page starts paging on every refresh. 486 of those walks appear
+    -- in one log, and they are the single largest thing this module does; actual path requests do
+    -- not even show up beside them. That is what made MapServer stop answering once the fleet grew,
+    -- and it looked exactly like "we have outgrown the pathfinder" while pathfinding was innocent.
+    --
+    -- The list only becomes wrong when a cell is ADDED or REMOVED, which merge/ObserveBlock already
+    -- know about. So stamp a generation there and rebuild only when it moves. A viewer refreshing
+    -- every three seconds now costs a comparison instead of a quarter-million-key walk.
+    -- AND RATE-LIMIT THE REBUILD, BECAUSE THE GENERATION IS ALWAYS DIFFERENT.
+    --
+    -- Keying purely on the generation looked right and achieved almost nothing: seventeen exploring
+    -- drones add cells continuously, so the counter had passed 9,700 within the hour and every
+    -- single map-page refresh still found the index stale and walked all 218,426 cells again. A
+    -- cache invalidated faster than it is used is just an expensive way to do no caching.
+    --
+    -- The page list does not need to be current to the cell. A viewer seeing a map thirty seconds
+    -- behind is fine; a MapServer that stops answering path requests is not. So: rebuild only if
+    -- the world actually changed AND the list has had time to be worth something.
+    -- NO WALK. PowGPSServer maintains this list as cells arrive -- see worldKeyList.
+    --
+    -- The rebuild that used to live here was gated first on the world generation, then on a
+    -- thirty-second timer when that turned out to be useless (seventeen drones add cells
+    -- continuously, so the generation is always stale). Neither helped once the map passed 324,000
+    -- cells: the walk began taking longer than the gap between walks, and MapServer stopped
+    -- answering path requests altogether -- 181 "pathfinder did not answer" across the fleet, and
+    -- the module reported unreachable. It was not overloaded by the fleet, it was overloaded by
+    -- its own index.
+    --
+    -- Appending on first sight is O(1) and happens where the newness is already being tested.
+    m_PageKeys = PowGPSServer.worldKeyList()
 
     -- One number, taken from the list just built. The count used to be its own second walk of all
     -- 269,650 cells, doubling the cost of the very handler that was being killed for taking too
     -- long -- and it existed to answer a question ("does the serving path see the same world the
     -- loader logged?") that it already answered: it does, live and keys were equal.
-    if s_Offset == 0 and _G.Log then
-        _G.Log(("LoadWorld: %d cells"):format(#m_PageKeys))
-    end
+    -- (the reindex above logs when it actually happens; logging per page-start told us only that
+    --  somebody had refreshed a web page)
 
     local s_N = #m_PageKeys
     local s_Page, s_Sent = {}, 0
@@ -291,7 +353,10 @@ function OnGetPath(p_ID, p_Message)
     local z2 = p_Message.data[6]
     local discover = p_Message.data[7]
     local priority =p_Message.data[8]
-    local s_Path, s_Why = PowGPSServer.a_star(x1, y1, z1, x2, y2, z2, discover, priority)
+    -- The request already tells us where the asker IS -- record it, so every other drone's next
+    -- path plans around this one instead of through it. Free: no new endpoint, no extra traffic.
+    PowGPSServer.noteDroneAt(p_ID, x1, y1, z1)
+    local s_Path, s_Why = PowGPSServer.a_star(x1, y1, z1, x2, y2, z2, discover, priority, p_ID)
     if(s_Path == false) then
         -- Pass the SEARCH's reason through. "failed to find path" is the same string whether the
         -- goal was solid, the budget ran out, or there is genuinely no route -- three problems
@@ -413,20 +478,46 @@ end
 
 function OnGetBounds(p_ID, p_Message)
     local s_Chunks, s_Gps = Coverage()
-    return true, {bounds = {chunks = s_Chunks, gps = s_Gps},
+    return true, {bounds = {chunks = s_Chunks, gps = s_Gps,
+                            reach = DATA["reach"], centre = DATA["centre"]},
                   message = #s_Chunks .. " chunk region(s), " .. #s_Gps .. " gps region(s)"}
 end
 
 -- Where the GPS hosts are. Registering them is what lets the fleet reason about positioning
 -- coverage at all -- before this, a drone that flew out of modem range just stopped being able
 -- to navigate, with nothing anywhere modelling why.
+-- REGISTERING A HOST TWICE MUST NOT COUNT IT TWICE.
+--
+-- HQ pushes the whole constellation on every bridge connect -- deliberately, because MapServer
+-- restarts independently and a stale host list paralyses the fleet -- and this appended blindly. So
+-- the list grew by 16 on every HQ restart, and it was found holding each host twice over.
+--
+-- That is not untidiness. GetBounds ships this list to the drone, which counts how many of them it
+-- can actually hear and requires four. With every host duplicated, a drone that can hear TWO
+-- physical hosts counts four, believes it has a fix, and moves on dead reckoning it thinks is GPS.
+-- Coverage looks healthy and is imaginary -- the same failure this file already carries two
+-- comments about, arriving by a third route.
+local function sameSpot(a, x, y, z)
+    return a.x == x and a.y == y and a.z == z
+end
+
+
 function OnAddGpsHost(p_ID, p_Message)
     local d = p_Message.data or {}
     local p = d.pos or d.gps
     if p == nil then return false, "Missing pos" end
+    local s_X = tonumber(p[1] or p.x)
+    local s_Y = tonumber(p[2] or p.y)
+    local s_Z = tonumber(p[3] or p.z)
+    if s_X == nil or s_Y == nil or s_Z == nil then return false, "Bad pos" end
     DATA["gpsHosts"] = DATA["gpsHosts"] or {}
-    DATA["gpsHosts"][#DATA["gpsHosts"] + 1] =
-        {x = tonumber(p[1] or p.x), y = tonumber(p[2] or p.y), z = tonumber(p[3] or p.z)}
+    for _, e in ipairs(DATA["gpsHosts"]) do
+        if sameSpot(e, s_X, s_Y, s_Z) then
+            -- Idempotent on purpose: the push is meant to be safe to repeat.
+            return true, {message = #DATA["gpsHosts"] .. " gps hosts registered"}
+        end
+    end
+    DATA["gpsHosts"][#DATA["gpsHosts"] + 1] = {x = s_X, y = s_Y, z = s_Z}
     PowNet.MarkDirty()
     return true, {message = #DATA["gpsHosts"] .. " gps hosts registered"}
 end
@@ -439,6 +530,12 @@ function OnSetBounds(p_ID, p_Message)
         miny = tonumber(d.miny), maxy = tonumber(d.maxy),
         minz = tonumber(d.minz), maxz = tonumber(d.maxz),
     }
+    -- The radius the fleet must stay inside, kept alongside the box rather than instead of it: the
+    -- box still bounds the force-loaded chunks, the circle bounds what a drone can call home from.
+    DATA["reach"] = tonumber(d.reach)
+    if d.cx ~= nil then
+        DATA["centre"] = {x = tonumber(d.cx), y = tonumber(d.cy), z = tonumber(d.cz)}
+    end
     PowNet.MarkDirty()
     return true, {message = "bounds set", bounds = DATA["bounds"]}
 end
@@ -469,13 +566,27 @@ local m_DroneEvents = {
 -- This matters because the base sits in a desert. Guessing where to dig wasted a whole dig job on
 -- sand; asking the map first is free.
 
+-- NO PATTERN ENGINE. THIS RUNS ONCE PER CELL, ACROSS TWO HUNDRED THOUSAND CELLS.
+--
+-- The obvious version is string.match with an anchored pattern, and it was fine while this only
+-- parsed the odd key. It is not fine now: the prune and the large-region coverage query both walk
+-- every known cell and call this on each one, so a single request became 200,000 invocations of
+-- Lua's pattern matcher -- which is exactly the sort of per-cell cost that makes MapServer stop
+-- answering path requests.
+--
+-- Two plain finds and three substrings do the same job without the engine. `plain = true` on find
+-- matters: without it the colon is still compiled as a pattern. tonumber does the validation for
+-- free, so a malformed key still returns nil exactly as before.
 local function parseKey(p_Key)
-    -- Anchored, and the sign is matched explicitly. A bare "-" inside a character class is Lua's
-    -- lazy quantifier, which silently fails on negative coordinates -- and every coordinate here
-    -- is negative.
-    local x, y, z = string.match(p_Key, "^(%-?%d+):(%-?%d+):(%-?%d+)$")
-    if x == nil then return nil end
-    return tonumber(x), tonumber(y), tonumber(z)
+    local a = string.find(p_Key, ":", 1, true)
+    if a == nil then return nil end
+    local b = string.find(p_Key, ":", a + 1, true)
+    if b == nil then return nil end
+    local x = tonumber(string.sub(p_Key, 1, a - 1))
+    local y = tonumber(string.sub(p_Key, a + 1, b - 1))
+    local z = tonumber(string.sub(p_Key, b + 1))
+    if x == nil or y == nil or z == nil then return nil end
+    return x, y, z
 end
 
 -- The block index: name -> { count, at = { positions } }, plus a reverse map so it can be
@@ -503,6 +614,118 @@ local function idxRemovePos(p_Name, p_Key)
     end
     if e.count == 0 and (e.at == nil or #e.at == 0) then m_BlockIndex[p_Name] = nil end
 end
+
+-- FORGET BLOCKS THAT SHOULD NEVER HAVE BEEN RECORDED.
+--
+-- The scanner returns every non-air block, drones included, so each drone wrote its neighbours into
+-- the world map as permanent terrain. They moved; the record did not. 189 turtle blocks for a fleet
+-- of five -- white cubes floating wherever a drone once stood, and a_star routing the fleet around
+-- ghosts of itself.
+--
+-- The scan side no longer records them, but the map is persistent: what is already written stays
+-- written until something removes it. Hence this.
+-- DROP EVERYTHING THE FLEET CAN NEVER REACH.
+--
+-- The map had grown to 207,574 cells, most of it terrain surveyed around the ORIGINAL settlement
+-- 400 blocks away and around the old square region -- ground no drone can legally operate in and
+-- nothing will ever ask about again. It is not inert: every occupancy walk, every name index pass
+-- and every persist carries it, and this module is a single thread already serving five drones'
+-- uploads plus every path request. Drones began reporting "MapServer did not take 10 observations,
+-- keeping them" -- the map failing to learn what was being mined, which is what leaves phantom ore
+-- in the index for gather tasks to chase.
+--
+-- The operating region is the honest bound: outside it plus a working margin, the data is dead.
+-- Should this cell be dropped? Its own function so the RULE can be read without the bookkeeping
+-- around it, and so the two reasons a cell goes stay visibly separate: it is outside the footprint
+-- the fleet may work in, or it is above the altitude where honest terrain stops and phantom
+-- observations begin.
+local function makePruneTest(p_MinX, p_MaxX, p_MinZ, p_MaxZ, p_AboveY)
+    return function(x, y, z)
+        if x == nil then return false end            -- unparseable key: leave it for cellKey to fix
+        if x < p_MinX or x > p_MaxX or z < p_MinZ or z > p_MaxZ then return true end
+        return p_AboveY ~= nil and y ~= nil and y > p_AboveY
+    end
+end
+
+-- FORGET A CELL EVERYWHERE IT IS REMEMBERED.
+--
+-- Three structures describe the same block and all three have to let go of it: the occupancy map
+-- a_star walks, the name map, and the by-name index world.find reads. Clearing only the occupancy
+-- leaves an invisible wall the pathfinder still routes around; clearing only the name leaves a
+-- block that world.find reports and nothing can reach.
+--
+-- One function because prune and forget both do this and had their own copies of it.
+local function forgetCell(p_World, p_Key)
+    if p_World then
+        p_World[p_Key] = nil
+        if PowGPSServer.bumpWorldGeneration then PowGPSServer.bumpWorldGeneration() end
+        if PowGPSServer.forgetWorldKey then PowGPSServer.forgetWorldKey() end
+    end
+    local s_Was = m_BlockAt and m_BlockAt[p_Key]
+    if s_Was ~= nil then
+        m_BlockAt[p_Key] = nil
+        idxRemovePos(s_Was, p_Key)
+    end
+end
+
+function OnPrune(p_ID, p_Message)
+    local b = DATA["bounds"]
+    if b == nil then return false, "no bounds -- refusing to prune blind" end
+    local d = p_Message.data or {}
+    local s_Margin = tonumber(d.margin) or 32
+    local minx, maxx = b.minx - s_Margin, b.maxx + s_Margin
+    local minz, maxz = b.minz - s_Margin, b.maxz + s_Margin
+    -- ALTITUDE, not just footprint.
+    --
+    -- Pruning by x/z alone cannot reach the failure that actually poisoned this map: a drone with an
+    -- unverified position files its observations at coordinates it BELIEVES, and it believes it is
+    -- inside the region -- so the phantom terrain lands inside the bounds, where no footprint prune
+    -- will ever look. What gives it away is height. Ground here is y=64 and drones climb to 110 for
+    -- a GPS fix, so a run of solid cells at y=96..109 -- 250 per level, 213 of 250 columns solid at
+    -- BOTH ends of that range -- is not a hill. Hills taper. That was a slab of fiction hanging
+    -- directly over the settlement, and it is what the operator could see from the map view.
+    local s_AboveY = tonumber(d.aboveY)
+
+    local s_Drop = makePruneTest(minx, maxx, minz, maxz, s_AboveY)
+    local s_World = PowGPSServer.getCachedWorld()
+    local s_Gone, s_Kept, s_Walk = 0, 0, 0
+    for k in pairs(s_World) do
+        local x, y, z = parseKey(k)
+        if s_Drop(x, y, z) then
+            forgetCell(s_World, k)
+            s_Gone = s_Gone + 1
+        else
+            s_Kept = s_Kept + 1
+        end
+        s_Walk = s_Walk + 1
+        if s_Walk % 2000 == 0 then os.queueEvent("walk") os.pullEvent("walk") end
+    end
+    if s_Gone > 0 then PowNet.MarkDirty() end
+    Log(("prune: dropped %d cell(s) outside %d..%d x %d..%d%s, kept %d")
+        :format(s_Gone, minx, maxx, minz, maxz,
+                s_AboveY and (" or above y=" .. s_AboveY) or "", s_Kept))
+    return true, {dropped = s_Gone, kept = s_Kept, aboveY = s_AboveY,
+                  region = {minx = minx, maxx = maxx, minz = minz, maxz = maxz}}
+end
+
+function OnForget(p_ID, p_Message)
+    local d = p_Message.data or {}
+    local s_Match = tostring(d.match or "")
+    if #s_Match < 3 then return false, "need a match of at least 3 characters" end
+
+    local s_World = PowGPSServer.getCachedWorld()
+    local s_Gone = 0
+    for k, v in pairs(m_BlockAt or {}) do
+        if type(v) == "string" and v:find(s_Match, 1, true) then
+            forgetCell(s_World, k)
+            s_Gone = s_Gone + 1
+        end
+    end
+    if s_Gone > 0 then PowNet.MarkDirty() end
+    Log(("forgot %d block(s) matching %s"):format(s_Gone, s_Match))
+    return true, {forgot = s_Gone, match = s_Match}
+end
+
 
 -- Record what is at a position NOW. p_Name nil means "air / nothing there any more".
 function ObserveBlock(p_Key, p_Name)
@@ -544,7 +767,7 @@ function BackfillBlockAt()
     for name, e in pairs(m_BlockIndex or {}) do
         -- Same reason as IndexNames: this runs at boot over whatever the index has accumulated.
         s_Walked = s_Walked + 1
-        if s_Walked % 500 == 0 then os.sleep(0) end
+        if s_Walked % 500 == 0 then os.queueEvent("walk") os.pullEvent("walk") end
         for _, q in ipairs(e.at or {}) do
             if q and q.x then
                 m_BlockAt[q.x .. ":" .. q.y .. ":" .. q.z] = name
@@ -568,7 +791,7 @@ function IndexNames(p_Detail)
     local s_Seen = 0
     for key, info in pairs(p_Detail) do
         s_Seen = s_Seen + 1
-        if s_Seen % 2000 == 0 then os.sleep(0) end
+        if s_Seen % 2000 == 0 then os.queueEvent("walk") os.pullEvent("walk") end
         -- THE SHAPE EVERY MOVING DRONE ACTUALLY SENDS WAS THE ONE SHAPE THIS DID NOT ACCEPT.
         --
         -- pgps.detectAll records `{turtle.inspect()}`, which is {true, {name = "..."}} -- a plain
@@ -726,20 +949,48 @@ function OnRegionKnown(p_ID, p_Message)
     local d = p_Message.data or {}
     if not (d.min and d.max) then return false, "need min and max" end
 
+    -- COUNT OVER THE SMALLER SET. NEVER OVER THE REQUESTED VOLUME BY DEFAULT.
+    --
+    -- This walked the box cell by cell, so its cost was the size of the QUESTION rather than the
+    -- size of the data. Asking about the settlement's own operating region -- 112 x 264 x 112 -- is
+    -- 3.3 MILLION iterations with a yield per column, and it simply never returned: world.query
+    -- failed with "no response from MapServer" every time, while the same module answered a
+    -- 1,331-cell box fine. That is not a slow module, it is the wrong algorithm.
+    --
+    -- Two corrections. The total is arithmetic -- a box's volume is a multiplication, not a count.
+    -- And the known count iterates whichever domain is smaller: the box when the box is small, the
+    -- known-cells table when it is not. The table is bounded by what has actually been surveyed
+    -- (~207k), so the worst case is now bounded by the DATA and not by whatever a caller asks.
     local s_World = PowGPSServer.getCachedWorld()
-    local s_Known, s_Total = 0, 0
-    for x = math.floor(d.min.x), math.floor(d.max.x) do
-        for y = math.floor(d.min.y), math.floor(d.max.y) do
-            for z = math.floor(d.min.z), math.floor(d.max.z) do
-                s_Total = s_Total + 1
-                if s_World[x .. ":" .. y .. ":" .. z] ~= nil then s_Known = s_Known + 1 end
+    local s_MinX, s_MinY, s_MinZ = math.floor(d.min.x), math.floor(d.min.y), math.floor(d.min.z)
+    local s_MaxX, s_MaxY, s_MaxZ = math.floor(d.max.x), math.floor(d.max.y), math.floor(d.max.z)
+    local s_Total = (s_MaxX - s_MinX + 1) * (s_MaxY - s_MinY + 1) * (s_MaxZ - s_MinZ + 1)
+    if s_Total < 0 then s_Total = 0 end
+
+    local s_Known, s_Walk = 0, 0
+    local BOX_SCAN_MAX = 32768              -- past this, walking the known cells is cheaper
+    if s_Total <= BOX_SCAN_MAX then
+        for x = s_MinX, s_MaxX do
+            for y = s_MinY, s_MaxY do
+                for z = s_MinZ, s_MaxZ do
+                    if s_World[x .. ":" .. y .. ":" .. z] ~= nil then s_Known = s_Known + 1 end
+                end
             end
+            -- Not os.sleep(0): that waits a whole game tick per x-slice. See the A* loop.
+            os.queueEvent("boxscan") os.pullEvent("boxscan")
         end
-        -- The box can be tens of thousands of cells. Yielding keeps MapServer answering everything
-        -- else while it counts, which is the difference between a slow reply and a dead module.
-        -- Yield every column, not every eighth. This walk can be twenty thousand cells and
-        -- MapServer must keep answering path requests while it runs.
-        os.sleep(0)
+    else
+        for k in pairs(s_World) do
+            local x, y, z = parseKey(k)
+            if x and x >= s_MinX and x <= s_MaxX and y >= s_MinY and y <= s_MaxY
+               and z >= s_MinZ and z <= s_MaxZ then
+                s_Known = s_Known + 1
+            end
+            s_Walk = s_Walk + 1
+            -- Yield on a COUNT, not per column: this loop has no columns, and a table walk that
+            -- never yields is the shape that has killed this module before.
+            if s_Walk % 2000 == 0 then os.queueEvent("walk") os.pullEvent("walk") end
+        end
     end
 
     -- STALENESS, alongside coverage. "Known" and "known recently" are different questions, and a
@@ -916,13 +1167,32 @@ local m_ServerEvents = {
     FindCaves  = { func = OnFindCaves },
     RegionKnown = { func = OnRegionKnown },
     BlockAt    = { func = OnBlockAt },
+    forget = {
+        func = OnForget, callable = true,
+        params = { match = {} }
+    },
+    prune = {
+        func = OnPrune, callable = true,
+        -- aboveY MUST be declared here. PowNet silently drops any field the endpoint does not
+        -- list, so an undeclared param does not error -- it simply never arrives, and the handler
+        -- runs with it nil while the caller believes it was honoured.
+        params = { margin = {}, aboveY = {} }
+    },
     gpshost = {
         func = OnAddGpsHost, callable = true,
         params = { pos = { length = 3 } }
     },
     bounds = {
         func = OnSetBounds, callable = true,
-        params = { minx={}, maxx={}, miny={}, maxy={}, minz={}, maxz={} }
+        -- reach/centre optional: they carry the RADIUS the fleet must stay inside, which is what
+        -- keeps every drone within modem range of the mast. A box alone cannot express that -- its
+        -- corners are half again as far out as its edges, and that is where drones were stranding.
+        -- Scalars, not a nested table: the param validator checks presence and length, and a
+        -- {x,y,z} table for `centre` failed it silently -- the whole bounds push was rejected and
+        -- the log said only "bounds=false".
+        params = { minx={}, maxx={}, miny={}, maxy={}, minz={}, maxz={},
+                   reach = {optional = true},
+                   cx = {optional = true}, cy = {optional = true}, cz = {optional = true} }
     },
     map = {
         func = OnMapMode,

@@ -20,7 +20,10 @@ import { allocate, checkOrder, SPEC, type Purpose } from '../world/plots.js';
 import { city, saveCity, factories } from '../world/city.js';
 import { chain, unmetInputs, buildOrder, inputsOf, type Factory } from '../world/factories.js';
 import { BLUEPRINTS, blueprint, materials, placementOrder, footprint } from '../world/blueprints.js';
+import { PALETTES, towerFloor, floorCost, specForLevel, LEVELS } from '../world/tower.js';
 import { supply, runSupplyTick, saveSupply, stockKey, type SupplyRule } from '../agent/supply.js';
+import { luaList } from '../lua-table.js';
+import { settlement, withinReach } from '../world/settlement.js';
 
 /**
  * Pull the fleet from DroneMan, which owns the registry.
@@ -56,8 +59,10 @@ const REPORTED_STATUS: Record<string, DroneStatus> = {
   idle: 'idle',
   mining: 'working', scanning: 'working', surveying: 'working',
   moving: 'working', rotation: 'working', updating: 'working',
-  // Hauling is the return leg to storage, which is what 'docking' means here.
-  hauling: 'docking',
+  // The return leg to storage. NOT 'docking' -- that is parking on a berth, a different activity
+  // that also exists here, and collapsing the two made the panel unreadable.
+  hauling: 'hauling',
+  docking: 'docking',
   // Stuck is a drone that has given up and said so. It needs a rescue, not a re-queue.
   stuck: 'stranded',
   // Physically fine, cannot act -- missing a position or a heading. Deliberately NOT idle: the
@@ -112,6 +117,12 @@ async function doRefreshFleet(): Promise<void> {
         role: d.role ?? 'miner',
         status: normaliseStatus(d.status, d.offline),
         reported: typeof d.status === 'string' ? d.status : undefined,
+        // WHAT it is doing, not just that it is doing something. "crafting" for twenty minutes is
+        // indistinguishable from "crafting the same impossible recipe for the ninth time" without
+        // the object of the verb; the drone has always known and simply never said.
+        detail: typeof d.detail === 'string' ? d.detail : undefined,
+        // Stock the fleet cannot see is stock the fleet does not have.
+        carrying: d.inv && typeof d.inv === 'object' ? d.inv as Record<string, number> : undefined,
         // The drone's own words for why it stopped. HQ used to drop this, so a drone that had
         // explicitly reported "stuck at -70,88,12 -- no progress over 4 legs" surfaced as the
         // generic "has gone quiet" -- which describes a drone that said NOTHING, the opposite of
@@ -198,6 +209,10 @@ export function buildBrief() {
         ? `${d.name} (#${d.id}) is STUCK — ${d.stuck}`
         : `${d.name} (#${d.id}) has gone quiet (${describeSilence(d.silentMs)}).`);
     else if (d.fuel < 200) problems.push(`${d.name} (#${d.id}) is low on fuel (${d.fuel}).`);
+    // LOOKS BUSY, ACHIEVES NOTHING -- the state that hid every expensive failure tonight. It is
+    // reported LAST of the drone problems on purpose: a lost or stuck drone is a louder fact about
+    // the same drone, and saying both would just be noise.
+    else if (!d.healthy) problems.push(`${d.name} (#${d.id}) ${d.unhealthyWhy}.`);
   }
   for (const o of orders) if (o.failure) problems.push(`Order ${o.id} (${o.kind}) failed: ${o.failure}`);
 
@@ -209,6 +224,8 @@ export function buildBrief() {
         id: d.id, name: d.name, status: d.status, doing: d.reported ?? null, fuel: d.fuel,
         pos: d.pos ?? null, order: d.order ?? null,
         silentSec: silentSec(d.silentMs),
+        // Observed, not reported: has this drone moved or delivered lately? See HiveState.karma.
+        healthy: d.healthy, stalledFor: d.unhealthyWhy ?? null,
       })),
     },
     orders: orders.map((o) => ({
@@ -250,7 +267,7 @@ registry.register({
      * accepted value of the one filter meant to find it.
      */
     status: z.enum([
-      'idle', 'working', 'docking', 'stranded', 'lost',
+      'idle', 'working', 'hauling', 'docking', 'stranded', 'lost',
       'mining', 'scanning', 'surveying', 'moving', 'rotation', 'updating', 'hauling',
       'stuck', 'offline',
     ]).optional().describe('HQ status (idle/working/docking/stranded/lost) or the drone\'s own word (mining, scanning, hauling…).'),
@@ -294,20 +311,76 @@ registry.register({
     'planning against it: low coverage means the drones have not looked there, and a ' +
     'stale region may have been changed by players or by your own earlier orders.',
   params: z.object({ min: vec3, max: vec3 }).strict(),
-  returns: 'Volume, known-cell count, coverage 0-1, top block types, observation ages, stale flag.',
+  returns: 'Volume, known-cell count, coverage 0-1 AND the same figure as percent 0-100, top block types, observation ages, stale flag.',
   danger: 'read',
   bounds: 'Region must be non-inverted. Very large regions return coarse summaries.',
   teach: [{
     situation: 'Is the hill north of base worth quarrying?',
     args: { min: { x: 100, y: 60, z: -60 }, max: { x: 130, y: 90, z: -30 } },
     result: {
-      volume: 29791, known: 811, coverage: 0.027,
+      volume: 29791, known: 811, coverage: 0.027, percent: 2,
       blocks: { stone: 640, dirt: 121, iron_ore: 22 },
       stale: false, newestObservationAgeMs: 41_000,
     },
     takeaway: 'Only 2.7% mapped — too little to plan a quarry. Scout it before ordering any digging.',
   }],
-  handler: async (a) => state.summarizeRegion(a.min, a.max),
+  handler: async (a) => {
+    // ASK THE THING THAT ACTUALLY HAS THE MAP.
+    //
+    // This used to read state.summarizeRegion -- HQ's own in-memory cell store, filled by a
+    // `scan.blocks` bridge event that NOTHING IN THE WORLD HAS EVER SENT. So the store was empty,
+    // and world.query answered `known: 0, coverage: 0, stale: true` for every region ever asked
+    // about, including cells a drone was standing in at the time, while MapServer sat on 150,000
+    // real observations.
+    //
+    // It never threw and never logged. Both supply-loop guards that gate on coverage therefore took
+    // the "we have never looked there" branch on every tick forever: a cave survey and a
+    // scout-support survey were dispatched every tick regardless of what was already mapped, which
+    // is what kept the queue full of re-surveys of ground the fleet had already read.
+    //
+    // MapServer.RegionKnown is the real answer, and its `percent` is the units the callers were
+    // always written against.
+    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    const r: any = await bridge.call('MapServer', 'RegionKnown',
+      { min: a.min, max: a.max }, { timeoutMs: 20_000 });
+
+    const volume =
+      (a.max.x - a.min.x + 1) * (a.max.y - a.min.y + 1) * (a.max.z - a.min.z + 1);
+    const known = Number(r?.known ?? 0);
+    const percent = Number(r?.percent ?? 0);
+
+    // Composition comes from the named-block index, which is a different and narrower thing than
+    // the occupancy map -- it only holds positions whose block NAME was reported. Saying so is the
+    // point: `blocks` is a partial answer and a plan that treats it as a census will be wrong.
+    const counts: Record<string, number> = {};
+    try {
+      const map = await loadBlocks();
+      for (const k in map) {
+        const [x, y, z] = k.split(':').map(Number);
+        if (x < a.min.x || x > a.max.x) continue;
+        if (y < a.min.y || y > a.max.y) continue;
+        if (z < a.min.z || z > a.max.z) continue;
+        const n = map[k].replace(/^minecraft:/, '');
+        counts[n] = (counts[n] ?? 0) + 1;
+      }
+    } catch { /* composition is a bonus; coverage is the answer that matters */ }
+
+    return {
+      volume,
+      known,
+      // Kept as a 0-1 fraction because that is what this tool has always documented and what the
+      // teach example shows. `percent` is the same number in the units the callers compare against;
+      // both are published so neither side has to guess which one it is holding.
+      coverage: volume ? +(known / volume).toFixed(3) : 0,
+      percent,
+      blocks: Object.fromEntries(Object.entries(counts).sort((x, y) => y[1] - x[1]).slice(0, 12)),
+      blocksNote: 'from the named-block index: identified positions only, not a full census',
+      oldestObservationAgeMs: r?.oldestMs ?? null,
+      newestObservationAgeMs: r?.newestMs ?? null,
+      neverSeen: !!r?.neverSeen,
+      stale: r?.neverSeen ? true : (r?.oldestMs ?? 0) > STALE_MS.world,
+    };
+  },
 });
 
 // ── order.issue ────────────────────────────────────────────────────────────
@@ -614,19 +687,53 @@ registry.register({
   handler: async (a, ctx) => {
     if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
 
+    // NEAREST FIRST, OR THE FLEET WALKS PAST THE THING IT IS LOOKING FOR.
+    //
+    // FindBlocks returns the first N matches in index order, which is arbitrary. With 844 known
+    // logs it handed back forty from the far north of the region -- so the drone flew 50 blocks to
+    // chase entries it had already harvested (stale, all air) while 180 oak logs stood inside the
+    // base, untouched, for hours. The gather then hit its give-up budget on those stale entries and
+    // started the same trip again.
+    //
+    // Ask for a wide sample and pick the closest, so "go and get some wood" means the wood here.
     const found: any = await bridge.call('MapServer', 'FindBlocks',
-      { match: a.match, limit: 40 }, { timeoutMs: 10000 });
+      { match: a.match, limit: 400 }, { timeoutMs: 15000 });
     const hits = found?.hits ?? found?.data?.hits ?? [];
-    const seeds = Array.isArray(hits) ? hits : Object.values(hits ?? {});
+    const all = Array.isArray(hits) ? hits : Object.values(hits ?? {});
+    const base = settlement.base;
+    const seeds = (all as any[])
+      .filter((h) => h && typeof h.x === 'number')
+      // INSIDE THE OPERATING CIRCLE, OR THE JOB IS AN INSTRUCTION TO GET LOST.
+      //
+      // The index still holds positions surveyed when the region was a square, and plenty of them
+      // are outside the circle the fleet can actually call home from. Seeding a gather straight
+      // from it is how D3 ended up at -496,53,126 -- out of modem range, out of GPS, not ticking,
+      // and only found by force-loading a 160-block box to look for it.
+      .filter((h) => withinReach(h))
+      .sort((p, q) =>
+        (Math.abs(p.x - base.x) + Math.abs(p.y - base.y) + Math.abs(p.z - base.z)) -
+        (Math.abs(q.x - base.x) + Math.abs(q.y - base.y) + Math.abs(q.z - base.z)))
+      .slice(0, 40);
     if (!seeds.length) {
       throw new ToolError(
         `Nothing matching "${a.match}" has been surveyed.`,
         'Survey the area first, or check world.find for what is actually known.');
     }
 
+    // FUEL OUTRANKS EVERYTHING ELSE THE FLEET COULD BE FETCHING.
+    //
+    // Every gather was queued at the same priority, so coal competed on equal terms with copper,
+    // zinc, lapis and dirt -- and lost, repeatedly, because there are six of them and one of it.
+    // Watched live: gather:coal_ore sat unassigned through tick after tick with idle miners
+    // available, while the settlement burned its last 128 coal and drones started dropping to zero.
+    //
+    // This is not a preference, it is an ordering constraint. A drone with no fuel cannot gather
+    // copper either -- it cannot do ANYTHING, including the rescue that would reach it. Fuel is
+    // upstream of every other material by definition, so it belongs above them in the queue.
+    const FUEL_MATCH = /coal|charcoal/;
     const res: any = await bridge.call('TaskMan', 'Add', {
       name: `gather:${a.match}`,
-      priority: 2,
+      priority: FUEL_MATCH.test(a.match) ? 1 : 2,
       work: { gather: { targets: seeds, match: a.match, limit: a.limit } },
     }, { timeoutMs: 8000 });
 
@@ -1106,24 +1213,46 @@ async function probeNodes() {
     // Asked in parallel: six sequential rednet round-trips at up to 5s each is long enough that
     // the page polling this would never see a complete answer.
     const nodes = await Promise.all(NODE_MODULES.map(async (m) => {
-      if (m.noStatus) {
-        return {
-          module: m.label, reachable: null, id: null, label: null, pos: null, upSec: null,
-          faults: 0, lastFault: null, monitor: null, log: [],
-          note: 'serves the VFS; does not implement Status, so it cannot be probed this way',
-        };
-      }
+      // No special case any more: MainFrame answers Status like everything else, so it is probed
+      // like everything else. The special case existed only because it could not be asked, and it
+      // is what showed a healthy module as "not answering" for its entire life.
       try {
-        const r: any = await bridge.call(m.host, 'Status', {}, { timeoutMs: 5000 });
+        // BUSY IS NOT DEAD. RETRY BEFORE CONDEMNING A MODULE.
+        //
+        // These are single-threaded computers. MapServer rebuilds a 206,000-cell map and does not
+        // answer while it does; probe it in that window and it reads "not answering" -- a healthy
+        // module shown as down, next to a MainFrame that was ALSO shown as down for a different
+        // spurious reason. That is how a dashboard teaches you to distrust it, and it sent me
+        // chasing a wedged MapServer that was busy doing its job.
+        //
+        // One retry after a short pause distinguishes "busy for a moment" from "gone". A genuinely
+        // wedged module fails both and is still reported, which is the case that matters.
+        let r: any;
+        try {
+          r = await bridge.call(m.host, 'Status', {}, { timeoutMs: 5000 });
+        } catch {
+          await new Promise((res) => setTimeout(res, 1500));
+          r = await bridge.call(m.host, 'Status', {}, { timeoutMs: 5000 });
+        }
         const s = r?.data ?? r ?? {};
+        // A MONITOR LINE FROZEN AT BOOT IS NOT NEWS.
+        //
+        // DroneMan, StorageMan and DockingMan write "Starting..." once and never again, so the
+        // panel showed three healthy modules apparently stuck mid-boot for sixty hours. If the
+        // module has nothing newer to say, say how long it has been fine instead.
+        const upSec = typeof s.up === 'number' ? Math.round(s.up) : null;
+        let monitor = s.monitor ?? null;
+        if (upSec !== null && upSec > 120 && (!monitor || /^starting/i.test(String(monitor)))) {
+          monitor = `up ${Math.round(upSec / 60)}m, nothing to report`;
+        }
         return {
           module: m.label, reachable: true,
           id: s.id ?? null, label: s.label ?? null,
           pos: s.pos && typeof s.pos.x === 'number' ? s.pos : null,
-          upSec: typeof s.up === 'number' ? Math.round(s.up) : null,
+          upSec,
           faults: s.faults ?? 0,
           lastFault: s.lastFault ?? null,
-          monitor: s.monitor ?? null,
+          monitor,
           log: Array.isArray(s.log) ? s.log : [],
         };
       } catch (err) {
@@ -1480,11 +1609,11 @@ registry.register({
   name: 'plan.execute',
   summary: 'Expand a goal and queue the craftable steps as tasks.',
   description:
-    'Runs plan.make and submits its CRAFT steps to TaskMan in dependency order, so a crafter ' +
-    'picks them up as it frees. Gather and lumber steps are reported but NOT queued: those need ' +
-    'a site, and guessing where to dig is how drones get sent to the wrong place. Refuses ' +
-    'outright if anything in the plan is unobtainable, rather than queueing a chain that must ' +
-    'stall partway.',
+    'Runs plan.make and submits its CRAFT steps to TaskMan, each waiting on the one before it, so ' +
+    'a crafter cannot take the last step first and fail for want of the step it is blocking. ' +
+    'Gather and lumber steps are dispatched too: those do not need a chosen site -- the material ' +
+    'is simply out there -- and leaving them unqueued is how a plan identifies a shortage and then ' +
+    'does nothing about it. Anything with no surveyed source comes back as `unsourced`.',
   params: z.object({
     item: z.string(),
     quantity: z.number().int().min(1).max(512).default(1),
@@ -1494,7 +1623,7 @@ registry.register({
   teach: [{
     situation: 'We have logs and want four chests.',
     args: { item: 'minecraft:chest', quantity: 4 },
-    result: { queued: [{ item: 'minecraft:oak_planks', runs: 8 }, { item: 'minecraft:chest', runs: 4 }], needsSite: [], missing: [] },
+    result: { queued: [{ item: 'minecraft:oak_planks', runs: 8 }, { item: 'minecraft:chest', runs: 4 }], unsourced: [], missing: [] },
     takeaway: 'Both craft steps queued in order; nothing needed a dig site because the logs were held.',
   }],
   handler: async (a, ctx) => {
@@ -1513,19 +1642,74 @@ registry.register({
         'Add a recipe or a source for those, or pick a different goal.');
 
     const queued: any[] = [];
-    const needsSite: any[] = [];
+    // NOT "needs a site" -- that was a wrong assumption, and it shaped the behaviour.
+    //
+    // Gathering does not need a designated site: logs, ore and dirt are simply out there, and the
+    // fleet can be told to go and get some. Only sinking a shaft needs a chosen spot. Calling every
+    // non-craft step "needsSite" made them all look like they were waiting on a human decision, so
+    // they were reported and dropped -- the planner would work out that the chest needs 32 logs and
+    // the fleet has 22, and then queue nothing.
+    //
+    // What is left here now genuinely means UNSOURCED: nothing surveyed matches it, so there is
+    // nowhere to send anyone yet.
+    const unsourced: any[] = [];
+    // CHAIN THE STEPS, DO NOT MERELY EMIT THEM IN ORDER.
+    //
+    // This said "in dependency order" and set no dependsOn at all: the steps came out of plan.make
+    // topologically sorted and were then queued as unrelated peers. So the crafter was free to take
+    // the LAST step first -- and did. craft-chest needs planks, planks did not exist yet, so it
+    // failed, was requeued, and took the crafter again, while craft-oak_planks sat behind it marked
+    // "no crafter free". The one task that would have unblocked the chain was starved by the task
+    // waiting on it, for ever.
+    //
+    // The order was already correct; it just was not binding. Making each step wait on the one
+    // before it is what turns a list into the tree the queue is supposed to be.
+    let previous: number | undefined;
     for (const step of plan.steps) {
-      if (step.action !== 'craft') { needsSite.push({ item: step.item, action: step.action, runs: step.runs }); continue; }
+      // A SHORTAGE THE PLAN FOUND IS A SHORTAGE SOMEBODY SHOULD GO AND FIX.
+      //
+      // Gather steps were reported as needsSite and then dropped on the floor. So the planner would
+      // work out that the chest needs planks, and the planks need 32 logs, and the fleet has 22 --
+      // and then queue nothing to close the gap. The craft failed on missing logs for ever while
+      // the miners, idle, were never told to cut any. The plan knew; nothing asked it.
+      //
+      // order.gather is region-filtered and nearest-first, so this is safe to fire automatically.
+      // Anything it cannot source (no known deposits) still comes back as needsSite for a human.
+      if (step.action !== 'craft') {
+        if (step.action === 'gather' || step.action === 'lumber') {
+          try {
+            const g: any = await registry.invoke('order.gather',
+              { match: step.item.replace(/^[a-z0-9_]+:/, ''), limit: 64 }, ctx);
+            const gd = g?.data ?? g;
+            if (gd?.dispatched) {
+              queued.push({ item: step.item, runs: step.runs, action: 'gather', task: gd.task, after: previous });
+              // THE GATHER IS THE FIRST LINK, NOT A SIDE ERRAND.
+              //
+              // Dispatched and then left dangling, it was just another queued gather competing with
+              // speculative ones -- so the scheduler had no way to know that THIS wood is what the
+              // whole chain is waiting on. Chaining the next craft onto it makes the gather a
+              // blocker, which the blocker pass places first and will interrupt other work for.
+              if (typeof gd.task === 'number') previous = gd.task;
+              continue;
+            }
+          } catch { /* nothing surveyed for it; fall through and report honestly */ }
+        }
+        unsourced.push({ item: step.item, action: step.action, runs: step.runs });
+        continue;
+      }
       const res: any = await bridge.call('TaskMan', 'Add', {
         name: `craft-${step.item.replace('minecraft:', '')}`,
         priority: 3,
+        dependsOn: previous,
         work: { craft: { item: step.item, runs: step.runs, grid: step.grid, inputs: recipeInputs(step.item) } },
       }, { timeoutMs: 8000 });
       if (typeof res === 'string') throw new ToolError(`TaskMan refused ${step.item}: ${res}`, 'Check fleet.tasks.');
-      queued.push({ item: step.item, runs: step.runs, task: res?.id });
+      const id = res?.id ?? res?.data?.id;
+      queued.push({ item: step.item, runs: step.runs, task: id, after: previous });
+      previous = typeof id === 'number' ? id : previous;
     }
     ctx.log(`plan.execute ${a.item} x${a.quantity}`, { queued: queued.length });
-    return { goal: a.item, quantity: a.quantity, queued, needsSite, missing: plan.missing, satisfied: plan.satisfied };
+    return { goal: a.item, quantity: a.quantity, queued, unsourced, missing: plan.missing, satisfied: plan.satisfied };
   },
 });
 
@@ -1702,13 +1886,20 @@ registry.register({
     }, { timeoutMs: 8000 });
     if (typeof shaft === 'string') throw new ToolError(`TaskMan refused the shaft: ${shaft}`, 'Check fleet.tasks.');
 
-    // The scout waits for the shaft. dependsOn is what makes this a mission rather than two
-    // unrelated orders racing each other -- sending the scout first would strand it on the surface
-    // scanning dirt, which is exactly what surveying has been doing.
+    // The scout waits for the shaft to REACH ITS DEPTH, not to finish.
+    //
+    // dependsOn is what makes this a mission rather than two unrelated orders racing each other --
+    // sending the scout first would strand it on the surface scanning dirt. But waiting for the
+    // whole dig to complete serialises work that is meant to overlap: the scan at y=12 becomes
+    // possible the moment the shaft passes y=12, and everything after that is branch tunnels the
+    // scout does not care about. `after` is the shaft's progress percentage at which the scan is
+    // workable -- 95, not 100, because arriving slightly early costs a short wait at the shaft head
+    // and arriving late costs the whole remainder of the dig.
     const scan: any = await bridge.call('TaskMan', 'Add', {
       name: `scan-${plot.name}-y${a.depth}`,
       priority: 2,
       dependsOn: shaft?.id,
+      after: 95,
       work: { survey: { w: 4, h: 4, radius: 8, pos: { x: head.x, y: a.depth, z: head.z } } },
     }, { timeoutMs: 8000 });
     if (typeof scan === 'string') throw new ToolError(`TaskMan refused the scan: ${scan}`, 'Check fleet.tasks.');
@@ -1830,7 +2021,10 @@ registry.register({
       try {
         // Through DroneMan: the Bridge can only address MODULES, so anything aimed at a drone has
         // to be relayed by the module that owns the registry.
-        const res: any = await bridge.call('DroneMan', 'Relay', { id, on: a.on }, { timeoutMs: 12000 });
+        // Comfortably past DroneMan's own per-drone wait plus its queueing, so a slow relay reads
+        // as "that drone declined" rather than "the registry is down" -- two very different faults
+        // that this budget used to conflate.
+        const res: any = await bridge.call('DroneMan', 'Relay', { id, on: a.on }, { timeoutMs: 20000 });
         if (typeof res === 'string') out.push({ id, relaying: false, error: res });
         else out.push({ id, relaying: a.on, result: res ?? null });
       } catch (err) {
@@ -1843,6 +2037,30 @@ registry.register({
 });
 
 
+/**
+ * Item -> count across every chest the fleet can see.
+ *
+ * The same eight lines were written out three times, and the copies had already diverged on the one
+ * thing that matters: what to do when storage cannot be read. Two of them planned against an empty
+ * map, which is right for a planner -- over-ordering is recoverable. The third dispatches a drone to
+ * place two thousand blocks, where believing in cobblestone you do not have strands it mid-floor.
+ * So the caller decides, and has to say so.
+ */
+async function readStock(onUnreadable: 'empty' | 'throw'): Promise<Record<string, number>> {
+  const stock: Record<string, number> = {};
+  try {
+    const res: any = await bridge.call('StorageMan', 'stock', {}, { timeoutMs: 8000 });
+    for (const d of luaList<any>(res?.detail ?? res?.data?.detail) ?? []) {
+      if (typeof d?.name === 'string') stock[d.name] = (stock[d.name] ?? 0) + (d.count ?? 0);
+    }
+  } catch {
+    if (onUnreadable === 'throw') {
+      throw new ToolError('Cannot read storage, so cannot cost the work.', 'Check hive.nodes.');
+    }
+  }
+  return stock;
+}
+
 // ── order.build ────────────────────────────────────────────────────────────
 //
 // The end of the loop: material becomes infrastructure, on ground that was reserved for it.
@@ -1851,6 +2069,96 @@ registry.register({
 // than one that never started: the site is validated against the plot registry, the cost is
 // expanded through the recipe graph, and any missing material is CRAFTED first. The build itself is
 // queued to depend on those craft steps, so it cannot begin and stall halfway.
+registry.register({
+  name: 'order.tower',
+  summary: 'Build one floor of the tower, in cobblestone, as a chain of drone-sized build tasks.',
+  description:
+    'The tower generator has existed and been unreachable: nothing imported it, so no tool could ' +
+    'ask for a floor and the settlement had no cellar, no ground floor and no way to get one. ' +
+    'This is that ask. It costs the floor, keeps only the blocks the fleet can actually afford, ' +
+    'and splits the rest into tasks small enough for one drone to carry -- a floor is ~2,350 ' +
+    'blocks and a turtle holds 1,024, so a single build task could never finish one.',
+  params: z.object({
+    level: z.number().int().min(-3).max(7).default(-1)
+      .describe('Which level. -1 is the sorted-storage cellar, 0 the ground/ingest floor.'),
+    palette: z.enum(['cobble', 'brick', 'create']).default('cobble')
+      .describe('cobble is tier 0: everything in it falls out of a mining shaft.'),
+    blocksPerTask: z.number().int().min(32).max(512).default(192)
+      .describe('Blocks per build task. Must fit a drone: 192 is three stacks with room to work.'),
+  }).strict(),
+  returns: 'The level, what it costs, what was affordable, and the queued build tasks.',
+  danger: 'destructive',
+  bounds: 'Centred on the settlement base. Only blocks whose material is in stock are queued.',
+  teach: [{
+    situation: 'Storage is 78% cobblestone and the settlement has nothing to spend it on.',
+    args: { level: -1, palette: 'cobble' as const, blocksPerTask: 192 },
+    result: { level: -1, queued: 12, cobblestoneUsed: 2310 },
+    takeaway: 'The spoil heap becomes the building. Mining already paid for it.',
+  }],
+  handler: async (a, ctx) => {
+    const spec = specForLevel(a.level);
+    const mats = PALETTES[a.palette]!;
+    const blocks = towerFloor(spec, a.level, mats);
+    const cost = floorCost(blocks);
+
+    // WHAT THE FLEET CAN ACTUALLY AFFORD, not what the design asks for.
+    //
+    // A floor wants twelve glass, and glass needs a furnace the settlement does not yet have --
+    // so a task demanding it dies with "ran out of minecraft:glass partway through" and abandons a
+    // half-built floor. The cobblestone is the point here: 2,310 of the 2,354 blocks, and the one
+    // material there are ten thousand of. Build what is affordable now and reface later; that is
+    // exactly what the palette ladder is for.
+    const stock = await readStock('throw');
+    const affordable = blocks.filter((b) => (stock[b.item] ?? 0) > 0);
+    const skipped = blocks.length - affordable.length;
+    if (!affordable.length) throw new ToolError(
+      `Nothing in stock for a ${a.palette} level ${a.level}.`,
+      `It needs ${Object.keys(cost).join(', ')}.`);
+
+    // Slab first, then outward and upward -- a turtle places against an adjacent face, so the
+    // ground must exist before anything can stand on it. Same ordering rule as a blueprint.
+    const ordered = [...affordable].sort((x, y) =>
+      x.dy - y.dy ||
+      (Math.abs(x.dx) + Math.abs(x.dz)) - (Math.abs(y.dx) + Math.abs(y.dz)) ||
+      x.dx - y.dx || x.dz - y.dz);
+
+    const base = settlement.base;
+    const origin = { x: base.x, y: base.y + a.level * spec.floorHeight, z: base.z };
+
+    // CHUNKED, AND CHAINED. A drone holds sixteen stacks; a floor is fifteen hundred blocks of
+    // cobblestone. One task per drone-load, each waiting on the one before so the floor is laid in
+    // order rather than by whoever happens to be free.
+    const queued: any[] = [];
+    let prev: number | undefined;
+    for (let i = 0; i < ordered.length; i += a.blocksPerTask) {
+      const part = ordered.slice(i, i + a.blocksPerTask);
+      const res: any = await bridge.call('TaskMan', 'Add', {
+        name: `tower-L${a.level}-p${String(queued.length + 1).padStart(2, '0')}`,
+        // ONE. The settlement should be building its base before it speculatively gathers more ore
+        // -- which it will otherwise do for ever, because there is always another material short.
+        priority: 1,
+        dependsOn: prev,
+        work: { build: { origin, blocks: part } },
+      }, { timeoutMs: 12000 });
+      if (typeof res === 'string') break;      // TaskMan refused; stop rather than queue a gap
+      prev = res?.id;
+      queued.push({ task: res?.id, blocks: part.length });
+    }
+
+    ctx.log('order.tower', { level: a.level, palette: a.palette, tasks: queued.length });
+    return {
+      level: a.level, name: LEVELS.find((l) => l.index === a.level)?.name ?? String(a.level),
+      origin, cost, affordable: affordable.length, skippedForMaterials: skipped,
+      tasks: queued,
+      note: skipped
+        ? `${skipped} block(s) skipped -- no stock for them yet; reface when the smelters run`
+        : 'everything affordable',
+    };
+  },
+});
+
+
+// ── order.build ────────────────────────────────────────────────────────────
 registry.register({
   name: 'order.build',
   summary: 'Build a blueprint on a plot, crafting whatever it needs first.',
@@ -2174,6 +2482,359 @@ registry.register({
 // whole fleet this way -- two miners and a scout were permanently "working" on orders that reported
 // "cannot reach site" every time, so the supply loop correctly concluded there was nobody free and
 // did nothing at all. From outside that looks like autonomy having stopped.
+// ── hive.plan ──────────────────────────────────────────────────────────────
+registry.register({
+  name: 'hive.plan',
+  summary: 'The work queue as a dependency TREE, with the reason each task is blocked.',
+  description:
+    'fleet.tasks is a flat list, which cannot answer the question that actually matters: WHY is ' +
+    'nothing happening. The queue is a tree -- order.build queues the crafts it needs and waits ' +
+    'on them, and those crafts wait on their materials -- so a blocked build looks exactly like ' +
+    'an idle fleet unless you can see the chain. This renders that chain and names the blocker.',
+  params: z.object({}).strict(),
+  returns: 'Roots with nested children, each carrying state and a blockedBy reason.',
+  danger: 'read',
+  bounds: 'Read-only view of TaskMan and DroneMan.',
+  teach: [{
+    situation: 'The crafter is idle and nothing is being built. Why?',
+    args: {},
+    result: {
+      tree: [{
+        id: 1845, name: 'build-claim-post-docks-01', state: 'blocked',
+        blockedBy: 'waiting on craft-oak_planks (#1844)',
+        children: [{ id: 1844, name: 'craft-oak_planks', state: 'failing',
+                     blockedBy: 'storage has none of the ingredients: minecraft:oak_log' }],
+      }],
+    },
+    takeaway: 'The build is not stuck -- it is waiting on planks, which are waiting on wood nobody has.',
+  }],
+  handler: async () => {
+    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    const t: any = await bridge.call('TaskMan', 'GetTasks', {}, { timeoutMs: 10000 });
+    const tasks = (luaList<any>(t?.tasks ?? t?.data?.tasks) ?? []).filter(Boolean);
+    const drones = luaList<any>(
+      (await bridge.call('DroneMan', 'GetDrones', {}, { timeoutMs: 8000 }) as any)?.drones,
+    ) ?? [];
+
+    const byId = new Map<string, any>(tasks.map((x: any) => [String(x.id), x]));
+    const done = (x: any) => (x?.progress ?? 0) >= 100;
+
+    // Which roles could actually take work right now. "No drone free" is a different problem from
+    // "waiting on a dependency", and conflating them is why the queue looked broken when it was
+    // merely busy.
+    const freeRoles = new Set(
+      drones.filter((d: any) => d.status === 'idle' && !d.offline).map((d: any) => d.role ?? 'miner'),
+    );
+    const roles = new Set(drones.map((d: any) => d.role ?? 'miner'));
+
+    const describe = (x: any): { state: string; blockedBy: string | null } => {
+      if (done(x)) return { state: 'done', blockedBy: null };
+      if (x.paused) return { state: 'paused', blockedBy: 'paused' };
+      if (x.enabled === false) return { state: 'disabled', blockedBy: 'disabled' };
+      if (x.assigned) return { state: 'running', blockedBy: null };
+
+      const dep = x.dependsOn != null ? byId.get(String(x.dependsOn)) : null;
+      if (dep && !done(dep)) {
+        return { state: 'blocked', blockedBy: `waiting on ${dep.name} (#${dep.id})` };
+      }
+      // A task that keeps failing is not merely queued, and its reason is the whole story.
+      if (x.failure) {
+        return {
+          state: (x.attempts ?? 0) > 0 ? 'failing' : 'queued',
+          blockedBy: `${x.failure}${x.attempts ? ` (attempt ${x.attempts})` : ''}`,
+        };
+      }
+      const role = x.role ?? 'miner';
+      if (!roles.has(role)) return { state: 'blocked', blockedBy: `no ${role} in the fleet` };
+      if (!freeRoles.has(role)) return { state: 'queued', blockedBy: `no ${role} free` };
+      return { state: 'queued', blockedBy: null };
+    };
+
+    const node = (x: any): any => ({
+      id: x.id, name: x.name, verb: x.role, progress: x.progress ?? 0,
+      assigned: x.assigned ?? null,
+      ...describe(x),
+      children: tasks
+        .filter((c: any) => c.dependsOn != null && String(c.dependsOn) === String(x.id))
+        .map(node),
+    });
+
+    const roots = tasks.filter(
+      (x: any) => x.dependsOn == null || !byId.has(String(x.dependsOn)),
+    );
+    const tree = roots.map(node);
+    const live = tasks.filter((x: any) => !done(x));
+    return {
+      tree,
+      counts: {
+        live: live.length,
+        running: live.filter((x: any) => x.assigned).length,
+        blocked: live.filter((x: any) => describe(x).state === 'blocked').length,
+        failing: live.filter((x: any) => describe(x).state === 'failing').length,
+      },
+    };
+  },
+});
+
+// ── world.prune ────────────────────────────────────────────────────────────
+registry.register({
+  name: 'world.prune',
+  summary: 'Drop map cells outside the operating region.',
+  description:
+    'The map is persistent and append-only in practice, so it accumulates terrain the fleet can ' +
+    'never reach -- ground around the ORIGINAL settlement 400 blocks away, and the corners of the ' +
+    'old square region. That is not inert: MapServer is a single thread serving five drones\' ' +
+    'uploads plus every path request, and it carries the dead weight through every occupancy walk, ' +
+    'name-index pass and persist. At 207k cells drones began reporting "MapServer did not take 10 ' +
+    'observations, keeping them" -- the map failing to learn what was being mined, which is exactly ' +
+    'what leaves phantom ore in the index for gather tasks to chase for ever.',
+  params: z.object({
+    margin: z.number().int().min(0).max(256).default(32)
+      .describe('Blocks of slack outside the region to keep.'),
+    aboveY: z.number().int().min(-64).max(320).optional()
+      .describe('Also drop every cell above this altitude. Use to clear phantom terrain: a drone ' +
+                'with an unverified position files observations INSIDE the region at coordinates ' +
+                'it only believes, so the junk is out of reach of a footprint prune and gives ' +
+                'itself away by height instead.'),
+  }).strict(),
+  returns: 'How many cells were dropped and how many kept.',
+  danger: 'destructive',
+  bounds: 'Map records only, and only outside the operating region. Nothing in the world changes.',
+  teach: [{
+    situation: 'Drones report "MapServer did not take N observations" and path requests are slow.',
+    args: { margin: 32 },
+    result: { dropped: 141_000, kept: 66_000 },
+    takeaway: 'Most of the map was ground the fleet is not allowed to enter.',
+  }],
+  handler: async (a, ctx) => {
+    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    const r: any = await bridge.call('MapServer', 'prune',
+      { margin: a.margin, aboveY: a.aboveY }, { timeoutMs: 60000 });
+    if (typeof r === 'string') throw new ToolError(`MapServer refused: ${r}`, 'Does it have bounds yet?');
+    ctx.log('world.prune', { margin: a.margin, aboveY: a.aboveY, dropped: r?.dropped, kept: r?.kept });
+    return r;
+  },
+});
+
+// ── fleet.probe ────────────────────────────────────────────────────────────
+registry.register({
+  name: 'fleet.probe',
+  summary: 'Evaluate a Lua expression on a real drone and return the answer.',
+  description:
+    'For settling a question about what the game actually does, instead of inferring it and ' +
+    'finding out in production. Every semantic bug in the drone code -- items dropped on the ' +
+    'floor, an upgrade silently not applied, three wrong implementations of chest withdrawal -- ' +
+    'was answerable by asking the world once. The only thing making those expensive was having ' +
+    'no way to ask except edit, sync, reboot, wait. This is that way. Read-only by convention; ' +
+    'the drone pcalls it, so a bad probe cannot take it down.',
+  params: z.object({
+    id: z.number().int().describe('Computer id of the drone, from fleet.status.'),
+    code: z.string().min(1).max(500).describe('Lua expression, e.g. `peripheral.wrap("bottom") ~= nil`.'),
+  }).strict(),
+  returns: 'The value, serialised, plus its type — or the error it raised.',
+  danger: 'read',
+  bounds: 'Runs on one drone. Keep probes read-only: nothing stops a probe that moves or digs.',
+  teach: [{
+    situation: 'Can a turtle read the chest beneath it, or must it suck items out to find out what is there?',
+    args: { id: 47, code: 'peripheral.wrap("bottom").list()' },
+    result: { ok: true, type: 'table', value: '{ [1] = { count = 43, name = "minecraft:cobblestone" } }' },
+    takeaway: 'It can. Answered in seconds; the alternative cost three wrong implementations.',
+  }],
+  handler: async (a, ctx) => {
+    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    const r: any = await bridge.call('DroneMan', 'GoTo',
+      { id: a.id, verb: 'Probe', pos: { x: 0, y: 0, z: 0 }, code: a.code }, { timeoutMs: 15000 });
+    if (typeof r === 'string') throw new ToolError(`DroneMan refused: ${r}`, 'Check the drone id.');
+    ctx.log('fleet.probe', { id: a.id, code: a.code.slice(0, 60) });
+    return { sent: r, note: 'the answer is written to the drone log; see its trace' };
+  },
+});
+
+// ── world.forget ───────────────────────────────────────────────────────────
+registry.register({
+  name: 'world.forget',
+  summary: 'Remove blocks matching a name from the world map, index and occupancy grid.',
+  description:
+    'For records that should never have existed. The scanner returns every non-air block, so ' +
+    'drones recorded EACH OTHER as permanent terrain -- 190 turtle blocks for a fleet of five, ' +
+    'drawn as white cubes floating wherever a drone once stood, and routed around by the ' +
+    'pathfinder as though they were walls. The scan side no longer records them, but the map is ' +
+    'persistent: what is written stays written until something removes it.',
+  params: z.object({
+    match: z.string().min(3).describe('Name substring, e.g. "turtle".'),
+  }).strict(),
+  returns: 'How many records were forgotten.',
+  danger: 'destructive',
+  bounds: 'Map records only. Nothing in the world is changed.',
+  teach: [{
+    situation: 'The map shows white blocks floating in mid-air where drones used to be.',
+    args: { match: 'turtle' },
+    result: { forgot: 190, match: 'turtle' },
+    takeaway: 'Those were drones recorded as terrain, not real blocks.',
+  }],
+  handler: async (a, ctx) => {
+    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    const r: any = await bridge.call('MapServer', 'forget', { match: a.match }, { timeoutMs: 20000 });
+    if (typeof r === 'string') throw new ToolError(`MapServer refused: ${r}`, 'Check the match string.');
+    ctx.log('world.forget', { match: a.match, forgot: r?.forgot });
+    return r;
+  },
+});
+
+// ── fleet.handover ─────────────────────────────────────────────────────────
+registry.register({
+  name: 'fleet.handover',
+  summary: 'Have a drone carrying an item fly it directly to a drone that is blocked without it.',
+  description:
+    'Everything the fleet owns normally has to pass through a chest, which makes the chest a ' +
+    'bottleneck and a single point of failure -- and early on there may not be one. A crafter ' +
+    'blocked for want of wood cannot be helped by the miner beside it holding sixteen logs. This ' +
+    'is the fuel-relief manoeuvre generalised: the holder flies above the recipient and hands the ' +
+    'items down. Picks the holder automatically unless you name one.',
+  params: z.object({
+    to: z.number().int().describe('Computer id of the drone that needs the item.'),
+    match: z.string().min(2).describe('Item name substring, e.g. "_log".'),
+    from: z.number().int().optional().describe('Specific holder; otherwise the nearest one carrying it.'),
+  }).strict(),
+  returns: 'The chosen holder, the recipient, and how much it is carrying.',
+  danger: 'destructive',
+  bounds: 'Interrupts the holder\'s current job. Refuses if nobody is carrying a match.',
+  teach: [{
+    situation: 'The crafter is blocked on oak_log and a miner is holding sixteen of them.',
+    args: { to: 47, match: '_log' },
+    result: { from: 'D3', to: 'D4', held: 16 },
+    takeaway: 'No chest involved -- the wood goes straight from the drone that has it to the one that needs it.',
+  }],
+  handler: async (a, ctx) => {
+    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    const drones = state.listDrones();
+    const recipient = drones.find((d) => d.id === a.to);
+    if (!recipient) throw new ToolError(`No drone ${a.to}.`, 'Check fleet.status.');
+    if (!recipient.pos) {
+      throw new ToolError(`${recipient.name} has no known position.`,
+        'It cannot be delivered to until it reports one.');
+    }
+
+    const held = (d: typeof drones[number]) => {
+      let n = 0;
+      for (const [name, c] of Object.entries(d.carrying ?? {})) {
+        if (name.includes(a.match)) n += Number(c) || 0;
+      }
+      return n;
+    };
+    const dist = (d: typeof drones[number]) =>
+      d.pos ? Math.abs(d.pos.x - recipient.pos!.x) + Math.abs(d.pos.y - recipient.pos!.y)
+            + Math.abs(d.pos.z - recipient.pos!.z) : Infinity;
+
+    const holders = drones
+      .filter((d) => d.id !== a.to && held(d) > 0 && (a.from == null || d.id === a.from))
+      .sort((x, y) => dist(x) - dist(y));
+
+    if (!holders.length) {
+      throw new ToolError(
+        `No drone is carrying anything matching "${a.match}".`,
+        'Check fleet.status carrying, or gather some first.');
+    }
+
+    const from = holders[0];
+    await bridge.call('DroneMan', 'GoTo', {
+      id: from.id, verb: 'Handover',
+      pos: recipient.pos, drone: recipient.name, match: a.match,
+    }, { timeoutMs: 8000 });
+    ctx.log('fleet.handover', { from: from.name, to: recipient.name, match: a.match });
+    return { from: from.name, to: recipient.name, held: held(from), match: a.match };
+  },
+});
+
+// ── storage.recall ─────────────────────────────────────────────────────────
+registry.register({
+  name: 'storage.recall',
+  summary: 'Send drones carrying a material back to storage to deposit it.',
+  description:
+    'The fleet\'s own inventory is not usable by the fleet: a drone holding sixteen logs is, to ' +
+    'every planner, holding nothing. So a craft fails for want of wood that exists, two blocks ' +
+    'away, inside a miner. This finds who is carrying what you need and tells them to unload.',
+  params: z.object({
+    match: z.string().min(2).describe('Item name substring, e.g. "_log" or "coal".'),
+  }).strict(),
+  returns: 'Which drones were carrying it and were asked to deposit.',
+  danger: 'destructive',
+  bounds: 'Only interrupts drones that actually hold a match; others are left alone.',
+  teach: [{
+    situation: 'craft-oak_planks keeps failing on "storage has none of the ingredients", but a miner cut logs earlier.',
+    args: { match: '_log' },
+    result: { recalled: [{ drone: 'D3', held: 16 }] },
+    takeaway: 'The wood existed all along; it was just inside a drone where nothing could see it.',
+  }],
+  handler: async (a, ctx) => {
+    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    const drones = state.listDrones();
+    const holders = drones
+      .map((d) => {
+        const inv = d.carrying ?? {};
+        let held = 0;
+        for (const [name, n] of Object.entries(inv)) {
+          if (name.includes(a.match)) held += Number(n) || 0;
+        }
+        return { d, held };
+      })
+      .filter((x) => x.held > 0);
+
+    if (!holders.length) {
+      return { recalled: [], note: `no drone is carrying anything matching "${a.match}"` };
+    }
+
+    const out: any[] = [];
+    for (const { d, held } of holders) {
+      try {
+        // Deposit is the drone's own well-trodden path to the chest -- no new protocol, and it
+        // already knows how to get there from underground.
+        // A verb, not a flag: OnGoTo never read `deposit`, so the previous version of this
+        // reported success while the drone carried on mining with a full hold.
+        await bridge.call('DroneMan', 'GoTo',
+          { id: d.id, verb: 'Unload', pos: d.pos }, { timeoutMs: 8000 });
+        out.push({ drone: d.name, held, asked: true });
+      } catch (err) {
+        out.push({ drone: d.name, held, asked: false, error: String(err).slice(0, 120) });
+      }
+    }
+    ctx.log('storage.recall', { match: a.match, holders: out.length });
+    return { recalled: out };
+  },
+});
+
+// ── fleet.retire ───────────────────────────────────────────────────────────
+registry.register({
+  name: 'fleet.retire',
+  summary: 'Write off a drone that cannot be recovered, so the fleet stops planning around it.',
+  description:
+    'Removes a drone from the registry. Use ONLY when a drone is genuinely unreachable -- outside ' +
+    'the operating region, or silent with a position known to be wrong. A lost drone that stays ' +
+    'registered keeps generating rescues aimed at its last reported position, and those rescues ' +
+    'consume the drones that still work: one casualty can occupy the whole fleet indefinitely. ' +
+    'The turtle is not destroyed; if it ever heartbeats again it re-registers from scratch.',
+  params: z.object({
+    id: z.number().int().describe('Computer id of the drone, from fleet.status.'),
+    reason: z.string().max(200).default('unrecoverable'),
+  }).strict(),
+  returns: 'The retired drone name and id.',
+  danger: 'destructive',
+  bounds: 'Registry only. Does not break, move or shut down the turtle.',
+  teach: [{
+    situation: 'D1 drifted outside the region, stopped ticking, and its record still shows a position inside it.',
+    args: { id: 20, reason: 'outside the operating region; reported position is stale' },
+    result: { retired: 'D1', id: '20' },
+    takeaway: 'Rescues for D1 stop being generated, and the drones that still work go back to real jobs.',
+  }],
+  handler: async (a, ctx) => {
+    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    const r: any = await bridge.call('DroneMan', 'RetireDrone', { id: a.id }, { timeoutMs: 8000 });
+    if (typeof r === 'string') throw new ToolError(`DroneMan refused: ${r}`, 'Check fleet.status for the id.');
+    ctx.log('fleet.retire', { id: a.id, reason: a.reason });
+    return { ...r, reason: a.reason };
+  },
+});
+
 registry.register({
   name: 'task.stop',
   summary: 'Abandon a queued or stuck task so its drone is released.',
@@ -2203,8 +2864,11 @@ registry.register({
           holder = list.find((t: any) => String(t.id) === String(id))?.assignedTo;
         } catch { /* best effort; stopping the task still matters */ }
 
+        // abandon:true, not just ok:false. A plain failure goes through TaskMan's retry path --
+        // it spends one of three attempts and requeues -- so "stopped" tasks kept being dispatched
+        // and the queue could not be cleared at all.
         const res: any = await bridge.call('TaskMan', 'TaskDone',
-          { id, ok: false, reason: a.reason }, { timeoutMs: 8000 });
+          { id, ok: false, abandon: true, reason: a.reason }, { timeoutMs: 8000 });
 
         // STOP THE DRONE TOO. Cancelling the task in the queue does not reach the machine: it
         // keeps executing, never goes idle, and can never be given anything again -- which looks

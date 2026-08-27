@@ -10,8 +10,9 @@
 # StorageMan enumerates inventories through the WIRED modem network -- peripheral.getNames() over the
 # cable, not a search of nearby blocks. So a chest on its own is invisible no matter where it sits.
 # Each chest needs a wired modem touching it, every modem needs to reach the others, and the chain
-# has to reach StorageMan's computer. wired_modem_full is modem and cable in one block, which makes
-# the whole thing placeable by command.
+# has to reach StorageMan's computer. wired_modem_full is modem and cable in one block, and BOTH of
+# its blockstates matter: modem=true switches it on, peripheral=true attaches what it is touching.
+# Setting only the first is the same as not placing it at all.
 #
 # The layout is two rows for exactly that reason:
 #
@@ -41,9 +42,21 @@ for x in $(seq $X_FROM $X_TO); do
   rc "setblock $x $Y $CHEST_Z minecraft:chest" >/dev/null
 done
 
-echo "== wired modems, active"
+echo "== wired modems, active AND attached"
+# peripheral=true IS SETTABLE, AND IS THE WHOLE BALL GAME.
+#
+# This placed modems with modem=true only, which turns the modem ON but attaches NOTHING -- every
+# modem read peripheral=false, StorageMan enumerated zero chests, and the whole fleet was rebuilt
+# around that: a deposit ledger instead of real stock, drones wrapping chests by hand, Provide
+# permanently broken, and smelting impossible because a furnace could never join the network. It was
+# written down as an environment invariant ("a modem only attaches when right-clicked, and setblock
+# cannot right-click") and believed for weeks.
+#
+# It is simply not true. peripheral is an ordinary blockstate and setblock sets it, at which point
+# CC:T attaches the adjacent inventory for real: storage.stock went from "0 chests (ledger)" to
+# "4 chests, 92 free slots (peripherals)" the moment it was set.
 for x in $(seq $X_FROM $X_TO); do
-  rc "setblock $x $Y $MODEM_Z computercraft:wired_modem_full[modem=true]" >/dev/null
+  rc "setblock $x $Y $MODEM_Z computercraft:wired_modem_full[modem=true,peripheral=true]" >/dev/null
 done
 
 echo "== placed $(( X_TO - X_FROM + 1 )) chests and the same number of modems"

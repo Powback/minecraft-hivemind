@@ -75,6 +75,17 @@ export interface Detection {
   detail: string;
 }
 
+/** Consecutive 60s ticks a committed drone may sit still before it counts as wedged. */
+const STUCK_TICKS = 15;
+
+/**
+ * Consecutive ticks a drone may be idle before that is treated as a fault.
+ *
+ * Deliberately short. A drone genuinely between jobs is idle for a tick or two; five minutes of
+ * nothing means the fleet has stopped growing and nobody noticed.
+ */
+const IDLE_TICKS = 5;
+
 const near = (
   a?: { x: number; y: number; z: number } | null,
   b?: { x: number; y: number; z: number } | null,
@@ -92,7 +103,14 @@ const near = (
  * is the only way to catch a truncated read from outside -- the read itself reports success either
  * way, which is precisely what made it dangerous.
  */
-export function detect(o: Observation, best: Map<string, number>): Detection[] {
+export interface Anchor { x: number; y: number; z: number; ticks: number }
+
+export function detect(
+  o: Observation,
+  best: Map<string, number>,
+  anchors: Map<string, Anchor> = new Map(),
+  idle: Map<string, number> = new Map(),
+): Detection[] {
   const out: Detection[] = [];
 
   for (const m of o.modules) {
@@ -136,6 +154,37 @@ export function detect(o: Observation, best: Map<string, number>): Detection[] {
       });
     }
 
+    // COMMITTED, BUSY, AND NOT ACTUALLY GOING ANYWHERE.
+    //
+    // D1 held the shaft task for the settlement's own centre plot for HOURS. Every minute it
+    // reported status "working", reported "mining", accepted the task, failed to reach the head,
+    // threw, and was handed the same task straight back. Not one existing detector fired:
+    // idle-but-committed needs the drone to say idle and it said working; work-done-not-reported
+    // needs it to be standing on the target and it never got there; queue-starvation needs idle
+    // drones and every drone was busy. The fleet looked perfectly healthy from every angle while
+    // the one job that gates the whole build made no progress at all.
+    //
+    // POSITION, NOT PROGRESS, is the liveness signal. progress sits at 0 for jobs that are running
+    // perfectly well -- a gather task reports 0% throughout -- so it cannot distinguish working
+    // from wedged. Where the drone IS can: a drone doing real work moves, and one that has not left
+    // a 3-block box in a quarter of an hour while holding unfinished work is thrashing, whatever it
+    // says about itself.
+    if (d.pos && d.status !== 'idle' && d.status !== 'docking' && d.status !== 'hauling') {
+      const prev = anchors.get(d.name);
+      if (prev && near(d.pos, prev, 3)) {
+        prev.ticks++;
+        if (prev.ticks === STUCK_TICKS) {
+          out.push({
+            key: `notmoving:${d.name}`, kind: 'committed-but-not-moving', severity: 'wedge',
+            detail: `${d.name} reports ${d.status} holding task(s) ${mine.map((t) => t.id).join(', ')} `
+                  + `but has not moved from ${d.pos.x},${d.pos.y},${d.pos.z} in ${prev.ticks} ticks`,
+          });
+        }
+      } else {
+        anchors.set(d.name, { ...d.pos, ticks: 0 });
+      }
+    }
+
     // A miner dug through rock to a trapped scout's exact position, arrived, went idle -- and the
     // task stayed at 0% and assigned, holding a rescue slot against every other trapped drone. The
     // work was done and nothing knew it.
@@ -162,6 +211,44 @@ export function detect(o: Observation, best: Map<string, number>): Detection[] {
     }
   }
 
+  // AN IDLE DRONE IS A FAULT, NOT A REST STATE.
+  //
+  // The point of this fleet is to expand without being told to. A drone with nothing to do means
+  // one of two things, and both are faults: either the queue is empty -- so nothing is generating
+  // the next piece of work, and the system has quietly stopped growing -- or there IS work and the
+  // scheduler could not place it. Neither shows up as an error anywhere; the fleet simply sits
+  // there looking healthy, which is exactly how a whole afternoon can pass with five drones parked
+  // and the build chain untouched.
+  //
+  // Reported per drone with the reason, because "no work exists" and "work exists and you are not
+  // doing it" need completely different fixes.
+  for (const d of o.drones) {
+    if (d.status !== 'idle') { idle.delete(d.name); continue; }
+    if ((held.get(d.name) ?? []).length > 0) continue;   // idle-but-committed, reported above
+
+    const n = (idle.get(d.name) ?? 0) + 1;
+    idle.set(d.name, n);
+    if (n !== IDLE_TICKS) continue;                      // once per streak, not every tick
+
+    const role = d.role ?? 'miner';
+    const waiting = o.tasks.filter(
+      (t) => !t.assigned && (t.progress ?? 0) < 100 && (t.role ?? 'miner') === role,
+    );
+    out.push(
+      waiting.length
+        ? {
+            key: `idlework:${d.name}`, kind: 'idle-while-work-waits', severity: 'stall',
+            detail: `${d.name} has been idle ${n} ticks while ${waiting.length} unassigned `
+                  + `${role} task(s) wait: ${waiting.slice(0, 3).map((t) => t.id).join(', ')}`,
+          }
+        : {
+            key: `idlenowork:${d.name}`, kind: 'idle-nothing-to-do', severity: 'stall',
+            detail: `${d.name} has been idle ${n} ticks and there is no ${role} work queued at `
+                  + `all -- nothing is generating the next job, so the settlement is not expanding`,
+          },
+    );
+  }
+
   // 114 live tasks, 10 assigned, 11 drones idle. Nothing was broken; the work simply was not moving,
   // and no single component was in a position to notice.
   const idleCount = o.drones.filter((d) => d.status === 'idle').length;
@@ -186,6 +273,10 @@ export class Ledger {
   private open = new Map<string, Incident>();
   private closed: Incident[] = [];
   private best = new Map<string, number>();
+  /** Where each drone was last seen standing, and for how many ticks. See committed-but-not-moving. */
+  private anchors = new Map<string, Anchor>();
+  /** Consecutive idle ticks per drone. See idle-nothing-to-do. */
+  private idleTicks = new Map<string, number>();
   private file: string;
 
   constructor(stateDir = process.env.HIVE_STATE ?? '/state') {
@@ -249,6 +340,8 @@ export class Ledger {
   counts() { return { open: this.open.size, closed: this.closed.length }; }
   openIncidents() { return [...this.open.values()]; }
   reads() { return this.best; }
+  positions() { return this.anchors; }
+  idleStreaks() { return this.idleTicks; }
 
   /**
    * MTBI and the self-resolution rate.
@@ -397,7 +490,8 @@ export async function runSentinelTick(): Promise<{ opened: number; open: number 
     const o = await observe();
     if (!o) return { opened: 0, open: sentinel.ledger.counts().open };
     sentinel.lastObservation = o;
-    const found = detect(o, sentinel.ledger.reads());
+    const found = detect(o, sentinel.ledger.reads(), sentinel.ledger.positions(),
+                         sentinel.ledger.idleStreaks());
     const opened = await sentinel.ledger.reconcile(found, o.at);
     for (const inc of opened) {
       console.log(`[sentinel] ${inc.severity.toUpperCase()} ${inc.kind}: ${inc.detail}`);

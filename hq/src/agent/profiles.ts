@@ -69,6 +69,16 @@ export const PROFILES: Record<string, AgentProfile> = {
       'order.issue',
       'order.abort',
       'task.stop',
+      // Writing off an unrecoverable drone is a fleet-management decision, and withholding it means
+      // one lost drone can occupy every working drone indefinitely via rescues it can never fulfil.
+      'fleet.retire',
+      // The tree view is how you find out WHY nothing is happening.
+      'hive.plan',
+      'storage.recall',
+      'fleet.handover',
+      'world.forget',
+      'world.prune',
+      'fleet.probe',
       'recover.dispatch',
       'fleet.goto',
       'plan.make',
@@ -76,6 +86,10 @@ export const PROFILES: Record<string, AgentProfile> = {
       'order.mine',
       'order.prospect',
       'order.build',
+      // The tower. It queues a floor as a chain of drone-sized build tasks at priority 1, which is
+      // a large and visible commitment of the fleet -- but it is also the only consumer the
+      // settlement has for the cobblestone that otherwise fills every chest it owns.
+      'order.tower',
       'factory.route',
       'factory.create',
       'factory.attach',

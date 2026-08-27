@@ -324,6 +324,289 @@ function OnClearRoutes(p_ID, p_Message)
     return true, {cleared = true}
 end
 
+-- STOCK THE FLEET CAN ACTUALLY SEE.
+--
+-- Everything here counts items by walking peripherals -- peripheral.getNames() over the wired
+-- network. That network does not exist and cannot be made to exist by this fleet: a wired modem
+-- only attaches the chest beside it when somebody RIGHT-CLICKS it, and setblock can create the
+-- block but not the attachment. Every modem in the bay reads peripheral=false.
+--
+-- So stock reported 0 kinds, 0 items, 0 chests while those chests physically held coal, copper,
+-- iron and zinc, and the blindness propagated all the way up: with stock at zero every supply rule
+-- evaluates as "short", so the fleet gathers raw ore for ever and can never conclude it has enough
+-- of anything to smelt, craft or build. That is the whole reason nothing has ever been built.
+--
+-- The drones already know what they put in the chest -- Deposit() walks its own inventory to drop
+-- it -- and that knowledge was being thrown away. Reporting it gives a real ledger with no
+-- peripheral access whatsoever. If the wired network is ever formed, the peripheral scan is
+-- authoritative again and this becomes a fallback; until then it is the only truth available.
+local function ledger()
+    if DATA["ledger"] == nil then DATA["ledger"] = {} end
+    return DATA["ledger"]
+end
+
+local function ledgerAdd(p_Name, p_Count)
+    if type(p_Name) ~= "string" or type(p_Count) ~= "number" then return end
+    local L = ledger()
+    L[p_Name] = math.max(0, (L[p_Name] or 0) + p_Count)
+    if L[p_Name] == 0 then L[p_Name] = nil end
+end
+
+-- Drones report both directions: what they dropped, and what they took back out for fuel.
+-- Counting only deposits would make the ledger drift upward for ever, which is a different lie.
+-- WHERE, NOT JUST HOW MUCH.
+--
+-- The ledger counted totals and threw the location away, so "we have 22 oak_log" could not answer
+-- "which chest". With deposits spread across the bay so drones stop jamming on one block, that is
+-- the question that actually matters: the crafter stood on its own assigned chest asking for wood
+-- that was two chests along, and reported "storage would not hand over ingredients" for hours.
+--
+-- The drone already knows where it put things -- it is standing on the chest. Recording that turns
+-- a search of the bay into a lookup.
+local function whereAdd(p_Name, p_Pos)
+    if type(p_Name) ~= "string" or type(p_Pos) ~= "table" or p_Pos.x == nil then return end
+    if DATA["where"] == nil then DATA["where"] = {} end
+    DATA["where"][p_Name] = {x = p_Pos.x, y = p_Pos.y, z = p_Pos.z}
+end
+
+function OnDeposited(p_ID, p_Message)
+    local d = p_Message.data or {}
+    local s_N = 0
+    for name, count in pairs(d.items or {}) do
+        ledgerAdd(name, tonumber(count) or 0)
+        if d.at then whereAdd(name, d.at) end
+        s_N = s_N + (tonumber(count) or 0)
+    end
+    if s_N ~= 0 then PowNet.MarkDirty() end
+    return true, {counted = s_N}
+end
+
+-- Which chest was the last to receive this. Substring match, so "oak_log" finds
+-- "minecraft:oak_log" and "_log" finds whichever wood was put down most recently.
+-- OBSERVED CONTENTS OF ONE CHEST, REPLACING WHATEVER WE BELIEVED ABOUT IT.
+--
+-- The ledger added up reported deltas, which drifts the moment one report is missed -- and one was,
+-- immediately: 22 logs withdrawn, the craft failed, they were put back unreported, and stock showed
+-- zero while the chest held 22. Deltas cannot self-correct; a reading can.
+--
+-- Drones can read a chest they are standing on, so this is ground truth. Keyed by position, so a
+-- fleet spread across four chests builds a real per-chest picture rather than one blurred total.
+function OnChestContents(p_ID, p_Message)
+    local d = p_Message.data or {}
+    if type(d.at) ~= "table" or d.at.x == nil then return false, "no position" end
+    if type(d.items) ~= "table" then return false, "no contents" end
+
+    if DATA["chestAt"] == nil then DATA["chestAt"] = {} end
+    local s_Key = ("%d:%d:%d"):format(d.at.x, d.at.y, d.at.z)
+
+    -- BIND THE POSITION TO THE NETWORK NAME, BY MATCHING WHAT IS INSIDE.
+    --
+    -- A wired peripheral has a name and no coordinates; a drone has coordinates and no name. So
+    -- StorageMan could see seven chests on the network and only send drones to the four somebody
+    -- had registered by hand -- two of which were full, while chest_3 and chest_4 sat with 54 free
+    -- slots each and no way to route anything to them. Drones went idle holding cargo they could
+    -- not deposit, and the fetch sweep searched 2 chests out of 7 and reported the wood missing.
+    --
+    -- The drone is standing ON the chest and has just read it. Whichever networked inventory holds
+    -- exactly that is the same chest -- so the two halves identify each other, and the mapping
+    -- builds itself as drones go about their work. No registration step to forget.
+    local function sameContents(p_List, p_Items)
+        local a = {}
+        for _, it in pairs(p_List or {}) do
+            if it and it.name then a[it.name] = (a[it.name] or 0) + (it.count or 0) end
+        end
+        local n1, n2 = 0, 0
+        for k, v in pairs(a) do n1 = n1 + 1 if (p_Items[k] or 0) ~= v then return false end end
+        for _ in pairs(p_Items) do n2 = n2 + 1 end
+        return n1 == n2
+    end
+    if DATA["chestName"] == nil then DATA["chestName"] = {} end
+    if DATA["chestName"][s_Key] == nil then
+        for _, name in ipairs(peripheral.getNames()) do
+            local ok, inv = pcall(peripheral.wrap, name)
+            if ok and inv and inv.list then
+                local ok2, l = pcall(inv.list)
+                if ok2 and sameContents(l, d.items) then
+                    DATA["chestName"][s_Key] = name
+                    -- Register it as a deposit point too, if nobody had.
+                    local known = false
+                    for _, dep in ipairs(DATA["deposits"] or {}) do
+                        if dep.pos and dep.pos.x == d.at.x and dep.pos.y == d.at.y
+                           and dep.pos.z == d.at.z then known = true dep.peripheral = name break end
+                    end
+                    if not known then
+                        DATA["deposits"][#DATA["deposits"] + 1] = {pos = d.at, peripheral = name}
+                        Log(("learned chest %s at %d,%d,%d"):format(name, d.at.x, d.at.y, d.at.z))
+                    end
+                    break
+                end
+            end
+        end
+    end
+    local s_N = 0
+    for _, c in pairs(d.items) do s_N = s_N + (tonumber(c) or 0) end
+    DATA["chestAt"][s_Key] = {pos = d.at, items = d.items, at = os.epoch("utc"),
+                              used = tonumber(d.used), size = tonumber(d.size)}
+    PowNet.MarkDirty()
+    return true, {recorded = s_Key, kinds = (function() local n=0 for _ in pairs(d.items) do n=n+1 end return n end)(), items = s_N}
+end
+
+-- MOVE A DEEP STACK WITHIN ITS CHEST SO A TURTLE CAN ACTUALLY REACH IT.
+--
+-- A turtle takes from a chest with suckDown, which only ever hands over the chest's FIRST occupied
+-- slot. Reaching slot N therefore means pulling N-1 stacks out first -- and a turtle has SIXTEEN
+-- slots. Anything past slot 16 of a 27-slot chest is unreachable no matter how many times it tries:
+-- the crafter found its oak logs in slot 20, pulled sixteen stacks of cobblestone, ran out of room,
+-- put it all back and reported "nothing available for: minecraft:oak_log". Then did it again, in
+-- every chest, for ever. From outside it looks like a drone wandering the bay doing nothing.
+--
+-- StorageMan can do what the turtle cannot, now that the modems are attached: address the chest
+-- over the wired network and rearrange it. One pushItems into a low slot turns an unreachable stack
+-- into the first thing suckDown hands over.
+function OnBringToFront(p_ID, p_Message)
+    local d = p_Message.data or {}
+    local s_Match = tostring(d.match or "")
+    if #s_Match < 2 then return false, "need something to look for" end
+    Rescan()
+
+    -- SEARCH THE NETWORK, NOT THE REGISTRY.
+    --
+    -- This walked DATA["deposits"] and wrapped dep.peripheral -- and those entries were written when
+    -- the modems were unattached, so their peripheral field is nil and the loop matched nothing. It
+    -- answered "no chest holds: minecraft:oak_log" to a turtle that was standing on the chest and
+    -- had just read the logs out of slot 20 itself. The network is the authority on what exists;
+    -- the registry only records where a drone should fly to.
+    local s_Names = {}
+    for _, name in ipairs(peripheral.getNames()) do
+        local ok, t = pcall(peripheral.getType, name)
+        if ok and t and (t == "minecraft:chest" or tostring(t):find("chest", 1, true)
+                         or tostring(t):find("barrel", 1, true)) then
+            s_Names[#s_Names + 1] = name
+        end
+    end
+    -- Position for the reply, when we know it: the drone needs somewhere to fly to.
+    local function posOf(p_Name)
+        for _, dep in ipairs(DATA["deposits"] or {}) do
+            if dep.peripheral == p_Name then return dep.pos end
+        end
+        return nil
+    end
+
+    for _, s_PName in ipairs(s_Names) do
+        do
+            local dep = {peripheral = s_PName, pos = posOf(s_PName)}
+            local ok, inv = pcall(peripheral.wrap, dep.peripheral)
+            if ok and inv and inv.list then
+                local ok2, l = pcall(inv.list)
+                if ok2 and type(l) == "table" then
+                    local s_Slot, s_Name
+                    for slot, it in pairs(l) do
+                        if it and it.name and it.name:find(s_Match, 1, true) then
+                            s_Slot, s_Name = slot, it.name break
+                        end
+                    end
+                    if s_Slot then
+                        -- Already within reach of sixteen sucks: nothing to do.
+                        if s_Slot <= 16 then
+                            return true, {pos = dep.pos, slot = s_Slot, item = s_Name, moved = false}
+                        end
+                        -- Find a free low slot to bring it to.
+                        local s_Free
+                        for i = 1, 16 do if l[i] == nil then s_Free = i break end end
+                        if s_Free == nil then
+                            -- Every low slot is occupied: shove one to the back to make room.
+                            local s_Tail
+                            local s_Size = (inv.size and select(2, pcall(inv.size))) or 27
+                            for i = 17, (tonumber(s_Size) or 27) do if l[i] == nil then s_Tail = i break end end
+                            if s_Tail then
+                                pcall(inv.pushItems, dep.peripheral, 1, 64, s_Tail)
+                                s_Free = 1
+                            end
+                        end
+
+                        -- A FULL CHEST IS NOT A DEAD END -- THERE ARE OTHER CHESTS.
+                        --
+                        -- With 27 of 27 slots occupied there is nowhere to shuffle WITHIN the chest,
+                        -- and this gave up: "chest is full -- nowhere to move it", leaving the logs
+                        -- permanently unreachable in slot 20 and the crafter circling the bay. But
+                        -- pushItems moves between inventories, which is the whole point of the wired
+                        -- network -- so send the stack somewhere with room and point the drone there.
+                        if s_Free == nil then
+                            for _, other in ipairs(s_Names) do
+                                if other ~= dep.peripheral then
+                                    local ok4, oinv = pcall(peripheral.wrap, other)
+                                    if ok4 and oinv and oinv.list then
+                                        local ok5, ol = pcall(oinv.list)
+                                        local osize = 27
+                                        if oinv.size then local o6, sz = pcall(oinv.size) if o6 then osize = tonumber(sz) or 27 end end
+                                        local ofree
+                                        if ok5 and type(ol) == "table" then
+                                            for i = 1, math.min(16, osize) do if ol[i] == nil then ofree = i break end end
+                                        end
+                                        if ofree then
+                                            local ok7, movedN = pcall(inv.pushItems, other, s_Slot, 64, ofree)
+                                            if ok7 and (tonumber(movedN) or 0) > 0 then
+                                                Log(("brought %s forward into %s slot %d (from a full chest)")
+                                                    :format(tostring(s_Name), other, ofree))
+                                                return true, {pos = posOf(other), slot = ofree,
+                                                              item = s_Name, moved = true,
+                                                              from = s_Slot, chest = other}
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                            return false, "every chest is full -- cannot surface " .. tostring(s_Name)
+                        end
+                        local ok3, moved = pcall(inv.pushItems, dep.peripheral, s_Slot, 64, s_Free)
+                        if not ok3 or (tonumber(moved) or 0) == 0 then
+                            return false, ("could not move %s from slot %d"):format(tostring(s_Name), s_Slot)
+                        end
+                        return true, {pos = dep.pos, slot = s_Free, item = s_Name,
+                                      moved = true, from = s_Slot}
+                    end
+                end
+            end
+        end
+    end
+    return false, "no chest holds: " .. s_Match
+end
+
+function OnWhereIs(p_ID, p_Message)
+    local d = p_Message.data or {}
+    local s_Match = tostring(d.match or "")
+    if #s_Match < 2 then return false, "need something to look for" end
+    -- Observed chests first: a reading beats a running total that may have missed an event.
+    for _, c in pairs(DATA["chestAt"] or {}) do
+        for name, count in pairs(c.items or {}) do
+            if (tonumber(count) or 0) > 0 and name:find(s_Match, 1, true) then
+                return true, {pos = c.pos, item = name, count = count, source = "observed"}
+            end
+        end
+    end
+    local L = ledger()
+    for name, pos in pairs(DATA["where"] or {}) do
+        if name:find(s_Match, 1, true) and (L[name] or 0) > 0 then
+            return true, {pos = pos, item = name, count = L[name], source = "ledger"}
+        end
+    end
+    return false, "not recorded anywhere: " .. s_Match
+end
+
+function OnWithdrawn(p_ID, p_Message)
+    local d = p_Message.data or {}
+    local s_N = 0
+    for name, count in pairs(d.items or {}) do
+        ledgerAdd(name, -(tonumber(count) or 0))
+        -- Emptied: forget where it was, or the next lookup sends a drone to a chest that no longer
+        -- has any -- which is exactly the wasted trip this index exists to prevent.
+        if DATA["where"] and (ledger()[name] or 0) <= 0 then DATA["where"][name] = nil end
+        s_N = s_N + (tonumber(count) or 0)
+    end
+    if s_N ~= 0 then PowNet.MarkDirty() end
+    return true, {counted = s_N}
+end
+
 function OnStock(p_ID, p_Message)
     Rescan()
     local s_Kinds, s_Items, s_Slots = 0, 0, 0
@@ -344,23 +627,126 @@ function OnStock(p_ID, p_Message)
     for _, name in ipairs(m_Chests) do
         s_Chests[#s_Chests + 1] = {name = name, free = m_Free[name]}
     end
-    return true, {chests = s_Chests, message = string.format("%d kinds, %d items, %d chests, %d free slots, %d furnaces",
-        s_Kinds, s_Items, #m_Chests, s_Slots, #m_Furnaces),
+
+    -- No chest is visible as a peripheral, so fall back to what the drones say they delivered.
+    -- Flagged as `source`, because a ledger and a census are different kinds of answer and a
+    -- planner should be able to tell which one it is holding.
+    local s_Source = "peripherals"
+    if #m_Chests == 0 then
+        s_Source = "ledger"
+        s_Kinds, s_Items, s_Detail = 0, 0, {}
+        for name, count in pairs(ledger()) do
+            s_Kinds = s_Kinds + 1
+            s_Items = s_Items + count
+            s_Detail[#s_Detail + 1] = {name = name, count = count}
+        end
+        table.sort(s_Detail, function(a, b) return a.count > b.count end)
+    end
+
+    return true, {chests = s_Chests, source = s_Source,
+        message = string.format("%d kinds, %d items, %d chests, %d free slots, %d furnaces (%s)",
+        s_Kinds, s_Items, #m_Chests, s_Slots, #m_Furnaces, s_Source),
         kinds = s_Kinds, items = s_Items, free = s_Slots, detail = s_Detail}
 end
 
 -- Where a full drone should fly to unload. Deposit points are physical positions a drone can
 -- reach and drop into; the network name alone is no use to something that has to fly there.
+-- SPREAD THE FLEET ACROSS THE BAY INSTEAD OF QUEUEING IT ON ONE BLOCK.
+--
+-- This always returned the FIRST deposit point, so every drone in the fleet was sent to the same
+-- single square of ground. Turtles are solid to each other, so they do not queue -- they jam: D4
+-- parked on the spot, D3 hovered directly above it grinding at a drone it is forbidden to dig,
+-- D7 shuffled beside them, and all three reported themselves busy while nothing moved. With five
+-- drones and one access point that is not an edge case, it is the normal state.
+--
+-- The bay has four chests. Handing each drone a different one costs nothing and removes the
+-- contention entirely -- and asking drones to be polite about a shared block would have been a
+-- much worse answer than simply not sharing it.
+--
+-- Keyed on the asker so a given drone keeps going to the same chest: stable is easier to reason
+-- about than round-robin, and it keeps each drone's route short and predictable.
+-- EVERY drop-off point, for a drone that needs to FIND something.
+--
+-- DepositPoint hands each drone its own chest so they stop jamming on one block -- correct for
+-- putting things down, wrong for picking them up. Nothing indexes which chest holds what (there is
+-- no peripheral network here), so a drone looking for logs has to be able to walk the bay: keyed to
+-- chest 4 of 4, the crafter stood on an empty chest asking for wood that was two chests along, and
+-- reported "storage would not hand over ingredients" for hours.
+function OnDepositPoints(p_ID, p_Message)
+    Rescan()
+    local s_Out = {}
+    for _, d in ipairs(DATA["deposits"] or {}) do
+        -- Ship the last OBSERVED contents alongside each point, so a drone sweeping for an item can
+        -- skip the chests already known not to hold it. Without this the sweep is a blind tour of
+        -- the whole bay every time -- which, with four other drones in the way and a crafter that
+        -- has no pickaxe to clear its own route, took longer than the craft it was serving.
+        local seen = nil
+        if d.pos and DATA["chestAt"] then
+            local rec = DATA["chestAt"][("%d:%d:%d"):format(d.pos.x, d.pos.y, d.pos.z)]
+            if rec then seen = rec.items end
+        end
+        s_Out[#s_Out + 1] = {pos = d.pos, peripheral = d.peripheral,
+                             free = m_Free[d.peripheral], items = seen}
+    end
+    if #s_Out == 0 then return false, "no deposit points configured" end
+    return true, {points = s_Out, count = #s_Out}
+end
+
 function OnDepositPoint(p_ID, p_Message)
     Rescan()
+    local s_Usable = {}
     for _, d in ipairs(DATA["deposits"]) do
         local f = m_Free[d.peripheral]
-        if f == nil or f > 0 then
-            return true, {pos = d.pos, peripheral = d.peripheral, free = f,
-                          message = "drop at " .. d.pos.x .. "," .. d.pos.y .. "," .. d.pos.z}
+        if f == nil or f > 0 then s_Usable[#s_Usable + 1] = d end
+    end
+    if #s_Usable == 0 then
+        return false, "no deposit point with free space -- add one with: p StorageMan deposit -pos x y z"
+    end
+
+    -- SEND THEM TO THE EMPTIEST CHEST, NOT TO A FIXED ONE PER DRONE.
+    --
+    -- Spreading by drone id looks like load balancing and is not: the id never changes, so each
+    -- drone returns to the SAME chest for its entire life regardless of what is in it. D7 was posted
+    -- to -476 permanently -- the fullest chest in the bay at 25 of 27 slots, and the one the crafter
+    -- was camped on -- while -474 sat completely empty two blocks away. Every one of its deposits
+    -- queued for the single busiest square in the settlement, and its gathers failed behind them.
+    --
+    -- Observed contents make the honest choice available: fewest items wins. It self-balances,
+    -- it keeps drones off each other's squares, and it degrades to the old behaviour for any chest
+    -- nobody has looked in yet.
+    -- Rank on FREE SLOTS, and never offer a chest with none.
+    --
+    -- Ranking on the item total sent drones to chests that were slot-full but light, where they
+    -- could not unload at all -- and a miner that cannot unload cannot gather either, so its task
+    -- failed on arrival every time. m_Free is authoritative when the peripheral is known; the
+    -- observed slot count covers the chests whose deposit entries predate the modems working and
+    -- therefore have no peripheral name at all.
+    local function freeOf(d)
+        if d.peripheral and m_Free[d.peripheral] ~= nil then return m_Free[d.peripheral] end
+        if d.pos == nil or DATA["chestAt"] == nil then return nil end
+        local rec = DATA["chestAt"][("%d:%d:%d"):format(d.pos.x, d.pos.y, d.pos.z)]
+        if rec == nil or rec.used == nil then return nil end
+        return math.max(0, (tonumber(rec.size) or 27) - tonumber(rec.used))
+    end
+    local s_Pick, s_Best = nil, nil
+    for _, d in ipairs(s_Usable) do
+        local f = freeOf(d)
+        if f ~= nil and f > 0 and (s_Best == nil or f > s_Best) then s_Pick, s_Best = d, f end
+    end
+    -- Nothing with known free space: fall back to a point of unknown fullness rather than refuse,
+    -- but skip the ones we KNOW are full.
+    if s_Pick == nil then
+        for _, d in ipairs(s_Usable) do
+            if freeOf(d) == nil then s_Pick = d break end
         end
     end
-    return false, "no deposit point with free space -- add one with: p StorageMan deposit -pos x y z"
+    -- Nothing observed yet: fall back to the id spread, which is at least deterministic.
+    if s_Pick == nil then
+        s_Pick = s_Usable[(math.abs(tonumber(p_ID) or 0) % #s_Usable) + 1]
+    end
+    return true, {pos = s_Pick.pos, peripheral = s_Pick.peripheral,
+                  free = m_Free[s_Pick.peripheral], points = #s_Usable,
+                  message = "drop at " .. s_Pick.pos.x .. "," .. s_Pick.pos.y .. "," .. s_Pick.pos.z}
 end
 
 function OnAddDeposit(p_ID, p_Message)
@@ -506,7 +892,13 @@ local m_DroneEvents = {}
 local m_ServerEvents = {
     FindItem     = { func = OnFind },
     DepositPoint = { func = OnDepositPoint },
+    DepositPoints = { func = OnDepositPoints },
     GetStock     = { func = OnStock },
+    Deposited    = { func = OnDeposited },
+    ChestContents = { func = OnChestContents },
+    WhereIs      = { func = OnWhereIs },
+    BringToFront = { func = OnBringToFront },
+    Withdrawn    = { func = OnWithdrawn },
     -- The other direction. Storage was deposit-only, which blocked every job that needs inputs.
     Provide      = { func = OnProvide },
     AddRoute     = { func = OnAddRoute },

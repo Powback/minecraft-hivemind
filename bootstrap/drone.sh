@@ -33,7 +33,14 @@ state() { rc "computercraft dump" | grep -E "^#$1 " | awk -F'|' '{gsub(/ /,"",$2
 
 case $ROLE in
   miner|loader)  TOOL='{id:"minecraft:diamond_pickaxe"}' ;;
-  crafter)       TOOL='{id:"computercraft:crafting_table"}' ;;
+  # minecraft:, NOT computercraft: -- the same trap the header warns about, which this line then
+  # walked straight into. Verified against the mod's own recipe tree:
+  #   data/computercraft/recipe/turtle_normal/minecraft/crafting_table.json
+  # Given the wrong namespace the upgrade is dropped SILENTLY: the turtle places, reports success,
+  # comes up with no crafting table, and registers itself as a miner because Role() decides from
+  # turtle.craft being nil. The fleet then has no crafter, every craft task stays unassigned, and
+  # every build waits behind it for ever -- which is exactly why nothing has ever been built.
+  crafter)       TOOL='{id:"minecraft:crafting_table"}' ;;
   scout)         TOOL='{id:"advancedperipherals:geoscanner_turtle"}' ;;
   *) echo "unknown role $ROLE"; exit 1 ;;
 esac

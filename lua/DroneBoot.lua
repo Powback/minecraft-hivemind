@@ -14,17 +14,40 @@ turtle.refuel(64)
 -- Wait for MainFrame rather than spinning on Connect. The blind retry loop hammered rednet with
 -- lookups during every fleet reload -- visible on the wire as a flood of dns traffic -- and gave
 -- no indication whether it was making progress or would never succeed.
+-- A DRONE MUST BE ABLE TO COME HOME WITHOUT THE NETWORK.
+--
+-- This waited for MainFrame and then span on Connect for ever. Out of modem range that never
+-- succeeds -- and the code that walks a stray drone back into range lives in DroneLogic, which this
+-- loop never reaches. So a drone that drifted outside the settlement was permanently lost the
+-- moment it rebooted: it could not phone home, therefore it never ran, therefore it never moved
+-- back into somewhere it could phone home from. D1 was found 56 blocks outside the region with
+-- 2,219 fuel, perfectly healthy, and no way to use any of it.
+--
+-- After a bounded wait, boot anyway on the local copy. Everything downstream already copes: pgps
+-- knows the region, refixLoop walks an out-of-bounds drone back toward it, and the moment it is in
+-- range again the normal update and registration happen on the next cycle. Running yesterday's code
+-- is a small risk; being unreachable for ever is not a risk, it is the loss of the drone.
 PowNet.WaitForService("MAINFRAME", 120)
 s_Connected, DATA = PowNet.Connect("Drone")
-while not s_Connected do
+local s_Tries = 0
+while not s_Connected and s_Tries < 10 do
     os.sleep(3)
+    s_Tries = s_Tries + 1
     s_Connected, DATA = PowNet.Connect("Drone")
 end
+if not s_Connected then
+    printError("No MainFrame -- booting on the local copy to walk back into range")
+    local h = fs.open("/offline-boot.txt", "w")
+    if h then h.write("booted without MainFrame; running local DroneLogic to return to the region\n") h.close() end
+end
 
-PowNet.UpdateModule("PowNet")
-PowNet.UpdateModule('DroneBoot.lua', '/startup')
-PowNet.UpdateModule('DroneLogic.lua', '/DroneLogic.lua')
-PowNet.UpdateModule('pgps.lua', '/pgps')
+-- Only when there is somebody to update FROM. Offline these are pointless and can block.
+if s_Connected then
+    PowNet.UpdateModule("PowNet")
+    PowNet.UpdateModule('DroneBoot.lua', '/startup')
+    PowNet.UpdateModule('DroneLogic.lua', '/DroneLogic.lua')
+    PowNet.UpdateModule('pgps.lua', '/pgps')
+end
 
 -- RECORD WHY IT STOPPED, AND MAKE THE NEXT RUN SAY SO.
 --

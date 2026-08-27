@@ -382,8 +382,9 @@ local function writeLines(p_Name, p_Header, p_Rows)
             s_File.write(table.concat(s_Buf, "\n") .. "\n")
             s_Buf = {}
             -- Same reason as the read side: a large write must let the module breathe, or CC
-            -- terminates it mid-save and leaves a staging file behind.
-            os.sleep(0)
+            -- terminates it mid-save and leaves a staging file behind. queueEvent rather than
+            -- os.sleep(0), which costs a full game tick per 512 lines and does no work in it.
+            os.queueEvent("save") os.pullEvent("save")
         end
     end
 
@@ -475,7 +476,7 @@ function load()
                     local s_Row = 0
                     for k, occ, nid in s_Rows:gmatch("([^\n=]+)=([^,\n]+),(%d+)") do
                         s_Row = s_Row + 1
-                        if s_Row % 500 == 0 then os.sleep(0) end
+                        if s_Row % 500 == 0 then os.queueEvent("walk") os.pullEvent("walk") end
                         cachedWorld[k] = tonumber(occ)
                         local id = tonumber(nid)
                         if id and id > 0 and m_Names[id] then
@@ -486,8 +487,9 @@ function load()
                 end
             end
             -- One yield per file rather than per row: 70 yields instead of 455, and the work
-            -- between them is now bounded by one file rather than unbounded.
-            os.sleep(0)
+            -- between them is now bounded by one file rather than unbounded. queueEvent rather
+            -- than os.sleep(0) -- 70 ticks of waiting was three and a half seconds of the boot.
+            os.queueEvent("load") os.pullEvent("load")
           end
         end
         say("load: parsed " .. s_Cells .. " cells")
@@ -542,7 +544,7 @@ function save()
     local s_Seen2 = 0
     for k in pairs(cachedWorld) do
         s_Seen2 = s_Seen2 + 1
-        if s_Seen2 % 5000 == 0 then os.sleep(0) end
+        if s_Seen2 % 5000 == 0 then os.queueEvent("walk") os.pullEvent("walk") end
         local c = chunkOfKey(k)
         if c and m_Dirty[c] then
             local b = s_Buckets[c]
@@ -817,6 +819,7 @@ function SetDronePos(idx, y, z)
         idx = x..":"..y..":"..z
     end
     d = d or 0
+    if cachedWorld[idx] == nil then noteWorldKey(idx) end
     cachedWorld[idx] = 2
     return true
 end
@@ -990,11 +993,34 @@ end
 -- every drone passes through, so a drone running an old copy -- or a future one with a new way of
 -- being wrong -- cannot poison the map. A key that will not parse is dropped rather than stored,
 -- because an unparseable key is not a cell, it is a cell nobody can ever look up again.
+-- NO PATTERN ENGINE HERE EITHER. This is the hottest key parse in the system: it runs once per
+-- uploaded CELL, in both merge paths, for every observation every drone sends -- seventeen drones
+-- reporting continuously. The anchored float pattern was doing real work per cell to answer a
+-- question two plain finds answer for nothing.
+--
+-- The fast path also skips the rebuild entirely when the key is already integral, which is the
+-- overwhelmingly common case: drones send integer cells, and only the rare fractional one (a fix
+-- that arrived mid-move) needs flooring and reassembly. That turns most calls into two finds, three
+-- tonumbers and a return of the ORIGINAL string -- no allocation at all.
 local function cellKey(p_Key)
     if type(p_Key) ~= "string" then return nil end
-    local x, y, z = p_Key:match("^(-?%d+%.?%d*):(-?%d+%.?%d*):(-?%d+%.?%d*)$")
-    if x == nil then return nil end
-    return math.floor(tonumber(x)) .. ":" .. math.floor(tonumber(y)) .. ":" .. math.floor(tonumber(z))
+    local a = string.find(p_Key, ":", 1, true)
+    if a == nil then return nil end
+    local b = string.find(p_Key, ":", a + 1, true)
+    if b == nil then return nil end
+    local x = tonumber(string.sub(p_Key, 1, a - 1))
+    local y = tonumber(string.sub(p_Key, a + 1, b - 1))
+    local z = tonumber(string.sub(p_Key, b + 1))
+    if x == nil or y == nil or z == nil then return nil end
+    local fx, fy, fz = math.floor(x), math.floor(y), math.floor(z)
+    -- REUSE THE STRING ONLY IF IT IS ALREADY CANONICAL AS TEXT, not merely integral as a number.
+    -- "-478.0:64.0:78.0" is integral and would have been returned unchanged, filing that cell under
+    -- a second key that no lookup for "-478:64:78" will ever find. This function exists precisely to
+    -- stop that, so the fast path has to check the TEXT -- a single plain find for a dot.
+    if fx == x and fy == y and fz == z and string.find(p_Key, ".", 1, true) == nil then
+        return p_Key
+    end
+    return fx .. ":" .. fy .. ":" .. fz
 end
 
 local function mergeCachedWorldDetail(newData, p_ID)
@@ -1021,10 +1047,78 @@ local function mergeCachedWorldDetail(newData, p_ID)
     end
 end
 
+-- Bumped whenever the SET of known cells changes. Consumers that build an index over the whole map
+-- (MapServer's page-key list) use this to know when their index is stale, instead of rebuilding it
+-- every time somebody asks -- which was a full walk of 208,625 cells per map-page refresh and the
+-- single most expensive thing the module did.
+--
+-- Only additions and removals matter. Overwriting a cell's VALUE leaves the key set identical, so
+-- it deliberately does not bump: a drone re-reporting known ground must not invalidate anything.
+local m_WorldGen = 0
+function worldGeneration() return m_WorldGen end
+function bumpWorldGeneration() m_WorldGen = m_WorldGen + 1 end
+
+-- THE LIST OF CELL KEYS, MAINTAINED INCREMENTALLY INSTEAD OF REBUILT.
+--
+-- MapServer needs an ordered key list to page the map to the browser, and it built one by walking
+-- every cell. That walk was gated first on the world generation and then, when that proved useless,
+-- on a thirty-second timer -- but seventeen drones add cells continuously, so the generation is
+-- ALWAYS stale and the timer just meant the walk happened every thirty seconds instead of every
+-- refresh. The map has since grown to 324,000 cells, and the walk now takes longer than the gap
+-- between walks.
+--
+-- The result was not a slow map, it was NO PATHFINDING: 181 "pathfinder did not answer" across the
+-- fleet in one night, MapServer reported unreachable, and every drone's routing silently degraded
+-- to whatever it could manage without a route. The module was not overloaded by the fleet; it was
+-- overloaded by its own index.
+--
+-- Nothing here needs a walk. The only moment the list changes is when a key is FIRST seen, and
+-- mergeCachedWorld already tests exactly that to bump the generation. So append there, build once
+-- lazily, and the per-refresh cost becomes a table lookup.
+--
+-- Removals leave holes rather than shuffling a quarter-million-entry array: the pager already skips
+-- keys whose cell is gone, and the list is compacted when the holes get expensive.
+local m_KeyList  = nil
+local m_KeyHoles = 0
+
+function noteWorldKey(p_Key)
+    if m_KeyList ~= nil then m_KeyList[#m_KeyList + 1] = p_Key end
+end
+
+function forgetWorldKey()
+    if m_KeyList ~= nil then m_KeyHoles = m_KeyHoles + 1 end
+end
+
+function worldKeyList()
+    -- Rebuild only when there has never been a list, or when a quarter of it is holes -- at which
+    -- point the pager is walking past more dead keys than live ones and the walk pays for itself.
+    if m_KeyList == nil or (m_KeyHoles > 0 and m_KeyHoles * 4 > #m_KeyList) then
+        m_KeyList, m_KeyHoles = {}, 0
+        local s_Since = 0
+        for k in pairs(cachedWorld) do
+            m_KeyList[#m_KeyList + 1] = k
+            -- Yield periodically: CC kills a coroutine that runs 10s without yielding, uncatchably,
+            -- and this is the one place that still touches every cell.
+            s_Since = s_Since + 1
+            if s_Since >= 2000 then
+                s_Since = 0
+                os.queueEvent("worldKeys") os.pullEvent("worldKeys")
+            end
+        end
+    end
+    return m_KeyList
+end
+
 local function mergeCachedWorld(newData)
     for k,v in pairs(newData) do
         local s_K = cellKey(k)
-        if s_K then cachedWorld[s_K] = v MarkChunkDirty(s_K) end
+        if s_K then
+            if cachedWorld[s_K] == nil then
+                m_WorldGen = m_WorldGen + 1
+                noteWorldKey(s_K)
+            end
+            cachedWorld[s_K] = v MarkChunkDirty(s_K)
+        end
     end
 end
 
@@ -1057,6 +1151,7 @@ function ClearAged()
         if(isAged(v.lastUpdated.day, v.lastUpdated.time)) then
             print("cleared as too old")
             cachedWorld[k] = nil
+            forgetWorldKey()
             table.insert(s_Aged, k)
         end
     end
@@ -1129,8 +1224,46 @@ local ASTAR_WEIGHT = 1.35
 local ASTAR_MARGIN = 24
 local ASTAR_MAX_NODES = 20000
 
-function a_star(x1, y1, z1, x2, y2, z2, discover, priority)
+-- WHERE THE OTHER DRONES ARE, RIGHT NOW.
+--
+-- The pathfinder knew the terrain and nothing about the fleet, so it happily routed one drone
+-- straight through another -- which is not a wall, so nothing was ever recorded, so it planned the
+-- identical route again on the next attempt. That is the make-way dance: two drones facing each
+-- other, each following a path that says the other is not there. Recording drones as TERRAIN was
+-- tried and was worse (190 phantom blocks that outlived the drones and were routed around for ever).
+--
+-- The distinction that makes it work is TIME. A drone's position is true for seconds, not for ever,
+-- so it is held separately from the map with a timestamp and expires on its own. Planning around it
+-- is what the coordination was supposed to buy.
+local m_DroneAt = {}
+local DRONE_STALE = 15          -- seconds after which a reported position means nothing
+
+function noteDroneAt(p_Id, x, y, z)
+    if p_Id == nil or x == nil then return end
+    m_DroneAt[tostring(p_Id)] = {key = x..":"..y..":"..z, at = os.clock()}
+end
+
+-- The set of cells currently occupied by drones OTHER than the one asking.
+local function occupiedByOthers(p_Asker)
+    local out, now = {}, os.clock()
+    for id, rec in pairs(m_DroneAt) do
+        if id ~= tostring(p_Asker) and (now - rec.at) <= DRONE_STALE then
+            out[rec.key] = true
+        end
+    end
+    return out
+end
+
+-- Is this cell one a DIGGING drone may route through?
+--
+-- Solid is not the same as impassable. Stone is solid and cutting it is the job; a chest is solid
+-- and breaking it is forbidden. digTo used to be a separate greedy axis-walker that consulted no map
+-- at all, so it walked into the same protected blocks for ever no matter how many times the fleet
+-- recorded them. Making it a PASSABILITY MODE of the one pathfinder is the whole fix: one map, one
+-- search, and "we are not allowed through there" is a fact the router already has.
+function a_star(x1, y1, z1, x2, y2, z2, discover, priority, asker, dig)
     discover = discover or 1
+    local s_Busy = occupiedByOthers(asker)
     local idx_start = x1..":"..y1..":"..z1
     local idx_goal  = x2..":"..y2..":"..z2
     priority = priority or false
@@ -1163,7 +1296,23 @@ function a_star(x1, y1, z1, x2, y2, z2, discover, priority)
         s_Nodes = s_Nodes + 1
         -- Yield periodically. CC:T terminates a coroutine that runs too long without one, so an
         -- unyielding search is not slow -- it is killed, and the caller gets no answer at all.
-        if s_Nodes % 200 == 0 then os.sleep(0) end
+        --
+        -- BUT NOT WITH os.sleep(0). THAT IS NOT A FREE YIELD, IT IS A TICK.
+        --
+        -- os.sleep(0) is startTimer(0) plus a pullEvent, and a zero-delay timer does not fire until
+        -- the NEXT GAME TICK -- fifty milliseconds. Every 200 nodes, so a search that spends its
+        -- full 20,000-node budget costs a hundred sleeps: five seconds of wall clock, almost all of
+        -- it waiting rather than searching. MapServer answers one drone at a time, so with
+        -- seventeen drones asking that is a queue nobody reaches the front of, and the fleet logged
+        -- 54 "pathfinder did not answer" in two minutes while MapServer sat there idle-waiting.
+        --
+        -- queueEvent/pullEvent yields to the scheduler and resumes in the SAME tick, because the
+        -- event is already in the queue when we ask for it. The watchdog is satisfied -- it wants a
+        -- yield, not a delay -- and the search runs at the speed of the search. The same pair is
+        -- used for exactly this reason wherever this codebase walks a large structure.
+        if s_Nodes % 200 == 0 then
+            os.queueEvent("astar") os.pullEvent("astar")
+        end
         if s_Nodes > ASTAR_MAX_NODES then
             return false, ("gave up after %d nodes"):format(s_Nodes)
         end
@@ -1186,8 +1335,29 @@ function a_star(x1, y1, z1, x2, y2, z2, discover, priority)
                     local s_Cell = cachedWorld[idx_neighbor]
                     -- Free, unknown, or the goal itself. Unknown is PASSABLE and merely priced at
                     -- `discover` -- exploring is allowed, it is just not free.
+                    -- ...and not through a drone that is standing there. Skipped for the goal
+                    -- itself: "go to where that drone is" is a legitimate order (a handover, a
+                    -- rescue), and by the time we arrive it has usually moved.
+                    -- In dig mode a solid cell is passable if we are allowed to break what is in
+                    -- it. Everything else is unchanged, so a non-digging drone still routes only
+                    -- through air and no caller has to know which mode it is in.
+                    -- THE MAP CARRIES THE MEANING, SO NOTHING HERE NEEDS A LIST OF BLOCK NAMES.
+                    --
+                    -- 0 air, 1 solid, 2 a turtle, 3 solid AND FORBIDDEN -- something the fleet is not
+                    -- allowed to break. The drone is the only thing that knows which blocks are
+                    -- protected and it already refuses them; recording that refusal as its own value
+                    -- means the router simply reads it. The alternative was a third copy of the
+                    -- protected-names list living on the server, out of step with the other two the
+                    -- moment anybody edited one.
+                    --
+                    -- So: air is passable to everyone, ordinary solid is passable to a digger, and
+                    -- forbidden is passable to nobody, ever.
+                    local s_Passable = ((s_Cell or 0) == 0) or idx_neighbor == idx_goal
+                    if not s_Passable and dig and s_Cell == 1 then s_Passable = true end
+                    if s_Cell == 3 then s_Passable = false end
                     if (exclusions[idx_neighbor] == nil or priority)
-                       and (((s_Cell or 0) == 0) or idx_neighbor == idx_goal)
+                       and s_Passable
+                       and (s_Busy[idx_neighbor] == nil or idx_neighbor == idx_goal)
                        and not closedset[idx_neighbor] then
                         local s_Step = (s_Cell == nil) and discover or 1
                         if s_Cell == 2 then s_Step = s_Step - 1 end

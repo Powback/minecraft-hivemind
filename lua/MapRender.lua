@@ -89,7 +89,9 @@ function rebuild(world)
 
     for idx, v in pairs(world) do
         s_Seen = s_Seen + 1
-        if s_Seen % 2000 == 0 then os.sleep(0) end
+        -- queueEvent, not os.sleep(0): this runs on MapServer's computer, and a tick of waiting
+            -- here is a tick MapServer is not answering path requests in. See the A* loop.
+            if s_Seen % 2000 == 0 then os.queueEvent("render") os.pullEvent("render") end
         -- `%-` not `-`: a bare - is Lua's lazy quantifier, so "(-?%d+)" silently matches nothing
         -- for negative coordinates, which is most of this world.
         local sx, sy, sz = string.match(idx, "^(%-?%d+):(%-?%d+):(%-?%d+)$")

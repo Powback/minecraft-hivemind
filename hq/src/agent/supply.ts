@@ -262,6 +262,568 @@ async function callTool(name: string, args: unknown) {
 }
 
 /** One pass. Returns what it did, for the tool and the tests. */
+/**
+ * Total fleet fuel below which the supply loop dispatches nothing but coal.
+ *
+ * Three drones topping up to 2,500 each is 7,500, and the fleet burns roughly 120 fuel a minute
+ * working. 4,000 leaves well over half an hour of margin to find, cut and carry coal home before
+ * anything is actually at risk -- while being low enough that a healthy fleet still spends most of
+ * its time on the other materials.
+ */
+const FUEL_PRIORITY_BELOW = 4000;
+
+/**
+ * Everything one rule's dispatch is allowed to see and change.
+ *
+ * The three `*Free` flags are deliberately MUTABLE and shared: each role may take one job per tick,
+ * so a rule that dispatches a miner has to stop the next rule dispatching another one. They were
+ * plain `let`s in a 450-line function, which is exactly the kind of state that is invisible until
+ * it is wrong.
+ */
+export type SupplyCtx = {
+  now: number;
+  queued: Set<string>;
+  did: string[];
+  waiting: string[];
+  minerFree: boolean;
+  scoutFree: boolean;
+  crafterFree: boolean;
+  idleCrafter: unknown;
+  held: (m: string) => number;
+};
+
+/**
+ * Why this rule is not dispatched this tick, or null to go ahead. PURE -- no I/O, no mutation.
+ *
+ * Extracted because the fuel-priority test could not reach it. That test re-implemented this
+ * decision as a two-line copy and asserted against the copy, so it passed whatever supply.ts did:
+ * a test shaped exactly like the bug it was written for, checking a duplicate of the code instead
+ * of the code. It now imports this function.
+ */
+export function ruleSkipReason(
+  rule: SupplyRule,
+  gate: { fuelCritical: boolean; have: number; cooldownUntil: number; now: number },
+): { kind: 'fuel' | 'satisfied' | 'cooldown'; message?: string } | null {
+  // Coal, charcoal or anything else that burns; everything else waits until the fleet can move.
+  if (gate.fuelCritical && !/coal/.test(rule.match)) return { kind: 'fuel' };
+  if (gate.have >= rule.min) return { kind: 'satisfied' };
+  // Say when a cooldown is the reason. Skipping silently makes "waiting a few minutes" look exactly
+  // like "nothing to do", which is how idle drones and an empty log get read as a broken scheduler
+  // rather than a timer.
+  if (gate.cooldownUntil > gate.now) {
+    const secs = Math.ceil((gate.cooldownUntil - gate.now) / 1000);
+    return { kind: 'cooldown', message: `${rule.match} (${secs}s cooldown)` };
+  }
+  return null;
+}
+
+/**
+ * Go and LOOK. gather can only revisit coordinates the map already holds, so a material that has
+ * never been seen -- iron, at depth, below anything a surface scan can reach -- is unreachable by
+ * any amount of gathering. This is the job that changes that.
+ */
+async function dispatchMine(rule: SupplyRule, have: number, ctx: SupplyCtx): Promise<boolean> {
+  if (!ctx.minerFree) return false;
+  supply.cooldowns[rule.match] = ctx.now + COOLDOWN_MS;
+  const r: any = await callTool('order.prospect', { depth: rule.depth ?? 40 });
+  if (r?.ok === false) {
+    note(`${rule.match}: ${have}/${rule.min}, prospecting refused — ${r?.error ?? '?'}`);
+    return false;
+  }
+  ctx.minerFree = false;
+  supply.dispatched++;
+  supply.lastAction = `prospect for ${rule.match}`;
+  note(`${rule.match}: ${have}/${rule.min} → prospecting at y=${rule.depth ?? 40}`);
+  ctx.did.push(`prospect ${rule.match}`);
+  return true;
+}
+
+async function dispatchCraft(rule: SupplyRule, have: number, ctx: SupplyCtx): Promise<boolean> {
+  if ([...ctx.queued].some((n) => n.startsWith(`craft-${stockKey(rule).replace(/^.*:/, '')}`))) {
+    note(`${rule.match}: ${have}/${rule.min}, already being crafted`);
+    return false;
+  }
+  // Needs a crafter, not a miner. Nothing else can serve the job, so waiting for one is the correct
+  // behaviour rather than dispatching it at a drone that will refuse at the last step.
+  if (!ctx.idleCrafter) return false;               // no cooldown burned: retry when one frees up
+  supply.cooldowns[rule.match] = ctx.now + COOLDOWN_MS;
+  // The TARGET, not the deficit. expand() already subtracts what storage holds, so passing
+  // (target - have) subtracts the same stock twice: asking for "8 more chests" while holding 8
+  // planned to zero steps and the loop reported "nothing craftable" with a full chest.
+  const want = rule.limit ?? rule.min;
+  const r: any = await callTool('plan.execute', { item: stockKey(rule), quantity: want });
+  const steps = r?.data?.queued ?? r?.queued ?? [];
+  if (!steps.length) {
+    note(`${rule.match}: ${have}/${rule.min}, nothing craftable — ${JSON.stringify(r?.data?.unsourced ?? [])}`);
+    return false;
+  }
+  ctx.crafterFree = false;
+  supply.dispatched++;
+  supply.lastAction = `craft ${stockKey(rule)}`;
+  note(`${rule.match}: ${have}/${rule.min} → craft x${want} queued (${steps.length} steps)`);
+  ctx.did.push(`craft ${stockKey(rule)}`);
+  return true;
+}
+
+/**
+ * Dig it if we know where it is; prospect if we have never seen it; survey if neither.
+ *
+ * The order matters and the last two rungs are not interchangeable. gather can only revisit
+ * coordinates the map already holds, and a surface survey cannot reach ore at depth -- a scanner
+ * sees 8 blocks and iron is fifty below. A material that has NEVER been seen is a prospecting
+ * problem, not a gathering one. Without the prospect rung the loop fell straight through to "wait
+ * for a scout" and sat there with three idle miners and coal at 0/32.
+ */
+async function dispatchGather(rule: SupplyRule, have: number, ctx: SupplyCtx): Promise<boolean> {
+  // Ask for the dig first, but only if a miner could actually take it.
+  if (ctx.minerFree) {
+    const r: any = await callTool('order.gather', { match: rule.match, limit: rule.limit ?? 64 });
+    if (r?.ok !== false) {
+      supply.cooldowns[rule.match] = ctx.now + COOLDOWN_MS;
+      ctx.minerFree = false;
+      supply.dispatched++;
+      supply.lastAction = `gather ${rule.match}`;
+      note(`${rule.match}: ${have}/${rule.min} → gather dispatched`);
+      ctx.did.push(`gather ${rule.match}`);
+      return true;
+    }
+  }
+
+  if (ctx.minerFree && rule.depth !== undefined
+      && ![...ctx.queued].some((n) => n.startsWith('shaft-'))) {
+    supply.cooldowns[rule.match] = ctx.now + COOLDOWN_MS;
+    const p: any = await callTool('order.prospect', { depth: rule.depth });
+    if (p?.ok !== false) {
+      ctx.minerFree = false;
+      supply.dispatched++;
+      supply.lastAction = `prospect for ${rule.match}`;
+      note(`${rule.match}: ${have}/${rule.min}, none known -> prospecting at y=${rule.depth}`);
+      ctx.did.push(`prospect ${rule.match}`);
+      return true;
+    }
+    note(`${rule.match}: prospecting refused -- ${p?.error ?? '?'}`);
+  }
+
+  return dispatchSurvey(rule, have, ctx);
+}
+
+/** Last rung: nothing known and nothing to prospect for -- send a scout to look. */
+async function dispatchSurvey(rule: SupplyRule, have: number, ctx: SupplyCtx): Promise<boolean> {
+  // Say so rather than skipping in silence: "no scout free" and "nothing to do" are different
+  // states and looked identical in the log.
+  if (!ctx.scoutFree) {
+    ctx.waiting.push(`${rule.match} (no scout free)`);
+    return false;
+  }
+  supply.cooldowns[rule.match] = ctx.now + COOLDOWN_MS;
+  let area = frontier();
+  if (!area) {
+    // WRAP, don't stop. The spiral walking off the edge of the loaded region is not the same as the
+    // region being fully surveyed -- the cursor is a position, not a completion record, and a
+    // survey that failed still advanced it. Left as a dead end the loop simply stopped exploring
+    // for good, which is what happened here: the last prospecting run was two hours before anyone
+    // noticed.
+    supply.frontier = 0;
+    area = frontier();
+    if (!area) { note(`${rule.match}: no surveyable tile inside the loaded region`); return false; }
+    note('exploration frontier wrapped -- starting another pass from the base outward');
+  }
+  supply.frontier = (supply.frontier ?? 0) + 1;
+  await bridge.call('TaskMan', 'Add', {
+    name: `find-${rule.match}`,
+    priority: 3,
+    work: { survey: { kind: 'explore', radius: 8, min: area.min, max: area.max } },
+  }, { timeoutMs: 8000 });
+  ctx.scoutFree = false;
+  supply.dispatched++;
+  supply.lastAction = `survey for ${rule.match}`;
+  note(`${rule.match}: ${have}/${rule.min}, none known → survey tile ${supply.frontier} `
+     + `at ${area.min.x},${area.min.z}..${area.max.x},${area.max.z}`);
+  ctx.did.push(`survey for ${rule.match}`);
+  return true;
+}
+
+/** One rule, start to finish. Throwing is contained by the caller so one bad rule cannot end the tick. */
+async function dispatchRule(rule: SupplyRule, have: number, ctx: SupplyCtx): Promise<boolean> {
+  if (rule.action === 'mine') return dispatchMine(rule, have, ctx);
+  if (rule.action === 'craft') return dispatchCraft(rule, have, ctx);
+  if (rule.action !== 'gather') {
+    supply.cooldowns[rule.match] = ctx.now + COOLDOWN_MS;
+    note(`${rule.match}: ${have}/${rule.min} → ${rule.action} not yet automatable`);
+    return false;
+  }
+  return dispatchGather(rule, have, ctx);
+}
+
+/**
+ * Read the queue's FAILURES back into the planner.
+ *
+ * Returns a tick result when it re-planned something -- the re-plan IS the action, so the tick
+ * ends there -- or null to carry on with the rest of the pass.
+ */
+async function replanShortfalls(): Promise<{ acted: boolean; reason: string } | null> {
+// A SHORTFALL FOUND AT RUNTIME IS A PLANNING INPUT, NOT JUST A FAILURE.
+//
+// plan.execute builds the dependency chain ONCE, from the stock it can see at that moment. When a
+// craft later runs short -- because the intermediate got consumed, or the first pass only made a
+// partial batch -- nothing notices. craft-chest sat "failing: nothing available for oak_planks"
+// while sixteen oak logs sat in a chest and a crafter stood idle beside them: every fact needed to
+// fix it was known, and no loop connected them. That is the whole point of having a tree.
+//
+// So read the failures and re-plan what they are short of. plan.execute is idempotent-ish (it
+// queues nothing when stock already satisfies the goal) and dedupes by task name in TaskMan, so
+// re-running it costs nothing when the answer has not changed.
+try {
+  const tl: any = await bridge.call('TaskMan', 'GetTasks', {}, { timeoutMs: 5000 });
+  const tasks = luaList(tl?.tasks ?? tl?.data?.tasks ?? []) ?? [];
+  const shortOf = new Set<string>();
+  for (const t of tasks) {
+    const why = String((t as any)?.failure ?? '');
+    // "nothing available for: minecraft:oak_planks" / "short of minecraft:oak_log x8"
+    const m = why.match(/(?:nothing available for|short of)\s*:?\s*([a-z0-9_]+:[a-z0-9_]+)/i);
+    if (m) shortOf.add(m[1]);
+  }
+  for (const item of shortOf) {
+    try {
+      const r: any = await callTool('plan.execute', { item, quantity: 16 });
+      const rd = r?.data ?? r;
+      const queued = (rd?.queued ?? []).length;
+      if (queued > 0) {
+        supply.dispatched += queued;
+        note(`a task was short of ${item} -- re-planned it, ${queued} step(s) queued`);
+        return { acted: true, reason: `re-planned ${item} for a failing task` };
+      }
+    } catch { /* not craftable from what we have; the failure stands and is reported as such */ }
+  }
+} catch (err) {
+  note(`shortfall re-plan: ${(err as Error)?.message ?? err}`);
+}
+  return null;
+}
+
+/**
+ * Which materials already have a gather in flight.
+ *
+ * ONE LIVE GATHER PER MATERIAL. TaskMan's name dedup only looks at tasks still queued, so once a
+ * gather is ASSIGNED its name is free again -- and the top-up, running every sixty seconds,
+ * cheerfully queued another. Ten identical gather:oak_log tasks piled up, each claiming a drone for
+ * the same 192 candidates. That is worse than idling: the fleet looks fully occupied while several
+ * drones re-walk ground another drone has already cleared.
+ */
+function materialsBeingGathered(tasks: unknown[]): Set<string> {
+  const live = new Set<string>();
+  for (const t of tasks) {
+    const nm = String((t as any)?.name ?? '');
+    if (nm.startsWith('gather:') && ((t as any).progress ?? 0) < 100) {
+      live.add(nm.slice('gather:'.length));
+    }
+  }
+  return live;
+}
+
+/**
+ * Top the queue up to the idle-drone count, so no drone is idle purely for want of a task.
+ *
+ * Returns a tick result when it queued something -- topping up IS the action for this tick -- or
+ * null to carry on.
+ */
+async function topUpQueue(live: any[]): Promise<{ acted: boolean; reason: string } | null> {
+// KEEP THE QUEUE AS DEEP AS THE FLEET.
+//
+// Every task takes exactly one drone, so a queue shorter than the idle count leaves the remainder
+// standing still by arithmetic -- and this loop dispatched ONE thing per tick with cooldowns, which
+// cannot keep up with a fleet that just grew from five drones to fifteen. Ten miners sat idle in a
+// row, fighting each other for space, while the world was full of wood and ore nobody had been
+// told to fetch. Idle is not a resting state here: it means the settlement has stopped growing.
+//
+// So: count the idle, count the queue, and top up from what the map actually knows about. Nothing
+// speculative -- order.gather refuses anything unsurveyed and is region-filtered and nearest-first.
+try {
+  const idleCount = live.filter((d: any) => d.status === 'idle').length;
+  if (idleCount > 0) {
+    const tl: any = await bridge.call('TaskMan', 'GetTasks', {}, { timeoutMs: 5000 });
+    const tasks = luaList(tl?.tasks ?? tl?.data?.tasks ?? []) ?? [];
+    const open = tasks.filter((t: any) =>
+      t && t.state !== 'done' && t.state !== 'failed' && !t.assigned).length;
+    const wanted = idleCount - open;
+    if (wanted > 0) {
+      // Cycled, so one plentiful material cannot crowd out the rest of the economy.
+      const MATERIALS = ['oak_log', 'coal_ore', 'iron_ore', 'copper_ore',
+                         'zinc_ore', 'lapis_ore', 'sand', 'gravel'];
+
+      // ONE LIVE GATHER PER MATERIAL.
+      //
+      // TaskMan dedupes by name only against tasks still QUEUED, so once a gather is assigned the
+      // name is free again -- and this loop, running every sixty seconds, cheerfully queued
+      // another. Ten identical gather:oak_log tasks piled up, each one claiming a drone for the
+      // same 192 candidates, which is worse than idling: the fleet looks fully occupied while
+      // several drones re-walk ground another drone already cleared.
+      const liveFor = materialsBeingGathered(tasks);
+
+      let queued = 0;
+      for (const m of MATERIALS) {
+        if (queued >= wanted) break;
+        if (liveFor.has(m)) continue;          // already being worked; queuing another wastes a drone
+        try {
+          const g: any = await callTool('order.gather', { match: m, limit: 64 });
+          const gd = g?.data ?? g;
+          if (gd?.dispatched) {
+            queued++;
+            supply.dispatched++;
+            note(`${idleCount} drone(s) idle with ${open} unassigned task(s) -- queued gather:${m}`);
+          }
+        } catch { /* nothing surveyed for it; try the next material */ }
+      }
+      if (queued > 0) return { acted: true, reason: `topped up the queue with ${queued} gather(s)` };
+    }
+  }
+} catch (err) {
+  note(`queue top-up: ${(err as Error)?.message ?? err}`);
+}
+  return null;
+}
+
+/**
+ * A cave is the best possible place to send a scanner: the ore is already EXPOSED, so a single
+ * scan sees far more than the same scan in solid rock. world.caves had been finding them for a
+ * long time and absolutely nothing consumed the result.
+ */
+async function surveyCaves(ctx: SupplyCtx): Promise<void> {
+// EXPLORE THE CAVES. Nobody was.
+//
+// world.caves has found them for a long time -- open pockets with an entrance, complete with
+// their bounding boxes -- and absolutely nothing consumed that. Every cave survey so far was
+// dispatched by hand. Meanwhile the exploration spiral sent scouts to tile solid rock in a
+// fixed pattern, which is the least informative ground there is.
+//
+// A cave is the best possible place to send a scanner: the ore is already EXPOSED, so a single
+// scan sphere reads far more usable material than the same sphere buried in stone, and a miner
+// sent afterwards can reach it without cutting a shaft to get there.
+if (ctx.scoutFree) {
+  try {
+    const caves: any = await callTool('world.caves', { min: 8 });
+    const list = (caves?.data?.caves ?? []) as any[];
+    for (const c of list) {
+      if (!c?.min || !c?.max) continue;
+      // Pad outward: a scan centred inside an open pocket mostly reads air. The interesting
+      // part of a cave is the rock around it, which is where the exposed ore actually sits.
+      const box = {
+        min: { x: c.min.x - 4, y: Math.max(0, c.min.y - 4), z: c.min.z - 4 },
+        max: { x: c.max.x + 4, y: c.max.y + 4, z: c.max.z + 4 },
+      };
+      // PERCENT, NOT COVERAGE. `coverage` is a 0-1 fraction and this compares against 60, so
+      // the guard could never pass even at 100% mapped -- every cave re-dispatched a survey on
+      // every tick for ever. Same mistake at the scout-support guard below.
+      const q: any = await callTool('world.query', box);
+      if ((q?.data?.percent ?? 0) >= 60) continue;      // already read this one
+
+      await bridge.call('TaskMan', 'Add', {
+        name: `cave-${c.min.x},${c.min.y},${c.min.z}`,
+        priority: 2,
+        work: { survey: { kind: 'scout', radius: 8, min: box.min, max: box.max } },
+      }, { timeoutMs: 8000 });
+      ctx.scoutFree = false;
+      supply.dispatched++;
+      supply.lastAction = `cave survey at ${c.min.x},${c.min.y},${c.min.z}`;
+      note(`cave of ${c.size ?? '?'} cells at ${c.min.x},${c.min.y},${c.min.z} is `
+         + `${q?.data?.percent ?? 0}% mapped → scout dispatched`);
+      ctx.did.push('cave survey');
+      break;                                            // one per tick
+    }
+  } catch (err) {
+    note(`cave survey: ${(err as Error)?.message ?? err}`);
+  }
+}
+}
+
+/**
+ * Pair a scout with a miner that is digging blind.
+ *
+ * A geo scanner sees eight blocks THROUGH rock, so a scout standing over a working miner is worth
+ * more than one wandering the surface. This is the collaboration the fleet was supposed to have
+ * and never did -- pairing existed only inside order.prospect.
+ */
+async function scoutForMiners(ctx: SupplyCtx): Promise<void> {
+// SEND A SCOUT TO WHERE THE MINERS ARE DIGGING BLIND.
+//
+// This is the collaboration the fleet was supposed to have and never did. Pairing existed only
+// inside order.prospect -- a shaft task with a scan task depending on it -- so a miner working
+// anywhere else dug through rock nobody had ever scanned while idle scouts were dispatched to
+// survey tiles chosen by a spiral that knew nothing about where the fleet actually was. D13
+// spent its shift surrounded by unknown terrain with scouts free the whole time.
+//
+// A geo scanner sees eight blocks THROUGH rock. A scout standing over a working miner is worth
+// far more than the same scout surveying open ground on the other side of the base, because what
+// it reveals is immediately actionable: the miner turns toward ore instead of past it, and does
+// not have to turn at all where the map already answers.
+if (ctx.scoutFree) {
+  try {
+    const fleet: any = await callTool('fleet.status', {});
+    const miners = (fleet?.data?.drones ?? []).filter(
+      (d: any) => d.role === 'miner' && d.status === 'working' && d.pos?.x !== undefined);
+
+    for (const m of miners) {
+      // How well is the ground around this miner mapped? A 24-block box centred on it.
+      const half = 12;
+      const box = {
+        min: { x: m.pos.x - half, y: Math.max(0, m.pos.y - 8), z: m.pos.z - half },
+        max: { x: m.pos.x + half, y: m.pos.y + 8, z: m.pos.z + half },
+      };
+      const q: any = await callTool('world.query', box);
+      const cov = q?.data?.percent ?? 0;   // percent: see the cave guard above
+      if (cov >= 25) continue;          // already mapped well enough to be useful
+
+      await bridge.call('TaskMan', 'Add', {
+        name: `support-${m.name}`,
+        priority: 1,                    // ahead of speculative exploration: this has a customer
+        work: { survey: { kind: 'assist', radius: 8, min: box.min, max: box.max } },
+      }, { timeoutMs: 8000 });
+      ctx.scoutFree = false;
+      supply.dispatched++;
+      supply.lastAction = `scout support for ${m.name}`;
+      note(`${m.name} is mining at ${m.pos.x},${m.pos.y},${m.pos.z} with ${cov}% of the `
+         + `surrounding rock mapped → scout dispatched to support it`);
+      ctx.did.push(`scout support for ${m.name}`);
+      break;                            // one per tick; the next tick takes the next miner
+    }
+  } catch (err) {
+    note(`scout support: ${(err as Error)?.message ?? err}`);
+  }
+}
+}
+
+/**
+ * The set of task names already outstanding, or a refusal.
+ *
+ * NOT KNOWING what is queued is a reason to WAIT, not to proceed -- so this returns an explicit
+ * refusal rather than an empty set. Treating an unreadable queue as an empty one is how the
+ * duplicates got created in the first place.
+ */
+async function buildQueuedSet(): Promise<{ queued: Set<string> } | { refuse: string }> {
+// WHAT IS ALREADY QUEUED.
+//
+// The cooldown stops a material being re-dispatched every tick, and it does NOT stop the queue
+// filling with duplicates over hours: each cooldown expiry adds another identical survey while
+// the first one is still waiting for the single scout to become free. Seven copies of
+// "find-coal_ore" piled up that way, so the queue looked busy and nothing was being achieved --
+// there was one scout and eight jobs that all needed one.
+//
+// A shortage that already has work outstanding does not need more work; it needs the work to
+// finish.
+const queued = new Set<string>();
+try {
+  const res: any = await bridge.call('TaskMan', 'GetTasks', {}, { timeoutMs: 15000 });
+  // luaList, not Array.isArray. An EMPTY task queue serialises to {} rather than [], so the
+  // array check classed it unreadable -- and the loop then refused to dispatch, which kept the
+  // queue empty, which kept it refusing. On a fresh world nothing could ever start.
+  const list = luaList<any>(res?.tasks ?? res?.data?.tasks);
+  // A REFUSAL COMES BACK AS A VALUE, NOT AN EXCEPTION.
+  //
+  // PowNet puts an error in the same field a success uses, so a failed GetTasks arrives as a
+  // plain string -- and `undefined?.tasks ?? []` then iterates nothing, leaving the dedup set
+  // empty with no error raised anywhere. Dedup silently switched itself off and the queue filled
+  // with nine copies of the same two surveys. An empty result and an unreadable one look
+  // identical and mean opposite things, so they must be told apart explicitly.
+  if (list === null) {
+    return { refuse: `cannot read the task queue (${typeof res === 'string' ? res : typeof res}); not dispatching blind` };
+  }
+  // Prefer the COMPLETE name list over the paged task objects. TaskMan caps the task array to
+  // stay inside the websocket frame, so counting names from that page under-reports duplicates and
+  // the loop cheerfully adds another copy of work already outstanding -- nine find-iron_ore among
+  // 159 live tasks with two assigned. The cap was mine and so was the regression.
+  const names = luaList<string>(res?.liveNames ?? res?.data?.liveNames);
+  if (names && names.length) {
+    for (const n of names) if (typeof n === 'string') queued.add(n);
+  } else {
+    for (const t of list) {
+      if ((t?.progress ?? 0) < 100 && typeof t?.name === 'string') queued.add(t.name);
+    }
+  }
+} catch {
+  // NOT KNOWING what is queued is a reason to WAIT, not to proceed.
+  //
+  // Treating an unreadable queue as an empty one is how duplicates got created in the first
+  // place: every tick that could not reach TaskMan cheerfully added another survey for a
+  // shortage that already had three. A tick skipped costs a minute; a tick that dispatches blind
+  // costs a drone and clogs the queue behind it.
+  return { refuse: 'cannot read the task queue; not dispatching blind' };
+}
+  return { queued };
+}
+
+/**
+ * A SETTLEMENT THAT RUNS OUT OF SLOTS MUST BUILD MORE, NOT STOP.
+ *
+ * Storage reached 7 chests and ZERO free slots, and everything downstream jammed at once in a way
+ * that reads as several unrelated faults: a miner cannot unload, so it cannot pick up coal, so fuel
+ * relief fails with "storage had nothing burnable" while 391 coal sits in a chest; a gather returns
+ * "took nothing"; a craft cannot bank its output. None of those are the bug. The bug is that the
+ * settlement noticed it was full and did nothing about it, and waited for a human to notice.
+ *
+ * Being full is a SHORTAGE like any other, and the loop already knows how to answer a shortage --
+ * it just had no rule that could say "short of somewhere to put things". This is that rule.
+ *
+ * chest-row is deliberately the cheapest blueprint there is: bare chests, no floor, no modems. A
+ * jam is exactly when the settlement cannot afford anything that needs planks, because planks need
+ * logs and a log needs a free slot to be deposited into.
+ */
+const FREE_SLOTS_FLOOR = 6;
+
+/**
+ * Free slots across every chest the fleet can actually see, or null when it has seen none.
+ *
+ * null is NOT zero, and the difference decides whether the settlement starts building: a fresh
+ * world with no chest readings yet looks identical to a jammed one if you let an empty list total
+ * to zero, and the answer to "we have no readings" is to wait, not to build.
+ */
+async function observedFreeSlots(): Promise<number | null> {
+  const stock: any = await bridge.call('StorageMan', 'stock', {}, { timeoutMs: 8000 });
+  const chests = luaList<any>(stock?.chests ?? stock?.data?.chests) ?? [];
+  if (!chests.length) return null;
+  return chests.reduce((n: number, c: any) => n + (Number(c.free) || 0), 0);
+}
+
+async function expandStorageIfFull(
+  live: any[], queued: Set<string>,
+): Promise<{ acted: boolean; reason: string } | null> {
+  // Any live drone will do -- RoleForWork sends builds to a miner, and miners are the general
+  // workers. Waiting for a specific role here would make the settlement stay jammed because the
+  // wrong kind of drone was free.
+  if (!live.length) return null;
+  // DO NOT STACK EXPANSIONS, AND DO NOT TRUST A TIMER TO PREVENT IT.
+  //
+  // The first version guarded only on a three-minute cooldown, which is not the same question: the
+  // cooldown expires while the previous build is still outstanding, so at 0 free slots this queued
+  // build-chest-row-storage-03, -05, -06, -07 and -08 -- the duplicate-task problem again, in a new
+  // costume, from the rule that was supposed to be fixing things. An outstanding build IS the
+  // answer to "should I queue a build", and it is a fact rather than a guess about elapsed time.
+  //
+  // The cooldown stays as a second line of defence for the window between queueing and the task
+  // appearing in the list.
+  if ([...queued].some((n) => n.startsWith('build-chest-row'))) return null;
+  const until = supply.cooldowns['__storage'] ?? 0;
+  if (until > Date.now()) return null;
+
+  const free = await observedFreeSlots();
+  if (free === null || free > FREE_SLOTS_FLOOR) return null;
+
+  note(`storage down to ${free} free slot(s) -- expanding before everything jams behind it`);
+  try {
+    const r: any = await callTool('order.build', { blueprint: 'chest-row' });
+    if (r?.ok === false) {
+      note(`storage expansion refused -- ${r?.error ?? '?'}`);
+      return null;
+    }
+    supply.cooldowns['__storage'] = Date.now() + COOLDOWN_MS;
+    supply.dispatched++;
+    supply.lastAction = 'expand storage';
+    return { acted: true, reason: `storage was down to ${free} free slots -- queued a chest-row` };
+  } catch (err) {
+    note(`storage expansion failed -- ${(err as Error)?.message ?? err}`);
+    return null;
+  }
+}
+
 export async function runSupplyTick(): Promise<{ acted: boolean; reason: string }> {
   supply.lastRun = Date.now();
   if (!supply.enabled) return { acted: false, reason: 'disabled' };
@@ -281,6 +843,34 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
   // miner silently blocked every scan. One scout also covers many miners -- surveying is what
   // makes the next several digs possible -- so making it wait on a free miner had it backwards.
   const idle = (role: string) => live.find((d: any) => (d.role ?? 'miner') === role && d.status === 'idle');
+
+  // FIRST. NOTHING ELSE CAN SUCCEED WHILE THERE IS NOWHERE TO PUT ANYTHING.
+  //
+  // This used to sit after replanShortfalls and topUpQueue, both of which RETURN EARLY the moment
+  // they do anything -- and with ten idle drones the top-up queues a gather almost every tick. So
+  // the one rule that could unjam the settlement was placed behind two rules that almost always
+  // preempt it, and it effectively never ran: storage sat at 0 free slots with ten drones idle.
+  //
+  // The ordering is not just about reachability, it is about correctness. Topping up the gather
+  // queue while storage is full is actively harmful -- it sends more drones to fetch material that
+  // has nowhere to go, and each of them then fails in a way that looks like its own fault.
+  // The queue is read FIRST, before any phase decides to add to it. Not knowing what is already
+  // outstanding is a reason to wait, not to proceed -- and every phase below can queue work, so
+  // every one of them needs the answer. This used to be read halfway down, which is why the storage
+  // rule had to guard itself with a timer instead of a fact.
+  const q = await buildQueuedSet();
+  if ('refuse' in q) return { acted: false, reason: q.refuse };
+  const queued = q.queued;
+
+  const expanded = await expandStorageIfFull(live, queued);
+  if (expanded) return expanded;
+
+  const replanned = await replanShortfalls();
+  if (replanned) return replanned;
+
+  const toppedUp = await topUpQueue(live);
+  if (toppedUp) return toppedUp;
+
   const idleMiner = idle('miner');
   const idleScout = idle('scout');
   const idleCrafter = idle('crafter');
@@ -297,54 +887,6 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
     detail.filter((d: any) => typeof d.name === 'string' && d.name.includes(m))
           .reduce((n: number, d: any) => n + (d.count ?? 0), 0);
 
-  // WHAT IS ALREADY QUEUED.
-  //
-  // The cooldown stops a material being re-dispatched every tick, and it does NOT stop the queue
-  // filling with duplicates over hours: each cooldown expiry adds another identical survey while
-  // the first one is still waiting for the single scout to become free. Seven copies of
-  // "find-coal_ore" piled up that way, so the queue looked busy and nothing was being achieved --
-  // there was one scout and eight jobs that all needed one.
-  //
-  // A shortage that already has work outstanding does not need more work; it needs the work to
-  // finish.
-  const queued = new Set<string>();
-  try {
-    const res: any = await bridge.call('TaskMan', 'GetTasks', {}, { timeoutMs: 15000 });
-    // luaList, not Array.isArray. An EMPTY task queue serialises to {} rather than [], so the
-    // array check classed it unreadable -- and the loop then refused to dispatch, which kept the
-    // queue empty, which kept it refusing. On a fresh world nothing could ever start.
-    const list = luaList<any>(res?.tasks ?? res?.data?.tasks);
-    // A REFUSAL COMES BACK AS A VALUE, NOT AN EXCEPTION.
-    //
-    // PowNet puts an error in the same field a success uses, so a failed GetTasks arrives as a
-    // plain string -- and `undefined?.tasks ?? []` then iterates nothing, leaving the dedup set
-    // empty with no error raised anywhere. Dedup silently switched itself off and the queue filled
-    // with nine copies of the same two surveys. An empty result and an unreadable one look
-    // identical and mean opposite things, so they must be told apart explicitly.
-    if (list === null) {
-      return { acted: false, reason: `cannot read the task queue (${typeof res === 'string' ? res : typeof res}); not dispatching blind` };
-    }
-    // Prefer the COMPLETE name list over the paged task objects. TaskMan caps the task array to
-    // stay inside the websocket frame, so counting names from that page under-reports duplicates and
-    // the loop cheerfully adds another copy of work already outstanding -- nine find-iron_ore among
-    // 159 live tasks with two assigned. The cap was mine and so was the regression.
-    const names = luaList<string>(res?.liveNames ?? res?.data?.liveNames);
-    if (names && names.length) {
-      for (const n of names) if (typeof n === 'string') queued.add(n);
-    } else {
-      for (const t of list) {
-        if ((t?.progress ?? 0) < 100 && typeof t?.name === 'string') queued.add(t.name);
-      }
-    }
-  } catch {
-    // NOT KNOWING what is queued is a reason to WAIT, not to proceed.
-    //
-    // Treating an unreadable queue as an empty one is how duplicates got created in the first
-    // place: every tick that could not reach TaskMan cheerfully added another survey for a
-    // shortage that already had three. A tick skipped costs a minute; a tick that dispatches blind
-    // costs a drone and clogs the queue behind it.
-    return { acted: false, reason: 'cannot read the task queue; not dispatching blind' };
-  }
 
   const now = Date.now();
   // Each role can take one job per tick. A tick can therefore start a dig AND a survey, which is
@@ -356,242 +898,58 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
   const did: string[] = [];
   const waiting: string[] = [];
 
+  // FUEL IS NOT ONE MATERIAL AMONG MANY. IT IS THE PRECONDITION FOR ALL OF THEM.
+  //
+  // The rules are walked in order and every one of them reads as short, because StorageMan cannot
+  // report stock -- so the loop round-robins through dirt, copper, zinc and lapis regardless of
+  // whether the fleet can still move. It was caught doing exactly that: D1 gathering DIRT while
+  // total fleet fuel fell from 7,556 to 5,664 and the coal in storage never moved off 129. A fleet
+  // that spends its last few thousand fuel on dirt is not self-sustaining, it is just slow to die.
+  //
+  // So when the tank is low, coal outranks everything. Not a permanent priority -- once there is a
+  // comfortable reserve the normal round-robin resumes and the other materials get their turn.
+  // LIVE drones, not every drone on the books.
+  //
+  // This summed the WHOLE fleet, and fuel inside a drone nobody can reach is not fuel the fleet
+  // has. Measured at the point of collapse: eleven reachable drones at ZERO fuel, and 41,234 fuel
+  // sitting inside five drones that had been silent for six to fifteen hours. The loop read 41,234,
+  // concluded there was a comfortable reserve, and went on round-robining dirt and copper while
+  // every drone that could actually move ran dry -- which is the exact death spiral the threshold
+  // exists to prevent, entered through the one input nobody checked.
+  //
+  // `live` already excludes offline and lost drones; it just was not used here.
+  const fleetFuel = live.reduce((n: number, d: any) => n + (Number(d.fuel) || 0), 0);
+  const fuelCritical = fleetFuel < FUEL_PRIORITY_BELOW;
+  if (fuelCritical) note(`fleet fuel ${fleetFuel} below ${FUEL_PRIORITY_BELOW} -- coal only this tick`);
+
+  const ctx: SupplyCtx = {
+    now, queued, did, waiting,
+    minerFree, scoutFree, crafterFree,
+    idleCrafter, held,
+  };
   for (const rule of supply.rules) {
-    if (!minerFree && !scoutFree && !crafterFree) break;
+    if (!ctx.minerFree && !ctx.scoutFree && !ctx.crafterFree) break;
     const have = held(stockKey(rule));
-    if (have >= rule.min) continue;
-    // Say when a cooldown is the reason. Skipping silently makes "waiting a few minutes" look
-    // exactly like "nothing to do", which is how idle drones and an empty log get read as a broken
-    // scheduler rather than a timer.
-    if ((supply.cooldowns[rule.match] ?? 0) > now) {
-      const secs = Math.ceil(((supply.cooldowns[rule.match] ?? 0) - now) / 1000);
-      waiting.push(`${rule.match} (${secs}s cooldown)`);
+    const skip = ruleSkipReason(rule, {
+      fuelCritical, have, now,
+      cooldownUntil: supply.cooldowns[rule.match] ?? 0,
+    });
+    if (skip) {
+      if (skip.message) waiting.push(skip.message);
       continue;
     }
-
     try {
-      if (rule.action === 'mine') {
-        // Go and LOOK. gather can only revisit coordinates the map already holds, so a material
-        // that has never been seen -- iron, at depth, below anything a surface scan can reach --
-        // is unreachable by any amount of gathering. This is the job that changes that.
-        if (!minerFree) continue;
-        supply.cooldowns[rule.match] = now + COOLDOWN_MS;
-        const r: any = await callTool('order.prospect', { depth: rule.depth ?? 40 });
-        if (r?.ok === false) {
-          note(`${rule.match}: ${have}/${rule.min}, prospecting refused — ${r?.error ?? '?'}`);
-          continue;
-        }
-        minerFree = false;
-        supply.dispatched++;
-        supply.lastAction = `prospect for ${rule.match}`;
-        note(`${rule.match}: ${have}/${rule.min} → prospecting at y=${rule.depth ?? 40}`);
-        did.push(`prospect ${rule.match}`);
-        continue;
-      }
-
-      if (rule.action === 'craft' && [...queued].some((n) => n.startsWith(`craft-${stockKey(rule).replace(/^.*:/, '')}`))) {
-        note(`${rule.match}: ${have}/${rule.min}, already being crafted`);
-        continue;
-      }
-
-      if (rule.action === 'craft') {
-        // Needs a crafter, not a miner. Nothing else can serve the job, so waiting for one is the
-        // correct behaviour rather than dispatching it at a drone that will refuse at the last step.
-        if (!idleCrafter) continue;                 // no cooldown burned: retry when one frees up
-        supply.cooldowns[rule.match] = now + COOLDOWN_MS;
-        // The TARGET, not the deficit. expand() already subtracts what storage holds, so passing
-        // (target - have) subtracts the same stock twice: asking for "8 more chests" while holding
-        // 8 planned to zero steps and the loop reported "nothing craftable" with a full chest.
-        const want = rule.limit ?? rule.min;
-        const r: any = await callTool('plan.execute', { item: stockKey(rule), quantity: want });
-        const queued = r?.data?.queued ?? r?.queued ?? [];
-        if (!queued.length) {
-          note(`${rule.match}: ${have}/${rule.min}, nothing craftable — ${JSON.stringify(r?.data?.needsSite ?? [])}`);
-          continue;
-        }
-        crafterFree = false;
-        supply.dispatched++;
-        supply.lastAction = `craft ${stockKey(rule)}`;
-        note(`${rule.match}: ${have}/${rule.min} → craft x${want} queued (${queued.length} steps)`);
-        did.push(`craft ${stockKey(rule)}`);
-        continue;
-      }
-
-      if (rule.action !== 'gather') {
-        supply.cooldowns[rule.match] = now + COOLDOWN_MS;
-        note(`${rule.match}: ${have}/${rule.min} → ${rule.action} not yet automatable`);
-        continue;
-      }
-
-      // Ask for the dig first, but only if a miner could actually take it.
-      if (minerFree) {
-        const r: any = await callTool('order.gather', { match: rule.match, limit: rule.limit ?? 64 });
-        if (r?.ok !== false) {
-          supply.cooldowns[rule.match] = now + COOLDOWN_MS;
-          minerFree = false;
-          supply.dispatched++;
-          supply.lastAction = `gather ${rule.match}`;
-          note(`${rule.match}: ${have}/${rule.min} → gather dispatched`);
-          did.push(`gather ${rule.match}`);
-          continue;
-        }
-      }
-
-      // Nothing surveyed matches: the honest answer is "go and look", not "dig somewhere".
-      //
-      // This branch used to just log and stop, which was survivable only because the index was
-      // append-only -- a mined-out vein stayed listed for ever, so the loop always had somewhere to
-      // send a miner. Now that the index prunes what drones observe, exhausting a vein empties it
-      // properly and this is where the loop would otherwise come to rest permanently. So it
-      // dispatches the scan it was only describing.
-        // NOTHING SURVEYED: SEND SOMEONE TO LOOK UNDERGROUND.
-        //
-        // gather can only revisit coordinates the map already holds, and a surface survey cannot
-        // reach ore at depth -- a scanner sees 8 blocks and iron is fifty below. A material that has
-        // NEVER been seen is not a gathering problem, it is a prospecting one. Without this branch
-        // the loop fell straight through to "wait for a scout" and sat there with three idle miners
-        // and coal at 0/32.
-        if (minerFree && rule.depth !== undefined
-            && ![...queued].some((n) => n.startsWith('shaft-'))) {
-          supply.cooldowns[rule.match] = now + COOLDOWN_MS;
-          const p: any = await callTool('order.prospect', { depth: rule.depth });
-          if (p?.ok !== false) {
-            minerFree = false;
-            supply.dispatched++;
-            supply.lastAction = `prospect for ${rule.match}`;
-            note(`${rule.match}: ${have}/${rule.min}, none known -> prospecting at y=${rule.depth}`);
-            did.push(`prospect ${rule.match}`);
-            continue;
-          }
-          note(`${rule.match}: prospecting refused -- ${p?.error ?? '?'}`);
-        }
-
-        // Say so rather than skipping in silence: "no scout free" and "nothing to do" are
-        // different states and looked identical in the log.
-        if (!scoutFree) {
-          waiting.push(`${rule.match} (no scout free)`);
-          continue;
-        }
-      supply.cooldowns[rule.match] = now + COOLDOWN_MS;
-      let area = frontier();
-      if (!area) {
-        // WRAP, don't stop. The spiral walking off the edge of the loaded region is not the same
-        // as the region being fully surveyed -- the cursor is a position, not a completion record,
-        // and a survey that failed still advanced it. Left as a dead end the loop simply stopped
-        // exploring for good, which is what happened here: the last prospecting run was two hours
-        // before anyone noticed.
-        supply.frontier = 0;
-        area = frontier();
-        if (!area) { note(`${rule.match}: no surveyable tile inside the loaded region`); continue; }
-        note('exploration frontier wrapped -- starting another pass from the base outward');
-      }
-      supply.frontier = (supply.frontier ?? 0) + 1;
-      await bridge.call('TaskMan', 'Add', {
-        name: `find-${rule.match}`,
-        priority: 3,
-        work: { survey: { kind: 'explore', radius: 8, min: area.min, max: area.max } },
-      }, { timeoutMs: 8000 });
-      scoutFree = false;
-      supply.dispatched++;
-      supply.lastAction = `survey for ${rule.match}`;
-      note(`${rule.match}: ${have}/${rule.min}, none known → survey tile ${supply.frontier} `
-         + `at ${area.min.x},${area.min.z}..${area.max.x},${area.max.z}`);
-      did.push(`survey for ${rule.match}`);
+      await dispatchRule(rule, have, ctx);
     } catch (err) {
       supply.cooldowns[rule.match] = now + COOLDOWN_MS;
       note(`${rule.match}: dispatch failed — ${(err as Error)?.message ?? err}`);
     }
   }
+  // The dispatchers own these from here; the remaining phases read them back off the context.
+  minerFree = ctx.minerFree; scoutFree = ctx.scoutFree; crafterFree = ctx.crafterFree;
 
-  // EXPLORE THE CAVES. Nobody was.
-  //
-  // world.caves has found them for a long time -- open pockets with an entrance, complete with
-  // their bounding boxes -- and absolutely nothing consumed that. Every cave survey so far was
-  // dispatched by hand. Meanwhile the exploration spiral sent scouts to tile solid rock in a
-  // fixed pattern, which is the least informative ground there is.
-  //
-  // A cave is the best possible place to send a scanner: the ore is already EXPOSED, so a single
-  // scan sphere reads far more usable material than the same sphere buried in stone, and a miner
-  // sent afterwards can reach it without cutting a shaft to get there.
-  if (scoutFree) {
-    try {
-      const caves: any = await callTool('world.caves', { min: 8 });
-      const list = (caves?.data?.caves ?? []) as any[];
-      for (const c of list) {
-        if (!c?.min || !c?.max) continue;
-        // Pad outward: a scan centred inside an open pocket mostly reads air. The interesting
-        // part of a cave is the rock around it, which is where the exposed ore actually sits.
-        const box = {
-          min: { x: c.min.x - 4, y: Math.max(0, c.min.y - 4), z: c.min.z - 4 },
-          max: { x: c.max.x + 4, y: c.max.y + 4, z: c.max.z + 4 },
-        };
-        const q: any = await callTool('world.query', box);
-        if ((q?.data?.coverage ?? 0) >= 60) continue;    // already read this one
-
-        await bridge.call('TaskMan', 'Add', {
-          name: `cave-${c.min.x},${c.min.y},${c.min.z}`,
-          priority: 2,
-          work: { survey: { kind: 'scout', radius: 8, min: box.min, max: box.max } },
-        }, { timeoutMs: 8000 });
-        scoutFree = false;
-        supply.dispatched++;
-        supply.lastAction = `cave survey at ${c.min.x},${c.min.y},${c.min.z}`;
-        note(`cave of ${c.size ?? '?'} cells at ${c.min.x},${c.min.y},${c.min.z} is `
-           + `${q?.data?.coverage ?? 0}% mapped → scout dispatched`);
-        did.push('cave survey');
-        break;                                            // one per tick
-      }
-    } catch (err) {
-      note(`cave survey: ${(err as Error)?.message ?? err}`);
-    }
-  }
-
-  // SEND A SCOUT TO WHERE THE MINERS ARE DIGGING BLIND.
-  //
-  // This is the collaboration the fleet was supposed to have and never did. Pairing existed only
-  // inside order.prospect -- a shaft task with a scan task depending on it -- so a miner working
-  // anywhere else dug through rock nobody had ever scanned while idle scouts were dispatched to
-  // survey tiles chosen by a spiral that knew nothing about where the fleet actually was. D13
-  // spent its shift surrounded by unknown terrain with scouts free the whole time.
-  //
-  // A geo scanner sees eight blocks THROUGH rock. A scout standing over a working miner is worth
-  // far more than the same scout surveying open ground on the other side of the base, because what
-  // it reveals is immediately actionable: the miner turns toward ore instead of past it, and does
-  // not have to turn at all where the map already answers.
-  if (scoutFree) {
-    try {
-      const fleet: any = await callTool('fleet.status', {});
-      const miners = (fleet?.data?.drones ?? []).filter(
-        (d: any) => d.role === 'miner' && d.status === 'working' && d.pos?.x !== undefined);
-
-      for (const m of miners) {
-        // How well is the ground around this miner mapped? A 24-block box centred on it.
-        const half = 12;
-        const box = {
-          min: { x: m.pos.x - half, y: Math.max(0, m.pos.y - 8), z: m.pos.z - half },
-          max: { x: m.pos.x + half, y: m.pos.y + 8, z: m.pos.z + half },
-        };
-        const q: any = await callTool('world.query', box);
-        const cov = q?.data?.coverage ?? 0;
-        if (cov >= 25) continue;          // already mapped well enough to be useful
-
-        await bridge.call('TaskMan', 'Add', {
-          name: `support-${m.name}`,
-          priority: 1,                    // ahead of speculative exploration: this has a customer
-          work: { survey: { kind: 'assist', radius: 8, min: box.min, max: box.max } },
-        }, { timeoutMs: 8000 });
-        scoutFree = false;
-        supply.dispatched++;
-        supply.lastAction = `scout support for ${m.name}`;
-        note(`${m.name} is mining at ${m.pos.x},${m.pos.y},${m.pos.z} with ${cov}% of the `
-           + `surrounding rock mapped → scout dispatched to support it`);
-        did.push(`scout support for ${m.name}`);
-        break;                            // one per tick; the next tick takes the next miner
-      }
-    } catch (err) {
-      note(`scout support: ${(err as Error)?.message ?? err}`);
-    }
-  }
+  await surveyCaves(ctx);
+  await scoutForMiners(ctx);
 
   if (did.length) return { acted: true, reason: did.join(', ') };
   if (waiting.length) return { acted: false, reason: `waiting on cooldown: ${waiting.join(', ')}` };

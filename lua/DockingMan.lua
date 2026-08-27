@@ -28,7 +28,12 @@ function Init()
     if DATA["occupants"] == nil then
         DATA["occupants"] = {}
     end
-    North, West, East, South, Up, Down = 0, 1, 2, 3, 4, 5
+    -- The compass constants that used to be declared here were UNUSED, and wrong: they read
+    -- `North, West, East, South = 0, 1, 2, 3`, swapping East and South against pgps, PowGPSServer
+    -- and DroneLogic. Nothing in this file ever read them, so it never fired -- but this is the
+    -- module that hands out dock berths and their orientations, and one future reference would have
+    -- turned every approach ninety degrees. Deleted rather than corrected: the canonical set lives
+    -- in pgps (pgps.HEADINGS), and a copy that agrees today is still a copy that can drift.
 end
 
 function GetXZFromHeading( p_Heading )

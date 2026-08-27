@@ -64,6 +64,22 @@ export const settlement: Settlement = {
   ],
 };
 
+/**
+ * Is this position inside the circle the fleet may work in?
+ *
+ * The BOX bounds the force-loaded chunks; the CIRCLE bounds what a drone can still call home from,
+ * because modem range is a sphere and the box's corners sit half again as far out as its edges.
+ * Work targets have to respect the circle -- the block index still holds positions surveyed when
+ * the region was a square, so seeding a job straight from it sends drones to places they cannot be
+ * heard from. D3 was recovered from -496,53,126, sixty-four blocks out, having been dispatched
+ * there by an ordinary gather.
+ */
+export function withinReach(p: { x: number; z: number }): boolean {
+  const { base, reach } = settlement;
+  const dx = p.x - base.x, dz = p.z - base.z;
+  return dx * dx + dz * dz <= reach * reach;
+}
+
 /** The box drones may move in. Derived, so it cannot disagree with base. */
 export function bounds() {
   const { base, reach } = settlement;
@@ -84,19 +100,43 @@ export function bounds() {
  */
 export async function pushSettlement(
   call: (module: string, method: string, args: unknown, opts?: unknown) => Promise<unknown>,
-): Promise<{ bounds: boolean; hosts: number }> {
+): Promise<{ bounds: boolean; hosts: number; expected: number; failed: string[] }> {
   let ok = false;
   try {
-    await call('MapServer', 'bounds', bounds(), { timeoutMs: 8000 });
+    // Send the RADIUS as well as the box. The box bounds the force-loaded chunks; the radius bounds
+    // what a drone can still call home from. A square region of reach 56 has edges ~60 blocks from
+    // the mast and corners ~82 -- past the 64-block modem range -- so its corners were places a
+    // drone could legally walk into and then never be heard from again. Two drones died in them.
+    await call('MapServer', 'bounds',
+      { ...bounds(), reach: settlement.reach,
+        cx: settlement.base.x, cy: settlement.base.y, cz: settlement.base.z },
+      { timeoutMs: 8000 });
     ok = true;
   } catch { /* reported by the caller; a failed push must not take HQ down */ }
 
+  // ONE HOST FAILING IS NOT A REASON TO SKIP THE REST -- BUT IT IS NOT A REASON TO FORGET IT EITHER.
+  //
+  // This used to swallow the error and return only a success count, and exactly one host went
+  // missing every time: the FIRST, which lands while MapServer is still busy writing the bounds
+  // change pushed a line earlier, and times out. The push then reported "gpsHosts=15" with nothing
+  // to compare 15 against, so a constellation permanently one host short looked like a clean push.
+  //
+  // A single retry after the write settles fixes the actual cause; naming what is still missing
+  // makes the residue visible instead of quietly shrinking the constellation.
+  const pending: typeof settlement.gpsHosts = [];
   let hosts = 0;
   for (const h of settlement.gpsHosts) {
     try {
       await call('MapServer', 'gpshost', { pos: [h.x, h.y, h.z] }, { timeoutMs: 8000 });
       hosts++;
-    } catch { /* one host failing is not a reason to skip the rest */ }
+    } catch { pending.push(h); }
   }
-  return { bounds: ok, hosts };
+  const failed: string[] = [];
+  for (const h of pending) {
+    try {
+      await call('MapServer', 'gpshost', { pos: [h.x, h.y, h.z] }, { timeoutMs: 8000 });
+      hosts++;
+    } catch { failed.push(`${h.x},${h.y},${h.z}`); }
+  }
+  return { bounds: ok, hosts, expected: settlement.gpsHosts.length, failed };
 }

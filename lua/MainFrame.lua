@@ -78,6 +78,29 @@ local function main()
                 rednet.send(senderID, replyMessage, PowNet.SERVER_PROTOCOL)
 
 
+            -- ANSWER "ARE YOU ALIVE", LIKE EVERY OTHER MODULE.
+            --
+            -- MainFrame served the VFS and implemented no Status, so the dashboard had to special
+            -- case it -- and rendered the fleet's most load-bearing component as "not answering"
+            -- for its entire life. Every drone pulls its code from here on every boot; if this were
+            -- really down nothing would run at all. A permanently red healthy component teaches you
+            -- to ignore the panel, which is worse than having no panel.
+            --
+            -- Cheap to answer and it removes the special case rather than dressing it up.
+            elseif message.type == PowNet.MESSAGE_TYPE.CALL and message.dataKey == "Status" then
+                local s_Files = 0
+                pcall(function() s_Files = #fs.list("disk") end)
+                local replyMessage = newMessage(PowNet.MESSAGE_TYPE.CALL, message.ID, "Status", {
+                    up = os.clock(),
+                    id = os.getComputerID(),
+                    label = os.getComputerLabel(),
+                    faults = 0,
+                    monitor = ("serving %d files"):format(s_Files),
+                    log = {},
+                })
+                replyMessage.reply = true
+                rednet.send(senderID, replyMessage, PowNet.SERVER_PROTOCOL)
+
             elseif message.type == PowNet.MESSAGE_TYPE.SET then
                 if not receivedMessages[message.ID] then
                     if(message.data ~= nil ) then
