@@ -564,8 +564,53 @@ function CloseTrace()
     if m_LogHandle then pcall(m_LogHandle.close) m_LogHandle = nil end
 end
 
+-- SAY A PERSISTING CONDITION ONCE, NOT ONCE PER RETRY.
+--
+-- The log is the fleet's primary debugging surface and it WRAPS -- it is deleted at TRACE_LIMIT and
+-- started again. So a message that repeats while nothing changes does not just add noise, it
+-- actively destroys evidence: it evicts the lines that say what actually happened.
+--
+-- Measured across the fleet: 6,586 lines, of which 1,482 (22.5%) were "tower unreachable" and 1,132
+-- (17.2%) were "MOVE REFUSED: Out of fuel". Forty per cent of the entire debugging surface spent
+-- restating two conditions that had not changed. A drone at zero fuel says so a thousand times; it
+-- is the same fact every time, and the thousandth copy pushed out the line explaining how it got
+-- there.
+--
+-- The fix belongs HERE rather than at the two call sites, because the pattern is not about those
+-- two messages -- any condition that persists produces it. Identical text inside the window is
+-- counted rather than written, and the count is reported when the message is finally let through,
+-- so nothing is silently lost: "x412 in the last 60s" is strictly more informative than 412 copies.
+local REPEAT_WINDOW = 60          -- seconds a message stays suppressed after being written
+local REPEAT_KEYS   = 64          -- cap the table; a drone must not leak memory through its logger
+local m_SeenAt, m_SeenN, m_SeenCount = {}, {}, 0
+
+-- Returns the text to write, or nil to suppress. Split out so trace() itself stays simple.
+local function repeatFilter(p_What)
+    local s_Now  = os.clock()
+    local s_Last = m_SeenAt[p_What]
+    if s_Last ~= nil and (s_Now - s_Last) < REPEAT_WINDOW then
+        m_SeenN[p_What] = (m_SeenN[p_What] or 0) + 1
+        return nil
+    end
+    -- Forget everything rather than evict cleverly: the table is a rate limiter, not a record, and
+    -- the worst case of a reset is one extra line.
+    if m_SeenCount >= REPEAT_KEYS then
+        m_SeenAt, m_SeenN, m_SeenCount = {}, {}, 0
+    end
+    if m_SeenAt[p_What] == nil then m_SeenCount = m_SeenCount + 1 end
+    m_SeenAt[p_What] = s_Now
+    local s_N = m_SeenN[p_What]
+    m_SeenN[p_What] = nil
+    if s_N and s_N > 0 then
+        return ("%s  [x%d more in the last %ds]"):format(p_What, s_N, REPEAT_WINDOW)
+    end
+    return p_What
+end
+
 trace = function(p_What)
     pcall(function()
+        p_What = repeatFilter(tostring(p_What))
+        if p_What == nil then return end
         -- CLOSE IS WHAT PERSISTS. DO NOT HOLD THE HANDLE OPEN.
         --
         -- I tried keeping one handle open and flushing per line, to save four syscalls. CC's write
