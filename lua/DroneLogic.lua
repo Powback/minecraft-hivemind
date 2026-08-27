@@ -6191,6 +6191,28 @@ end
 -- watchdog owns it.
 local IDLE_BEFORE_DOCK = 45
 
+-- THE ACCESS SQUARE IS A COLUMN, NOT A BLOCK.
+--
+-- The old check was ContainerBelow() alone, so a drone hovering three blocks above a chest never
+-- moved -- and it blocks the approach just as completely, because everything arriving at that chest
+-- has to come down through it.
+--
+-- Counted in the bay: six idle drones stacked at y=65..68 over the four chests at y=64. Every
+-- deposit and every build pickup failed with "could not reach the pickup chest", the tower never
+-- placed a block, and drones burned their fuel flying back and forth retrying until they went dry.
+-- They were queueing for the thing they were standing on.
+--
+-- Vacating deliberately does NOT need DockingMan. It has been down for a day, so idle drones have
+-- no berth to go to -- which is precisely when they must not be occupying the storage column.
+local function inStorageColumn()
+    if ContainerBelow() then return true end
+    if not (m_HomePos and m_HomePos.x) then return false end
+    local cx, cy, cz = pgps.getCachedPosition()
+    if cx == nil or cy == nil then return false end
+    if math.abs(cx - m_HomePos.x) > 1 or math.abs(cz - m_HomePos.z) > 1 then return false end
+    return cy > m_HomePos.y and (cy - m_HomePos.y) <= 8
+end
+
 local function idleDockLoop()
     local s_IdleSince = nil
     while true do
@@ -6223,8 +6245,21 @@ local function idleDockLoop()
             end
         end
 
-        if (not executing) and (not m_Refuelling) and ContainerBelow() then
-            trace("resting on a chest -- clearing the access square")
+        -- THE ACCESS SQUARE IS A COLUMN, NOT A BLOCK.
+        --
+        -- This only fired when a container was directly underneath, so a drone hovering three
+        -- blocks above a chest never moved -- and it blocks the approach just as completely, because
+        -- everything arriving at that chest has to come down through it.
+        --
+        -- Counted in the bay: six idle drones stacked at y=65..68 over the four chests at y=64.
+        -- Every deposit and every build pickup failed with "could not reach the pickup chest", the
+        -- tower never placed a block, and drones burned their fuel flying back and forth retrying
+        -- until they went dry. They were queueing for the thing they were standing on.
+        --
+        -- Vacating does not need DockingMan. It has been down for a day, so idle drones have no
+        -- berth to go to -- which is exactly when they must not be occupying the storage column.
+        if (not executing) and (not m_Refuelling) and inStorageColumn() then
+            trace("idling in a storage access column -- stepping aside")
             for _ = 1, 4 do
                 if pgps.forward() then break end
                 pgps.turnRight()
