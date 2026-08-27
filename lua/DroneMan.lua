@@ -349,6 +349,16 @@ function OnGetDrones(p_ID, p_Message)
             -- liveness from `status`, and "offline" then reads as "busy doing something", which
             -- stalled the supply loop on a drone that no longer exists.
             offline = v.offline, lastSeen = v.lastSeen,
+            -- WHAT CODE IT IS RUNNING. This reply is an explicit allowlist, so a field the drone
+            -- reports but nobody copies here is dropped in silence -- the same failure shape as
+            -- PowNet dropping undeclared params, one layer up. `build` arrived in the heartbeat,
+            -- OnHeartbeat stored it, and it never reached HQ because of this list.
+            --
+            -- It exists because fourteen of twenty computers ran a stale pgps for hours with
+            -- nothing reporting it: the drift bug the update had fixed came back on exactly the
+            -- machines that had not received it, and it was only found by md5-ing files on the
+            -- host by hand.
+            build = v.build,
         }
     end
     return true, {drones = s_List, count = #s_List}

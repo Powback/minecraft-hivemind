@@ -208,6 +208,39 @@ function Init()
 end
 
 
+-- WHAT CODE IS THIS DRONE ACTUALLY RUNNING?
+--
+-- UpdateModule fetches each module from MainFrame on boot and writes it carefully -- but it has no
+-- concept of a hash. It never asks whether the copy on disk is already current, and never verifies
+-- that what landed matches the source. So a drone that could not reach MainFrame on boot simply
+-- kept whatever it had, silently, for ever.
+--
+-- That is not theoretical. FOURTEEN OF TWENTY computers sat on a stale pgps for hours after a fix
+-- was deployed, and nothing anywhere reported it: the drift bug the fix had cured came straight
+-- back, measured at zero on the six updated machines and still firing on the fourteen that were
+-- not. It was only found by md5-ing files on the host by hand. The loop is vicious -- the drones
+-- that most need a fix are the ones out of contact, which is exactly why they cannot pull it.
+--
+-- A checksum in the heartbeat turns that from invisible into obvious: every drone says what it is
+-- running, and one glance across the fleet shows who is stale. Cheap and additive rather than
+-- cryptographic -- this needs to detect DIFFERENCE between copies of our own files, not resist an
+-- adversary, and it must run on a turtle without breaking the 10s coroutine budget.
+local function fileStamp(p_Path)
+    if not fs.exists(p_Path) then return 0 end
+    local h = fs.open(p_Path, "r")
+    if not h then return 0 end
+    local s_Text = h.readAll() or ""
+    h.close()
+    local s_Sum, s_Len = 0, #s_Text
+    -- Sample rather than sum every byte: a full pass over a 300KB module on every heartbeat is
+    -- exactly the sort of thing that trips CC's coroutine budget. Stride sampling plus the length
+    -- distinguishes our own versions reliably.
+    for i = 1, s_Len, 61 do
+        s_Sum = (s_Sum * 31 + s_Text:byte(i)) % 16777213
+    end
+    return (s_Sum * 8191 + s_Len) % 16777213
+end
+
 function SendHeartBeat()
     -- Read the position, do not re-derive it. This used to call setLocationFromGPS, which steps
     -- the turtle forward and back to work out its heading -- acceptable once during Init, and the
@@ -377,6 +410,9 @@ function SendHeartBeat()
 
     local s_Data = {pos = s_Pos, status = s_Report, detail = m_Detail, fuel = s_Fuel, role = Role(),
                     inv = s_Inv,
+                    -- What code this drone is running, so a stale fleet is visible instead of
+                    -- silently reintroducing bugs that were already fixed. See fileStamp.
+                    build = {pgps = fileStamp("/pgps"), logic = fileStamp("/DroneLogic.lua")},
                     stuck = s_Why, hosting = m_Hosting,
                     crash = (m_LastCrash ~= false and m_LastCrash ~= "") and m_LastCrash or nil}
     local s_Message = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Heartbeat", s_Data)

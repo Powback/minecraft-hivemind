@@ -123,6 +123,19 @@ async function doRefreshFleet(): Promise<void> {
         detail: typeof d.detail === 'string' ? d.detail : undefined,
         // Stock the fleet cannot see is stock the fleet does not have.
         carrying: d.inv && typeof d.inv === 'object' ? d.inv as Record<string, number> : undefined,
+        // WHAT CODE THE DRONE IS RUNNING.
+        //
+        // There are FOUR hand-maintained field lists between a drone and this object: the heartbeat
+        // payload, DroneMan's registry copy, DroneMan's GetDrones reply, and this patch. Each is an
+        // allowlist, so anything new is dropped in silence by whichever one nobody remembered to
+        // update -- and the caller still gets a perfectly well-formed drone with the field missing.
+        // Adding `build` needed edits in three of the four; I found the last two only by tracing
+        // the value hop by hop after it arrived as None twice.
+        //
+        // It exists because fourteen of twenty computers ran a stale pgps for hours and nothing
+        // said so: the drift bug the update had fixed came back on exactly the machines that never
+        // received it, and it took md5-ing files on the host by hand to see it.
+        build: d.build && typeof d.build === 'object' ? d.build as Record<string, number> : undefined,
         // The drone's own words for why it stopped. HQ used to drop this, so a drone that had
         // explicitly reported "stuck at -70,88,12 -- no progress over 4 legs" surfaced as the
         // generic "has gone quiet" -- which describes a drone that said NOTHING, the opposite of

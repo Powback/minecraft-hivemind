@@ -31,6 +31,8 @@ export interface Cell {
 export type DroneStatus = 'idle' | 'working' | 'hauling' | 'docking' | 'stranded' | 'lost';
 
 export interface Drone {
+  /** Checksums of the modules this drone is running, so a stale fleet is visible. */
+  build?: Record<string, number>;
   id: number;
   name: string;
   role: string;
