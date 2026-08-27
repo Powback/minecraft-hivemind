@@ -928,6 +928,47 @@ local m_Recovering = false
 function setRecovering(p_On) m_Recovering = p_On and true or false end
 function isRecovering() return m_Recovering end
 
+-- The unit vector the drone is currently facing, or nil if the heading is unknown. `deltas` is a
+-- local, so a caller outside this file cannot reach it -- and a caller that has just driven the
+-- turtle forward by hand needs exactly this to say which way it went.
+function headingDelta()
+    if cachedDir == nil then return nil end
+    local D = deltas[cachedDir]
+    if D == nil then return nil end
+    return D[1], D[2], D[3]
+end
+
+-- A MOVE PGPS DID NOT MAKE IS STILL A MOVE.
+--
+-- Some callers genuinely have to drive the turtle directly: the heading probe cannot use forward()
+-- because forward() applies the very heading being tested, and SurfaceForFix climbs precisely when
+-- there is no fix, which is the one condition forward() refuses to move under. Both are correct to
+-- go raw. Both were wrong to stay silent about it.
+--
+-- SurfaceForFix was the expensive one. It climbs up to RECOVERY_CLIMB blocks with turtle.up(),
+-- calling verifyPosition after each -- and that call FAILS every time, because no fix is exactly
+-- why the drone is climbing. So the whole ascent went unrecorded: the cache kept its old y, the
+-- audit recorded no intent for it, and when a fix finally arrived it read as sudden drift with
+-- the horizontal intent still matching. Caught live on D16, on the FIXED build:
+--
+--   position corrected by 10: -493,84,76 -> -488,79,76
+--   audit matched (6,-3,0) yet the fix moved us 10 -- both cannot be right
+--
+-- Both were right again. The audit was measuring a journey with ten blocks missing from it, and
+-- the phantom drift went on to trip the heading re-check -- so the climb that was supposed to
+-- RECOVER a position was manufacturing the drift that made everyone think it was lost.
+--
+-- Tell the truth about the step instead: move the cache, record the intent, drop a crumb. The
+-- caller keeps its raw move; the bookkeeping stops lying about it.
+function noteExternalStep(dx, dy, dz)
+    if cachedX == nil then return false end
+    cachedX, cachedY, cachedZ = cachedX + dx, cachedY + dy, cachedZ + dz
+    notePlannedStep(dx, dy, dz, false)   -- never "straight": these are one-off steps, not a run
+    breadcrumb()
+    savePose()
+    return true
+end
+
 function positionVerified()
     return m_LastFix ~= nil and (os.clock() - m_LastFix) <= FIX_MAX_AGE
 end

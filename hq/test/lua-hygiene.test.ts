@@ -785,3 +785,49 @@ describe('lua hygiene: a position assertion must re-anchor the audit', () => {
     expect(offenders).toEqual([]);
   });
 });
+
+/**
+ * A MOVE PGPS DID NOT MAKE IS STILL A MOVE.
+ *
+ * Some callers genuinely have to drive the turtle directly -- the heading probe cannot use
+ * pgps.forward(), because forward() applies the very heading being tested, and SurfaceForFix climbs
+ * precisely when there is no fix, which is the one condition forward() refuses to move under.
+ *
+ * Going raw is fine. Staying SILENT about it is not. SurfaceForFix climbed up to RECOVERY_CLIMB
+ * blocks with turtle.up() and told the position layer nothing, calling verifyPosition after each --
+ * a call that fails every time, because no fix is exactly why the drone is climbing. The whole
+ * ascent went unrecorded, and surfaced later as drift that the audit could not explain:
+ *
+ *   position corrected by 10: -493,84,76 -> -488,79,76
+ *   audit matched (6,-3,0) yet the fix moved us 10 -- both cannot be right
+ *
+ * That phantom drift trips the heading re-check, so the climb meant to RECOVER a position was
+ * manufacturing the evidence that the drone was lost. This was found on a build that had already
+ * fixed three other writers of the same cache -- which is why it is a rule and not a note.
+ */
+describe('lua hygiene: raw turtle moves must be reported to pgps', () => {
+  it('every direct turtle move outside pgps records the step', () => {
+    const offenders: string[] = [];
+    for (const f of files) {
+      if (f === 'pgps.lua' || f.startsWith('libs/')) continue;   // pgps IS the position layer
+      const raw = read(f).split('\n');
+      const lines = code(read(f));
+      lines.forEach((l, i) => {
+        if (!/turtle\.(forward|back|up|down)\s*\(/.test(l)) return;
+        if (exempt(raw, i, 6)) return;
+        // The report may come a little after the move -- the caller usually checks the result and
+        // measures something first -- so look ahead a short window for the acknowledgement.
+        const after = lines.slice(i, i + 14).join('\n');
+        // NOT verifyPosition. It only repairs the cache when it SUCCEEDS, and the case this rule
+        // exists for -- SurfaceForFix climbing to regain a fix -- is precisely the case where it
+        // fails on every pass. Accepting it here made the rule pass over the bug that motivated it.
+        if (/noteExternalStep|notePlannedStep|setLocationFromGPS/.test(after)) return;
+        offenders.push(
+          `${f}:${i + 1} drives the turtle directly without telling pgps -- ` +
+            `call pgps.noteExternalStep(dx,dy,dz), or justify it with a lua-hygiene: allow comment`,
+        );
+      });
+    }
+    expect(offenders).toEqual([]);
+  });
+});

@@ -5700,6 +5700,9 @@ function HeadingFromPeers()
     -- Step, measure, step back. Raw moves, because pgps.forward() would apply the very heading we
     -- are trying to check -- and it is put back exactly as ensureHeading does it, with the return
     -- move CHECKED, because an unchecked back() is what started this whole class of bug.
+    -- lua-hygiene: allow (this step is CANCELLED by the turtle.back() below, so the net
+    -- displacement is zero and there is nothing to report. The case where the return move fails is
+    -- the case that moved us, and that branch calls noteExternalStep.)
     local s_Fwd = turtle.forward()
     if not s_Fwd then return nil end
     local s_After = pingPeers(s_Nonce .. "b", 2)
@@ -5710,6 +5713,12 @@ function HeadingFromPeers()
         -- in exactly this shape is what drifted the fleet in the first place.
         trace(("heading probe could not step back (%s) -- we are one block forward of the cache")
             :format(tostring(s_BackErr)))
+        -- Saying it in the log is not the same as recording it. The drone really is one block
+        -- forward; put that in the position layer so the next fix does not read it as drift.
+        -- cachedDir may be the wrong heading -- that is what this probe is testing -- but the
+        -- audit's job is to compare INTENT against reality, and this is honestly our intent.
+        local hx, hy, hz = pgps.headingDelta()
+        if hx then pgps.noteExternalStep(hx, hy, hz) end
     end
 
     local s_Best, s_BestErr, s_NextErr = scoreHeadings(cx, cy, cz, s_Before, s_After)
@@ -6034,6 +6043,10 @@ local function climbForFix()
                 i - 1, s_UpErr and (" -- " .. tostring(s_UpErr)) or ""))
             return false
         end
+        -- The climb is real; the position layer has to hear about it. verifyPosition below fails on
+        -- every pass here -- no fix is the whole reason we are climbing -- so without this the
+        -- entire ascent stayed invisible and surfaced later as phantom drift. See noteExternalStep.
+        pgps.noteExternalStep(0, 1, 0)
         if pgps.verifyPosition(true) then          -- just climbed: the old failure is out of date
             trace(("refix: regained a position after climbing %d"):format(i))
             return true
