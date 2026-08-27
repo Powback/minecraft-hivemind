@@ -1548,7 +1548,7 @@ function OnSurvey(p_ID, p_Message)
         end
         TaskEnd()
         m_Status = "idle"
-        UploadWorld()
+        UploadWorld(true)      -- job over: flush, do not hold for the throttle
         m_Job = nil saveResume()
         reportTask(d, true, nil, {scanned = s_Total, sweeps = s_Scans})
         return true, {message = "scanned " .. s_Total .. " blocks in " .. s_Scans .. " sweeps"}
@@ -1591,7 +1591,7 @@ function OnSurvey(p_ID, p_Message)
 
     TaskEnd()
     m_Status = "idle"
-    UploadWorld()
+    UploadWorld(true)      -- job over: flush, do not hold for the throttle
     m_Job = nil saveResume()
     reportTask(d, true, nil, {cells = s_Cells, blocked = s_Blocked})
     return true, {message = "surveyed " .. s_Cells .. " cells, " .. s_Blocked .. " blocked"}
@@ -5298,9 +5298,37 @@ PowNet.RegisterEvents(m_ServerEvents, m_DroneEvents)
 -- detectAll() has always recorded observations locally and MapServer has always had a handler to
 -- merge them; the two were never connected, so the server's world was `{}` no matter how far the
 -- fleet flew. This is the missing wire.
-function UploadWorld()
+-- BATCH, DO NOT TRICKLE. MapServer is one single-threaded computer serving the whole fleet.
+--
+-- UploadWorld is called from NINE places -- after every scan column in a survey, after every job,
+-- after every mining line -- so with a dozen drones running it produced a continuous drip of tiny
+-- SaveWorld calls. Measured with `computercraft track`: MapServer handled 2,063 events in sixty
+-- seconds, 12.6 SECONDS of CPU (21% of wall clock) and four times the event count of any other
+-- module, while DroneMan and StorageMan sat at 0.4ms average doing nothing.
+--
+-- A CC computer answers one thing at a time, so a saturated MapServer stops answering its own
+-- status poll and reads as DOWN -- which is what put MainFrame, DroneMan and MapServer all in the
+-- alert at once, none of them actually broken. Drones saw the same saturation as "pathfinder did
+-- not answer" 69 times in one window, and a drone that cannot path cannot work.
+--
+-- The observations themselves are cheap; the per-call overhead is not. Holding them for a few
+-- seconds costs nothing -- the map does not care whether a block was reported now or twelve
+-- seconds from now -- and it collapses many small calls into one larger one.
+--
+-- Nothing is dropped: takeWorldDelta is NOT called while throttled, so the delta stays queued in
+-- pgps and rides out on the next permitted upload. p_Force exists for the paths that must flush
+-- before the drone stops (job end, standing down), where a delay would mean losing them to a
+-- reboot rather than merely postponing them.
+local UPLOAD_MIN_GAP = 12
+local m_LastUpload   = 0
+
+function UploadWorld(p_Force)
+    if not p_Force and (os.clock() - m_LastUpload) < UPLOAD_MIN_GAP then
+        return true            -- still queued in pgps; not an error
+    end
     local s_World, s_Detail, s_Count = pgps.takeWorldDelta()
     if(s_Count == 0) then
+        m_LastUpload = os.clock()
         return true
     end
     local s_Message = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "SaveWorld",
@@ -5318,6 +5346,7 @@ function UploadWorld()
         Say("MapServer did not take " .. s_Count .. " observations, keeping them")
         return false
     end
+    m_LastUpload = os.clock()
     Say("Uploaded " .. s_Count .. " observations")
     return true
 end
