@@ -2125,11 +2125,32 @@ registry.register({
     const base = settlement.base;
     const origin = { x: base.x, y: base.y + a.level * spec.floorHeight, z: base.z };
 
-    // CHUNKED, AND CHAINED. A drone holds sixteen stacks; a floor is fifteen hundred blocks of
-    // cobblestone. One task per drone-load, each waiting on the one before so the floor is laid in
-    // order rather than by whoever happens to be free.
+    // CHUNKED, AND DELIBERATELY NOT CHAINED.
+    //
+    // A drone holds sixteen stacks and a floor is ~1,500 blocks, so the work is split one task per
+    // drone-load. Those tasks USED to chain -- `dependsOn: prev` -- "so the floor is laid in order
+    // rather than by whoever happens to be free".
+    //
+    // That is the reason the tower was never built. Not fuel, not pathing, not congestion: a flat
+    // floor laid out of order is indistinguishable from one laid in order, and the chain bought
+    // that invisible tidiness at the price of the entire build. Observed live, with SIX drones
+    // idle:
+    //
+    //   tower-L0-p01  running
+    //   tower-L0-p02  running
+    //   tower-L0-p03  blocked  waiting on tower-L0-p02
+    //   ... all eleven remaining blocked, each on the one before
+    //
+    // Two tasks can run no matter how many drones are free, and the moment the head of the chain
+    // stalls -- a drone goes dry, gets rescued, drops to lost, all routine here -- everything
+    // behind it waits for ever. Cobblestone sat at 10,864 with 1 free storage slot and did not move
+    // by a single block over three minutes, which then jams storage, which strands more drones.
+    //
+    // The patches are independent. Let whoever is free take one.
+    //
+    // If a future level genuinely needs the one below it finished first, chain the LEVELS -- do not
+    // reintroduce ordering between patches of the same floor.
     const queued: any[] = [];
-    let prev: number | undefined;
     for (let i = 0; i < ordered.length; i += a.blocksPerTask) {
       const part = ordered.slice(i, i + a.blocksPerTask);
       const res: any = await bridge.call('TaskMan', 'Add', {
@@ -2137,11 +2158,9 @@ registry.register({
         // ONE. The settlement should be building its base before it speculatively gathers more ore
         // -- which it will otherwise do for ever, because there is always another material short.
         priority: 1,
-        dependsOn: prev,
         work: { build: { origin, blocks: part } },
       }, { timeoutMs: 12000 });
       if (typeof res === 'string') break;      // TaskMan refused; stop rather than queue a gap
-      prev = res?.id;
       queued.push({ task: res?.id, blocks: part.length });
     }
 
