@@ -66,7 +66,22 @@ export const DEFAULT_RULES: SupplyRule[] = [
   // untouched while scouts were sent to look for more of the two materials that had rules.
   //
   // `match` is a substring, so each of these also picks up its deepslate variant.
-  { match: 'coal_ore', min: 32, action: 'gather', limit: 64, depth: 50 },
+  // SIZED TO CONSUMPTION, NOT PICKED BY EYE.
+  //
+  // min:32/limit:64 was the same shape as every other ore, and coal is not like every other ore --
+  // it is the thing the fleet BURNS, so its target has to be a rate, not a tidy number.
+  //
+  // Measured while the tower was building: reachable fleet fuel fell 27,449 -> 11,011 in about
+  // thirty minutes. That is ~16,400 fuel, ~205 coal, so roughly 400 coal/hour of real consumption.
+  // Against that, min:32 means "do nothing until the fleet is eight minutes from empty", and
+  // limit:64 means one successful gather buys 5,120 fuel -- about eight minutes. The loop was
+  // topping up in units smaller than the interval it takes to notice, which is why four drones went
+  // dry within twenty minutes of a full refuel, every single time, all of them mid-build.
+  //
+  // 256 is a little under an hour of headroom at the measured burn: enough that a failed or slow
+  // gather does not immediately strand anyone, without hoarding into a warehouse that has 6 free
+  // slots. Revisit if the burn rate changes -- the number is derived from it, not chosen.
+  { match: 'coal_ore', min: 256, action: 'gather', limit: 256, depth: 50 },
   { match: 'iron_ore', min: 32, action: 'gather', limit: 64, depth: 35 },
   { match: 'copper_ore', min: 32, action: 'gather', limit: 64, depth: 45 },
   { match: 'zinc_ore', min: 32, action: 'gather', limit: 64, depth: 40 },
