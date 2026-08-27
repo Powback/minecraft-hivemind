@@ -52,6 +52,39 @@ The diagnostic that matters most: log when the audit *matches* but the fix still
 contradiction proves something is writing the position cache **outside** the move functions, and it
 is the fastest way to find it.
 
+## 2b. An assertion is not a move — re-anchor the frame
+
+The contradiction above was logged for days before anyone chased it. It was right, and this is what
+it was pointing at.
+
+Anything that measures displacement **since** an event holds an anchor. Every function that
+*asserts* a position — writes the cache rather than stepping to it — has to move that anchor, or the
+next comparison is taken from a place the agent no longer claims:
+
+| writer | what it is | had it right? |
+|---|---|---|
+| `verifyPosition` | GPS fix | yes — audit, write, re-anchor |
+| `setLocation` | mesh trilateration, ~10 blocks | **no** |
+| `loadPose` | restored from disk at boot | **no** |
+| `setLocationFromGPS` | boot heading derivation | **no** |
+| `probe` | adopts its position when the return step fails | **no** |
+
+Four of five. The one that got it right was the one written first, alongside the audit itself; the
+others were written later by someone who did not know the audit existed.
+
+**The cost was not the confusing log line.** Phantom drift is an *input to control flow*: it tripped
+"drift too big → re-check the heading", which steps the turtle forward and back to re-derive a
+heading that was never wrong — 82 times in one window, on drones already too far out to afford the
+fuel. That is where "the corrections just fuck you up and waste time" comes from, and it was
+self-inflicted.
+
+The `probe` case is the one to remember: it *is* the heading re-derivation. A failed probe booked
+its own un-returned step as drift, and drift is what calls the probe. **A correction that feeds its
+own trigger does not converge** — look for that shape whenever a recovery path runs "constantly".
+
+Generally: when a value is both a *measurement* and a *trigger*, every unaccounted write to it
+becomes a spurious action, not just a spurious number.
+
 ## 3. Probes that move the turtle are a last resort
 
 Deriving heading by stepping out, reading GPS, and stepping back is the obvious approach and it is a
@@ -299,9 +332,34 @@ The fix is the cheap part. Rules that earned their place here:
 - diagnostics carrying computed values must reach the log
 - nothing writes map state behind the verified-position gate
 - primitives are called with the shapes they document
+- every writer of the position cache re-anchors the audit
 
 Verify the rule **fails when it should** before trusting it. Re-introduce the exact bug and watch it
 break the build. A lint that never fires is worse than none.
+
+Write the rule against the *class*, not the instance you just fixed. The position-cache rule was
+added for three known offenders and immediately found a fourth — in the heading probe, the worst
+place it could have been. Had it been written as "setLocation must call resetAudit", it would have
+passed and taught nothing.
+
+### The checker itself is code, and it fails silently too
+
+A missing linter must never read as a clean one. This one threw on absence — correctly — and still
+went down unnoticed for a different reason:
+
+```js
+['luacheck', `${HOME}/.luarocks/bin/luacheck`].find(b => b === 'luacheck' || existsSync(b))
+```
+
+The first clause is true for the first candidate every time, so the fallback was unreachable. Dead
+code that nothing exercised, until Homebrew moved the default `lua` to 5.5 — which luacheck cannot
+parse. The PATH copy started throwing, the fallback that would have covered it could not be
+selected, and the gate reported "not found" while a working build sat in `~/.luarocks`.
+
+**Select a tool by running it, not by naming it** — the same "verify at the effect" rule that applies
+to the fleet applies to your own tooling. And note the shape: an *upstream environment upgrade*
+disabled a safety check without any commit touching it. When a gate goes quiet, confirm it still
+runs before trusting a green build.
 
 ---
 
