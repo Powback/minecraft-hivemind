@@ -52,7 +52,26 @@ local function clearOldMessages()
         end
     end
 end
+-- ONCE PER BOOT. INIT id=0 IS A FLEET-WIDE STANDDOWN, NOT A GREETING.
+--
+-- Every module and drone that receives this drops out of main, writes its DATA back, reboots and
+-- re-pulls its source. That is correct for an update -- and catastrophic on repeat, because a
+-- module takes about 250 seconds to come back up, so a second broadcast lands while the fleet is
+-- still recovering from the first.
+--
+-- It WAS firing twice per boot. `Connect()` is called at file scope, and then again from main()
+-- because m_Notified is still false when the loop starts -- the guard that exists to make this
+-- once-only never saw the first call. MainFrame's own trace shows the result, with broadcasts
+-- landing after `hosted`:
+--
+--   broadcast INIT id=0 / loaded PowNet / hosted / broadcast INIT id=0 / entering parallel / broadcast INIT id=0
+--
+-- So modules connected, were immediately stood down again, rebooted, and the Bridge sat in
+-- "Waiting for MainFrame... (10/10)" indefinitely while MainFrame was up and hosting the whole
+-- time. Guarding inside Connect makes it idempotent whoever calls it.
 local function Connect()
+    if m_Notified then return end
+    m_Notified = true
     -- Initialize our data for faster lookup
     local s_Message = newMessage(PowNet.MESSAGE_TYPE.INIT, 0,"MAINFRAME")
     rednet.broadcast(s_Message, PowNet.SERVER_PROTOCOL)

@@ -1,3 +1,18 @@
+-- FIRST LINE, UNCONDITIONAL, NO DEPENDENCIES. A breadcrumb for "did startup run at all?"
+--
+-- MainFrame spent hours powered ON while writing nothing anywhere -- no MainFrame.log, no
+-- mf-boot.txt, no last-run.txt -- which is indistinguishable from a computer that never ran its
+-- bootloader, a bootloader that died before its first Log(), and a module that exited to a shell
+-- prompt. Those need completely different fixes and nothing on disk could tell them apart.
+--
+-- Deliberately before EVERYTHING: no Log (not defined yet), no shell, no PowNet, no label lookup.
+-- If this file is missing after a power cycle, /startup itself never executed.
+pcall(function()
+    local h = fs.open("/boot-stage.txt", "w")
+    if h then h.write("stage=entered-startup label=" .. tostring(os.getComputerLabel())
+                      .. " at=" .. tostring(os.time()) .. "\n") h.close() end
+end)
+
 local s_Label = os.getComputerLabel()
 if(s_Label == nil and fs.exists("disk/startup")) then
     print("Copying Startup Data.")
@@ -76,11 +91,56 @@ end
 SetStatus("Booting...")
 
 --MainFrame only
+--
+-- SAME TREATMENT AS EVERY OTHER MODULE: SURFACE THE ERROR, AND ALWAYS REBOOT.
+--
+-- This used to be shell.run() followed by a bare `return`, and it cost a full day of
+-- misdiagnosis. Two separate faults in three lines:
+--
+--   * shell.run CATCHES the program's error itself and returns false, so a MainFrame dying on its
+--     first line was indistinguishable from one exiting cleanly. The rest of this file already
+--     knows this -- it uses loadfile+pcall precisely because "shell.run always reports success and
+--     tells you nothing" -- and MainFrame, the one module whose failure stops the settlement, was
+--     the one still using it.
+--   * No os.reboot(). Every other module reboots when it exits; MainFrame returned to a shell
+--     prompt and sat there. Powered ON, executing NOTHING, hosting nothing.
+--
+-- That last state is invisible to every check that exists: `computercraft dump` reports On, the
+-- watchdog sees On and does nothing, and HQ can only say "unreachable", which reads like
+-- congestion. It was found by noticing MainFrame was ABSENT from `computercraft track` while all
+-- six other modules were executing -- and confirmed by MainFrame.log ending at "Connected!" with
+-- nothing after it.
+--
+-- Every unexplained "MainFrame switched off" today was this. It never switched off.
 if(s_Label == "MainFrame") then
+    pcall(function()
+        local h = fs.open("/boot-stage.txt", "a")
+        if h then h.write("stage=mainframe-branch\n") h.close() end
+    end)
     shell.setDir("disk")
-    shell.run("MainFrame.lua")
-    Log("Offline", colors.red)
-    return
+    -- shell.run, NOT loadfile+pcall -- AND I BROKE THIS ONCE ALREADY.
+    --
+    -- Swapping to loadfile to surface the error looked like a strict improvement (it is what every
+    -- other module does, and shell.run famously swallows errors). It is not, HERE. shell.run
+    -- launches the program the way CC expects, alongside the rednet daemon that answers
+    -- rednet.lookup; running it inline inside startup's own context left MainFrame hosting but
+    -- never replying to lookups. Every module in the row then sat in "Waiting for MainFrame...
+    -- (10/10) -- rebooting to try again" while MainFrame was demonstrably up, hosted, and in its
+    -- parallel loop. shell.setDir also applies to shell.run and not to loadfile, so the swap
+    -- quietly changed which file ran as well.
+    --
+    -- Keep the launch exactly as it was. The genuine bug was never the launcher -- it was the bare
+    -- `return` below, which left the computer at a shell prompt: powered ON, hosting nothing,
+    -- invisible to every check. That is what os.reboot() fixes, and it is the only change here.
+    local s_Ok = shell.run("MainFrame.lua")
+    pcall(function()
+        local h = fs.open("/last-run.txt", "w")
+        h.write(("module=MainFrame shell.run=%s at=%s\n"):format(tostring(s_Ok), tostring(os.time())))
+        h.close()
+    end)
+    Log("MainFrame exited -- rebooting rather than sitting at a shell", colors.red)
+    os.sleep(3)
+    os.reboot()
 end
 
 
