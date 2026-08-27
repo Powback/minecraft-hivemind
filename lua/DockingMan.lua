@@ -36,19 +36,24 @@ function Init()
     -- in pgps (pgps.HEADINGS), and a copy that agrees today is still a copy that can drift.
 end
 
+-- CANONICAL COMPASS: N, W, S, E = 0, 1, 2, 3, and north is MINUS z.
+--
+-- This read 0=n, 1=e, 2=s, 3=w -- the clockwise convention the vendored LAMA library uses, not the
+-- anticlockwise one every first-party module has agreed on since the compass was unified. It also
+-- had the SIGN wrong: it returned z = +1 for north, and north is -z.
+--
+-- So a berth on heading 1 was placed to the east when the fleet meant west, and a berth on heading
+-- 0 was placed south of the tower instead of north. This is the module that hands out dock berths
+-- AND their approach orientation, so both the slot position and the direction a drone faces to
+-- reach it were wrong.
+--
+-- The dead constants in Init() had exactly this fault and were deleted for it. This one is live,
+-- and was missed because deleting the unused copy looked like finishing the job.
 function GetXZFromHeading( p_Heading )
-    if( p_Heading == 0) then --n
-        return {x = 0, z = 1}
-    end
-    if( p_Heading == 1) then -- e
-        return {x = 1, z = 0}
-    end
-    if( p_Heading == 2) then -- s
-        return {x = 0, z = -1}
-    end
-    if( p_Heading == 3) then -- w
-        return {x = -1, z = 0}
-    end
+    if p_Heading == 0 then return {x =  0, z = -1} end   -- north
+    if p_Heading == 1 then return {x = -1, z =  0} end   -- west
+    if p_Heading == 2 then return {x =  0, z =  1} end   -- south
+    if p_Heading == 3 then return {x =  1, z =  0} end   -- east
     return false
 end
 function GetTowerPos( p_Index )

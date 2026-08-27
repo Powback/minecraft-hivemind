@@ -687,3 +687,38 @@ describe('lua hygiene: the map is only as good as the position it was recorded f
     expect(body).toMatch(/positionVerified\(\)/);
   });
 });
+
+describe('lua hygiene: heading-to-offset maps use the canonical compass', () => {
+  /**
+   * N, W, S, E = 0, 1, 2, 3, and NORTH IS MINUS Z. The declarations are already checked elsewhere;
+   * this checks the places that turn a heading into an actual offset, which is where it does damage.
+   *
+   * DockingMan's GetXZFromHeading read 0=n, 1=e, 2=s, 3=w -- the clockwise convention the vendored
+   * LAMA library uses -- and returned z = +1 for north. So a berth on heading 1 was sited east when
+   * the fleet meant west, and one on heading 0 sited south instead of north, in the module that
+   * hands out dock berths AND the direction a drone faces to reach them.
+   *
+   * The dead constants in the same file had the identical fault and were deleted for it. Deleting
+   * the unused copy looked like finishing the job; the live one survived another day. That is the
+   * whole reason this rule exists rather than a note in a comment.
+   */
+  it('heading 0 is north (-z) and heading 2 is south (+z)', () => {
+    const offenders: string[] = [];
+    for (const f of files) {
+      if (f.startsWith('libs/')) continue;              // vendored: lama genuinely uses the other one
+      const raw = read(f).split('\n');
+      code(read(f)).forEach((l, i) => {
+        // A branch on heading N that yields a z offset in the same statement.
+        const m = /==\s*([0-3])\s*\)?\s*then.*z\s*=\s*(-?\d+)/.exec(l);
+        if (!m) return;
+        const heading = Number(m[1]);
+        const z = Number(m[2]);
+        const wrong = (heading === 0 && z > 0) || (heading === 2 && z < 0);
+        if (wrong && !exempt(raw, i, 4)) {
+          offenders.push(`${f}:${i + 1} heading ${heading} maps to z=${z} -- north is -z, south is +z`);
+        }
+      });
+    }
+    expect(offenders).toEqual([]);
+  });
+});
