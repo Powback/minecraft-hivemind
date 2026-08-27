@@ -1042,6 +1042,14 @@ function Role()
     return "miner"
 end
 
+-- How many candidates in a row may be unreachable before a gather gives up.
+--
+-- Candidates are sorted NEAREST-FIRST, so consecutive misses mean the remaining ones are further
+-- and almost certainly worse. Each miss costs a digTo budget plus a flyTo budget and returns
+-- nothing, so proving the point six times over is how a drone arrives at a chest with no fuel.
+-- Three is enough to distinguish "one awkward target" from "this whole area is out of reach".
+local GATHER_MAX_MISS_RUN = 3
+
 -- SAVE / UPDATE / RESUME
 --
 -- An update is a reboot, and a reboot used to mean a drone forgot what it was doing. A survey
@@ -3667,6 +3675,7 @@ function OnGather(p_ID, p_Message)
         local s_Queue  = {}
         local s_Seen   = {}
         local s_Got, s_Missed = 0, 0
+        local s_MissRun = 0        -- consecutive unreachable candidates; see GATHER_MAX_MISS_RUN
 
         local function key(x, y, z) return x .. ":" .. y .. ":" .. z end
         local function push(x, y, z)
@@ -3862,6 +3871,7 @@ function OnGather(p_ID, p_Message)
                 end
 
                 if s_At ~= false then
+                    s_MissRun = 0            -- reached one: the streak is broken
                     local s_Ok, s_Blk = turtle.inspectDown()
                     -- One line per candidate. There are only ever a few dozen, and without this the
                     -- counters say "checked 4, took 0, missed 0" without ever saying what was found
@@ -3904,6 +3914,34 @@ function OnGather(p_ID, p_Message)
                 else
                     trace(("gather: could not reach %d,%d,%d"):format(t.x, t.y, t.z))
                     s_Missed = s_Missed + 1
+                    -- STOP PAYING FOR CANDIDATES WE CANNOT REACH.
+                    --
+                    -- Each miss is not free. A failed candidate costs a digTo budget (up to 96
+                    -- steps, every one a block broken AND a move) plus a flyTo budget (up to 128),
+                    -- and returns nothing. Measured live, repeatedly:
+                    --
+                    --   JOB Gather FAILED took nothing from 7 candidates (6 unreachable)
+                    --
+                    -- Six misses is on the order of several hundred fuel spent to gather zero ore,
+                    -- and the drone then goes dry -- which shortens its reach, which makes the next
+                    -- run miss more. That is the fuel spiral, and it is self-reinforcing.
+                    --
+                    -- Candidates are sorted NEAREST-FIRST, so consecutive misses are strong
+                    -- evidence that the rest are worse, not better: if the closest few are out of
+                    -- reach the far ones certainly are. Give up and let the drone keep the fuel to
+                    -- reach a chest, rather than spending it proving the same point five more times.
+                    --
+                    -- Consecutive, not total: a run that is succeeding and hits one awkward target
+                    -- should carry on, which is why this resets on every success below.
+                    s_MissRun = s_MissRun + 1
+                    -- SPEND THE CHECK BUDGET, DON'T ADD A BRANCH.
+                    --
+                    -- Each consecutive miss shrinks s_MaxChecks so the loop's EXISTING
+                    -- `s_Checked < s_MaxChecks` guard stops us -- no second exit condition to keep
+                    -- in sync, and no extra decision point in a function that is already the
+                    -- largest in the file.
+                    s_MaxChecks = math.min(s_MaxChecks,
+                                           s_Checked + (GATHER_MAX_MISS_RUN - s_MissRun))
                 end
             end
         end
