@@ -6109,6 +6109,23 @@ local function climbForFix()
                 return false
             end
         end
+        -- STOP AT THE CEILING. Raw turtle.up() bypasses mayStep, so nothing else bounds this.
+        --
+        -- SKY_FIX_CEILING existed but only climbForFixIfAffordable ever consulted it -- this loop,
+        -- the one that actually runs when a drone has lost its fix, would climb RECOVERY_CLIMB=80
+        -- blocks from wherever it started with no altitude limit at all. Found live: D8 at y=182,
+        -- forty-two blocks above the ceiling, a hundred blocks from a base whose operating circle
+        -- is fifty-six, holding fuel and labour the settlement could not reach.
+        --
+        -- Above the ceiling another block buys nothing: GPS range stops improving, the drone is
+        -- leaving the region it is allowed to work in, and every block costs fuel it will need to
+        -- get home. cachedY is dead-reckoned but noteExternalStep below keeps it honest during the
+        -- climb, which is exactly what makes this check possible.
+        local _, s_Cy = pgps.getCachedPosition()
+        if s_Cy ~= nil and s_Cy >= SKY_FIX_CEILING then
+            trace(("refix: at y=%d, the ceiling -- climbing further will not find GPS"):format(s_Cy))
+            return false
+        end
         local s_Up, s_UpErr = turtle.up()
         if not s_Up then
             -- Name the cause. "could not rise" reads as terrain and sent everyone looking for a
