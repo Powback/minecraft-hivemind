@@ -2848,13 +2848,24 @@ registry.register({
   handler: async (a, ctx) => {
     if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
     const r: any = await bridge.call('DroneMan', 'RetireDrone', { id: a.id }, { timeoutMs: 8000 });
-    if (typeof r === 'string') throw new ToolError(`DroneMan refused: ${r}`, 'Check fleet.status for the id.');
-    // AND FROM HQ'S OWN ROSTER. DroneMan's registry is not the list fleet.status reads.
+    // CLEAR HQ'S OWN ROSTER FIRST, AND REGARDLESS OF WHAT DRONEMAN SAYS.
     //
-    // This call used to stop at the line above, so the in-world registry forgot the drone and HQ
-    // did not -- ok:true, and the drone still in every subsequent fleet.status. Retiring five
-    // destroyed drones reported five successes and removed none of them.
+    // DroneMan's registry is not the list fleet.status reads -- HQ keeps its own Map, and that is
+    // the one everything downstream plans against.
+    //
+    // Two bugs met here. Originally this stopped at the DroneMan call, so the in-world registry
+    // forgot the drone and HQ did not: ok:true, and the drone still present in every subsequent
+    // fleet.status. Retiring five destroyed drones reported five successes and removed none.
+    //
+    // The first fix then sat AFTER the throw, which reopened the same hole from the other side:
+    // once DroneMan has already forgotten a drone it answers "no such drone", the tool throws, and
+    // HQ's copy is never cleared -- so a retry could not clean up after a partial failure. That is
+    // exactly the state five destroyed drones were left in. DroneMan not knowing the drone is not
+    // a reason to keep it on the roster; it is the strongest reason to drop it.
     const forgotten = state.retireDrone(a.id);
+    if (typeof r === 'string' && !forgotten) {
+      throw new ToolError(`DroneMan refused: ${r}`, 'Check fleet.status for the id.');
+    }
     ctx.log('fleet.retire', { id: a.id, reason: a.reason, forgottenByHQ: forgotten });
     return { ...r, reason: a.reason, forgottenByHQ: forgotten };
   },
