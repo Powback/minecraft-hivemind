@@ -1330,16 +1330,33 @@ function ensureHeading(p_Force)
             break
         end
         s_Risen = s_Risen + 1
-        cachedY = cachedY + 1
+        -- noteExternalStep, NOT `cachedY = cachedY + 1`.
+        --
+        -- Poking the cache keeps the POSITION right and leaves the AUDIT blind, and that gap is
+        -- the whole bug. probe() is called from inside this climb and re-anchors the audit at the
+        -- RAISED position; the unwind below then descends without telling it, so the anchor is left
+        -- N blocks above where the drone actually is and every later fix reads as drift that
+        -- nothing can explain. Measured on a drone running the fixed build:
+        --
+        --   audit matched (7,12,2) yet the fix moved us 24 -- both cannot be right
+        --   drift of 24 is too big for dead reckoning -- re-checking the heading
+        --
+        -- Twenty-four blocks is enough that a reliever sent to a stranded drone arrives nowhere
+        -- near it and "drops nothing", which is what stopped fuel relief from ever completing.
+        --
+        -- The old exemptions argued cachedY is only touched when the step really happened. True,
+        -- and beside the point: the pose was never what broke.
+        noteExternalStep(0, 1, 0)
         if probe() then
-            -- lua-hygiene: allow (unwinding our own climb -- cachedY is only decremented when the
-            -- step actually happened, so a refusal here cannot corrupt the pose)
-            for _ = 1, s_Risen do if turtle.down() then cachedY = cachedY - 1 end end
+            -- lua-hygiene: allow (unwinding our own climb: a refused descent needs no reason, it
+            -- just means we stay higher -- and noteExternalStep only records the step when
+            -- turtle.down() actually returned true, so cache and audit stay together either way)
+            for _ = 1, s_Risen do if turtle.down() then noteExternalStep(0, -1, 0) end end
             return true
         end
     end
     -- lua-hygiene: allow (unwinding our own climb, as above)
-    for _ = 1, s_Risen do if turtle.down() then cachedY = cachedY - 1 end end
+    for _ = 1, s_Risen do if turtle.down() then noteExternalStep(0, -1, 0) end end
 
     -- Still boxed: dig a peephole. Only a drone with a pickaxe can do this, which is fine -- it is
     -- also the only kind of drone that can bury itself in the first place.
