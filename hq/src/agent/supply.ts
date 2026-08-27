@@ -98,6 +98,19 @@ export const DEFAULT_RULES: SupplyRule[] = [
   // caches -- so the fleet should keep a working stock of both without being asked.
   { match: 'minecraft:oak_planks', stock: 'minecraft:oak_planks', min: 32, action: 'craft', limit: 32 },
   { match: 'minecraft:chest', stock: 'minecraft:chest', min: 4, action: 'craft', limit: 4 },
+  // THE SETTLEMENT HAD NO RENEWABLE FUEL SOURCE. Every joule came from mining coal_ore, and the
+  // fleet burns ~400 coal/hour -- so the energy balance was negative by construction and no supply
+  // target could fix it. Measured at the point this was added: coal 56, logs 0, furnaces 0.
+  //
+  // StorageMan already services every furnace on the wired network on a 10s tick (pull output, top
+  // up fuel, load input). The only missing piece was a furnace. One is eight cobblestone, and
+  // storage holds 10,706 of it doing nothing -- so this both creates the fuel path and eats the
+  // material that jams the warehouse. Crafted by the fleet, not spawned.
+  //
+  // Charcoal then comes from the oak_log rule above, which already exists and had nothing
+  // downstream of it. Note a furnace still has to be PLACED on the wired network to be serviced;
+  // crafting it is the prerequisite, not the whole job.
+  { match: 'minecraft:furnace', stock: 'minecraft:furnace', min: 2, action: 'craft', limit: 4 },
 ];
 
 /**
