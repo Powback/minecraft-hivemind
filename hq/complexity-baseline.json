@@ -1,7 +1,7 @@
 {
   "note": "Cyclomatic-complexity debt. This file may only ever SHRINK -- see test/complexity.test.ts.",
   "max": 15,
-  "total": 79,
+  "total": 78,
   "files": {
     "lua/DroneLogic.lua": {
       "cc": [
@@ -25,7 +25,6 @@
         19,
         18,
         17,
-        17,
         16
       ],
       "names": [
@@ -48,7 +47,6 @@
         "gpsRelay",
         "refixLoop",
         "harvestAround",
-        "SurfaceForFix",
         "DescribeJob",
         "meshForward"
       ]

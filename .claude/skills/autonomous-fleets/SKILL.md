@@ -67,6 +67,33 @@ trap:
 Prefer passive inference. Keep the probe only for the genuinely ambiguous case, and never let it
 write position without recording that it did.
 
+## 3b. A recovery action that costs fuel can bankrupt the fleet
+
+Climbing to find GPS is a good idea and it is not free. `SurfaceForFix` runs on every failed deposit,
+so a drone that cannot reach storage climbs *again and again* — thirty to forty blocks each time.
+
+Measured: D3 found at **y=96 with zero fuel**, D14 at 68 and D17 at 72, all above a base at y=64, all
+dry. They had not run out working. They had run out **climbing** — and a drone stranded at ninety-six
+is worse off than one merely unsure of itself at ground level, because even the fuel relief has to
+fly up to reach it.
+
+**Rule:** any recovery that spends a resource must check it can afford the round trip. Up *and* back,
+plus reserve. Skipping the climb still leaves every cheaper option available (GPS from here, peers,
+holding position); running dry at altitude removes all of them.
+
+Generalise it: **a self-heal that consumes the resource it is trying to protect needs a budget.**
+
+## 3c. Offline agents never receive the fix written for them
+
+The recovery code exists so a drone that has lost contact can get itself home. A drone that has lost
+contact **cannot pull updates** — so the two drones `SurfaceForFix` and `SeekCoverage` were written
+for were the only two in the fleet that did not have them. Their module was 309KB against 351KB on
+the distribution disk, through half a dozen fleet-wide deploys that silently skipped them.
+
+**Rule:** verify deployment at the recipient, not at the distribution point. `grep -c` the new symbol
+in the target's own copy. And when the fix is *for* unreachable agents, push it to them directly —
+the ordinary channel is by definition the one that does not work for them.
+
 ## 4. A wrong fact is worse than no fact
 
 Observations are keyed by the drone's *believed* position. An unverified drone teaches the map
@@ -85,6 +112,15 @@ Corollary: **a bad trilateration is worse than none.** A linear solver always re
 "it solved" and "it is right" are unrelated statements. Check the solution against the ranges it came
 from and reject it if it misses. Before that check, one fix put a drone 239 blocks from where it
 actually was — and that garbage was written straight into the map.
+
+### Record positives and negatives over the same volume
+
+A scanner reported solids within radius 8; the code cleared air within radius 4. The shell between
+them is **write-only** — a cell out there can be marked solid by a scan and can never be cleared by
+one. Eight-cubed against four-cubed is eight times more volume gaining blocks than shedding them.
+
+That is why re-surveying visibly failed to repair the map: it was structurally incapable of it. If
+you record what IS there over a wider area than what ISN'T, the map only ever grows.
 
 ## 5. Prune surgically; measure before you wipe
 
@@ -141,6 +177,26 @@ fail. Eighteen accumulated, outranking everything real, and the queue looked ful
 
 Check against the same modular "never dig this" list every other component uses. A second copy of
 that list will be wrong the first time somebody adds a machine to one and not the other.
+
+## 10b. Fuel outranks everything, and equal priority is not neutral
+
+Every gather was queued at the same priority, so coal competed on equal terms with copper, zinc,
+lapis and dirt — and lost repeatedly, because there are six of them and one of it. Watched live:
+`gather:coal_ore` sat unassigned tick after tick with idle miners available, while the settlement
+burned its last 128 coal.
+
+This is an ordering constraint, not a preference. A drone with no fuel cannot gather copper either —
+it cannot do anything, including the rescue that would reach it.
+
+## 10c. Timeouts must be agreed between caller and callee
+
+A registry handler waited **8 seconds per drone, sequentially**, inside a single-threaded module —
+stalling every other caller — while the client gave it 12 seconds for the whole call. The client
+reported "no response from the registry" while the registry sat there working.
+
+Two rules fall out: a blocking wait inside a shared module is a wait imposed on *everyone*, so keep
+it short and fail fast; and a caller's patience must exceed the callee's worst case, or a slow
+success is indistinguishable from a dead module.
 
 ## 11. Deadlocks that need X to get X
 

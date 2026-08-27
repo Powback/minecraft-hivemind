@@ -2578,6 +2578,37 @@ local SKY_FIX_Y = 110
 -- past this buys nothing and costs fuel, air, and the risk of an unbounded ascent.
 local SKY_FIX_CEILING = 140
 
+-- Declared above SurfaceForFix, which is now the first thing to need them. A `local` used above
+-- its declaration is a nil GLOBAL lookup in Lua -- silent, and the comparison would simply throw.
+local FUEL_RESERVE = 900
+local FUEL_PER_BLOCK_HOME = 3
+
+-- NEVER SPEND THE LAST OF THE FUEL GAINING ALTITUDE.
+--
+-- Climbing to find GPS is worth doing and is NOT worth being stranded for. Every failed deposit
+-- calls SurfaceForFix, so a drone that cannot reach storage climbs again and again -- and each
+-- climb is thirty to forty blocks of fuel it may not be able to spend twice.
+--
+-- Measured: D3 was found at y=96 with zero fuel, D14 at 68 and D17 at 72, all above a base at y=64,
+-- all dry. They had not run out working; they had run out CLIMBING. A drone stranded at ninety-six
+-- is far worse off than one merely unsure of itself at ground level -- it cannot even be reached by
+-- the fuel relief, because the relief has to fly up to it.
+--
+-- The climb must be affordable twice over: once up, once back down to the bay.
+local function climbForFixIfAffordable(p_Cy)
+    local s_Target = math.min(math.max(SKY_FIX_Y, (p_Cy or 64) + 8), SKY_FIX_CEILING)
+    if (p_Cy or 0) >= s_Target then return false end
+    local s_Rise = math.max(0, s_Target - (p_Cy or 64))
+    local s_Fuel = turtle.getFuelLevel()
+    if s_Fuel ~= "unlimited" and s_Fuel < (s_Rise * 2 + FUEL_RESERVE) then
+        trace(("skipping the climb to y=%d: %d fuel will not pay for %d blocks up and back")
+            :format(s_Target, s_Fuel, s_Rise))
+        return false
+    end
+    ClimbToOpenAir(s_Target)
+    return true
+end
+
 -- WHEN YOU DO NOT KNOW WHERE YOU ARE, GET TO OPEN SKY BEFORE YOU DECIDE WHICH WAY TO GO.
 --
 -- Fixing the unchecked turtle.back() in pgps stops position error ACCUMULATING, but it cannot undo
@@ -2688,8 +2719,19 @@ function SurfaceForFix()
     --
     -- Height buys modem range only up to a point, and past SKY_FIX_Y the extra blocks buy nothing a
     -- fix was going to come from. If we are already above it, we are as high as this helps.
-    local s_Target = math.min(math.max(SKY_FIX_Y, (cy or 64) + 8), SKY_FIX_CEILING)
-    if (cy or 0) < s_Target then ClimbToOpenAir(s_Target) end
+    -- NEVER SPEND THE LAST OF THE FUEL GAINING ALTITUDE.
+    --
+    -- Climbing to find GPS is worth doing and is NOT worth being stranded for. Every failed deposit
+    -- calls this, so a drone that cannot reach storage climbs again and again -- and each climb is
+    -- thirty to forty blocks of fuel it may not be able to spend twice.
+    --
+    -- Measured: D3 was found at y=96 with zero fuel, D14 at 68 and D17 at 72, all above a base at
+    -- y=64, all dry. They had not run out working; they had run out CLIMBING, and a drone stranded
+    -- at ninety-six is far worse off than one that is merely unsure of itself at ground level -- it
+    -- cannot even fall back on the fuel relief, because the relief has to fly up to reach it.
+    --
+    -- The climb must be affordable twice over: once to get up, once to get back down to the bay.
+    climbForFixIfAffordable(cy)
     local s_Ok, s_Drift = pgps.verifyPosition(true)
     if s_Ok then
         trace(("position re-fixed, we were out by %s block(s)"):format(tostring(s_Drift or 0)))
@@ -3065,8 +3107,6 @@ local FUEL_TOPUP  = 2000
 --
 -- So the floor scales with how far away home is. Three fuel per block of Manhattan distance covers
 -- a route that is not a straight line, plus a flat allowance for the search itself.
-local FUEL_RESERVE = 900
-local FUEL_PER_BLOCK_HOME = 3
 
 -- Where storage is, remembered from the last time we asked. A drone that is nearly out of fuel
 -- should not have to complete a network round trip before it is allowed to worry about it.
