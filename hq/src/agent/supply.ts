@@ -96,6 +96,26 @@ export const DEFAULT_RULES: SupplyRule[] = [
  */
 const COOLDOWN_MS = 3 * 60 * 1000;
 
+/**
+ * What the fleet is carrying, summed by item name. PURE, so it can be tested without a world.
+ *
+ * Pass only drones that can still act. A drone that cannot be reached cannot hand anything over,
+ * so its cargo is not supply -- it is loss, and counting it produces exactly the confident-but-
+ * wrong totals that stop the loop from fixing a real shortage.
+ */
+export function carriedStock(drones: any[]): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const d of drones ?? []) {
+    const c = d?.carrying;
+    if (!c || typeof c !== 'object') continue;
+    for (const [name, raw] of Object.entries(c)) {
+      const n = Number(raw) || 0;
+      if (n > 0) out[name] = (out[name] ?? 0) + n;
+    }
+  }
+  return out;
+}
+
 /** What to COUNT for a rule, as opposed to what to mine. */
 export function stockKey(r: SupplyRule): string {
   return r.stock ?? r.match.replace(/_ore$/, '');
@@ -947,9 +967,32 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
   // anything. Empty stock is the NORMAL state of a settlement that has not mined yet -- it is the
   // condition the loop exists to resolve, so it must be the one case it handles cleanly.
   const detail = luaList<any>(stock?.detail ?? stock?.data?.detail) ?? [];
-  const held = (m: string) =>
-    detail.filter((d: any) => typeof d.name === 'string' && d.name.includes(m))
-          .reduce((n: number, d: any) => n + (d.count ?? 0), 0);
+  // STOCK INSIDE A DRONE IS STILL STOCK THE FLEET HAS.
+  //
+  // `held` counted chests only, so everything in transit was invisible to every decision this loop
+  // makes. Measured live: the fleet was carrying 3,567 items -- including 421 COAL, about 33,680
+  // fuel -- while storage reported 61 coal, the monitor alerted COAL LOW, and this loop dispatched
+  // find-coal_ore to go and mine more. It was mining a material it already had, because the
+  // material was in a drone's hold rather than a chest.
+  //
+  // That is not a rare state. Storage sits at 0 free slots, so a drone that finishes a job CANNOT
+  // deposit and simply keeps its load -- the fuller the warehouse, the more stock is invisible, and
+  // the more phantom shortages this loop invents. The blindness gets worse exactly when it hurts.
+  //
+  // Counted over `live` only, never over every drone on the books. Material inside a lost drone is
+  // not material the fleet has, and treating it as available is precisely the bug that caused the
+  // fuel death spiral (41,234 phantom fuel counted from five unreachable drones while every
+  // reachable one sat at zero). Same trap, same rule: count what can actually act.
+  const carried = carriedStock(live);
+  const held = (m: string) => {
+    const inChests = detail
+      .filter((d: any) => typeof d.name === 'string' && d.name.includes(m))
+      .reduce((n: number, d: any) => n + (d.count ?? 0), 0);
+    const inHolds = Object.entries(carried)
+      .filter(([name]) => name.includes(m))
+      .reduce((n, [, v]) => n + v, 0);
+    return inChests + inHolds;
+  };
 
 
   const now = Date.now();
