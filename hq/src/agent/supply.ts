@@ -740,6 +740,59 @@ async function surveyCaves(ctx: SupplyCtx): Promise<void> {
  * more than one wandering the surface. This is the collaboration the fleet was supposed to have
  * and never did -- pairing existed only inside order.prospect.
  */
+/**
+ * Support tasks whose reason for existing has gone. PURE, so the rule is testable.
+ *
+ * scoutForMiners only ever creates support-X for a miner that is WORKING right now, which is
+ * correct at creation -- and nothing ever retired them, so they outlived their target.
+ *
+ * Found live: all three open support tasks pointed at drones that were lost or idle. They are
+ * queued at priority 1, AHEAD of exploration, and the settlement has exactly two scouts (role comes
+ * from hardware -- a geo scanner -- so a miner cannot be promoted to cover). One of those two was
+ * dry. So the single working scout was being pointed at priority-1 work supporting drones that had
+ * stopped digging long ago, while eleven scout tasks sat queued. From outside, that reads as
+ * "the scouts aren't helping".
+ *
+ * A task nobody can benefit from is worse than no task: it outranks the work that would have
+ * helped.
+ */
+export function staleSupportTasks(
+  tasks: Array<{ id: number; name?: string; progress?: number }>,
+  drones: Array<{ name?: string; status?: string }>,
+): number[] {
+  const working = new Set(
+    (drones ?? []).filter((d) => d?.status === 'working').map((d) => d.name),
+  );
+  return (tasks ?? [])
+    .filter((t) => String(t?.name ?? '').startsWith('support-'))
+    .filter((t) => (t?.progress ?? 0) < 100)
+    .filter((t) => !working.has(String(t.name).slice('support-'.length)))
+    .map((t) => t.id);
+}
+
+/**
+ * Retire support work whose target stopped mining.
+ *
+ * Runs BEFORE more scout work is dispatched. These tasks sit at priority 1, so a stale one outranks
+ * every useful scout job in the queue -- and with two scouts in the entire settlement that is the
+ * difference between scouts helping and scouts appearing to do nothing.
+ *
+ * Best effort throughout: cleanup must never be the thing that breaks a supply tick.
+ */
+async function retireStaleSupport(live: any[], did: string[]): Promise<void> {
+  try {
+    const all: any = await callTool('fleet.tasks', {});
+    const stale = staleSupportTasks(all?.data?.tasks ?? [], live);
+    if (!stale.length) return;
+    await callTool('task.stop', {
+      id: stale.slice(0, 32),
+      reason: 'the drone this supported is no longer working -- priority-1 work with no customer',
+    });
+    note(`retired ${stale.length} stale support task(s)`);
+    did.push(`retired ${stale.length} stale support`);
+  } catch { /* best effort */ }
+}
+
 async function scoutForMiners(ctx: SupplyCtx): Promise<void> {
 // SEND A SCOUT TO WHERE THE MINERS ARE DIGGING BLIND.
 //
@@ -1085,6 +1138,7 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
   // The dispatchers own these from here; the remaining phases read them back off the context.
   minerFree = ctx.minerFree; scoutFree = ctx.scoutFree; crafterFree = ctx.crafterFree;
 
+  await retireStaleSupport(live, did);
   await surveyCaves(ctx);
   await scoutForMiners(ctx);
 
