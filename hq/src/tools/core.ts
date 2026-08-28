@@ -2176,9 +2176,25 @@ registry.register({
       const part = ordered.slice(i, i + a.blocksPerTask);
       const res: any = await bridge.call('TaskMan', 'Add', {
         name: `tower-L${a.level}-p${String(queued.length + 1).padStart(2, '0')}`,
-        // ONE. The settlement should be building its base before it speculatively gathers more ore
+        // TWO, NOT ONE. FUEL OUTRANKS BUILDING -- BUILDING IS WHAT SPENDS THE FUEL.
+        //
+        // This was priority 1, reasoning that the base should be built before the fleet
+        // speculatively gathers more ore. That is right about ORE and wrong about COAL, and the
+        // queue cannot tell them apart: 13 tower patches at priority 1 against a single
+        // gather:coal_ore at priority 1 means the tower takes every drone, and the settlement stops
+        // mining the fuel the tower is burning.
+        //
+        // Measured directly. Tower OFF, over 12 minutes: coal 489 -> 642, energy +14,476, rising at
+        // every sample. Tower ON, same conditions, next 12 minutes: coal frozen at 642, energy
+        // -5,442, and cobblestone did not move either -- so it bought nothing with what it spent.
+        //
+        // Priority 2 puts it behind fuel and ahead of speculative ore, which is the order the
+        // original comment actually wanted. Same class of inversion as fuel relief preempting the
+        // coal gather it depended on: work that CONSUMES fuel must never outrank the work that
+        // PRODUCES it.
+        priority: 2,
+        // (superseded) ONE. The settlement should be building its base before it gathers more ore
         // -- which it will otherwise do for ever, because there is always another material short.
-        priority: 1,
         work: { build: { origin, blocks: part } },
       }, { timeoutMs: 12000 });
       if (typeof res === 'string') break;      // TaskMan refused; stop rather than queue a gap

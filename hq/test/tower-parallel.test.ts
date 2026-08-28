@@ -53,7 +53,24 @@ describe('tower patches are independent', () => {
     expect(towerRaw).toMatch(/independent/i);
   });
 
-  it('still queues the patches at priority 1', () => {
-    expect(tower).toMatch(/priority:\s*1/);
+  /**
+   * PRIORITY 2, AND THIS ASSERTION USED TO SAY 1.
+   *
+   * I wrote it expecting 1, because order.tower's comment argued the base should be built before
+   * the fleet speculatively gathers ore. That is right about ORE and wrong about COAL, and the
+   * queue cannot tell them apart -- 13 tower patches at priority 1 against one gather:coal_ore at
+   * priority 1 means the tower takes every drone and the settlement stops mining the fuel the
+   * tower burns.
+   *
+   * Measured directly, same fleet and conditions, back to back:
+   *   tower OFF, 12 min: coal 489 -> 642, energy +14,476, rising at every sample
+   *   tower ON,  12 min: coal frozen at 642, energy -5,442, cobblestone unmoved
+   *
+   * Work that CONSUMES fuel must never outrank the work that PRODUCES it -- the same inversion as
+   * fuel relief preempting the coal gather it depended on.
+   */
+  it('queues the patches BELOW fuel work, at priority 2', () => {
+    expect(tower).toMatch(/priority:\s*2/);
+    expect(tower).not.toMatch(/^\s*priority:\s*1\s*,/m);
   });
 });
