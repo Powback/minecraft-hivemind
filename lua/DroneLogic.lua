@@ -3892,6 +3892,25 @@ function OnGather(p_ID, p_Message)
                     -- instead of accumulating ghosts for ever.
                     if not (s_Ok and s_Blk and wanted(s_Blk.name)) then
                         local s_Idx = t.x .. ":" .. t.y .. ":" .. t.z
+                        -- EARN THE FIX FIRST, OR THE CORRECTION IS THROWN AWAY.
+                        --
+                        -- noteObservation refuses anything recorded on an unverified position --
+                        -- correctly, that gate is what stopped drift from polluting the map. But a
+                        -- drone that has just dug or flown to a remote candidate is exactly the
+                        -- drone WITHOUT a fresh fix, so every ghost report was silently suppressed
+                        -- at the one moment it could be made.
+                        --
+                        -- The index therefore never self-corrected. Seen live:
+                        --   gather: at -489,71,56 for -489,70,56 -> air
+                        -- ore that had already been mined, still in the index, still generating
+                        -- gather tasks, still costing a full approach to re-discover the same
+                        -- absence. Coal stayed flat at 583 for nine minutes while drones spent
+                        -- their fuel visiting deposits that were not there.
+                        --
+                        -- One cheap attempt to re-verify before reporting. Underground it will
+                        -- often fail and we skip, which is the old behaviour and no worse; above
+                        -- ground it succeeds and the ghost is pruned for the whole fleet.
+                        pcall(pgps.verifyPosition)
                         if s_Ok and s_Blk then
                             pcall(pgps.noteObservation, s_Idx, 1, {true, {name = s_Blk.name}})
                         else
