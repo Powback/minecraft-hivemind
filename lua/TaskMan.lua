@@ -803,6 +803,32 @@ local TRIES_PER_ROLE = 4
 -- over half an hour to find, cut and carry coal home before anything is actually at risk.
 local FLEET_FUEL_LOW = 4000
 
+-- Does this task make fuel? Declared ABOVE the placement loop that asks -- a local used above its
+-- declaration is a silent nil global in Lua, and here that would make EVERY task look like non-fuel
+-- work and stop the fleet dead the moment fuel ran low.
+--
+-- THE SUBSTRING "coal" WAS THE WHOLE TEST, AND IT IS WHY THE SETTLEMENT HAS NO RENEWABLE FUEL.
+--
+-- Below FLEET_FUEL_LOW the placement loop refuses everything that is not fuel work. Correct policy.
+-- But it recognised fuel work by looking for "coal" in the task NAME, so `gather:oak_log` failed the
+-- test -- and a log is fuel twice over: a turtle burns it directly, and one coal smelts eight of
+-- them into eight charcoal, which is the only smelt in the settlement that ends with more fuel than
+-- it started with.
+--
+-- So the rule read: when fuel is short, permit only the fuel that is buried thirty blocks down in
+-- caves where three drones have already stranded, and forbid the fuel growing on the surface
+-- nineteen blocks from base. The fleet sat idle at 0 coal with `gather:oak_log` unassigned in the
+-- queue and drones reporting idle beside it, which is exactly what it looks like from outside: a
+-- scheduler that has given up.
+--
+-- HQ already had this right -- supply.ts `producesFuel()` permits wood explicitly, "the reachable
+-- half of the fuel supply". This was a second, dumber copy of the same idea, and the two disagreed.
+local function taskProducesFuel(p_Name)
+    local s_Name = tostring(p_Name)
+    -- "charcoal" contains "coal", so it is covered. "log" catches gather:oak_log and find-oak_log.
+    return s_Name:find("coal") ~= nil or s_Name:find("log") ~= nil or s_Name:find("wood") ~= nil
+end
+
 local function fleetFuelLow()
     local s_Total, s_Known = 0, false
     for _, d in ipairs(fleet()) do
@@ -1681,7 +1707,7 @@ function Tick()
                     -- moving again, and it is fuel work by definition.
                     local s_FuelOnly = fleetFuelLow()
                     local s_IsFuelWork = (v.work and v.work.rescue ~= nil)
-                        or (tostring(v.name):find("coal") ~= nil)
+                        or taskProducesFuel(v.name)
                     local s_Role = RoleForWork(v.work)
                     if s_FuelOnly and not s_IsFuelWork then
                         -- skip: the fleet cannot afford this right now
