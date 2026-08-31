@@ -1079,7 +1079,25 @@ local function rescueNeeded()
         -- on top of the casualty and drops it; the casualty's own fuel watchdog sucks it up and
         -- burns it without needing to know a rescue happened. See OnRelieve.
         local s_Fuel = tonumber(d.fuel)
-        local s_Dry = s_Trapped and s_Fuel ~= nil and s_Fuel < DISPATCH_FUEL_FLOOR
+        -- TRUST A LOW FUEL READING. DO NOT TRUST A HIGH ONE.
+        --
+        -- d.fuel is replayed from the last heartbeat that reached base, so it is stalest for exactly
+        -- the drones in trouble -- a stale HIGH reading is the NORMAL case for a casualty. D21 was
+        -- on the books at 2,534 fuel while a probe of the turtle itself returned 0. Requiring
+        -- s_Trapped on top of that made it stricter again.
+        --
+        -- Getting this wrong is not symmetric, which is what makes the old test dangerous:
+        --   * calling a DRY drone "trapped" names the task rescue-, which pins it to a MINER -- and
+        --     the thing that empties one miner's tank is an empty larder, which empties all of them
+        --     at once. The task is then unassignable precisely when it is needed. Measured just now:
+        --     rescue-D9, rescue-D20 and rescue-D21 all queued, all role=miner, all unassigned, with
+        --     D15 and D12 sitting at a probed ZERO and the only fuelled drone in the settlement a
+        --     crafter holding 948.
+        --   * calling a TRAPPED drone "dry" sends someone with coal, which any drone can carry. If
+        --     that was the wrong guess the attempt fails cheaply and rescueTries escalates.
+        --
+        -- So: unknown fuel counts as dry, and being trapped is no longer a precondition for it.
+        local s_Dry = (s_Fuel == nil) or (s_Fuel < DISPATCH_FUEL_FLOOR)
         -- STRANDED MINERS GET RESCUED TOO.
         --
         -- This skipped them on the theory that a miner can dig itself out. It can, right up until it
