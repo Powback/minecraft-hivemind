@@ -58,9 +58,9 @@
         50,
         34,
         30,
-        21,
         19,
         18,
+        17,
         17,
         17,
         16
@@ -71,10 +71,10 @@
         "OnStartTask",
         "OnTaskDone",
         "placeRescues",
-        "placeBlockers",
         "freeOrphanedDrones",
         "workPos",
         "pickDrone",
+        "placeBlockers",
         "releaseStalledAssignments",
         "blockers"
       ]

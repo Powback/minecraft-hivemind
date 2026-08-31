@@ -1357,6 +1357,34 @@ local function blockers()
     return s_Out
 end
 
+-- May this task be interrupted so its drone can go and relieve a dry one?
+--
+-- The whole condition lives here rather than inline so the preempt loop stays inside the
+-- complexity gate, and so the rule can be read in one place: it must be THIS drone's task, still
+-- unfinished, not itself a rescue -- and not the coal gather, because relief with no coal in
+-- storage fails and requeues, and preempting the gather means it can never succeed.
+local function preemptable(p_Task, p_DroneId)
+    if p_Task.assignedTo ~= p_DroneId then return false end
+    if (p_Task.progress or 0) >= 100 then return false end
+    if p_Task.work and p_Task.work.rescue then return false end
+    -- taskProducesFuel, NOT a local copy. There was one here that matched only "coal" and
+    -- "charcoal", so gather:oak_log read as ordinary work and was preempted for rescue duty every
+    -- pass. Caught in D15's log mid-run:
+    --
+    --   JOB Gather start {"taskId":6968, ... oak_log ...}
+    --   GoTo received from 12
+    --   Aborting (was executing: true)
+    --
+    -- which is the deadlock this guard exists to prevent, arriving through the guard itself: relief
+    -- with nothing burnable in storage fails and requeues, and the task it keeps interrupting is the
+    -- only one that would end the shortage. Wood is fuel -- a log burns, and one coal turns eight of
+    -- them into eight charcoal.
+    --
+    -- That is now THREE copies of "what counts as fuel" this file has had to be corrected on today
+    -- (the emergency filter, the queue ordering, and this). One function, used everywhere.
+    return not taskProducesFuel(p_Task.name)
+end
+
 local function placeBlockers()
     local s_List = blockers()
     if #s_List == 0 then return 0 end
@@ -1374,8 +1402,18 @@ local function placeBlockers()
             for _, d in ipairs(fleet()) do
                 if RoleFits(d, s_Role) and not d.offline and hasFuel(d) then
                     for _, t in pairs(DATA["tasks"] or {}) do
-                        if t.assignedTo == d.id and (t.progress or 0) < 100
-                                and not (t.work and t.work.rescue) then
+                        -- THE SAME QUESTION THE RESCUE PREEMPT ASKS, SO IT GETS THE SAME ANSWER.
+                        --
+                        -- This had its own looser copy of the condition -- this drone's task,
+                        -- unfinished, not a rescue -- and no fuel exemption at all. So the guard
+                        -- that stops relief interrupting the lumber run did nothing here, and
+                        -- gather:oak_log was interrupted to clear a blocker instead. Same abort,
+                        -- different caller: "JOB Gather start ... oak_log" then "Aborting (was
+                        -- executing: true)" ninety seconds later, over and over.
+                        --
+                        -- Interrupting the only job that ends the fuel shortage is self-defeating
+                        -- whoever does it, so both paths now ask preemptable().
+                        if preemptable(t, d.id) then
                             -- Never preempt another blocker; that just moves the problem.
                             local s_IsBlocker = false
                             for _, w in ipairs(s_List) do
@@ -1441,33 +1479,6 @@ local function placeRescues()
     end
 
 -- Does this task, if left alone, end the fuel shortage? Used to keep it safe from preemption.
--- May this task be interrupted so its drone can go and relieve a dry one?
---
--- The whole condition lives here rather than inline so the preempt loop stays inside the
--- complexity gate, and so the rule can be read in one place: it must be THIS drone's task, still
--- unfinished, not itself a rescue -- and not the coal gather, because relief with no coal in
--- storage fails and requeues, and preempting the gather means it can never succeed.
-local function preemptable(p_Task, p_DroneId)
-    if p_Task.assignedTo ~= p_DroneId then return false end
-    if (p_Task.progress or 0) >= 100 then return false end
-    if p_Task.work and p_Task.work.rescue then return false end
-    -- taskProducesFuel, NOT a local copy. There was one here that matched only "coal" and
-    -- "charcoal", so gather:oak_log read as ordinary work and was preempted for rescue duty every
-    -- pass. Caught in D15's log mid-run:
-    --
-    --   JOB Gather start {"taskId":6968, ... oak_log ...}
-    --   GoTo received from 12
-    --   Aborting (was executing: true)
-    --
-    -- which is the deadlock this guard exists to prevent, arriving through the guard itself: relief
-    -- with nothing burnable in storage fails and requeues, and the task it keeps interrupting is the
-    -- only one that would end the shortage. Wood is fuel -- a log burns, and one coal turns eight of
-    -- them into eight charcoal.
-    --
-    -- That is now THREE copies of "what counts as fuel" this file has had to be corrected on today
-    -- (the emergency filter, the queue ordering, and this). One function, used everywhere.
-    return not taskProducesFuel(p_Task.name)
-end
 
     -- A DRY DRONE OUTRANKS A GATHER. PREEMPT FOR IT.
     --
