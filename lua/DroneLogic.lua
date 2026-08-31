@@ -2792,7 +2792,27 @@ local SKY_FIX_CEILING = 140
 
 -- Declared above SurfaceForFix, which is now the first thing to need them. A `local` used above
 -- its declaration is a nil GLOBAL lookup in Lua -- silent, and the comparison would simply throw.
-local FUEL_RESERVE = 900
+--
+-- 900 -> 300, AND THE 900 IS WHY THE FLEET KEPT STOPPING.
+--
+-- The flat reserve was sized for the worst case of pathfinder thrash: "moveTo, then digTo (256
+-- steps), then flyTo (512)" -- a drone could burn 768 fuel going nowhere, so it had to hold more
+-- than that before it was allowed to start. That reasoning was sound when it was written. The
+-- 512-fuel half of it was the climb to CRUISE_Y, and that flyover has been deleted: a route A*
+-- cannot supply is now reported instead of flown around at altitude. The worst case it was
+-- defending against no longer exists, so the number defending against it should not either.
+--
+-- What it cost while it stayed: the floor is FUEL_RESERVE + 3/block home, so a drone sitting AT
+-- base needs ~900 before it may do anything at all. D4 was found holding 946 against a floor of
+-- ~950 -- a FOUR fuel shortfall -- and that was enough to put it in permanent distress, which makes
+-- it report "stuck", which makes pickDrone skip it, which left every one of eight queued tasks
+-- unassigned while 64 coal sat in a chest it would not walk to. The entire settlement was blocked
+-- on a rounding error. D15 did the same thing at 829, refusing a lumber run costing under 150.
+--
+-- 300 still covers a local search plus a bounded walk home on top of the distance term, and the
+-- system is now far better at recovering when it is wrong: relief can be carried by any drone, a
+-- write-off expires, and the floor collapses entirely when storage is known dry.
+local FUEL_RESERVE = 300
 local FUEL_PER_BLOCK_HOME = 3
 
 -- NEVER SPEND THE LAST OF THE FUEL GAINING ALTITUDE.
