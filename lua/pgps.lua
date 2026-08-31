@@ -1337,9 +1337,23 @@ function ensureHeading(p_Force)
                     return true
                 end
             end
-            -- lua-hygiene: allow (cachedDir is nil here BY DEFINITION -- this loop is what derives
-            -- it. There is no cache to keep in step with, so an unchecked turn cannot desync one.)
-            turtle.turnLeft()   -- blocked that way; try another
+            -- "cachedDir is nil here BY DEFINITION" was the old exemption on this line, and it was
+            -- false: ensureHeading(p_Force) skips its early return when forced, so probe() runs with
+            -- a PERFECTLY GOOD cachedDir whenever a drift check re-derives the heading. Every raw
+            -- turn taken here then rotated the drone without rotating the cache. The loop only comes
+            -- out even if it runs all four times; the hard-error return above leaves it k
+            -- quarter-turns out, permanently, and this path runs constantly because it is what a
+            -- drone does whenever it loses GPS.
+            --
+            -- That is the "heading error that appears MID-run" in the logs: "wanted -4,0,0 got
+            -- -2,0,2" -- two steps west, then this turn fired, then two steps south, all booked as
+            -- west. D14 walked all four ways looking for GPS and ended 76 blocks from where its own
+            -- pose said it was, which is why the relief sent to it arrived nowhere near it.
+            --
+            -- pgps.turnLeft already does the raw turn when cachedDir is nil (see its first line), so
+            -- it is correct for BOTH callers: derivation keeps its unchecked turn, and the forced
+            -- re-derivation keeps its cache in step.
+            turnLeft()   -- blocked that way; try another
         end
         return false
     end
@@ -1401,9 +1415,10 @@ function ensureHeading(p_Force)
         for _ = 1, 4 do
             digGuarded(turtle.dig, turtle.detect, turtle.inspect)
             if probe() then return true end
-            -- lua-hygiene: allow (boxed-in recovery, spinning to find a wall to dig through. The
-            -- heading is unknown until probe() succeeds, so there is no cached value to corrupt.)
-            turtle.turnLeft()
+            -- Same fix as the turn inside probe(): "the heading is unknown here" is only true on the
+            -- unforced path. turnLeft() degrades to a raw turn when cachedDir is nil, so the
+            -- boxed-in spin still works with no heading and stops desyncing one that exists.
+            turnLeft()
         end
     end
 

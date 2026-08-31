@@ -6,6 +6,8 @@
  * stock), so the loop round-robins regardless of whether the fleet can still move.
  */
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { ruleSkipReason, fuelRunway, producesFuel, type SupplyRule } from '../src/agent/supply.js';
 
 const FUEL_PRIORITY_BELOW = 4000;
@@ -163,4 +165,38 @@ describe('a fuel emergency permits everything that burns, not just coal', () => 
       expect(producesFuel(m), m).toBe(false);
     }
   });
+});
+
+/**
+ * THE TWO DISPATCHERS THAT NEVER ASKED.
+ *
+ * `fuelCritical` gates materialPhases and, through ruleSkipReason, every rule in the tick's loop.
+ * surveyCaves and scoutForMiners are called after that loop and consulted neither -- so during a
+ * declared fuel emergency the settlement refused to gather dirt and then sent a scout on a cave
+ * survey at the edge of its range instead.
+ *
+ * That is worse than an ungated tick, because the emergency note prints once a minute and reads as
+ * if the fleet is being protected. It was found with storage on ZERO coal and the only fuelled
+ * mobile drone flying a survey while burning the 32 coal it was carrying home to the furnaces.
+ *
+ * Asserted at the call site rather than through the tick: runSupplyTick needs a live bridge, and a
+ * guard that only exists when a mock is wired up is a guard that stops guarding the day the mock
+ * changes.
+ */
+describe('exploration during a fuel emergency', () => {
+  const SRC = readFileSync(path.resolve(__dirname, '../src/agent/supply.ts'), 'utf8');
+  const lines = SRC.split('\n');
+
+  for (const call of ['await surveyCaves(', 'await scoutForMiners(']) {
+    it(`${call.trim()}…) is guarded by fuelCritical`, () => {
+      const at = lines.findIndex((l) => l.includes(call));
+      expect(at, `${call} must still exist`).toBeGreaterThan(-1);
+
+      // Only one call site each: a second, ungated one is exactly how this regressed the first time.
+      expect(lines.filter((l) => l.includes(call)).length, 'one call site only').toBe(1);
+
+      // The guard has to be immediately above the call, not merely somewhere in the function.
+      expect(lines.slice(Math.max(0, at - 6), at).join('\n')).toMatch(/fuelCritical/);
+    });
+  }
 });

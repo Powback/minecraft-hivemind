@@ -1240,8 +1240,32 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
   minerFree = ctx.minerFree; scoutFree = ctx.scoutFree; crafterFree = ctx.crafterFree;
 
   await retireStaleSupport(live, did);
-  await surveyCaves(ctx);
-  await scoutForMiners(ctx);
+
+  // EXPLORATION IS NOT FREE, AND A FUEL EMERGENCY IS EXACTLY WHEN IT LOOKS FREE.
+  //
+  // fuelCritical gates materialPhases above and every rule in the loop through ruleSkipReason, so
+  // during an emergency the tick correctly refuses to gather dirt, copper or lapis -- and then fell
+  // straight through to these two and dispatched a cave survey anyway. They were the only
+  // dispatchers in the whole tick that never asked. The protection reads as if it covers the tick;
+  // it covered everything except the part that sends a drone furthest from home.
+  //
+  // Measured at the point this was found: storage holding ZERO coal and zero charcoal, "fuel
+  // emergency: ... -- coal only this tick" printed once a minute for the preceding hour, and D19 --
+  // the only fuelled mobile drone left, carrying the 32 coal that was going to restart the furnaces
+  // -- flying a cave survey at the far edge of the region and burning that same coal to do it
+  // ("refuelled +78" three times in four minutes, one coal each). Stopping the task by hand did not
+  // help for longer than a tick: this line regenerated it (6870 -> 6890 -> 6908) and TaskMan handed
+  // it straight back to the same drone.
+  //
+  // Surveying is how the settlement finds its NEXT vein. Fuel is how it reaches any vein at all.
+  // When the second is in doubt the first is a luxury, and it is spent in the most expensive
+  // possible place: a scout at the edge of its range with no reserve to come home on.
+  if (fuelCritical) {
+    waiting.push('cave survey and miner support: fuel emergency');
+  } else {
+    await surveyCaves(ctx);
+    await scoutForMiners(ctx);
+  }
 
   if (did.length) return { acted: true, reason: did.join(', ') };
   if (waiting.length) return { acted: false, reason: `waiting on cooldown: ${waiting.join(', ')}` };

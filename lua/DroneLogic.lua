@@ -3296,6 +3296,38 @@ end
 -- get there -- and the dock is where the coal is. Returning early costs a trip; running dry costs
 -- the drone.
 local FUEL_TOPUP  = 2000
+
+-- When we last went to storage for fuel and found none, and how long that answer is trusted.
+--
+-- See RefuelAtStorage: without this a drone under its floor breaks off work, walks to empty
+-- chests, finds nothing and immediately does it again, while every other drone does the same --
+-- gridlocking the bay so thoroughly that a one-block hop fails and a gather spends 264s on a
+-- single candidate. The fuel it needs can only come from a gather that this behaviour prevents.
+--
+-- 180s because the fix for an empty larder is a gather or a smelt, and neither finishes faster
+-- than that. Re-checking sooner cannot find anything and costs another trip through the bay.
+local m_StorageDryAt = nil
+local STORAGE_DRY_TRUST = 180
+
+-- Fuel level below which an empty larder stops being a reason to keep working.
+--
+-- The point of ignoring the floor is to keep drones out of the bay while there is nothing to
+-- collect. It is NOT to let one strand itself: at this level the trip is still affordable, and a
+-- drone parked near storage with a little fuel can be relieved, whereas one that ran to zero in
+-- the field cannot. Well under the ~1,038 distance-scaled floor that was causing the thrash.
+local FUEL_STRANDING_RISK = 400
+
+-- Should we skip breaking off to refuel because storage was empty a moment ago?
+--
+-- A GLOBAL, and declared here above the fuel watchdog that calls it: a `local` used above its
+-- declaration is a nil global in Lua, silently, which is the most expensive mistake in this file.
+function StorageKnownDry(p_Fuel)
+    if m_StorageDryAt == nil then return false end
+    if (os.clock() - m_StorageDryAt) > STORAGE_DRY_TRUST then return false end
+    -- Genuinely low beats a stale "it was empty": go and look again rather than strand.
+    if type(p_Fuel) == "number" and p_Fuel < FUEL_STRANDING_RISK then return false end
+    return true
+end
 -- THE RESERVE HAS TO COVER THE TRIP HOME, AND THE TRIP HOME IS NOT A CONSTANT.
 --
 -- 600 flat was not a reserve, it was a coincidence. The journey it has to pay for is moveTo, then
@@ -6593,10 +6625,24 @@ function RefuelAtStorage()
     trace(("refuel at storage: %+d fuel (now %d, collected %d)")
         :format(s_Gained, turtle.getFuelLevel(), s_Got or 0))
     if s_Gained <= 0 then
+        -- REMEMBER THAT THE LARDER WAS EMPTY.
+        --
+        -- Without this the drone breaks off work again the moment it drops below its floor, walks
+        -- back to the same empty chests, finds nothing, and repeats -- and every other drone is
+        -- doing it at the same time. Seven of them converged on the bay, which is the most
+        -- congested airspace in the settlement, and gridlocked it: a gather logged "short hop of 1
+        -- failed direct" and took 264 SECONDS to attempt a single candidate before giving up.
+        --
+        -- That is a deadlock, not a shortage. Storage is empty because nobody is gathering, and
+        -- nobody is gathering because they are all queuing for fuel that does not exist. The tanks
+        -- were not even low -- 2,300 to 5,300 each -- they were merely under a distance-scaled
+        -- floor of ~1,038.
+        m_StorageDryAt = os.clock()
         Distress("no fuel in storage",
             "level " .. turtle.getFuelLevel() .. ", " .. tostring(s_Why or "storage had nothing burnable"))
         return false
     end
+    m_StorageDryAt = nil
     return true
 end
 
@@ -6748,7 +6794,7 @@ local function fuelLoop()
             s_Fuel = turtle.getFuelLevel()
         end
         local s_Floor = FuelFloorNow()
-        if s_Fuel ~= "unlimited" and s_Fuel < s_Floor then
+        if s_Fuel ~= "unlimited" and s_Fuel < s_Floor and not StorageKnownDry(s_Fuel) then
             trace(("fuel at %d (floor %d for this position) -- breaking off to refuel")
                 :format(s_Fuel, s_Floor))
             executing = false                      -- stop whatever job is running

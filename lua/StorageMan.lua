@@ -817,6 +817,40 @@ end
 
 local function isSmeltableInput(p_Name) return isSmeltable(p_Name) and not isFuel(p_Name) end
 
+-- SMELT WHAT PAYS FOR ITSELF FIRST.
+--
+-- firstInStorage walks `pairs(m_Index)`, and table order in Lua is arbitrary. The very first tick
+-- after the furnace input face was wired, that arbitrary order handed the settlement's LAST fuel to
+-- cobblestone: "drained minecraft:stone x2 from minecraft:furnace_0", with 2,410 cobblestone in
+-- front of 657 raw_copper. Storage had zero coal and zero charcoal at the time, so those were
+-- literally the last smelts available and they produced a decorative block.
+--
+-- Rank, lowest first:
+--   1  logs. The ONLY fuel-positive smelt: one coal smelts eight logs into eight charcoal, so this
+--      is the smelt that grows the fuel supply instead of consuming it. When fuel is the binding
+--      constraint -- and here it always is -- nothing else should ever go in ahead of a log.
+--   2  raw ore. What the settlement is actually mining for, and what building needs.
+--   9  cobblestone and deepslate. 2,585 in stock, no demand, and a furnace-hour each.
+local function smeltRank(p_Name)
+    if string.find(p_Name, "_log", 1, true) then return 1 end
+    if string.find(p_Name, "raw_", 1, true) or string.find(p_Name, "_ore", 1, true) then return 2 end
+    if string.find(p_Name, "cobble", 1, true) then return 9 end
+    return 5
+end
+
+-- The best thing waiting to be smelted, or nil if there is nothing. Same contract as
+-- firstInStorage(isSmeltableInput), which is what this replaces at both call sites.
+local function bestSmeltInput()
+    local s_Best, s_Rank = nil, nil
+    for name, e in pairs(m_Index) do
+        if e.at[1] and isSmeltableInput(name) then
+            local r = smeltRank(name)
+            if s_Rank == nil or r < s_Rank then s_Best, s_Rank = e, r end
+        end
+    end
+    return s_Best
+end
+
 local function drainTo(p_Fur, p_Slot)
     for _, cname in ipairs(m_Chests) do
         if (m_Free[cname] or 0) > 0 then
@@ -827,9 +861,52 @@ local function drainTo(p_Fur, p_Slot)
     return 0
 end
 
+-- Last thing ServiceFurnaces reported, so the tick can stay quiet while nothing changes.
+local m_LastFurnaceNote = nil
+
+-- SAY WHAT THE FURNACES ARE DOING, OR SMELTING FAILS INVISIBLY.
+--
+-- This function wrote nothing, ever, and the tick calls it inside a pcall -- so a throw, a furnace
+-- that cannot be wrapped, or simply never finding an input all look identical from outside:
+-- storage sits on 657 raw_copper next to two working furnaces with coal available and no ingot
+-- ever appears. There is no way to tell "smelting is off" from "smelting is on and doing nothing",
+-- which is the difference between flipping a flag and debugging a peripheral.
+--
+-- Deduplicated against the last message so a healthy idle tick costs one line, not one every 10s.
+local function furnaceNote(p_Msg)
+    if p_Msg == m_LastFurnaceNote then return end
+    m_LastFurnaceNote = p_Msg
+    Log("smelt: " .. p_Msg)
+end
+
+-- One line describing why a tick moved what it moved.
+--
+-- Separated from ServiceFurnaces so the branches live here: that function sits on the complexity
+-- gate, and the whole point of this diagnostic is that it must not be the thing that gets cut.
+-- "moved=0 input=NONE" and "moved=0 input=minecraft:raw_copper" are completely different faults --
+-- the first is an empty larder, the second is a furnace that will not accept what it is offered --
+-- and without this they are the same silence.
+local function furnaceSummary(p_Moved)
+    local s_In = bestSmeltInput()
+    local s_Fu = firstInStorage(isFuel)
+    local s_Sizes = {}
+    for _, fname in ipairs(m_Furnaces) do
+        local ok, fur = pcall(peripheral.wrap, fname)
+        local okS, s_Size = false, nil
+        if ok and fur then okS, s_Size = pcall(fur.size) end
+        s_Sizes[#s_Sizes + 1] = fname .. ":" .. ((okS and tostring(s_Size)) or "unreadable")
+    end
+    return ("%d furnace(s) [%s] moved=%d input=%s fuel=%s"):format(
+        #m_Furnaces, table.concat(s_Sizes, " "), p_Moved,
+        (s_In and (s_In.name or "yes")) or "NONE",
+        (s_Fu and (s_Fu.name or "yes")) or "NONE")
+end
+
 function ServiceFurnaces()
     if not DATA["smelting"] then return 0 end
     Rescan()
+    -- No early return for "no furnaces": the loop below simply does not run, and the summary at
+    -- the end reports `0 furnace(s)` -- which is the diagnostic that case needed anyway.
     local s_Moved = 0
     for _, fname in ipairs(m_Furnaces) do
         local ok, fur = pcall(peripheral.wrap, fname)
@@ -856,7 +933,7 @@ function ServiceFurnaces()
                     for slot = 1, s_Size do
                         if fresh[slot] == nil then
                             local moved = 0
-                            local e = firstInStorage(isSmeltableInput)
+                            local e = bestSmeltInput()
                             if e then
                                 local okp, r = pcall(fur.pullItems, e.at[1].where, e.at[1].slot, 32, slot)
                                 moved = (okp and (r or 0)) or 0
@@ -875,6 +952,7 @@ function ServiceFurnaces()
             end
         end
     end
+    furnaceNote(furnaceSummary(s_Moved))
     return s_Moved
 end
 
