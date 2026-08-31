@@ -672,6 +672,24 @@ end
 -- no peripheral network here), so a drone looking for logs has to be able to walk the bay: keyed to
 -- chest 4 of 4, the crafter stood on an empty chest asking for wood that was two chests along, and
 -- reported "storage would not hand over ingredients" for hours.
+-- What a chest ACTUALLY holds, from the index Rescan just built off the wired network.
+--
+-- Returns nil for a chest that is not on the network -- unknown, which is not the same as empty and
+-- must stay distinguishable, because "unknown" is the only answer that makes a drone go and look.
+local function liveContents(p_Peripheral)
+    if p_Peripheral == nil then return nil end
+    if m_Free[p_Peripheral] == nil then return nil end     -- not on the network: we cannot say
+    local s_Items = {}
+    for name, e in pairs(m_Index) do
+        for _, at in ipairs(e.at or {}) do
+            if at.where == p_Peripheral then
+                s_Items[name] = (s_Items[name] or 0) + (at.count or 0)
+            end
+        end
+    end
+    return s_Items                                          -- possibly empty, and that is a FACT
+end
+
 function OnDepositPoints(p_ID, p_Message)
     Rescan()
     local s_Out = {}
@@ -680,8 +698,23 @@ function OnDepositPoints(p_ID, p_Message)
         -- skip the chests already known not to hold it. Without this the sweep is a blind tour of
         -- the whole bay every time -- which, with four other drones in the way and a crafter that
         -- has no pickaxe to clear its own route, took longer than the craft it was serving.
-        local seen = nil
-        if d.pos and DATA["chestAt"] then
+        -- THE LIVE READ WINS. THE DRONE REPORT IS THE FALLBACK.
+        --
+        -- This shipped DATA["chestAt"] -- what a DRONE last reported seeing -- while the Rescan on
+        -- the first line of this function had just read every chest on the wired network directly.
+        -- Two sources of truth for the same question, and the fetch path was handed the weaker one.
+        --
+        -- The drone then trusts it hard: it skips every chest "known not to hold it", so a stale
+        -- snapshot does not merely slow the sweep, it removes the right chest from it entirely.
+        -- Measured: 48 coal sitting in the pickup chest, visible in storage.stock, while the fetch
+        -- logged "12 of 12 chests are known not to hold it -- skipping them" and CollectFuel
+        -- returned "storage had nothing burnable". Three fuel reliefs for D15 ran and completed on
+        -- that error; D15 stayed at zero through all of them, and so did D12 and D21.
+        --
+        -- ReportChest keeps its purpose -- chests off the network have no other observer -- so the
+        -- drone report is still used where the live read cannot answer.
+        local seen = liveContents(d.peripheral)
+        if seen == nil and d.pos and DATA["chestAt"] then
             local rec = DATA["chestAt"][("%d:%d:%d"):format(d.pos.x, d.pos.y, d.pos.z)]
             if rec then seen = rec.items end
         end
