@@ -69,6 +69,34 @@ local executing = false
 -- refuelled nothing, and carried on down to 185. The watchdog fired perfectly every time and was
 -- undone by the very line it used to interrupt the job.
 local m_Refuelling = false
+
+-- ONE ANSWER TO "CAN THIS DRONE TAKE WORK".
+--
+-- Three places decided this. RunJob and OnSurvey both refused while m_Refuelling; SendHeartBeat --
+-- which produces the status the SCHEDULER reads -- did not know about m_Refuelling at all. So a
+-- refuelling drone advertised itself as idle, TaskMan picked it, dispatched fire-and-forget,
+-- recorded the assignment, and the drone answered "JOB Lumber REFUSED: busy" to nobody. The task
+-- then belonged to a drone that was never going to run it, while the queue read as fully staffed
+-- and the fleet view showed the drone standing idle.
+--
+-- Caught on D31 holding lumber:oak_log -- the one job between this settlement and renewable fuel --
+-- assigned and refused on a loop for minutes. Exactly the duplicated-concept shape this codebase
+-- keeps paying for: one question, answered in three places, one of which had drifted.
+--
+-- Returns the REASON rather than a boolean, because "busy" and "refuelling" want different
+-- responses and the log has to name which one it was.
+local function unavailableReason()
+    if m_Refuelling then return "refuelling" end
+    if executing then return "busy" end
+    return nil
+end
+
+-- The status the SCHEDULER is allowed to see. Lives next to the predicate it defers to, because
+-- the whole fault was these two drifting apart: keeping them adjacent is the cheap part.
+local function reportableStatus(p_Status)
+    if p_Status ~= "idle" then return p_Status end
+    return unavailableReason() or p_Status
+end
 -- Forward declaration. reportTask is defined much further down, but OnGoTo -- which sits above it --
 -- has to call it now that a rescue is dispatched as a GoTo. Declared the obvious way, the name in
 -- OnGoTo would compile to a GLOBAL lookup and be nil at call time, so the drone would arrive and
@@ -350,20 +378,9 @@ function SendHeartBeat()
 
     local s_Report = m_Status
 
-    -- REFUELLING IS NOT IDLE, AND THE SCHEDULER HAS NO OTHER WAY TO FIND OUT.
-    --
-    -- RunJob refuses every job while m_Refuelling is set. The heartbeat never mentioned it, so the
-    -- drone reported "idle" -- the word the scheduler reads as "ready for work" -- TaskMan picked
-    -- it, dispatched fire-and-forget, recorded the assignment, and the drone answered
-    -- "JOB Lumber REFUSED: busy" to nobody at all. The task then belonged to a drone that was never
-    -- going to run it, while the queue looked fully staffed and the fleet view showed the drone
-    -- standing idle.
-    --
-    -- Caught on D31 holding the lumber sweep -- the single job standing between this settlement and
-    -- renewable fuel -- assigned and refused on a loop for minutes. Same principle as the "blocked"
-    -- reasons above: this field is about AVAILABILITY, and a drone that will refuse work is not
-    -- available, whatever it is otherwise doing.
-    if m_Refuelling and s_Report == "idle" then s_Report = "refuelling" end
+    -- IDLE MEANS AVAILABLE, so it must be the same answer RunJob would give. A drone that will
+    -- refuse the job must not advertise itself as ready for one.
+    s_Report = reportableStatus(s_Report)
 
     -- SAY WHAT IS IN THE CRATE. "hauling" names an activity and not a cargo, so a drone fetching
     -- logs for a blocked craft and one carrying cobblestone to a dump looked identical on the
@@ -1570,7 +1587,7 @@ function OnSurvey(p_ID, p_Message)
     local s_Drop = tonumber(d.drop) or 64
     local s_Climb= tonumber(d.climb) or 8
 
-    if executing or m_Refuelling then
+    if unavailableReason() then
         -- Busy is NOT a failure of the task -- it will be offered again -- so it is not reported.
         return false, "busy"
     end
@@ -3601,8 +3618,8 @@ end
 -- background loop beside the heartbeat and the fuel watchdog, does the work. The drone stays
 -- reachable while working, which is the normal state it is supposed to be in.
 function RunJob(p_Name, p_Data, p_Opts, p_Body)
-    if executing or m_Refuelling then
-        local s_Why = m_Refuelling and "refuelling" or "busy"
+    local s_Why = unavailableReason()
+    if s_Why then
         trace(("JOB %s REFUSED: %s"):format(p_Name, s_Why))
         -- SAY NO TO THE SCHEDULER, NOT JUST TO THE LOG.
         --
