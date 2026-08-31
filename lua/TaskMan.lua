@@ -66,7 +66,8 @@ function OnAddTask(p_ID, p_Message)
     local s_Path = nil
     if s_Work["dig"] then
         local ok, res = pcall(dig.PrepareTask, s_Work["dig"])
-        if ok then s_Path = res else print("dig planning failed: " .. tostring(res)) end
+        -- Log, not print: a CC terminal cannot be read from outside the game.
+        if ok then s_Path = res else Log("dig planning failed: " .. tostring(res)) end
     end
     -- ONE TABLE, NOT TWO. The second `local s_Task` shadowed the first and rebuilt it field by
     -- field -- dropping `priority` and `after` on the floor for every task ever created. Priority
@@ -136,7 +137,9 @@ local function fleet(p_Force)
     elseif m_Fleet == nil then
         -- Never had a list at all. Say so: an empty fleet and an unreachable DroneMan look
         -- identical from here and mean completely different things.
-        print("TaskMan cannot reach DroneMan -- no fleet to assign work to")
+        -- Log, not print. THIS is the message that explains an idle fleet with a full queue, and
+        -- it was being written to a screen nobody can read.
+        Log("TaskMan cannot reach DroneMan -- no fleet to assign work to")
     end
     return m_Fleet or {}
 end
@@ -284,7 +287,15 @@ end
 -- floor is the worst possible choice. fuel-D2 was handed to D3 at 714 fuel: itself nearly dry, 60
 -- blocks out, and certain to strand next to the drone it was sent to save. Two casualties instead
 -- of one.
-local RELIEF_FUEL_FLOOR = 1800
+-- The BASE cost of a relief, before the journey. Covers reaching storage, loading coal, the search
+-- at the far end and a margin -- the parts that do not depend on how far away the casualty is.
+-- pickDrone adds RELIEF_PER_BLOCK for every block of the trip the chosen candidate would fly.
+local RELIEF_FUEL_FLOOR = 300
+
+-- Three fuel out and three back, matching the rate the drones' own FuelFloorNow charges for the
+-- journey home. A round trip is the whole point of the reserve: a rescuer that arrives and cannot
+-- leave has turned one casualty into two.
+local RELIEF_PER_BLOCK = 6
 
 -- A RESCUE MUST AIM AT WHERE THE CASUALTY IS NOW, NOT WHERE IT WAS WHEN THE TASK WAS WRITTEN.
 --
@@ -314,7 +325,25 @@ local function pickDrone(p_Role, p_Pos, p_Avoid, p_MinFuel)
         local s_Enough = hasFuel(d)
         if s_Enough and p_MinFuel then
             local f = tonumber(d.fuel)
-            s_Enough = (f == nil) or (f >= p_MinFuel)
+            -- SCALE THE REQUIREMENT TO THE TRIP THIS CANDIDATE WOULD ACTUALLY MAKE.
+            --
+            -- p_MinFuel used to be a flat number, and it was set from RELIEF_FUEL_FLOOR = 1800 --
+            -- sized for the worst relief anyone had seen, a casualty sixty blocks out. Applied to
+            -- every casualty regardless of distance, it means a drone twenty blocks from the
+            -- stranded one is refused for want of fuel it would never spend.
+            --
+            -- That is the same shape of bug as the 900 flat fuel reserve, one layer up, and it had
+            -- the same effect: the best drone in the settlement held 942, nothing reached 1800, so
+            -- NO drone could relieve anyone and every fuel- task sat unplaceable for ever. The fleet
+            -- reported "every any is busy" while four drones stood idle.
+            --
+            -- So p_MinFuel is now the BASE and the distance is charged on top, at 6 per block: three
+            -- out and three back, the same rate the drones' own floor uses. A rescuer twenty blocks
+            -- away needs ~420; one two hundred blocks away needs ~1,500 and is still correctly
+            -- refused. The original worry stands and is now priced properly -- fuel-D2 went to D3 at
+            -- 714 fuel, sixty blocks out, and stranded beside the drone it was sent to save.
+            local s_Need = p_MinFuel + RELIEF_PER_BLOCK * distTo(d, p_Pos)
+            s_Enough = (f == nil) or (f >= s_Need)
         end
         if RoleFits(d, p_Role) then
             if d.status == "idle" and not committed(d.id) and s_Enough then
@@ -444,7 +473,7 @@ function OnStartTask(p_ID, p_Message)
         for _, alt in ipairs({"crafter", "loader", "scout"}) do
             s_Drone = pickDrone(alt, s_Where)
             if s_Drone ~= nil then
-                print("build going to a " .. alt .. " -- no miner free")
+                Log("build going to a " .. alt .. " -- no miner free")
                 break
             end
         end
@@ -1775,7 +1804,7 @@ function Tick()
                     if s_FuelOnly and not s_IsFuelWork then
                         -- skip: the fleet cannot afford this right now
                     elseif not s_NoDrone[s_Role] then
-                        local s_Ok = OnStartTask(0, {data = {id = v.id}})
+                        local s_Ok, s_Why = OnStartTask(0, {data = {id = v.id}})
                         if s_Ok then
                             s_Started = s_Started + 1
                             -- That drone is now busy; give the next tick a chance rather than
@@ -1800,14 +1829,37 @@ function Tick()
                             -- not free, and retrying forty tasks per tick is how the tick stops
                             -- finishing. A few attempts per role finds a placeable task without
                             -- turning the pass into a scan.
+                            -- SAY WHY NOTHING WAS PLACED.
+                            --
+                            -- This counted refusals and recorded not one of them, so "nine tasks
+                            -- queued, four drones reporting idle, nothing dispatched" had no
+                            -- explanation anywhere: not in TaskMan.log, not in fleet.tasks, not in
+                            -- hive.plan. Diagnosing an idle fleet had to start by reading this
+                            -- function's source and re-deriving what OnStartTask refuses on -- which
+                            -- is the most expensive possible way to learn a one-line answer, and it
+                            -- was paid repeatedly.
+                            --
+                            -- One line per role per pass: enough to name the blocker, not enough to
+                            -- turn a busy fleet's log into a wall of refusals.
                             s_Fails[s_Role] = (s_Fails[s_Role] or 0) + 1
+                            if s_Fails[s_Role] == 1 then
+                                Log(("could not place %s (%s): %s"):format(
+                                    tostring(v.name), tostring(s_Role),
+                                    tostring(s_Why or "OnStartTask gave no reason")))
+                            end
                             if s_Fails[s_Role] >= TRIES_PER_ROLE then s_NoDrone[s_Role] = true end
                         end
                     end
                 end
             end
         end)
-        if not s_Ok then print("Tick error: " .. tostring(s_Err)) end
+        -- Log, NOT print. print goes to the CC terminal, which cannot be read from outside the game
+        -- -- so the one message explaining why nothing is being dispatched was written to a screen
+        -- nobody can see. The whole placement pass runs inside that pcall, so if it throws, the
+        -- fleet simply stops being given work and every external view shows the same thing: idle
+        -- drones, a full queue, and no reason anywhere. Measured: nine tasks unassigned with a
+        -- healthy fuelled crafter and miner reporting idle, and not one line in TaskMan.log about it.
+        if not s_Ok then Log("Tick error: " .. tostring(s_Err)) end
     end
 end
 

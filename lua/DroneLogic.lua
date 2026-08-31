@@ -5815,7 +5815,23 @@ function TryRefuel()
     end
     -- Nothing to burn and running low: say so, because a fleet quietly grinding to a halt for
     -- want of coal looks exactly like a fleet with nothing to do.
-    if s_Before < (FUEL_LOW / 4) then
+    --
+    -- BUT "LOW" HAS TO MEAN "CANNOT WORK", NOT AN ARBITRARY FRACTION OF AN UNRELATED CONSTANT.
+    --
+    -- This fired below FUEL_LOW/4 -- a flat 1,000 chosen against nothing. Distress sets the drone's
+    -- status to "stuck", and TaskMan's pickDrone only ever considers a drone reporting "idle", so
+    -- raising it takes the drone out of service entirely. That turns a top-up that found no coal --
+    -- an optimisation failing -- into a drone declaring itself broken.
+    --
+    -- Measured: D4 holding 944 fuel, at base, with a floor of ~310 and every job in the settlement
+    -- affordable to it, raising this distress every fifteen seconds. All eight queued tasks sat
+    -- unassigned because the only fuelled drone in the fleet had marked itself unusable. Nothing
+    -- was wrong with it, and nothing in the log said "944 is fine" because nothing believed it.
+    --
+    -- FuelFloorNow IS the line. Below it the drone cannot be sure of getting home, which is the only
+    -- honest definition of too low to work -- and it already collapses when storage is known dry, so
+    -- this stops crying wolf during exactly the shortage it is meant to report.
+    if s_Before < FuelFloorNow() then
         Distress("low fuel", "level " .. s_Before .. ", nothing to refuel with at the dock")
     end
     return false
