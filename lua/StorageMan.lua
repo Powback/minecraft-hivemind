@@ -36,6 +36,10 @@ local SIDE_NAMES = {top = true, bottom = true, left = true, right = true, front 
 local function inventories()
     local s_Chests, s_Furnaces = {}, {}
     for _, name in ipairs(peripheral.getNames()) do
+        -- The other half of the scan, and it runs BEFORE the chest loop -- getType plus a wrap for
+        -- every peripheral on the wired network, each one a crossing into Java. Together these two
+        -- loops are what ran computer #14 over its budget by 22 seconds and left it powered off.
+        os.queueEvent("scan") os.pullEvent("scan")
         if not SIDE_NAMES[name] then
             local s_Type = peripheral.getType(name)
             if s_Type and string.find(s_Type, "furnace") then
@@ -57,6 +61,21 @@ function BuildIndex()
     -- Once, not twice: this walks every peripheral on the network and is the expensive part.
     local s_Chests, s_Furnaces = inventories()
     for _, name in ipairs(s_Chests) do
+        -- BREATHE BETWEEN CHESTS, OR THE HEART OF THE SETTLEMENT GETS KILLED MID-BEAT.
+        --
+        -- Every chest costs a peripheral.wrap plus a list() and a size(), and each of those crosses
+        -- into Java. Rescan runs on every tick AND on every query, so this loop is the single
+        -- hottest thing StorageMan does -- and it had no yield in it at all.
+        --
+        -- CC:T terminates a coroutine that runs ~10s without yielding, uncatchably. Measured in the
+        -- server log: "Terminating computer #14 due to timeout (ran over by 22.328 seconds)"
+        -- followed by InterruptedException. StorageMan died mid-scan, its bootloader never reached
+        -- os.reboot(), and the computer sat POWERED OFF -- taking stock, smelting and every
+        -- storage query in the settlement with it, while last-run.txt still read ok=true.
+        --
+        -- queueEvent/pullEvent rather than sleep(0): it satisfies the watchdog and resumes in the
+        -- SAME tick, so a full rescan still costs no wall clock.
+        os.queueEvent("rescan") os.pullEvent("rescan")
         local ok, inv = pcall(peripheral.wrap, name)
         if ok and inv then
             local ok2, items = pcall(inv.list)
@@ -154,12 +173,15 @@ function OnProvide(p_ID, p_Message)
 
     local s_Given, s_Short = {}, {}
     for _, req in ipairs(s_Want) do
+        -- A Provide can walk the whole index and push from several chests per requested item.
+        os.queueEvent("provide") os.pullEvent("provide")
         local s_Name  = req.name
         local s_Need  = tonumber(req.count) or 0
         local s_Moved = 0
 
         for name, e in pairs(m_Index) do
             if s_Moved >= s_Need then break end
+            os.queueEvent("provide") os.pullEvent("provide")
             -- Exact match here, NOT the substring matching Find uses. "iron" finding iron_ingot is
             -- helpful when a human is looking; a crafting grid filled with raw_iron because the
             -- recipe asked for iron_ingot produces nothing and wastes the trip.
@@ -239,6 +261,9 @@ function ServiceRoutes()
 
     local s_Moved, s_Tried = 0, 0
     for _, r in ipairs(s_Routes) do
+        -- Each route is a wrap plus a pushItems. Same rule as every other loop in this file that
+        -- crosses into Java: breathe, or the watchdog eventually catches this one instead.
+        os.queueEvent("route") os.pullEvent("route")
         if r.enabled ~= false and r.from and r.to and r.from ~= r.to then
             local src = peripheral.wrap(r.from)
             if src == nil then
@@ -423,6 +448,7 @@ function OnChestContents(p_ID, p_Message)
     if DATA["chestName"] == nil then DATA["chestName"] = {} end
     if DATA["chestName"][s_Key] == nil then
         for _, name in ipairs(peripheral.getNames()) do
+            os.queueEvent("scan") os.pullEvent("scan")
             local ok, inv = pcall(peripheral.wrap, name)
             if ok and inv and inv.list then
                 local ok2, l = pcall(inv.list)
@@ -493,6 +519,7 @@ function OnBringToFront(p_ID, p_Message)
     end
 
     for _, s_PName in ipairs(s_Names) do
+        os.queueEvent("scan") os.pullEvent("scan")
         do
             local dep = {peripheral = s_PName, pos = posOf(s_PName)}
             local ok, inv = pcall(peripheral.wrap, dep.peripheral)
@@ -533,6 +560,7 @@ function OnBringToFront(p_ID, p_Message)
                         -- network -- so send the stack somewhere with room and point the drone there.
                         if s_Free == nil then
                             for _, other in ipairs(s_Names) do
+                                os.queueEvent("scan") os.pullEvent("scan")
                                 if other ~= dep.peripheral then
                                     local ok4, oinv = pcall(peripheral.wrap, other)
                                     if ok4 and oinv and oinv.list then
@@ -952,6 +980,7 @@ end
 
 local function drainTo(p_Fur, p_Slot)
     for _, cname in ipairs(m_Chests) do
+        os.queueEvent("scan") os.pullEvent("scan")
         if (m_Free[cname] or 0) > 0 then
             local ok, moved = pcall(p_Fur.pushItems, cname, p_Slot)
             return ok and (moved or 0) or 0
@@ -990,6 +1019,7 @@ local function furnaceSummary(p_Moved)
     local s_Fu = firstInStorage(isFuel)
     local s_Sizes = {}
     for _, fname in ipairs(m_Furnaces) do
+        os.queueEvent("scan") os.pullEvent("scan")
         local ok, fur = pcall(peripheral.wrap, fname)
         local okS, s_Size = false, nil
         if ok and fur then okS, s_Size = pcall(fur.size) end
@@ -1053,6 +1083,9 @@ function ServiceFurnaces()
     -- the end reports `0 furnace(s)` -- which is the diagnostic that case needed anyway.
     local s_Moved = 0
     for _, fname in ipairs(m_Furnaces) do
+        -- Same reason as the chest loop: each furnace is a wrap, a size, two lists and up to four
+        -- item transfers, all crossing into Java, and this runs every tick.
+        os.queueEvent("smelt") os.pullEvent("smelt")
         local ok, fur = pcall(peripheral.wrap, fname)
         if ok and fur then
             local okS, s_Size = pcall(fur.size)

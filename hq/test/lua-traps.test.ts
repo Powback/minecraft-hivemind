@@ -145,3 +145,60 @@ describe('diagnostics must be readable from outside the game', () => {
     });
   }
 });
+
+describe('hot loops over peripherals must yield', () => {
+  /**
+   * CC:T terminates a coroutine that runs ~10s without yielding, and the kill is uncatchable: the
+   * bootloader never reaches os.reboot(), so the computer ends up POWERED OFF while last-run.txt
+   * still reads ok=true. That is the worst shape a failure can take here, because every external
+   * view says the module exited cleanly.
+   *
+   * Measured: "Terminating computer #14 due to timeout (ran over by 22.328 seconds)" -- StorageMan
+   * died inside BuildIndex, which wraps and lists every chest and furnace on the network with no
+   * yield, on every tick and every query. Stock, smelting and every storage query in the settlement
+   * went with it.
+   *
+   * Any loop that crosses into Java per iteration -- peripheral.wrap, .list, .size, pushItems,
+   * pullItems -- needs a yield in it. queueEvent/pullEvent, which resumes in the same tick.
+   */
+  const YIELDS = /os\.queueEvent|os\.pullEvent|os\.sleep/;
+  const CROSSES = /peripheral\.wrap|\.pushItems|\.pullItems|peripheral\.call/;
+  // ONLY LOOPS THAT GROW WITH THE NETWORK.
+  //
+  // A loop over one inventory's slots, or `for i = 1, 16`, is bounded and small however big the
+  // settlement gets -- and its OUTER loop is the one that needs the yield. Flagging those too
+  // produced eight false positives against four real ones, and a rule with that ratio gets
+  // exemption-stamped into uselessness. These are the collections that scale: every peripheral on
+  // the wired network, every chest, every furnace, every route, the whole item index.
+  const UNBOUNDED = /peripheral\.getNames\(\)|\bm_Chests\b|\bm_Furnaces\b|\bm_Index\b|\bs_Routes\b|\bs_Names\b|\bs_Chests\b/;
+
+  for (const file of files) {
+    it(file, () => {
+      const raw = readFileSync(path.join(LUA_DIR, file), 'utf8').split('\n');
+      const code = codeOnly(raw.join('\n'));
+      const bad: string[] = [];
+      code.forEach((l, i) => {
+        if (!/\bfor\b.*\bdo\b/.test(l)) return;
+        if (!UNBOUNDED.test(l)) return;
+        // The loop body: to the matching-ish `end` at the same indent, capped so one runaway
+        // regex cannot swallow the file.
+        const indent = (l.match(/^\s*/) ?? [''])[0].length;
+        let end = i + 1;
+        while (end < code.length && end < i + 60) {
+          if (new RegExp(`^\\s{${indent}}end\\b`).test(code[end])) break;
+          end++;
+        }
+        const body = code.slice(i, end).join('\n');
+        if (!CROSSES.test(body) || YIELDS.test(body)) return;
+        if (exemptNear(raw, i, 'lua-yield: allow')) return;
+        bad.push(`${file}:${i + 1} ${raw[i].trim().slice(0, 70)}`);
+      });
+      expect(bad, [
+        'This loop calls into Java every iteration and never yields. CC:T kills a coroutine that',
+        'runs ~10s without yielding, uncatchably -- the computer ends up OFF with a clean-looking',
+        'last-run. Add `os.queueEvent("x") os.pullEvent("x")` inside the loop, or if the iteration',
+        'count is genuinely bounded and small: -- lua-yield: allow (<why>)',
+      ].join('\n')).toEqual([]);
+    });
+  }
+});
