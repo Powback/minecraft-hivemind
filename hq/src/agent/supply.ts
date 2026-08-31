@@ -106,7 +106,7 @@ export const DEFAULT_RULES: SupplyRule[] = [
   //
   // This harvests mapped logs rather than farming trees. Real forestry (fell, replant, return) is
   // still worth having, but it is not what stands between this settlement and a fuel supply today.
-  { match: 'oak_log', min: 32, action: 'gather', limit: 64 },
+  { match: 'oak_log', min: 32, action: 'lumber', limit: 64 },
   // Made, not dug. Planks gate every build the settlement will ever do, and chests gate field
   // caches -- so the fleet should keep a working stock of both without being asked.
   { match: 'minecraft:oak_planks', stock: 'minecraft:oak_planks', min: 32, action: 'craft', limit: 32 },
@@ -522,6 +522,63 @@ async function dispatchCraft(rule: SupplyRule, have: number, ctx: SupplyCtx): Pr
  * problem, not a gathering one. Without the prospect rung the loop fell straight through to "wait
  * for a scout" and sat there with three idle miners and coal at 0/32.
  */
+/**
+ * FELL AND REPLANT, WHICH IS THE ONLY WAY WOOD EVER BECOMES RENEWABLE.
+ *
+ * The drone has had a complete forestry harvester the whole time: OnLumber sweeps an area in a
+ * serpentine, and for each trunk it meets fellTree() takes the whole tree, clears the canopy at
+ * each level so the saplings drop while the drone is standing there to collect them, and REPLANTS
+ * one before moving on. TaskMan already routes work.lumber to the "Lumber" verb.
+ *
+ * Nothing could ever ask for it. `action: 'lumber'` fell through dispatchRule to "not yet
+ * automatable", so the rule was switched to `gather` -- which mines a single log block out of a
+ * tree, leaves the rest standing, collects no sapling and replants nothing. That is strip-mining
+ * a forest one block at a time, and it is why the settlement's wood supply only ever went down.
+ *
+ * This is the missing wire, and it is the difference between a settlement that consumes a forest
+ * and one that farms it.
+ *
+ * Aimed at the DENSEST cluster rather than the nearest tree: the harvester sweeps an area, so its
+ * value is trees-per-sweep, not distance to the first one. A sweep that meets six trunks pays for
+ * the trip out; one that meets a single tree does not.
+ */
+async function dispatchLumber(rule: SupplyRule, have: number, ctx: SupplyCtx): Promise<boolean> {
+  if (!ctx.minerFree) return false;
+
+  const found: any = await bridge.call('MapServer', 'FindBlocks',
+    { match: rule.match, limit: 400 }, { timeoutMs: 15000 });
+  const hits = found?.hits ?? found?.data?.hits ?? [];
+  const all: any[] = (Array.isArray(hits) ? hits : Object.values(hits ?? {}))
+    .filter((h: any) => h && typeof h.x === 'number' && withinReach(h));
+
+  if (!all.length) return dispatchSurvey(rule, have, ctx);
+
+  // Densest first: count how many other known trunks sit inside the sweep this start would cover.
+  const SWEEP = 8;
+  let best = all[0];
+  let bestN = -1;
+  for (const h of all) {
+    const n = all.filter((o) =>
+      Math.abs(o.x - h.x) <= SWEEP && Math.abs(o.z - h.z) <= SWEEP).length;
+    if (n > bestN) { best = h; bestN = n; }
+  }
+
+  await bridge.call('TaskMan', 'Add', {
+    name: `lumber:${rule.match}`,
+    priority: 3,
+    work: { lumber: { w: SWEEP, l: SWEEP, start: { x: best.x, y: best.y, z: best.z } } },
+  }, { timeoutMs: 8000 });
+
+  supply.cooldowns[rule.match] = ctx.now + COOLDOWN_MS;
+  ctx.minerFree = false;
+  supply.dispatched++;
+  supply.lastAction = `lumber at ${best.x},${best.y},${best.z}`;
+  note(`${rule.match}: ${have}/${rule.min} -> lumber sweep at ${best.x},${best.y},${best.z} `
+     + `(${bestN} trunks in range, fells and replants)`);
+  ctx.did.push(`lumber ${rule.match}`);
+  return true;
+}
+
 async function dispatchGather(rule: SupplyRule, have: number, ctx: SupplyCtx): Promise<boolean> {
   // Ask for the dig first, but only if a miner could actually take it.
   if (ctx.minerFree) {
@@ -595,6 +652,7 @@ async function dispatchSurvey(rule: SupplyRule, have: number, ctx: SupplyCtx): P
 async function dispatchRule(rule: SupplyRule, have: number, ctx: SupplyCtx): Promise<boolean> {
   if (rule.action === 'mine') return dispatchMine(rule, have, ctx);
   if (rule.action === 'craft') return dispatchCraft(rule, have, ctx);
+  if (rule.action === 'lumber') return dispatchLumber(rule, have, ctx);
   if (rule.action !== 'gather') {
     supply.cooldowns[rule.match] = ctx.now + COOLDOWN_MS;
     note(`${rule.match}: ${have}/${rule.min} → ${rule.action} not yet automatable`);

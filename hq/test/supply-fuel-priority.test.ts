@@ -200,3 +200,41 @@ describe('exploration during a fuel emergency', () => {
     });
   }
 });
+
+/**
+ * WOOD IS FELLED AND REPLANTED, NOT MINED A BLOCK AT A TIME.
+ *
+ * The drone has always had a complete forestry harvester -- OnLumber sweeps an area, and for every
+ * trunk it meets fellTree() takes the whole tree, clears the canopy so the saplings drop while it
+ * is standing there, collects them, and REPLANTS one. TaskMan has always routed work.lumber to the
+ * "Lumber" verb.
+ *
+ * Nothing could ask for it: `action: 'lumber'` fell through dispatchRule to "not yet automatable",
+ * so the rule was switched to `gather`. Gather mines ONE log block out of a tree, leaves the rest
+ * standing, collects no sapling and replants nothing -- strip-mining a forest one block at a time,
+ * which is why the settlement's wood only ever went down.
+ *
+ * This is the difference between consuming a forest and farming one, so it is worth a guard.
+ */
+describe('wood is harvested by lumber, not gather', () => {
+  const SRC2 = readFileSync(path.resolve(__dirname, '../src/agent/supply.ts'), 'utf8');
+
+  it('the wood rule asks for lumber', () => {
+    const rule = /\{\s*match:\s*'oak_log'[^}]*\}/.exec(SRC2);
+    expect(rule, 'the oak_log rule must exist').toBeTruthy();
+    expect(rule![0], "wood must be felled and replanted, not chipped at").toMatch(/action:\s*'lumber'/);
+  });
+
+  it('lumber is actually dispatchable', () => {
+    // The whole bug was a rule asking for an action nothing implemented, which surfaced only as a
+    // once-a-minute note nobody read.
+    expect(SRC2).toMatch(/async function dispatchLumber\(/);
+    expect(SRC2).toMatch(/rule\.action === 'lumber'\) return dispatchLumber/);
+  });
+
+  it('aims at the densest cluster, since a sweep is paid for by trees-per-trip', () => {
+    const fn = /async function dispatchLumber\(([\s\S]*?)\n\}/.exec(SRC2)![1];
+    expect(fn).toMatch(/bestN/);
+    expect(fn, 'the task must carry a sweep area and a start').toMatch(/lumber:\s*\{\s*w:/);
+  });
+});
