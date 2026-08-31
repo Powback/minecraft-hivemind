@@ -115,3 +115,34 @@ describe('furnaces during a fuel shortage', () => {
     expect(body![1]).toMatch(/isFuel\(/);
   });
 });
+
+/**
+ * THE RANKING IS DEAD CODE IF THE GATE ABOVE IT SAYS NO.
+ *
+ * smeltRank puts logs FIRST, as the only fuel-positive smelt in the settlement. isSmeltable --
+ * which decides whether a thing may enter a furnace at all -- listed eight ores and sands and a
+ * `_ore$` pattern, and a log is neither. So the furnaces refused wood and the ranking never got a
+ * say, while the diagnostic reported "input=yes" because ore qualified.
+ *
+ * Measured with 255 oak logs in storage and both furnaces lit: cobblestone and raw iron went in,
+ * charcoal stayed at 0. Two functions, one question, opposite answers.
+ */
+describe('wood is smeltable', () => {
+  it('isSmeltable accepts logs, or the whole charcoal chain is unreachable', () => {
+    const body = /local function isSmeltable\(p_Name\)([\s\S]*?)\nend/.exec(CODE);
+    expect(body, 'isSmeltable must exist').toBeTruthy();
+    expect(body![1], 'logs must pass the smeltable gate').toMatch(/_log\$/);
+  });
+
+  it('accepts any species, not just oak', () => {
+    // Hard-coding oak is how a fleet standing in a birch forest starves next to firewood -- the
+    // same lesson the planks recipe already carries in the HQ recipe table.
+    const body = /local function isSmeltable\(p_Name\)([\s\S]*?)\nend/.exec(CODE)![1];
+    expect(body).not.toMatch(/oak_log/);
+  });
+
+  it('still ranks that log above ore, so the two agree', () => {
+    const r = smeltRanks();
+    expect(r.get('_log')!).toBeLessThan(r.get('raw_')!);
+  });
+});

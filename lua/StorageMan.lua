@@ -832,6 +832,20 @@ local FUEL      = {"minecraft:coal", "minecraft:charcoal", "minecraft:coal_block
 
 local function isSmeltable(p_Name)
     if SMELTABLE[p_Name] then return true end
+    -- WOOD SMELTS, AND LEAVING IT OUT IS WHY THE SETTLEMENT NEVER MADE CHARCOAL.
+    --
+    -- SMELTABLE lists eight ores and sands, and the pattern below catches `_ore`. A log is neither,
+    -- so isSmeltable said no and the furnaces would not accept one -- while smeltRank right below
+    -- ranks logs FIRST, as the only fuel-positive smelt there is. Two functions in this file, one
+    -- question, opposite answers, and the ranking was dead code for the case it was written for.
+    --
+    -- Measured with 255 oak logs in storage and both furnaces lit: they smelted cobblestone and raw
+    -- iron, charcoal stayed at 0, and the diagnostic cheerfully reported "input=yes fuel=yes"
+    -- because ore qualified even though the wood standing next to it did not.
+    --
+    -- Matches any species and the stripped variants -- every one of them smelts to charcoal, and
+    -- hard-coding oak is how a fleet in a birch forest starves next to firewood.
+    if string.match(p_Name, "_log$") or string.match(p_Name, "_wood$") then return true end
     -- Every vanilla ore smelts, including the deepslate_ variants. Anchored so it cannot match
     -- something that merely contains "ore".
     return string.match(p_Name, "_ore$") ~= nil
@@ -982,6 +996,24 @@ local function furnaceSummary(p_Moved)
         (s_Fu and (s_Fu.name or "yes")) or "NONE")
 end
 
+-- Does this item belong on this face at all?
+--
+-- The input face takes exactly one kind of thing and will physically accept anything, so it needs
+-- the stricter test; the output/fuel face keeps fuel AND finished product, so only genuinely
+-- finished goods come off it. Split out because ServiceFurnaces sits on the complexity gate and
+-- this is the decision most worth being able to read on its own.
+local function wrongForFace(p_Item, p_IsInputFace)
+    if p_Item == nil then return false end
+    if p_IsInputFace then return not isSmeltableInput(p_Item.name) end
+    return not isSmeltable(p_Item.name) and not isFuel(p_Item.name)
+end
+
+-- The one thing this face is for.
+local function fillFor(p_IsInputFace)
+    if p_IsInputFace then return bestSmeltInput(), 32 end
+    return firstInStorage(isFuel), 16
+end
+
 function ServiceFurnaces()
     if not DATA["smelting"] then return 0 end
     Rescan()
@@ -994,10 +1026,32 @@ function ServiceFurnaces()
             local okS, s_Size = pcall(fur.size)
             local ok2, items = pcall(fur.list)
             if okS and ok2 and s_Size then
-                -- 1. Take finished product out first: a full output slot stalls the furnace.
+                -- WHICH FACE THIS IS DECIDES WHAT MAY GO IN. THE FACE WILL NOT DECIDE IT FOR US.
+                --
+                -- This used to offer input to any empty slot and then fall back to offering FUEL,
+                -- on the stated reasoning that "the face rejects what it cannot hold". That is true
+                -- of the fuel and output faces and FALSE of the input face: a vanilla furnace's top
+                -- slot accepts any item pushed into it, smeltable or not.
+                --
+                -- So coal went into the INPUT slot, where nothing can ever consume it, and the
+                -- furnace stalled with a full input slot that no log could displace. Read out of the
+                -- world after wood was finally in stock:
+                --
+                --   Items: [{count: 6, Slot: 0b, coal}, {count: 16, Slot: 1b, coal}]
+                --   BurnTime: 0, CookTime: 0
+                --
+                -- while StorageMan reported "input=yes fuel=yes moved=0" and charcoal stayed at 0.
+                -- Both furnaces, jammed the same way, by the servicing code that was meant to feed
+                -- them. Note the peripheral size tells us the face: 1 = top (input only),
+                -- 2 = bottom (output and fuel). We already log it; now we act on it.
+                local s_IsInputFace = (s_Size == 1)
+
+                -- 1. Clear what does not belong on this face. On the output/fuel face that means
+                --    finished product; on the INPUT face it means anything that is not a valid
+                --    smelt input -- which is how the jammed coal gets out.
                 for slot = 1, s_Size do
                     local it = items[slot]
-                    if it and not isSmeltable(it.name) and not isFuel(it.name) then
+                    if wrongForFace(it, s_IsInputFace) then
                         local moved = drainTo(fur, slot)
                         if moved > 0 then
                             s_Moved = s_Moved + 1
@@ -1006,24 +1060,17 @@ function ServiceFurnaces()
                     end
                 end
 
-                -- 2. Fill whatever is empty. The face rejects what it cannot hold, so offering
-                --    input then fuel is enough -- no need to know which face this is.
+                -- 2. Fill what is empty, with the ONE thing this face is for.
                 local ok3, fresh = pcall(fur.list)
                 if ok3 then
                     for slot = 1, s_Size do
                         if fresh[slot] == nil then
+                            local e, s_Max = fillFor(s_IsInputFace)
                             local moved = 0
-                            local e = bestSmeltInput()
                             if e then
-                                local okp, r = pcall(fur.pullItems, e.at[1].where, e.at[1].slot, 32, slot)
+                                local okp, r = pcall(fur.pullItems, e.at[1].where, e.at[1].slot,
+                                                     s_Max, slot)
                                 moved = (okp and (r or 0)) or 0
-                            end
-                            if moved == 0 then
-                                local f = firstInStorage(isFuel)
-                                if f then
-                                    local okp, r = pcall(fur.pullItems, f.at[1].where, f.at[1].slot, 16, slot)
-                                    moved = (okp and (r or 0)) or 0
-                                end
                             end
                             if moved > 0 then s_Moved = s_Moved + 1 end
                         end
