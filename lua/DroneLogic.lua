@@ -349,6 +349,22 @@ function SendHeartBeat()
     end
 
     local s_Report = m_Status
+
+    -- REFUELLING IS NOT IDLE, AND THE SCHEDULER HAS NO OTHER WAY TO FIND OUT.
+    --
+    -- RunJob refuses every job while m_Refuelling is set. The heartbeat never mentioned it, so the
+    -- drone reported "idle" -- the word the scheduler reads as "ready for work" -- TaskMan picked
+    -- it, dispatched fire-and-forget, recorded the assignment, and the drone answered
+    -- "JOB Lumber REFUSED: busy" to nobody at all. The task then belonged to a drone that was never
+    -- going to run it, while the queue looked fully staffed and the fleet view showed the drone
+    -- standing idle.
+    --
+    -- Caught on D31 holding the lumber sweep -- the single job standing between this settlement and
+    -- renewable fuel -- assigned and refused on a loop for minutes. Same principle as the "blocked"
+    -- reasons above: this field is about AVAILABILITY, and a drone that will refuse work is not
+    -- available, whatever it is otherwise doing.
+    if m_Refuelling and s_Report == "idle" then s_Report = "refuelling" end
+
     -- SAY WHAT IS IN THE CRATE. "hauling" names an activity and not a cargo, so a drone fetching
     -- logs for a blocked craft and one carrying cobblestone to a dump looked identical on the
     -- panel -- and the interesting question is always which one it is.
