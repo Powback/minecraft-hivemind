@@ -713,11 +713,26 @@ function OnDepositPoints(p_ID, p_Message)
         --
         -- ReportChest keeps its purpose -- chests off the network have no other observer -- so the
         -- drone report is still used where the live read cannot answer.
+        -- LIVE READ, OR NOTHING. A STALE REPORT IS WORSE THAN NO REPORT.
+        --
+        -- The first version of this fix kept DATA["chestAt"] as a fallback when the live read
+        -- returned nil, on the reasoning that a drone's observation beats nothing for a chest off
+        -- the wired network. That reasoning is wrong for THIS field, and the bug came straight back.
+        --
+        -- The consumer treats `items` as authoritative and SKIPS any chest "known not to hold it".
+        -- So the two answers are not "some information" versus "none" -- they are:
+        --   nil        -> unknown, so the drone goes and looks. Costs one hop across the bay.
+        --   stale {}   -> definite, so the drone never looks again. Costs the fleet.
+        --
+        -- Measured after the first fix had already shipped and was verified deployed: D24 holding
+        -- 828 fuel, 64 coal sitting in storage, "12 of 12 chests are known not to hold it --
+        -- skipping them", then "no fuel in storage level 828, storage had nothing burnable". The
+        -- drone reports twelve deposit points and the network only has six chests, so six of them
+        -- have no peripheral name, fell through to this fallback, and answered from memory.
+        --
+        -- ReportChest still has its purpose -- stock accounting for chests nothing else can see --
+        -- it just no longer gets to tell a drone not to bother looking.
         local seen = liveContents(d.peripheral)
-        if seen == nil and d.pos and DATA["chestAt"] then
-            local rec = DATA["chestAt"][("%d:%d:%d"):format(d.pos.x, d.pos.y, d.pos.z)]
-            if rec then seen = rec.items end
-        end
         s_Out[#s_Out + 1] = {pos = d.pos, peripheral = d.peripheral,
                              free = m_Free[d.peripheral], items = seen}
     end
