@@ -1197,6 +1197,38 @@ function ApproachFromSide(p_Target, p_FlyBudget)
     return false
 end
 
+-- REACH THE ORDERED SITE, TRYING EVERY FACE THE FLEET HAS.
+--
+-- ABOVE IS NOT THE ONLY WAY IN, AND FOR A TREE IT IS THE ONE WAY THAT CANNOT WORK.
+--
+-- The job travel aimed at y+1 and nothing else. Correct for a mine head, where the block above the
+-- shaft is open sky -- and impossible for wood, because the block above a log is either more log or
+-- the leaves of its own canopy. So every lumber job ever dispatched arrived at "site unreachable by
+-- path", dug a hole into the tree from overhead if it had a pickaxe, or gave up. The settlement's
+-- only renewable fuel was unreachable by construction.
+--
+-- CLAUDE.md already records this exact trap for the gather loop, which grew ApproachFromSide to fix
+-- it. The generic job travel never got it: same fault, same fix. The sides of a trunk are open even
+-- when above and below are solid.
+--
+-- Order matters. Above first, because it is right for the mine heads that are most of the work and
+-- costs one pathfind. Then the sides, which are free of any assumption about what is overhead. Then
+-- the pickaxe, because a miner that cannot find a route to its own shaft head should make one --
+-- but only after the two routes that do not rearrange the world have been tried.
+function ReachSite(p_X, p_Y, p_Z)
+    local s_Above = p_Y and (p_Y + 1) or nil
+    local s_At = pgps.moveTo(p_X, s_Above, p_Z)
+    if s_At == false and p_Y ~= nil then
+        trace("site unreachable from above -- trying the sides")
+        s_At = ApproachFromSide({x = p_X, y = p_Y, z = p_Z})
+    end
+    if s_At == false and CanDig() then
+        trace("site unreachable by path -- digging in")
+        s_At = pgps.digTo(p_X, s_Above, p_Z)
+    end
+    return s_At
+end
+
 function GatherMissBudget(p_FuelBefore, p_Spent, p_Checked, p_MaxChecks)
     local s_Now = turtle.getFuelLevel()
     local s_Cost = 0
@@ -3737,15 +3769,7 @@ local function RunJobNow(p_Name, p_Data, p_Opts, p_Body)
 
     -- Go to the ordered site, or refuse. Digging "somewhere" is worse than digging nowhere.
     if o.travel ~= false and d.pos and d.pos.x and d.pos.z then
-        local s_Ty = tonumber(d.pos.y)
-        local s_Arrived = pgps.moveTo(tonumber(d.pos.x), s_Ty and (s_Ty + 1) or nil, tonumber(d.pos.z))
-        -- A miner that cannot find a route to its own shaft head should make one, not give up. The
-        -- site is a place the fleet chose deliberately; refusing to reach it strands the whole job
-        -- over ground that a pickaxe removes in a few seconds.
-        if s_Arrived == false and CanDig() then
-            trace("site unreachable by path -- digging in")
-            s_Arrived = pgps.digTo(tonumber(d.pos.x), s_Ty and (s_Ty + 1) or nil, tonumber(d.pos.z))
-        end
+        local s_Arrived = ReachSite(tonumber(d.pos.x), tonumber(d.pos.y), tonumber(d.pos.z))
         if s_Arrived == false then
             Distress("cannot reach site",
                 tostring(d.pos.x) .. "," .. tostring(d.pos.y) .. "," .. tostring(d.pos.z))
