@@ -43,16 +43,14 @@ const CODE = SRC.replace(/--.*$/gm, '');
  * hand. A duplicated table is how a guard silently stops guarding.
  */
 function smeltRanks(): Map<string, number> {
-  const body = /local function smeltRank\(p_Name\)([\s\S]*?)\nend/.exec(CODE);
-  expect(body, 'smeltRank must exist -- it is what makes the ordering deliberate').toBeTruthy();
+  // Reads the SMELT_RANK table. smeltRank used to re-derive categories from item names with its
+  // own string.find calls -- which is exactly the duplication that let it disagree with
+  // isSmeltable about logs. There is one classifier now (smeltCategory) and one rank table, so the
+  // guard reads the table.
+  const tbl = /local SMELT_RANK = \{([^}]*)\}/.exec(CODE);
+  expect(tbl, 'SMELT_RANK must exist -- it is what makes the ordering deliberate').toBeTruthy();
   const ranks = new Map<string, number>();
-  for (const line of body![1].split('\n')) {
-    const rank = /return\s+(\d+)/.exec(line);
-    if (!rank) continue;
-    for (const m of line.matchAll(/string\.find\(p_Name,\s*"([^"]+)"/g)) {
-      ranks.set(m[1], Number(rank[1]));
-    }
-  }
+  for (const m of tbl![1].matchAll(/(\w+)\s*=\s*(\d+)/g)) ranks.set(m[1], Number(m[2]));
   return ranks;
 }
 
@@ -66,9 +64,9 @@ describe('furnace input priority', () => {
 
   it('smelts logs before ore, and ore before cobblestone', () => {
     const r = smeltRanks();
-    const log = r.get('_log');
-    const raw = r.get('raw_');
-    const cobble = r.get('cobble');
+    const log = r.get('wood');
+    const raw = r.get('ore');
+    const cobble = r.get('bulk');
     expect(log, 'logs must be ranked: charcoal is the only fuel-positive smelt').toBeDefined();
     expect(raw, 'raw ore must be ranked').toBeDefined();
     expect(cobble, 'cobblestone must be ranked, and ranked last').toBeDefined();
@@ -131,18 +129,22 @@ describe('wood is smeltable', () => {
   it('isSmeltable accepts logs, or the whole charcoal chain is unreachable', () => {
     const body = /local function isSmeltable\(p_Name\)([\s\S]*?)\nend/.exec(CODE);
     expect(body, 'isSmeltable must exist').toBeTruthy();
-    expect(body![1], 'logs must pass the smeltable gate').toMatch(/_log\$/);
+    // isSmeltable defers to the classifier; the classifier is where wood is recognised.
+    expect(body![1], 'isSmeltable must defer to the one classifier').toMatch(/smeltCategory/);
+    const cat = /local function smeltCategory\(p_Name\)([\s\S]*?)\nend/.exec(CODE);
+    expect(cat, 'smeltCategory must exist').toBeTruthy();
+    expect(cat![1], 'logs must classify as wood').toMatch(/_log\$/);
   });
 
   it('accepts any species, not just oak', () => {
     // Hard-coding oak is how a fleet standing in a birch forest starves next to firewood -- the
     // same lesson the planks recipe already carries in the HQ recipe table.
-    const body = /local function isSmeltable\(p_Name\)([\s\S]*?)\nend/.exec(CODE)![1];
-    expect(body).not.toMatch(/oak_log/);
+    const cat = /local function smeltCategory\(p_Name\)([\s\S]*?)\nend/.exec(CODE)![1];
+    expect(cat).not.toMatch(/oak_log/);
   });
 
   it('still ranks that log above ore, so the two agree', () => {
     const r = smeltRanks();
-    expect(r.get('_log')!).toBeLessThan(r.get('raw_')!);
+    expect(r.get('wood')!).toBeLessThan(r.get('ore')!);
   });
 });

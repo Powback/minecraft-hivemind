@@ -880,9 +880,19 @@ end
 -- fuel problem rather than postponing it. When both are queued, wood goes first.
 local function fuelRank(p_Name)
     local s_Name = tostring(p_Name)
+    -- ASK taskProducesFuel WHETHER IT IS FUEL AT ALL. Do not re-decide it here.
+    --
+    -- These two both used to test for "coal" and "log" independently, which is how a settlement
+    -- ends up with three different answers to "what counts as fuel" -- the state this file was in
+    -- earlier today, when the emergency filter, the queue ordering and the preempt guard each had
+    -- their own version and two of them had never heard of wood.
+    --
+    -- The ranking's only job is preference AMONG fuels; membership belongs to one function.
+    if not taskProducesFuel(s_Name) then return 0 end
+    -- Wood outranks coal: coal is finite and thirty blocks underground where drones strand, while
+    -- wood is on the surface, regrows, and one coal turns eight logs into eight charcoal.
     if s_Name:find("log") or s_Name:find("wood") then return 2 end
-    if s_Name:find("coal") then return 1 end
-    return 0
+    return 1
 end
 
 local function fleetFuelLow()

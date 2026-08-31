@@ -3828,9 +3828,13 @@ end
 -- to decay on Minecraft's own schedule, which may be minutes -- and saplings come from leaf decay,
 -- so a drone that only takes logs walks away with no way to replant and the forest shrinks every
 -- pass. Breaking leaves makes the sapling drop now, while we are standing there to pick it up.
+-- ASK WoodFamily. It is the one place that knows what wood is.
+--
+-- This used to test "_log"/"_stem" itself while WoodFamily tested "_log"/"_wood" and isFuelSelected
+-- tested "_log"/"_planks"/"_wood" -- three functions, one question, three different answers, none
+-- of which covered the same set.
 local function isLog(p_Name)
-    return p_Name ~= nil and (string.find(p_Name, "_log", 1, true)
-                           or string.find(p_Name, "_stem", 1, true))
+    return WoodFamily(p_Name) == "log"
 end
 local function isLeaf(p_Name)     return p_Name ~= nil and string.find(p_Name, "_leaves", 1, true) end
 local function isSapling(p_Name)  return p_Name ~= nil and string.find(p_Name, "_sapling", 1, true) end
@@ -5356,7 +5360,8 @@ local function isFuelSelected(p_Slot)
     if n then
         if FUEL_NAMES[n] then return true end
         -- Logs and planks burn too, and there are dozens of wood types.
-        if n:find("_log") or n:find("_planks") or n:find("_wood") then return true end
+        -- Anything WoodFamily recognises burns: logs, planks and the nether stems alike.
+        if WoodFamily(n) ~= nil then return true end
     end
     local ok, is = pcall(turtle.refuel, 0)
     return ok and is == true
@@ -5434,7 +5439,11 @@ end
 function WoodFamily(p_Name)
     if type(p_Name) ~= "string" then return nil end
     if p_Name:find("_planks", 1, true) then return "planks" end
-    if p_Name:find("_log", 1, true) or p_Name:find("_wood", 1, true) then return "log" end
+    -- "_stem" is the nether woods (crimson, warped). isLog knew about them and this did not, which
+    -- is the drift this consolidation exists to end: three functions in this file each had their
+    -- own idea of what wood is, and they did not agree on the nether.
+    if p_Name:find("_log", 1, true) or p_Name:find("_wood", 1, true)
+       or p_Name:find("_stem", 1, true) then return "log" end
     return nil
 end
 

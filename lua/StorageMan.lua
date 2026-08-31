@@ -830,25 +830,28 @@ local SMELTABLE = {
 }
 local FUEL      = {"minecraft:coal", "minecraft:charcoal", "minecraft:coal_block"}
 
+-- WHAT KIND OF SMELT IS THIS? One classifier, so nothing downstream can disagree with it.
+--
+-- "Can this be smelted" and "how badly do we want it smelted" were answered by two functions that
+-- each re-derived the categories from item names. They drifted, and the drift was silent:
+-- isSmeltable did not recognise a log, while smeltRank ranked logs FIRST as the only fuel-positive
+-- smelt in the settlement. The ranking was dead code for the exact case it existed for, and the
+-- furnaces burned ore while 255 logs sat in storage and charcoal stayed at zero.
+--
+-- Order matters: raw_iron and raw_copper are in SMELTABLE and are ORE, so the ore test runs first.
+local function smeltCategory(p_Name)
+    if string.match(p_Name, "_log$") or string.match(p_Name, "_wood$") then return "wood" end
+    if string.match(p_Name, "_ore$") or string.find(p_Name, "raw_", 1, true) then return "ore" end
+    if SMELTABLE[p_Name] then
+        -- 2,700 in stock and no demand: worth smelting only when there is fuel to spare.
+        if string.find(p_Name, "cobble", 1, true) then return "bulk" end
+        return "other"
+    end
+    return nil
+end
+
 local function isSmeltable(p_Name)
-    if SMELTABLE[p_Name] then return true end
-    -- WOOD SMELTS, AND LEAVING IT OUT IS WHY THE SETTLEMENT NEVER MADE CHARCOAL.
-    --
-    -- SMELTABLE lists eight ores and sands, and the pattern below catches `_ore`. A log is neither,
-    -- so isSmeltable said no and the furnaces would not accept one -- while smeltRank right below
-    -- ranks logs FIRST, as the only fuel-positive smelt there is. Two functions in this file, one
-    -- question, opposite answers, and the ranking was dead code for the case it was written for.
-    --
-    -- Measured with 255 oak logs in storage and both furnaces lit: they smelted cobblestone and raw
-    -- iron, charcoal stayed at 0, and the diagnostic cheerfully reported "input=yes fuel=yes"
-    -- because ore qualified even though the wood standing next to it did not.
-    --
-    -- Matches any species and the stripped variants -- every one of them smelts to charcoal, and
-    -- hard-coding oak is how a fleet in a birch forest starves next to firewood.
-    if string.match(p_Name, "_log$") or string.match(p_Name, "_wood$") then return true end
-    -- Every vanilla ore smelts, including the deepslate_ variants. Anchored so it cannot match
-    -- something that merely contains "ore".
-    return string.match(p_Name, "_ore$") ~= nil
+    return smeltCategory(p_Name) ~= nil
 end
 
 -- A vanilla furnace is a SIDED container. CC:T exposes only the slots belonging to the face a
@@ -893,11 +896,13 @@ local function isSmeltableInput(p_Name) return isSmeltable(p_Name) and not isFue
 --      constraint -- and here it always is -- nothing else should ever go in ahead of a log.
 --   2  raw ore. What the settlement is actually mining for, and what building needs.
 --   9  cobblestone and deepslate. 2,585 in stock, no demand, and a furnace-hour each.
+-- Lowest smelts first. wood: the ONLY fuel-positive smelt -- one coal turns eight logs into eight
+-- charcoal -- so it is the one smelt that grows the fuel supply rather than spending it. ore: what
+-- the settlement is mining for. bulk: cobblestone, of which there is no shortage and no demand.
+local SMELT_RANK = { wood = 1, ore = 2, other = 5, bulk = 9 }
+
 local function smeltRank(p_Name)
-    if string.find(p_Name, "_log", 1, true) then return 1 end
-    if string.find(p_Name, "raw_", 1, true) or string.find(p_Name, "_ore", 1, true) then return 2 end
-    if string.find(p_Name, "cobble", 1, true) then return 9 end
-    return 5
+    return SMELT_RANK[smeltCategory(p_Name) or ""] or 5
 end
 
 -- The best thing waiting to be smelted, or nil if there is nothing. Same contract as
