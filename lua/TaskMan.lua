@@ -1637,6 +1637,37 @@ local function freeOrphanedDrones()
     end
 end
 
+-- THE ORDER TASKS ARE OFFERED IN, WHICH UNTIL NOW WAS WHATEVER pairs() FELT LIKE.
+--
+-- The placement loop walked DATA["tasks"] with pairs(), i.e. hash order, i.e. arbitrary -- so which
+-- job the one free miner received was a coin flip. Caught in the act: gather:coal_ore took the only
+-- fuelled miner in the settlement, sending it after ore thirty blocks underground where three
+-- drones have already stranded, while gather:oak_log -- surface, nineteen blocks out, and the ONLY
+-- renewable fuel this settlement has -- sat unassigned right beside it.
+--
+-- `priority` has been stored on every task since it was created and read by absolutely nothing.
+--
+-- Fuel work outranks everything else at equal priority, for the reason the supply loop already
+-- states: every other thing the settlement wants is downstream of being able to move. Ties then go
+-- to the oldest task, so nothing starves behind a stream of new arrivals -- which is a real risk
+-- here, because rescues are generated continuously.
+local function orderedTasks()
+    local s_List = {}
+    for k, v in pairs(DATA["tasks"] or {}) do
+        s_List[#s_List + 1] = {key = k, task = v}
+    end
+    table.sort(s_List, function(a, b)
+        local pa = tonumber(a.task.priority) or -1
+        local pb = tonumber(b.task.priority) or -1
+        if pa ~= pb then return pa > pb end
+        local fa = taskProducesFuel(a.task.name) and 1 or 0
+        local fb = taskProducesFuel(b.task.name) and 1 or 0
+        if fa ~= fb then return fa > fb end
+        return (tonumber(a.task.id) or 0) < (tonumber(b.task.id) or 0)
+    end)
+    return s_List
+end
+
 function Tick()
     while true do
         os.sleep(TICK_SECONDS)
@@ -1654,7 +1685,8 @@ function Tick()
             -- How many tasks of a role may fail to place before the role is written off for this
             -- pass. See the note at the failure branch below.
             local s_Fails = {}
-            for k,v in pairs(DATA["tasks"]) do
+            for _, s_Entry in ipairs(orderedTasks()) do
+                local k, v = s_Entry.key, s_Entry.task
                 -- Unassigned, enabled, not paused, not finished: try to place it. pickDrone
                 -- returns nothing when every drone of that role is busy, so this quietly
                 -- retries next tick rather than failing loudly every 15 seconds.
