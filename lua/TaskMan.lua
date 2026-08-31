@@ -271,7 +271,17 @@ end
 -- doing to go and refuel, so dispatching to it cannot produce work -- the drone abandons the task
 -- the moment it receives it, which reads as a mysteriously failing task rather than as an empty
 -- tank. A drone under the floor needs fuel, not orders.
-local DISPATCH_FUEL_FLOOR = 600
+-- "Enough to be given work at all" -- and it must agree with what the DRONE thinks that means.
+--
+-- This was 600 while DroneLogic's FUEL_RESERVE was 900, so it was the looser of the two and never
+-- bound anything. FUEL_RESERVE is now 300 (the y=110 flyover it was sized for is gone), which
+-- inverted the relationship: TaskMan began refusing work to drones that were perfectly able to do
+-- it. D9 sat idle at ~560 fuel while gather:coal_ore and gather:oak_log went unplaced and the log
+-- blamed "every miner is busy (D14)" -- D14 being a drone that has been silent for three days.
+--
+-- Two numbers for one idea is how they drift apart. They mean the same thing, so they are the same
+-- number: below this a drone cannot be sure of getting home, and above it, it can work.
+local DISPATCH_FUEL_FLOOR = 300
 
 local function hasFuel(d)
     -- Absent means unknown, not empty: an older DroneMan record with no fuel field must not take
