@@ -85,3 +85,33 @@ describe('furnace input priority', () => {
     expect(CODE).toMatch(/isSmeltableInput\(p_Name\)\s+return isSmeltable\(p_Name\) and not isFuel\(p_Name\)/);
   });
 });
+
+/**
+ * A FURNACE MUST NOT BURN THE SETTLEMENT'S LAST FUEL ON SOMETHING THAT MAKES NONE.
+ *
+ * Ranking logs above ore is a preference, not a limit: with no logs in stock the chooser fell
+ * through to raw ore and spent every coal on it. Two 64-coal bootstraps went that way in one
+ * session -- storage to 0 burnable, copper_ingot to 681, three drones at zero fuel and nothing able
+ * to fetch more. The settlement converted the one thing it cannot make into ingots it has no use
+ * for, twice.
+ *
+ * Below the reserve, only the fuel-POSITIVE smelt is allowed in: a furnace either grows the fuel
+ * supply or stays cold.
+ */
+describe('furnaces during a fuel shortage', () => {
+  it('smelts only rank-1 (fuel-positive) input when storage fuel is scarce', () => {
+    const body = /local function bestSmeltInput\(\)([\s\S]*?)\nend/.exec(CODE);
+    expect(body, 'bestSmeltInput must exist').toBeTruthy();
+    // The scarcity test must be present AND must gate the candidate, not merely be computed.
+    expect(body![1]).toMatch(/fuelInStorage\(\)\s*<\s*SMELT_FUEL_RESERVE/);
+    expect(body![1], 'scarcity must restrict the choice to rank 1').toMatch(/r\s*==\s*1/);
+  });
+
+  it('counts fuel by the same predicate the furnaces load with', () => {
+    // fuelInStorage must use isFuel, not its own list -- two lists of what burns is how one of them
+    // silently stops matching charcoal.
+    const body = /local function fuelInStorage\(\)([\s\S]*?)\nend/.exec(CODE);
+    expect(body).toBeTruthy();
+    expect(body![1]).toMatch(/isFuel\(/);
+  });
+});

@@ -54,8 +54,8 @@
     "lua/TaskMan.lua": {
       "cc": [
         69,
+        51,
         50,
-        49,
         34,
         30,
         21,
@@ -67,8 +67,8 @@
       ],
       "names": [
         "rescueNeeded",
-        "OnStartTask",
         "(anonymous)",
+        "OnStartTask",
         "OnTaskDone",
         "placeRescues",
         "placeBlockers",

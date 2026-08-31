@@ -840,12 +840,44 @@ end
 
 -- The best thing waiting to be smelted, or nil if there is nothing. Same contract as
 -- firstInStorage(isSmeltableInput), which is what this replaces at both call sites.
+-- Burnable units in storage, counted so the furnaces can tell "we have fuel to spend" from "we are
+-- spending the settlement's last fuel".
+local function fuelInStorage()
+    local s_Units = 0
+    for name, e in pairs(m_Index) do
+        if isFuel(name) then s_Units = s_Units + (e.total or 0) end
+    end
+    return s_Units
+end
+
+-- Below this, the furnaces smelt ONLY what makes more fuel.
+--
+-- 32 coal is four stacks of smelting -- enough to convert a delivery of logs into charcoal and get
+-- the fleet moving again, which is the only thing worth spending the last of it on.
+local SMELT_FUEL_RESERVE = 32
+
 local function bestSmeltInput()
+    -- DO NOT SPEND THE LAST FUEL ON SOMETHING THAT DOES NOT MAKE FUEL.
+    --
+    -- The ranking already prefers logs, but preference is not a limit: with no logs in stock it
+    -- happily fell through to raw ore and burned every coal in the settlement on it. That is what
+    -- happened to two 64-coal bootstraps in a row -- storage went to 0 burnable while copper_ingot
+    -- climbed to 681, with three drones at zero fuel and no way to fetch more. The settlement
+    -- converted the one thing it could not make into 681 ingots it has no use for.
+    --
+    -- Smelting ore is worth doing when there is fuel to spare and is never worth the LAST of it, for
+    -- the same reason the supply loop refuses to gather dirt during a fuel emergency: everything
+    -- else the settlement wants is downstream of being able to move.
+    local s_Scarce = fuelInStorage() < SMELT_FUEL_RESERVE
     local s_Best, s_Rank = nil, nil
     for name, e in pairs(m_Index) do
         if e.at[1] and isSmeltableInput(name) then
             local r = smeltRank(name)
-            if s_Rank == nil or r < s_Rank then s_Best, s_Rank = e, r end
+            -- Rank 1 is the fuel-positive smelt (logs -> charcoal). When fuel is scarce that is the
+            -- only thing allowed in, so a furnace either grows the supply or stays cold.
+            if (not s_Scarce) or r == 1 then
+                if s_Rank == nil or r < s_Rank then s_Best, s_Rank = e, r end
+            end
         end
     end
     return s_Best
