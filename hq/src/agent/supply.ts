@@ -543,7 +543,16 @@ async function dispatchCraft(rule: SupplyRule, have: number, ctx: SupplyCtx): Pr
  * the trip out; one that meets a single tree does not.
  */
 async function dispatchLumber(rule: SupplyRule, have: number, ctx: SupplyCtx): Promise<boolean> {
-  if (!ctx.minerFree) return false;
+  // SAY WHY, EVEN WHEN THE ANSWER IS "NOT NOW".
+  //
+  // A bare `return false` here is the same invisible failure that cost this settlement most of a
+  // session elsewhere: the tick prints its fuel-emergency line, the wood rule is skipped, and there
+  // is nothing anywhere connecting the two. "No miner free" and "no trees known" need completely
+  // different fixes and looked identical from outside.
+  if (!ctx.minerFree) {
+    ctx.waiting.push(`lumber ${rule.match}: no miner free`);
+    return false;
+  }
 
   const found: any = await bridge.call('MapServer', 'FindBlocks',
     { match: rule.match, limit: 400 }, { timeoutMs: 15000 });
@@ -551,7 +560,10 @@ async function dispatchLumber(rule: SupplyRule, have: number, ctx: SupplyCtx): P
   const all: any[] = (Array.isArray(hits) ? hits : Object.values(hits ?? {}))
     .filter((h: any) => h && typeof h.x === 'number' && withinReach(h));
 
-  if (!all.length) return dispatchSurvey(rule, have, ctx);
+  if (!all.length) {
+    note(`${rule.match}: ${have}/${rule.min}, no trees known inside the operating circle -> survey`);
+    return dispatchSurvey(rule, have, ctx);
+  }
 
   // Densest first: count how many other known trunks sit inside the sweep this start would cover.
   const SWEEP = 8;
