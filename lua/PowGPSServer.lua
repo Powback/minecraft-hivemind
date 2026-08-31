@@ -361,8 +361,22 @@ end
 local MAP_MAGIC = "pgps1"
 
 --- Write `p_Rows()` line by line. Streaming, so nothing ever holds the whole file in memory.
+-- Directories, made ONCE per boot instead of once per chunk.
+--
+-- This ran fs.isDir + fs.makeDir on every call, and writeLines is called once per dirty chunk --
+-- so a save of two hundred chunks was two hundred directory checks on top of two hundred
+-- open/write/close cycles. Filesystem calls cross into Java and are the most expensive thing a CC
+-- computer does; CC:T's own thread dump caught the shared worker sitting in
+-- WritableFileMount.makeDirectory while it terminated an unrelated computer for running over time.
+local m_DirsReady = {}
+local function ensureDir(p_Path)
+    if m_DirsReady[p_Path] then return end
+    if not fs.isDir(p_Path) then fs.makeDir(p_Path) end
+    m_DirsReady[p_Path] = true
+end
+
 local function writeLines(p_Name, p_Header, p_Rows)
-    if not fs.isDir("/egpsData") then fs.makeDir("/egpsData") end
+    ensureDir("/egpsData")
     local s_Tmp = "/egpsData/" .. p_Name .. ".new"
 
     -- Stage, then move. A save that runs out of space part way through leaves a truncated file,
@@ -553,8 +567,32 @@ function save()
         end
     end
 
-    local s_Failed = nil
+    -- A SAVE MUST NOT BE ABLE TO HOG THE COMPUTER THREAD, HOWEVER MUCH IS DIRTY.
+    --
+    -- Yielding once per chunk keeps THIS computer inside its own time budget, but CC:T runs every
+    -- computer in the world on a shared worker pool -- so an unbounded run of open/write/close
+    -- starves the others even while yielding politely. When the monitor then finds a computer over
+    -- budget it terminates it AND interrupts the shared worker, and any computer that happens to be
+    -- starting on that worker dies with `InterruptedException at ComputerExecutor.turnOn`. It then
+    -- cannot be started again: `computercraft turn-on 12` answers "Turned on 1/1" while the block
+    -- stays On:0b for ever.
+    --
+    -- That is not a hypothetical either. The server log has all three steps in sequence:
+    --   Terminating computer #10 due to timeout (ran over by 3.008 seconds)
+    --     Thread ComputerCraft-Computer-Worker-0 ... at WritableFileMount.makeDirectory
+    --   Error running task on computer #12: java.lang.InterruptedException at ...turnOn
+    -- MainFrame died, TaskMan became unstartable, and with MainFrame gone every remaining module sat
+    -- in WaitForService("MAINFRAME") -- the whole settlement dark, from one oversized save.
+    --
+    -- So bound the pass. Whatever is left stays in m_Dirty and is written by the next one; the map
+    -- is a cache of observations that are re-uploaded constantly, so a chunk reaching disk a minute
+    -- later costs nothing, and taking the fleet's scheduler down costs everything.
+    local CHUNKS_PER_SAVE = 24
+
+    local s_Failed, s_Wrote = nil, 0
     for c, keys in pairs(s_Buckets) do
+        if s_Wrote >= CHUNKS_PER_SAVE then break end
+        s_Wrote = s_Wrote + 1
         -- YIELD ONCE PER CHUNK, NOT ONLY EVERY 512 LINES.
         --
         -- The sink inside writeLines yields every 512 buffered lines, which covers a big chunk and

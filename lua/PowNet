@@ -31,9 +31,49 @@ local m_DroneEvents = {}
 local m_Update
 
 --===== OPEN REDNET =====--
-for _, side in ipairs(redstone.getSides()) do
-    if peripheral.getType(side) == "modem" then
-        rednet.open(side)
+--
+-- A MODEM THAT IS NOT READY YET IS NOT A MISSING MODEM.
+--
+-- This looked exactly once, at load time, and treated "no modem right now" as permanent. But a
+-- computer boots the instant its chunk loads, and the modem beside it is a separate block whose
+-- peripheral attaches on its own schedule. Lose that race -- server restart, chunk reload, world
+-- load, a redeploy that reboots everything at once -- and the module writes FATAL.txt and is dead
+-- for good, with the modem sitting right there, attached, milliseconds later.
+--
+-- Measured: MainFrame's FATAL.txt read "no modem attached to MainFrame", while the world had a
+-- wireless_modem_normal directly above it at -484,65,76, facing down, identical in every blockstate
+-- to DroneMan's and MapServer's working ones. Turning MainFrame on by hand, changing nothing else,
+-- attached it immediately and cleared the fault.
+--
+-- The cost of losing that race is the whole settlement. MainFrame hosts PowNet, so a dead MainFrame
+-- means every module sits in WaitForService("MAINFRAME") and every drone stands down -- which is
+-- what "all the modules keep going offline" actually was. Nothing retried, because nothing here
+-- believed a modem could arrive late.
+--
+-- So wait for it. `peripheral` fires on attach, and the timer bounds the wait so a genuinely
+-- modem-less computer still reports the hard fault below instead of hanging at boot for ever.
+local MODEM_WAIT = 15
+
+local function openAnyModem()
+    for _, side in ipairs(redstone.getSides()) do
+        if peripheral.getType(side) == "modem" then
+            rednet.open(side)
+        end
+    end
+    return rednet.isOpen()
+end
+
+if not openAnyModem() then
+    local s_Until = os.clock() + MODEM_WAIT
+    os.startTimer(1)
+    while os.clock() < s_Until do
+        local s_Event = os.pullEvent()
+        -- "peripheral" is the attach we are waiting for; the timer is the fallback for a modem that
+        -- was already in place before this computer started listening.
+        if s_Event == "peripheral" or s_Event == "timer" then
+            if openAnyModem() then break end
+            os.startTimer(1)
+        end
     end
 end
 
