@@ -1064,6 +1064,12 @@ end
 -- protection against the fuel spiral, without assuming the world is sorted.
 local GATHER_MISS_FUEL_BUDGET = 600
 
+-- Candidates that must be attempted before the miss budget may end a gather. The map contains
+-- ghosts -- entries recorded while a drone was 53 to 76 blocks from where it believed it was --
+-- so the first pick failing is ordinary, not a signal. Sampled against the server: four of six
+-- oak_log targets real, two air.
+local GATHER_MIN_CHECKS = 3
+
 -- Account for one unreachable candidate and decide whether the gather should stop.
 --
 -- Returns the updated miss-spend total and the updated check cap. Written as a helper taking and
@@ -1107,7 +1113,28 @@ function GatherMissBudget(p_FuelBefore, p_Spent, p_Checked, p_MaxChecks)
         s_Cost = p_FuelBefore - s_Now
     end
     local s_Total = (p_Spent or 0) + s_Cost
-    if s_Total >= GATHER_MISS_FUEL_BUDGET then return s_Total, p_Checked end
+    -- ONE BAD CANDIDATE MUST NOT END A JOB WITH 191 OTHERS IN IT.
+    --
+    -- The budget stops the sweep once misses have cost GATHER_MISS_FUEL_BUDGET, which is right --
+    -- a gather that is only burning fuel should stop. But it was checked with no floor on how many
+    -- candidates had been TRIED, so a single expensive miss consumed the whole allowance and
+    -- collapsed the cap to one:
+    --
+    --   gather: 1/192 checked, 0 taken, 0 unreachable
+    --   gather: could not reach -483,75,57
+    --   JOB Gather FAILED took nothing from 1 candidates (1 unreachable)
+    --
+    -- 191 untried targets abandoned because the first pick was bad -- and it was bad in a way that
+    -- is expected here: -483,75,57 is AIR. The map holds ghosts, recorded while drones believed
+    -- they were 53 to 76 blocks from where they actually were, so a share of every target list is
+    -- fiction. Sampled by hand against the server: four of six oak_log entries real, two air.
+    --
+    -- With two thirds of targets genuine, trying a handful finds wood; trying one is a coin flip
+    -- the settlement loses. So the budget cannot end the sweep until GATHER_MIN_CHECKS candidates
+    -- have actually been attempted. The fuel ceiling still applies after that.
+    if s_Total >= GATHER_MISS_FUEL_BUDGET and (p_Checked or 0) >= GATHER_MIN_CHECKS then
+        return s_Total, p_Checked
+    end
     return s_Total, p_MaxChecks
 end
 
