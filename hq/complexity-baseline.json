@@ -6,7 +6,7 @@
     "lua/DroneLogic.lua": {
       "cc": [
         83,
-        52,
+        60,
         52,
         45,
         45,
@@ -29,8 +29,8 @@
       ],
       "names": [
         "(anonymous)",
-        "OnSurvey",
         "(anonymous)",
+        "OnSurvey",
         "SendHeartBeat",
         "(anonymous)",
         "TakeFromChest",

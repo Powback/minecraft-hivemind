@@ -1092,13 +1092,29 @@ local GATHER_MIN_CHECKS = 3
 --
 -- Every branch lives in here rather than at the call site: the gather body is the largest function
 -- in the file and sits on the complexity gate.
-function NoteSeenColumn(p_X, p_Y, p_Z)
-    -- Our own cell: we are occupying it, so it is air. This is the cheapest true fact available
-    -- and it is exactly the one a felled trunk leaves behind as a ghost.
-    pcall(pgps.noteObservation, p_X .. ":" .. (p_Y + 1) .. ":" .. p_Z, 0)
+-- RECORD THE CELLS WE ACTUALLY LOOKED AT, WHICH DEPENDS ON WHICH SIDE WE CAME FROM.
+--
+-- This assumed the drone was always hovering at p_Y + 1 looking down, because every gather approach
+-- targeted t.y + 1. That is no longer true: a canopy log has leaves above it, so wood is now
+-- approached from BELOW, and calling this from down there would write two lies into the map --
+-- "air" at p_Y + 1, a cell it never looked at and which is usually the leaves that forced the
+-- approach in the first place, and inspectUp's reading (the TARGET) filed at p_Y + 2.
+--
+-- Both would be indistinguishable from real observations, and this map is already carrying ghosts
+-- from the era when drones were 53 to 76 blocks out. The whole point of this function is to PRUNE
+-- ghosts; a version that invents them is worse than no version at all.
+function NoteSeenColumn(p_X, p_Y, p_Z, p_FromBelow)
+    -- Our own cell: we are occupying it, so it is air. The cheapest true fact available, and
+    -- exactly the one a felled trunk leaves behind as a ghost.
+    local s_Own  = p_FromBelow and (p_Y - 1) or (p_Y + 1)
+    -- The cell on the far side of us, seen by looking away from the target.
+    local s_Far  = p_FromBelow and (p_Y - 2) or (p_Y + 2)
+    local s_Look = p_FromBelow and turtle.inspectDown or turtle.inspectUp
 
-    local s_Ok, s_Blk = turtle.inspectUp()
-    local s_Key = p_X .. ":" .. (p_Y + 2) .. ":" .. p_Z
+    pcall(pgps.noteObservation, p_X .. ":" .. s_Own .. ":" .. p_Z, 0)
+
+    local s_Ok, s_Blk = s_Look()
+    local s_Key = p_X .. ":" .. s_Far .. ":" .. p_Z
     if s_Ok and s_Blk and s_Blk.name then
         pcall(pgps.noteObservation, s_Key, 1, {true, {name = s_Blk.name}})
     else
@@ -4017,6 +4033,8 @@ function OnGather(p_ID, p_Message)
                     s_Near = math.abs(t.x - s_Cx) + math.abs(t.y - s_Cy) + math.abs(t.z - s_Cz)
                 end
                 local s_At = false
+                -- Which face we ended up on, so the inspect and the dig agree with the approach.
+                local s_FromBelow = false
                 if s_Cx == nil or s_Near > SHORT_HOP then
                     s_At = pgps.moveTo(t.x, t.y + 1, t.z)
                 end
@@ -4055,8 +4073,32 @@ function OnGather(p_ID, p_Message)
                     s_At = pgps.flyTo(t.x, t.y + 1, t.z, s_FlyBudget)
                 end
 
+                -- IF ABOVE IS SOLID, COME AT IT FROM UNDERNEATH.
+                --
+                -- Every approach above aims at t.y + 1 and then digs DOWN. That is right for ore:
+                -- a vein sits in rock with a shaft over it. It is wrong for a tree, and trees are
+                -- the settlement's only renewable fuel. A canopy log has LEAVES above it, so the
+                -- stand-above cell is solid and all three approaches fail -- which is why coal ore
+                -- at y=40 is reachable and oak_log at y=75 has never once been reached.
+                --
+                -- Measured on a real target, -484,75,58: oak_leaves on all four sides AND above,
+                -- and -484,74,58 directly beneath it is AIR, with a clear air column all the way
+                -- down to y=64. The tree was never unreachable; it was only unreachable from above.
+                --
+                -- hive.plan stated the consequence plainly: gather:oak_log "took nothing from 3
+                -- candidates (3 unreachable)", with craft-oak_planks blocked behind it and, behind
+                -- that, every chest, crafting table and building the settlement will ever make.
+                if s_At == false then
+                    s_FromBelow = true
+                    s_At = pgps.moveTo(t.x, t.y - 1, t.z)
+                    if s_At == false then
+                        s_At = pgps.flyTo(t.x, t.y - 1, t.z, s_FlyBudget or 64)
+                    end
+                    if s_At == false then s_FromBelow = false end
+                end
+
                 if s_At ~= false then
-                    local s_Ok, s_Blk = turtle.inspectDown()
+                    local s_Ok, s_Blk = (s_FromBelow and turtle.inspectUp or turtle.inspectDown)()
                     -- One line per candidate. There are only ever a few dozen, and without this the
                     -- counters say "checked 4, took 0, missed 0" without ever saying what was found
                     -- instead -- which is the only fact that distinguishes a stale index from a
@@ -4117,11 +4159,11 @@ function OnGather(p_ID, p_Message)
                         -- observable right now: the target below it, its own cell (occupied by the
                         -- drone, therefore air), and whatever is above. All three are real readings,
                         -- not inferences -- nothing is fabricated for cells it cannot see.
-                        pcall(NoteSeenColumn, t.x, t.y, t.z)
+                        pcall(NoteSeenColumn, t.x, t.y, t.z, s_FromBelow)
                     end
 
                     if s_Ok and s_Blk and wanted(s_Blk.name) then
-                        if DigDown() then
+                        if (s_FromBelow and DigUp or DigDown)() then
                             s_Got = s_Got + 1
                             -- The vein continues through the faces of what we just took.
                             push(t.x + 1, t.y, t.z)
