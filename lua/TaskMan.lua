@@ -141,12 +141,47 @@ local function fleet(p_Force)
     return m_Fleet or {}
 end
 
+-- The role that means "any drone will do".
+--
+-- A GLOBAL, and declared ABOVE RoleForWork and every matcher that reads it. A `local` used above
+-- its declaration is a nil global in Lua, silently -- and here that would make RoleForWork return
+-- nil, which compares equal to nothing, so fuel relief would go from assignable-to-one-role to
+-- assignable-to-none. That is the failure this constant exists to fix, arriving by the back door.
+--
+-- A string rather than nil because the value is also reported to HQ as a task's `role` and used as
+-- a table key in the start loop (s_NoDrone[s_Role]); both want something printable.
+ANY_ROLE = "any"
+
+-- Does this drone satisfy the role a piece of work asks for?
+--
+-- Every site that matched roles did it inline as `(d.role or "miner") == p_Role`, in three places,
+-- which is how a fourth place would have got it subtly wrong. The "miner" default is preserved:
+-- a drone with no role recorded is a general worker, not a drone that can do nothing.
+function RoleFits(p_Drone, p_Role)
+    if p_Role == ANY_ROLE then return true end
+    return ((p_Drone.role or "miner") == p_Role)
+end
+
 -- What kind of drone does this work need? Digging needs a tool; surveying needs a scanner.
 function RoleForWork(p_Work)
     if p_Work == nil then return "miner" end
     -- Digging someone out is miner work by definition: a scout carries a geo scanner where a
     -- pickaxe would go, so the drone that is trapped is precisely the one that cannot free itself.
-    if p_Work["rescue"] then return "miner" end
+    --
+    -- A FUEL relief is not that job, and pinning it to "miner" is a deadlock. Handing coal to a dry
+    -- drone is fly-there-and-HandTo: no pickaxe, no upgrade, any turtle can do it. But whatever
+    -- strands one miner -- an empty larder -- has almost always stranded every other miner at the
+    -- same moment, so demanding a miner to rescue a miner asks the fleet for the one thing the
+    -- emergency guarantees it does not have.
+    --
+    -- Measured: D9, D12 and D21 sat at ZERO fuel with fuel-D9/D12/D21 queued and permanently
+    -- unassignable, while D4 -- a crafter holding 2,254 fuel and an empty inventory, parked at
+    -- base, idle -- was excluded because its role did not match. The settlement had the fuel, the
+    -- casualties, and the task, and could not put the three together.
+    if p_Work["rescue"] then
+        if p_Work["rescue"].fuel then return ANY_ROLE end
+        return "miner"
+    end
     if p_Work["survey"] or p_Work["scan"] then return "scout" end
     -- Crafting needs a crafting-table upgrade, which is a different turtle entirely: turtle.craft
     -- simply does not exist on a miner, so routing a craft to one wastes the trip and fails at the
@@ -281,7 +316,7 @@ local function pickDrone(p_Role, p_Pos, p_Avoid, p_MinFuel)
             local f = tonumber(d.fuel)
             s_Enough = (f == nil) or (f >= p_MinFuel)
         end
-        if (d.role or "miner") == p_Role then
+        if RoleFits(d, p_Role) then
             if d.status == "idle" and not committed(d.id) and s_Enough then
                 if p_Avoid ~= nil and d.id == p_Avoid then
                     s_Fallback = s_Fallback or d
@@ -309,7 +344,7 @@ end
 local function pickDrones(p_Role)
     local s_Free, s_Busy = {}, nil
     for _, d in ipairs(fleet()) do
-        if (d.role or "miner") == p_Role then
+        if RoleFits(d, p_Role) then
             -- TRUST THE HEARTBEAT. DO NOT PING EVERY CANDIDATE.
             --
             -- This pinged each idle drone of the role with a FOUR SECOND timeout before considering
@@ -1192,7 +1227,7 @@ local function placeBlockers()
             local s_Where = workPos(v)
             local s_Best, s_BestD, s_BestTask = nil, nil, nil
             for _, d in ipairs(fleet()) do
-                if (d.role or "miner") == s_Role and not d.offline and hasFuel(d) then
+                if RoleFits(d, s_Role) and not d.offline and hasFuel(d) then
                     for _, t in pairs(DATA["tasks"] or {}) do
                         if t.assignedTo == d.id and (t.progress or 0) < 100
                                 and not (t.work and t.work.rescue) then
