@@ -1025,8 +1025,35 @@ end
 --
 -- Tell the truth about the step instead: move the cache, record the intent, drop a crumb. The
 -- caller keeps its raw move; the bookkeeping stops lying about it.
+-- DECLARED HERE, ABOVE noteExternalStep, WHICH IS THE FIRST THING TO USE IT.
+-- It used to live 1,300 lines further down, next to savePose. A `local` used above its
+-- declaration is a nil GLOBAL in Lua -- silent -- so the invalidation below would have called
+-- fs.exists(nil) and thrown inside the one path that runs when a drone is already lost.
+local POSE_FILE = "/pgps-pose.txt"
+
 function noteExternalStep(dx, dy, dz)
-    if cachedX == nil then return false end
+    -- MOVING WITH NO POSITION MUST INVALIDATE THE SAVED ONE.
+    --
+    -- Returning false here is honest -- with no cachedX there is nothing to add a step to -- but it
+    -- was silent, and the caller that hits this is climbForFix: the drone is climbing PRECISELY
+    -- because it has lost its fix. So the ascent is neither tracked nor saved, and the pose file
+    -- still holds wherever it was standing before it took off.
+    --
+    -- A reboot then restores that file and the drone asserts a position it has physically left.
+    -- Measured: D9 believed -480,65,68 while the server had it at y≈97, and the GPS correction that
+    -- followed moved it 39 blocks -- "bookkeeping disagrees with GPS since the last fix: wanted
+    -- 2,0,0 got -2,0,2", i.e. the reckoning was self-consistent and the ANCHOR was thirty-four
+    -- blocks wrong. It then flew 31 blocks back down, and every one of those blocks was fuel the
+    -- settlement did not have. All sixteen GPS hosts were verified correct against the server, so
+    -- the fix was right and the belief was wrong.
+    --
+    -- Deleting the pose is strictly better than keeping a stale one: pgps already knows how to
+    -- start with no position (it re-fixes, and refuses to dead-reckon until it has), whereas a
+    -- confidently wrong altitude is acted on.
+    if cachedX == nil then
+        if fs.exists(POSE_FILE) then pcall(fs.delete, POSE_FILE) end
+        return false
+    end
     cachedX, cachedY, cachedZ = cachedX + dx, cachedY + dy, cachedZ + dz
     notePlannedStep(dx, dy, dz, false)   -- never "straight": these are one-off steps, not a run
     breadcrumb()
@@ -2321,7 +2348,6 @@ end
 -- and turn; writing them down makes that survive a reboot. Throttled, because a file write per step
 -- is a real cost and the pose only has to be good enough to resume from -- a stale entry is
 -- corrected by the first GPS fix the drone gets.
-local POSE_FILE = "/pgps-pose.txt"
 local m_PoseDirty = 0
 
 function savePose(p_Force)
