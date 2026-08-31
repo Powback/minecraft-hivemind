@@ -39,8 +39,31 @@ Tools here return `ok: true` while doing nothing. All of these did, on the same 
 `task.stop` (requeued instead of stopping), `storage.recall` (dispatched nothing),
 `fleet.retire` (HQ still listed the drone), `DroneMan.GoTo` (silently dropped undeclared params).
 
-So: check the world, the drone log, or the state — not the return value. `fleet.status`,
-`hive.plan` and `hive.nodes` are the honest views.
+So: check the world, the drone log, or the state — not the return value. `hive.plan` and
+`hive.nodes` are the honest views.
+
+**`fleet.status` is NOT one of them for fuel, cargo or position.** Those three fields are replayed
+from the last heartbeat a drone managed to get home, and a drone that is out of radio range, dry, or
+lost is precisely the one whose heartbeat is oldest — so the numbers are freshest exactly when they
+matter least. Measured side by side in one minute:
+
+| | `fleet.status` said | actually |
+|---|---|---|
+| D21 fuel | 2,534 | **0** |
+| D21 cargo | 32 coal | 34 cobblestone, no coal |
+| D21 position | -534,69,26 | -481,65,55 (**53 blocks out**) |
+| D14 position | -439,109,56 | -369,64,60 (**70 blocks out**) |
+
+Two hours went into planning around fuel that did not exist: `storage.recall` cheerfully reported
+"D21 held 32, asked: true" for coal nobody had, and the drone was written off as stranded 74 blocks
+away when it was sitting 22 blocks from home. `computercraft dump` gives true positions, and
+`fleet.probe` gives true fuel and inventory in seconds:
+
+```
+fleet.probe { id: 51, code: 'return turtle.getFuelLevel()' }
+```
+
+Ask one of those before spending a decision on a number from `fleet.status`.
 
 **`fleet.probe` answers questions about the game in seconds.** Use it instead of inferring.
 
