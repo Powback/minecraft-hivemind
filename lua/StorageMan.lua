@@ -1007,6 +1007,11 @@ end
 -- the stricter test; the output/fuel face keeps fuel AND finished product, so only genuinely
 -- finished goods come off it. Split out because ServiceFurnaces sits on the complexity gate and
 -- this is the decision most worth being able to read on its own.
+-- What may stay in a furnace's fuel slot. Coal only: charcoal is the PRODUCT of the smelt that
+-- matters most here, and leaving it in the furnace strands the settlement's renewable fuel inside
+-- the machine that made it.
+local KEEP_AS_FUEL = { ["minecraft:coal"] = true, ["minecraft:coal_block"] = true }
+
 local function wrongForFace(p_Item, p_IsInputFace, p_Slot, p_Size)
     if p_Item == nil then return false end
     if p_IsInputFace then return not isSmeltableInput(p_Item.name) end
@@ -1021,9 +1026,18 @@ local function wrongForFace(p_Item, p_IsInputFace, p_Slot, p_Size)
     -- output slots in the world, and charcoal in STORAGE flat at 0 the whole time. The settlement
     -- was finally making its renewable fuel and could not collect any of it.
     --
-    -- The last exposed slot is the output. Everything comes out of it; the fuel slot keeps fuel.
-    if p_Slot == p_Size then return true end
-    return not isSmeltable(p_Item.name) and not isFuel(p_Item.name)
+    -- SLOT ORDER IS NOT WHAT YOU THINK, SO DO NOT DEPEND ON IT.
+    --
+    -- I first wrote this as "the last exposed slot is the output". Vanilla's SLOTS_FOR_DOWN is
+    -- {2, 1} -- OUTPUT first, fuel second -- so that drained the FUEL slot and left the product.
+    -- Observed: storage coal falling 64 -> 48 while both furnaces sat on a FULL 64-stack of
+    -- charcoal with CookTime 0 and BurnTime 0, stalled on their own output.
+    --
+    -- So decide by CONTENT, which needs no knowledge of the layout. On this face everything is
+    -- product except the fuel we are deliberately keeping there. Charcoal is fuel AND product, and
+    -- it belongs in storage where the whole fleet can reach it -- a furnace holding its own
+    -- charcoal is 64 charcoal nobody can burn.
+    return not KEEP_AS_FUEL[p_Item.name]
 end
 
 -- The one thing this face is for.
