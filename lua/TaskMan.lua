@@ -850,6 +850,28 @@ end
 --
 -- Recorded on DATA so it survives a restart and can be read back through the Abandoned endpoint,
 -- which is what puts it on the map. Cleared automatically when the drone reports in again.
+-- How long a written-off drone stays written off before the fleet tries again.
+--
+-- Long enough that a hopeless rescue is not retried every tick -- the reason the cap exists -- and
+-- short enough that a drone is not lost for the night over a shortage that cleared in ten minutes.
+local ABANDON_RETRY_MS = 15 * 60 * 1000
+
+-- Let a written-off drone be tried again once the write-off is old enough.
+--
+-- Declared ABOVE rescueNeeded, which calls it: a local used above its declaration is a silent nil
+-- global here. Kept as its own function rather than inlined because rescueNeeded is the most
+-- complex thing in this file and the complexity gate is right to refuse to let it grow.
+local function expireAbandonment(p_Drone, p_Key)
+    local s_Ab = (DATA["abandoned"] or {})[p_Key]
+    if s_Ab == nil then return end
+    if (os.epoch("utc") - (s_Ab.epoch or 0)) <= ABANDON_RETRY_MS then return end
+    DATA["abandoned"][p_Key] = nil
+    if DATA["rescueTries"] then DATA["rescueTries"][p_Key] = nil end
+    Log(("%s was written off %d min ago -- trying again, because conditions change")
+        :format(tostring(p_Drone.name), math.floor(ABANDON_RETRY_MS / 60000)))
+    PowNet.MarkDirty()
+end
+
 local function abandonDrone(p_Drone, p_Tries)
     local s_Key = tostring(p_Drone.id)
     DATA["abandoned"] = DATA["abandoned"] or {}
@@ -860,6 +882,10 @@ local function abandonDrone(p_Drone, p_Tries)
             reason = "three rescues reached it and it never recovered -- its reported position is "
                   .. "probably wrong, or it has left the loaded region",
             at = os.time(),
+            -- A REAL CLOCK, because the abandonment expires and os.time() cannot measure elapsed
+            -- time: it is the in-game clock, 0-24, and wraps every Minecraft day, so any "how long
+            -- ago" built on it is wrong twice a day.
+            epoch = os.epoch("utc"),
         }
         PowNet.MarkDirty()
     end
@@ -1119,6 +1145,25 @@ local function rescueNeeded()
         -- is a fault for a human to look at, not work to keep spending drones on.
         DATA["rescueTries"] = DATA["rescueTries"] or {}
         local s_Key = tostring(d.id)
+
+        -- ABANDONMENT MUST EXPIRE. "IT NEEDS A HUMAN" CANNOT BE A TERMINAL STATE IN A SETTLEMENT
+        -- WHOSE ENTIRE PURPOSE IS RUNNING WITHOUT ONE.
+        --
+        -- Three failed rescues means three attempts failed under the conditions of that moment -- an
+        -- empty larder, a role gate, a position that was wrong, a bug since fixed. None of those are
+        -- permanent. The counter was: it is cleared only when the drone reports healthy, and a drone
+        -- at zero fuel cannot become healthy without the relief that abandonment is blocking. That
+        -- circle is closed by hand or not at all.
+        --
+        -- Measured: D12, D14 and D15 all ABANDONED, all at a probed ZERO fuel, with 64 coal sitting
+        -- in storage and a working relief path that had never once been tried on them -- because
+        -- their three strikes were spent on the role-pinning and stale-fuel bugs that are now fixed.
+        -- The fleet had written off every miner it owned over failures that no longer existed.
+        --
+        -- So the write-off decays. It still stops the tick spending drones on a hopeless position
+        -- for the next quarter of an hour, which is what it is for; it just stops being forever.
+        expireAbandonment(d, s_Key)
+
         local s_Tries = DATA["rescueTries"][s_Key] or 0
         if s_Trapped and s_Tries >= 3 and not s_Pending[s_Key] then
             -- GIVING UP MUST BE VISIBLE, NOT JUST LOGGED.
