@@ -767,8 +767,14 @@ function dump(o)
     if type(o) == 'table' then
         local s = '{ '
         for k,v in pairs(o) do
-            if type(k) ~= 'number' then k = '"'..k..'"' end
-            s = s .. '['..k..'] = ' .. dump(v) .. ','
+            -- A COPY, not the loop variable. Assigning to a for control variable is rejected
+            -- outright by Lua 5.4, which is what `luac -p` on this machine is -- so this one line
+            -- made the fleet's most load-bearing file the only one no syntax check could ever
+            -- read. CC's Lua accepts it, so it never failed in world; it just silently opted
+            -- PowNet out of every guard the repo has.
+            local s_Key = k
+            if type(s_Key) ~= 'number' then s_Key = '"'..s_Key..'"' end
+            s = s .. '['..s_Key..'] = ' .. dump(v) .. ','
         end
         return s .. '} '
     else
