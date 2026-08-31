@@ -1002,9 +1002,22 @@ end
 -- the stricter test; the output/fuel face keeps fuel AND finished product, so only genuinely
 -- finished goods come off it. Split out because ServiceFurnaces sits on the complexity gate and
 -- this is the decision most worth being able to read on its own.
-local function wrongForFace(p_Item, p_IsInputFace)
+local function wrongForFace(p_Item, p_IsInputFace, p_Slot, p_Size)
     if p_Item == nil then return false end
     if p_IsInputFace then return not isSmeltableInput(p_Item.name) end
+    -- THE OUTPUT SLOT MUST BE EMPTIED EVEN WHEN WHAT IS IN IT IS FUEL.
+    --
+    -- The bottom face exposes TWO slots -- fuel and output -- and this treated them alike: "leave
+    -- anything that is fuel". Right for the fuel slot, wrong for the output slot, and catastrophic
+    -- for the one product that is both. CHARCOAL is fuel, so the drain skipped it, and it piled up
+    -- in the output slot until the furnace jammed on its own success.
+    --
+    -- Measured: logs falling 247 -> 135 as the furnaces consumed them, charcoal visible in both
+    -- output slots in the world, and charcoal in STORAGE flat at 0 the whole time. The settlement
+    -- was finally making its renewable fuel and could not collect any of it.
+    --
+    -- The last exposed slot is the output. Everything comes out of it; the fuel slot keeps fuel.
+    if p_Slot == p_Size then return true end
     return not isSmeltable(p_Item.name) and not isFuel(p_Item.name)
 end
 
@@ -1051,7 +1064,7 @@ function ServiceFurnaces()
                 --    smelt input -- which is how the jammed coal gets out.
                 for slot = 1, s_Size do
                     local it = items[slot]
-                    if wrongForFace(it, s_IsInputFace) then
+                    if wrongForFace(it, s_IsInputFace, slot, s_Size) then
                         local moved = drainTo(fur, slot)
                         if moved > 0 then
                             s_Moved = s_Moved + 1
