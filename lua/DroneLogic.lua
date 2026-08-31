@@ -1121,9 +1121,22 @@ end
 -- After booting: pick the job back up. The file lives in the computer's own directory, which
 -- survives reboots, so it does not depend on any server being reachable at the wrong moment.
 local RESUME_FILE = "/resume.txt"
--- Open sky over this world: the survey bounds top out at y=127 and the terrain surface sits around
--- y=70-90, so a drone at this height has clear air in every direction to cross under its own power.
-local CRUISE_Y = 110
+-- CRUISE_Y (110) WAS HERE, AND IS GONE ON PURPOSE. DO NOT PUT IT BACK.
+--
+-- It existed so a drone that could not reach a target could fly to y=110, cross above the terrain,
+-- and drop down. That is what you do when you have no map. This settlement HAS a map -- MapServer
+-- holds 262,000 named blocks and runs A* over them -- so the climb was never buying a route, it was
+-- buying a way to ignore the router.
+--
+-- It is also the most expensive move a drone can make: ~90 fuel for the round trip before a single
+-- block of horizontal progress, the GPS fix lost on the way up (four audible hosts do not follow it
+-- to 110), and the descent dead-reckoned. D15 left base with 634 fuel for a tree NINETEEN blocks
+-- away, logged "boxed in -- climbing to 110 to cross", and was found at y=102 with 322 fuel and no
+-- logs. That trip costs under 150 at ground level.
+--
+-- The only climbing left is climbForFix, which gains height for a reason that height actually
+-- solves -- a GPS fix needs four audible hosts and rock does not carry radio -- and which is
+-- bounded by SKY_FIX_CEILING and refuses outright when the fuel will not pay for the return.
 m_Job = nil          -- {verb, data} for whatever is currently running
 -- Forward declaration. resumeJob above dispatches through this table, and the table itself is
 -- defined near the bottom of the file once every handler exists. Without the declaration here the
@@ -1566,36 +1579,34 @@ function OnSurvey(p_ID, p_Message)
             trace("survey: no mapped route to the start -- flying")
             s_At = pgps.flyTo(tonumber(d.pos.x), s_Ty, tonumber(d.pos.z))
         end
-        -- LAST RESORT: CLIMB OUT AND CROSS OVER THE TOP.
+        -- DO NOT GO OVER THE TOP. THE SETTLEMENT HAS A PATHFINDER.
         --
-        -- Travelling at the drone's own altitude fails whenever the straight line between here and
-        -- there runs through a hill -- flyTo climbs over obstacles it meets, but it cannot climb out
-        -- of a shaft and back down into another one, and a scout carries a scanner instead of a
-        -- pickaxe so it cannot cut through. This was the fleet's single biggest source of wasted
-        -- work: "Survey FAILED: could not reach" three times per task, then the task given up, then
-        -- the supply loop building the same task again.
+        -- The old last resort was: climb out to y=110, cross above the terrain, drop down. The
+        -- reasoning was that a straight line at the drone's own altitude fails when a hill is in the
+        -- way, and a scout carries a scanner where a pickaxe would go, so it cannot cut through.
+        -- All true, and none of it argues for the sky -- it argues for asking the router, which is
+        -- the thing that knows where the hill is.
         --
-        -- A miner would dig. A scout goes over the top: up to open sky, across, and settle() drops it
-        -- onto the surface on arrival. CRUISE_Y sits above the highest terrain in the surveyed
-        -- world (bounds max out at y=127) while staying inside the build limit.
+        -- This used to answer an unreachable target by flying to CRUISE_Y, crossing at 110, and
+        -- dropping down. It is the single most expensive thing a drone can do and it buys nothing
+        -- that A* over the surveyed map does not do better: MapServer holds 262,000 named blocks
+        -- and computes a direct route; going to space is what you do when you have no map.
+        --
+        -- The cost is not marginal. A surface drone climbing to 110 and back spends ~90 fuel before
+        -- it has travelled a single block horizontally, loses its GPS fix on the way up (four
+        -- audible hosts do not follow it), and dead-reckons the descent -- so it arrives with less
+        -- fuel, a worse position, and often outside the operating circle. Measured: D15 left base
+        -- with 634 fuel to cut a tree NINETEEN blocks away, logged "boxed in -- climbing to 110 to
+        -- cross", and was found at y=102 holding 322 fuel and no logs. The trip costs under 150 at
+        -- ground level. It never reached the tree; no wood arrived; no charcoal was made; storage
+        -- stayed empty and the fleet went on starving -- one pointless climb at a time.
+        --
+        -- So a route that A* could not supply is now reported as what it is. Distress puts the drone
+        -- into "stuck", which is what TaskMan's rescue pass looks for, and the task goes back to the
+        -- queue for a drone that can dig. Failing in ten fuel and saying so beats succeeding at
+        -- ninety, and beats "succeeding" into the sky.
         if s_At == false then
-            local _, s_Cy = pgps.getCachedPosition()
-            if s_Cy == nil or s_Cy < CRUISE_Y then
-                trace(("survey: boxed in at y=%s -- climbing to %d to cross"):format(tostring(s_Cy), CRUISE_Y))
-                if pgps.flyTo(nil, CRUISE_Y, nil) ~= false then
-                    s_At = pgps.flyTo(tonumber(d.pos.x), CRUISE_Y, tonumber(d.pos.z))
-                else
-                    -- WALLED IN, WHICH IS A DIFFERENT PROBLEM FROM AN UNREACHABLE TARGET.
-                    --
-                    -- Failing to reach the survey start can mean the destination is bad. Failing to
-                    -- climb straight up out of where we are standing cannot: it means there is rock
-                    -- overhead and this drone has no pickaxe. That is worth waking someone for, and
-                    -- it is the difference between "give this task to another scout" and "send a
-                    -- miner". Distress puts the drone into "stuck", which is what TaskMan's rescue
-                    -- pass looks for.
-                    Distress("walled in", "cannot climb out to cross; needs a miner to dig through")
-                end
-            end
+            Distress("no route", "pathfinder found no way to the survey start; needs a miner to dig through")
         end
         if s_At == false then
             -- SCAN FROM WHERE YOU CAN STAND. THE SCANNER HAS A RADIUS.
@@ -3349,12 +3360,38 @@ end
 -- A GLOBAL, deliberately. depositIfFull is defined above the fuel watchdog and both need this; a
 -- `local function` here would be invisible to everything declared before it, which is the single
 -- most expensive mistake in this codebase -- six outages and counting.
+-- AN EMPTY LARDER MAKES THE RESERVE WORTHLESS, AND THE RESERVE MAKES THE LARDER PERMANENT.
+--
+-- FUEL_RESERVE is 900 flat, on top of the distance term. The 900 buys one thing: certainty that the
+-- drone can reach STORAGE AND REFUEL THERE. When storage has no fuel in it, that purchase is void
+-- -- arriving changes nothing -- and the only thing the 900 still does is forbid work.
+--
+-- That is a deadlock, not an inefficiency, because the work it forbids is the work that ENDS the
+-- shortage. Measured: D15 holding 829 fuel, twenty blocks from base, with a verified oak tree 33
+-- blocks away and a round trip that costs under 150. It declared "DISTRESS: low fuel level 829,
+-- nothing to refuel with at the dock", refused the lumber job, flew to an empty chest, found
+-- nothing, and did it again -- while the settlement's entire fuel income depended on that one
+-- gather. Charcoal is made from logs; logs are cut by a drone; the drone would not go because it
+-- was saving fuel to visit a chest that could not help it.
+--
+-- So when storage is KNOWN dry, the floor collapses to what it is actually for: getting home, plus
+-- a margin for the search at the far end. The full reserve returns the moment there is fuel to
+-- reserve for. StorageKnownDry already refuses to answer true below FUEL_STRANDING_RISK, so a
+-- genuinely nearly-empty drone still gets the big floor and still goes to look -- this relaxes the
+-- floor for drones with hundreds of fuel in the tank, which is exactly who was being paralysed.
+--
+-- A GLOBAL, deliberately. depositIfFull is defined above the fuel watchdog and both need this; a
+-- `local function` here would be invisible to everything declared before it, which is the single
+-- most expensive mistake in this codebase -- six outages and counting.
+local FUEL_DRY_MARGIN = 120
 function FuelFloorNow()
     if m_HomePos == nil then return FUEL_RESERVE end
     local cx, cy, cz = pgps.getCachedPosition()
     if cx == nil then return FUEL_RESERVE end
     local d = math.abs(m_HomePos.x - cx) + math.abs(m_HomePos.y - cy) + math.abs(m_HomePos.z - cz)
-    return FUEL_RESERVE + d * FUEL_PER_BLOCK_HOME
+    local s_Trip = d * FUEL_PER_BLOCK_HOME
+    if StorageKnownDry(turtle.getFuelLevel()) then return s_Trip + FUEL_DRY_MARGIN end
+    return FUEL_RESERVE + s_Trip
 end
 
 local function depositIfFull()
