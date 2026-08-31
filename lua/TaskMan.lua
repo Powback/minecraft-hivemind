@@ -868,6 +868,23 @@ local function taskProducesFuel(p_Name)
     return s_Name:find("coal") ~= nil or s_Name:find("log") ~= nil or s_Name:find("wood") ~= nil
 end
 
+-- How badly the settlement wants this fuel, not merely whether it is fuel.
+--
+-- taskProducesFuel answers yes for coal AND for wood, so ordering by it alone left the tie to be
+-- broken by task id -- and gather:coal_ore (#6950) is older than gather:oak_log (#6968), so every
+-- freed miner went underground and the lumber job was never once picked up.
+--
+-- These two are not equivalent. Coal is finite, sits thirty blocks down, and the shafts to it have
+-- stranded three drones this session. Wood is on the surface nineteen blocks from base, regrows,
+-- and one coal smelts eight logs into eight charcoal -- so wood is the only input that ENDS the
+-- fuel problem rather than postponing it. When both are queued, wood goes first.
+local function fuelRank(p_Name)
+    local s_Name = tostring(p_Name)
+    if s_Name:find("log") or s_Name:find("wood") then return 2 end
+    if s_Name:find("coal") then return 1 end
+    return 0
+end
+
 local function fleetFuelLow()
     local s_Total, s_Known = 0, false
     for _, d in ipairs(fleet()) do
@@ -1660,8 +1677,8 @@ local function orderedTasks()
         local pa = tonumber(a.task.priority) or -1
         local pb = tonumber(b.task.priority) or -1
         if pa ~= pb then return pa > pb end
-        local fa = taskProducesFuel(a.task.name) and 1 or 0
-        local fb = taskProducesFuel(b.task.name) and 1 or 0
+        local fa = fuelRank(a.task.name)
+        local fb = fuelRank(b.task.name)
         if fa ~= fb then return fa > fb end
         return (tonumber(a.task.id) or 0) < (tonumber(b.task.id) or 0)
     end)
