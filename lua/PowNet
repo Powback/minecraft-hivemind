@@ -728,6 +728,23 @@ function sendAndWaitForResponse(p_Recipient, message, protocol, p_Timeout)
     while true do
         local senderID, reply = rednet.receive(protocol, s_Timeout)
         if senderID == s_RecipientID and reply.ID == message.ID then
+            -- AN ANSWER WITH NO PAYLOAD IS STILL AN ANSWER.
+            --
+            -- This returned reply.data and nothing else, so a handler that ends `return true` --
+            -- succeeded, nothing to report -- came back as nil, which is the SAME value this
+            -- function returns for "nobody replied". The caller cannot tell a healthy exchange
+            -- from silence, and every caller in the fleet reads nil as unreachable.
+            --
+            -- That is what OnHeartbeat did. DroneMan received and processed every single
+            -- heartbeat, kept its registry current, and answered every one -- while each drone
+            -- concluded the tower could not hear it, logged "tower unreachable", counted a miss,
+            -- and eventually flew RecoverLink() back down its own breadcrumbs to re-establish a
+            -- link that had never once dropped. Weeks of "the drones keep going offline" was this
+            -- line: they were never offline, they were being told so by their own return value.
+            --
+            -- So fall back to the status flag when there is no payload. Endpoints that answer with
+            -- data are untouched; endpoints that answer `true` now say true instead of nothing.
+            if reply.data == nil and reply.status ~= nil then return reply.status end
             return reply.data
         elseif not senderID then
             if attemptNumber < 3 then
