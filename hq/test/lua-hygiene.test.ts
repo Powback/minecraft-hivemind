@@ -468,17 +468,29 @@ describe('lua hygiene: never move the turtle without recording it', () => {
    *
    * So: a raw turtle move must either have its result captured, or carry an explicit exemption
    * saying why losing track is safe there.
+   *
+   * ROTATION COUNTS AS A MOVE. This rule was written for forward/back/up/down and quietly omitted
+   * the turns -- and the turns were where it mattered most, because position self-corrects from GPS
+   * and heading NEVER does. turnLeft/turnRight updated cachedDir BEFORE calling turtle.turnLeft()
+   * and discarded the result, so a turn that did not happen left the drone permanently ninety
+   * degrees wrong, and savePose persisted that belief so a reboot could not clear it.
+   *
+   * D14 flew forty-eight blocks at right angles to its intended course -- "wanted -1,0,-47 got
+   * 48,0,-2" -- ended 83 blocks out, and failed every job it was given as "unreachable". TaskMan
+   * dutifully reclaimed each task and handed it to the next drone, which did the same thing, so the
+   * whole fleet churned assignments and reported NOBODY WORKING while every part looked healthy.
    */
   it('raw turtle moves capture their result', () => {
-    const RAW = /\bturtle\.(forward|back|up|down)\s*\(\s*\)/;
+    const VERBS = 'forward|back|up|down|turnLeft|turnRight';
+    const RAW = new RegExp(`\\bturtle\\.(${VERBS})\\s*\\(\\s*\\)`);
     const offenders: string[] = [];
     for (const f of files) {
       const raw = read(f).split('\n');
       code(read(f)).forEach((l, i) => {
         if (!RAW.test(l)) return;
         // Captured: `local ok = turtle.x()` / `local ok, err = turtle.x()` / used in a condition.
-        if (/=\s*turtle\.(forward|back|up|down)\s*\(/.test(l)) return;
-        if (/\b(if|while|and|or|not|return)\b.*turtle\.(forward|back|up|down)\s*\(/.test(l)) return;
+        if (new RegExp(`=\\s*turtle\\.(${VERBS})\\s*\\(`).test(l)) return;
+        if (new RegExp(`\\b(if|while|and|or|not|return)\\b.*turtle\\.(${VERBS})\\s*\\(`).test(l)) return;
         if (exempt(raw, i, 6)) return;
         offenders.push(`${f}:${i + 1} ${l.trim()}`);
       });

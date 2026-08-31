@@ -93,7 +93,20 @@ export const DEFAULT_RULES: SupplyRule[] = [
   { match: 'gold_ore', min: 16, action: 'gather', limit: 32, depth: 20 },
   { match: 'diamond_ore', min: 8, action: 'gather', limit: 32, depth: 0 },
   { match: 'dirt', min: 64, action: 'gather', limit: 64 },
-  { match: 'oak_log', min: 32, action: 'lumber' },
+  // GATHER, NOT LUMBER -- because `lumber` was never implemented in the dispatcher.
+  //
+  // dispatchRule handles mine, craft and gather; anything else falls through to "not yet
+  // automatable", sets a cooldown and does nothing. So this rule -- the only renewable fuel source
+  // the settlement has -- has never once dispatched a job. logs 0 and charcoal 0 all night were not
+  // a failing wood chain; there was no wood chain, and the note saying so scrolled past every tick.
+  //
+  // gather is the right action anyway: 1,069 oak_log are already mapped at y=64-70, on the SURFACE,
+  // inside the operating circle -- unlike the 1,046 coal_ore, every one of which is ten to forty
+  // blocks underground where the fleet cannot navigate and has stranded three drones trying.
+  //
+  // This harvests mapped logs rather than farming trees. Real forestry (fell, replant, return) is
+  // still worth having, but it is not what stands between this settlement and a fuel supply today.
+  { match: 'oak_log', min: 32, action: 'gather', limit: 64 },
   // Made, not dug. Planks gate every build the settlement will ever do, and chests gate field
   // caches -- so the fleet should keep a working stock of both without being asked.
   { match: 'minecraft:oak_planks', stock: 'minecraft:oak_planks', min: 32, action: 'craft', limit: 32 },
@@ -309,6 +322,15 @@ async function callTool(name: string, args: unknown) {
   return registry.invoke(name, args, { agent: 'supply', callId: `supply-${Date.now()}`, log: () => {} });
 }
 
+/**
+ * The two phases a settlement runs when it can afford to move: repair a shortfall that is blocking
+ * a task, then top the queue up. Both RETURN EARLY the moment they do anything, which is why the
+ * fuel gate must sit above them rather than below -- see the note at the call site.
+ */
+async function materialPhases(live: any[]): Promise<{ acted: boolean; reason: string } | null> {
+  return (await replanShortfalls()) ?? (await topUpQueue(live));
+}
+
 /** One pass. Returns what it did, for the tool and the tests. */
 /**
  * Total fleet fuel below which the supply loop dispatches nothing but coal.
@@ -319,6 +341,49 @@ async function callTool(name: string, args: unknown) {
  * its time on the other materials.
  */
 const FUEL_PRIORITY_BELOW = 4000;
+
+/** Fuel one coal yields when burned. A furnace-free settlement has no other conversion. */
+const FUEL_PER_COAL = 80;
+
+/**
+ * RUNWAY, NOT TANK LEVEL. Total reachable energy below which nothing but coal gets dispatched.
+ *
+ * FUEL_PRIORITY_BELOW asks what is already in the drones and ignores the coal that refills them, so
+ * a fleet holding one tankful with an empty warehouse reads as comfortable. Measured at the moment
+ * this was added: 7,078 fuel onboard against 50 coal in storage -- about twenty minutes of flying,
+ * and comfortably above the 4,000 tank threshold -- while the queue held ELEVEN tower-building
+ * tasks against a single coal gather. The settlement was laying masonry while it starved.
+ *
+ * The fleet burns roughly 400 coal an hour, so 16,000 is about half an hour of runway: late enough
+ * that a healthy settlement never sees it, early enough to still be able to fly out and fix it.
+ * Both earlier repairs to this gate were the same mistake in a different input -- fuel counted
+ * inside unreachable drones, then stock that could not be read. The number compared has to be the
+ * number that decides whether the settlement lives.
+ */
+const RUNWAY_CRITICAL_BELOW = 16_000;
+
+/**
+ * What the fleet can still burn: fuel in the tanks plus fuel the warehouse can hand it.
+ *
+ * Exact names, NOT substring matching. `held()` matches by `includes`, and
+ * 'minecraft:coal_ore'.includes('minecraft:coal') is true -- so a warehouse full of unsmelted ore
+ * would read as a full fuel reserve and cancel the very emergency this exists to declare.
+ */
+export function fuelRunway(
+  detail: any[], carried: Record<string, number>, fleetFuel: number,
+): { coalReserve: number; runway: number; critical: boolean } {
+  const exactStock = (name: string) =>
+    detail.filter((d: any) => d.name === name).reduce((n: number, d: any) => n + (d.count ?? 0), 0)
+    + (carried[name] ?? 0);
+  const coalReserve = exactStock('minecraft:coal') + exactStock('minecraft:charcoal');
+  const runway = fleetFuel + coalReserve * FUEL_PER_COAL;
+  // Either test can declare the emergency: an empty tank is urgent even with coal in the chest
+  // (the drone still has to reach it), and an empty warehouse is urgent even with full tanks.
+  return {
+    coalReserve, runway,
+    critical: fleetFuel < FUEL_PRIORITY_BELOW || runway < RUNWAY_CRITICAL_BELOW,
+  };
+}
 
 /**
  * Everything one rule's dispatch is allowed to see and change.
@@ -341,6 +406,24 @@ export type SupplyCtx = {
 };
 
 /**
+ * Does gathering this material end in something the fleet can BURN?
+ *
+ * This test was `/coal/`, which is right only for a settlement whose coal is reachable. Ours is
+ * not: 1,046 coal_ore locations are mapped and inside the operating circle, and every one of them
+ * sits between y=27 and y=58 -- ten to forty blocks underground, where there is no GPS and no drone
+ * can reliably navigate. Three drones stranded trying. Meanwhile 1,069 oak_log sit at y=64-70, on
+ * the surface, in easy reach, and charcoal burns exactly as well as coal.
+ *
+ * So a fuel emergency that permits only `coal` forbids the fleet from fetching the one fuel it can
+ * actually get to -- the gate starves the settlement it was written to save. Wood counts: logs are
+ * the feedstock for charcoal, which is the renewable half of the fuel supply and the half that does
+ * not require solving underground navigation first.
+ */
+export function producesFuel(match: string): boolean {
+  return /coal|charcoal|_log|planks/.test(match);
+}
+
+/**
  * Why this rule is not dispatched this tick, or null to go ahead. PURE -- no I/O, no mutation.
  *
  * Extracted because the fuel-priority test could not reach it. That test re-implemented this
@@ -353,7 +436,7 @@ export function ruleSkipReason(
   gate: { fuelCritical: boolean; have: number; cooldownUntil: number; now: number; storageFull?: boolean },
 ): { kind: 'fuel' | 'satisfied' | 'cooldown' | 'full'; message?: string } | null {
   // Coal, charcoal or anything else that burns; everything else waits until the fleet can move.
-  if (gate.fuelCritical && !/coal/.test(rule.match)) return { kind: 'fuel' };
+  if (gate.fuelCritical && !producesFuel(rule.match)) return { kind: 'fuel' };
 
   // DO NOT MINE INTO A WAREHOUSE WITH NO ROOM IN IT.
   //
@@ -1030,11 +1113,6 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
   const expanded = await expandStorageIfFull(live, queued);
   if (expanded) return expanded;
 
-  const replanned = await replanShortfalls();
-  if (replanned) return replanned;
-
-  const toppedUp = await topUpQueue(live);
-  if (toppedUp) return toppedUp;
 
   const idleMiner = idle('miner');
   const idleScout = idle('scout');
@@ -1065,6 +1143,33 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
   // fuel death spiral (41,234 phantom fuel counted from five unreachable drones while every
   // reachable one sat at zero). Same trap, same rule: count what can actually act.
   const carried = carriedStock(live);
+
+  // THE FUEL GATE HAS TO BE ABOVE THE PHASES THAT RETURN EARLY, OR IT IS NEVER REACHED.
+  //
+  // It was written at the bottom of the tick, below replanShortfalls and topUpQueue, both of which
+  // return the moment they do anything at all. So on a settlement with a single failing wood gather
+  // the tick short-circuited on the replan EVERY pass -- six identical notes in six minutes,
+  // "re-planned minecraft:oak_log for a failing task" -- and execution never once got as far as
+  // asking whether the fleet had any fuel. Coal sat at ZERO for the whole of it, and the sentinel
+  // correctly reported that nothing was generating the next job.
+  //
+  // The gate was not broken; it was unreachable, which is worse, because the code reads as if the
+  // protection is there. Line 1057 above records the same discovery being made about a different
+  // phase -- "this used to sit after replanShortfalls and topUpQueue, both of which RETURN EARLY".
+  // The lesson did not get applied to the one check the file calls the precondition for all others.
+  const fleetFuel = live.reduce((n: number, d: any) => n + (Number(d.fuel) || 0), 0);
+  const { coalReserve, runway, critical: fuelCritical } = fuelRunway(detail, carried, fleetFuel);
+  if (fuelCritical) {
+    note(`fuel emergency: ${fleetFuel} onboard + ${coalReserve} coal = ${runway} runway `
+       + `(floors ${FUEL_PRIORITY_BELOW} / ${RUNWAY_CRITICAL_BELOW}) -- coal only this tick`);
+  }
+
+  // Re-planning a wood shortfall and topping the queue up with assorted ore are both things a
+  // settlement does when it can afford to move. During a fuel emergency they are what stops it
+  // moving, so they are skipped and the tick falls through to the rule loop, where the same
+  // fuelCritical flag allows coal and nothing else.
+  const phases = fuelCritical ? null : await materialPhases(live);
+  if (phases) return phases;
   const held = (m: string) => {
     const inChests = detail
       .filter((d: any) => typeof d.name === 'string' && d.name.includes(m))
@@ -1106,10 +1211,6 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
   // exists to prevent, entered through the one input nobody checked.
   //
   // `live` already excludes offline and lost drones; it just was not used here.
-  const fleetFuel = live.reduce((n: number, d: any) => n + (Number(d.fuel) || 0), 0);
-  const fuelCritical = fleetFuel < FUEL_PRIORITY_BELOW;
-  if (fuelCritical) note(`fleet fuel ${fleetFuel} below ${FUEL_PRIORITY_BELOW} -- coal only this tick`);
-
   const ctx: SupplyCtx = {
     now, queued, did, waiting,
     minerFree, scoutFree, crafterFree,

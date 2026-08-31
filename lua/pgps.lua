@@ -573,11 +573,46 @@ end
 -- has a visible reason rather than looking like a broken scanner.
 function droppedObservations() return m_Suppressed end
 
+-- Most observations a single upload may carry.
+--
+-- This used to hand over EVERYTHING pending, and a drone that has been surveying for a while
+-- accumulates thousands. Measured on this fleet: batches of 9,736 and 13,214 observations in one
+-- rednet message, against 34-143 from the drones that had not been out long.
+--
+-- A message that size is not just slow to send: MapServer is single-threaded, so it is occupied
+-- parsing and indexing the whole batch, and the radio is occupied carrying it. Every heartbeat in
+-- that window is lost. The drones then hit LINK_LOST_AFTER, declared the link dead and ABORTED
+-- whatever they were doing -- 55 aborts across the fleet, with `Aborting (was executing: true)`
+-- landing in the middle of gathers. That is why lumber never completed: the job was killed by the
+-- map upload of a different drone before it could finish.
+--
+-- Bounded, and the remainder simply waits for the next cycle. Nothing is dropped -- the survey is
+-- worth keeping, it just must not arrive all at once. 256 is comfortably under the size where a
+-- single message starts costing MapServer a visible pause, and at one upload per 12s a genuine
+-- backlog still drains in minutes.
+local UPLOAD_MAX_BATCH = 256
+
 function takeWorldDelta()
-    local w, d, n = pendingWorld, pendingDetail, 0
-    for _ in pairs(w) do n = n + 1 end
-    pendingWorld, pendingDetail = {}, {}
+    local w, d, n = {}, {}, 0
+    -- Partial drain. Keys are copied out one at a time and REMOVED from pending, so the next call
+    -- continues where this one stopped; there is no cursor to keep in sync and no risk of sending
+    -- the same cell twice.
+    for k, v in pairs(pendingWorld) do
+        if n >= UPLOAD_MAX_BATCH then break end
+        w[k] = v
+        if pendingDetail[k] ~= nil then d[k] = pendingDetail[k] end
+        pendingWorld[k], pendingDetail[k] = nil, nil
+        n = n + 1
+    end
     return w, d, n
+end
+
+-- How many observations are still queued behind the batch cap. Lets a caller tell "nothing to
+-- send" from "sending as fast as the cap allows", which otherwise look identical from outside.
+function pendingObservations()
+    local n = 0
+    for _ in pairs(pendingWorld) do n = n + 1 end
+    return n
 end
 
 -- DIRECTIONS. THE ORDER IS ANTICLOCKWISE, AND IT IS NOT NEGOTIABLE.
@@ -1302,6 +1337,8 @@ function ensureHeading(p_Force)
                     return true
                 end
             end
+            -- lua-hygiene: allow (cachedDir is nil here BY DEFINITION -- this loop is what derives
+            -- it. There is no cache to keep in step with, so an unchecked turn cannot desync one.)
             turtle.turnLeft()   -- blocked that way; try another
         end
         return false
@@ -1364,6 +1401,8 @@ function ensureHeading(p_Force)
         for _ = 1, 4 do
             digGuarded(turtle.dig, turtle.detect, turtle.inspect)
             if probe() then return true end
+            -- lua-hygiene: allow (boxed-in recovery, spinning to find a wall to dig through. The
+            -- heading is unknown until probe() succeeds, so there is no cached value to corrupt.)
             turtle.turnLeft()
         end
     end
@@ -1593,9 +1632,27 @@ function turnLeft()
     -- Turning is still useful without a heading (it is how one is derived), so do the
     -- turn and leave the cache unknown rather than throwing.
     if cachedDir == nil then turtle.turnLeft() detectAll() return true end
+    -- TURN FIRST, THEN BELIEVE IT.
+    --
+    -- This updated cachedDir BEFORE calling turtle.turnLeft() and threw the result away, so a turn
+    -- that did not happen left the heading permanently 90 degrees wrong -- and savePose wrote that
+    -- belief to disk on the way out, so a reboot could not clear it either. forward() has always
+    -- got this right ("the cache only advances when turtle.forward() returned true", line 761); the
+    -- turns never did, which left the ONE quantity that never self-corrects as the only one updated
+    -- on faith.
+    --
+    -- D14's log is what this looks like from outside: "bookkeeping disagrees with GPS since the
+    -- last fix: wanted -1,0,-47 got 48,0,-2" -- forty-eight moves flown at ninety degrees to the
+    -- intended course, ending 83 blocks out, reporting progress the whole way. Every job it was
+    -- given ended "tower unreachable", so TaskMan reclaimed the task, gave it to the next drone,
+    -- and the fleet churned instead of working.
+    local s_Turned, s_Err = turtle.turnLeft()
+    if not s_Turned then
+        detectAll()
+        return false, s_Err or "turn refused"
+    end
     cachedDir = (cachedDir + 1) % 4
     noteTurn()          -- the audit can only invert a run that never turned; see auditHeading
-    turtle.turnLeft()
     detectAll()
     savePose(true)   -- heading changed: worth writing immediately
     return true
@@ -1614,9 +1671,14 @@ function turnRight()
     -- Turning is still useful without a heading (it is how one is derived), so do the
     -- turn and leave the cache unknown rather than throwing.
     if cachedDir == nil then turtle.turnRight() detectAll() return true end
+    -- TURN FIRST, THEN BELIEVE IT. See the note in turnLeft -- same bug, same fix.
+    local s_Turned, s_Err = turtle.turnRight()
+    if not s_Turned then
+        detectAll()
+        return false, s_Err or "turn refused"
+    end
     cachedDir = (cachedDir + 3) % 4
     noteTurn()          -- the audit can only invert a run that never turned; see auditHeading
-    turtle.turnRight()
     detectAll()
     savePose(true)   -- heading changed: worth writing immediately
     return true
@@ -1640,6 +1702,8 @@ function turnTo(_targetDir)
     if cachedDir == nil then
         ensureHeading()
         if cachedDir == nil then
+            -- lua-hygiene: allow (ensureHeading has just failed, so cachedDir is still nil and
+            -- stays nil -- "turning blind beats dying", and there is no belief to falsify.)
             turtle.turnLeft()
             return false, "no heading"
         end
@@ -1751,6 +1815,30 @@ end
 local MOVE_MAX_REPLANS = 40
 local MOVE_MAX_STALLS  = 4
 
+-- Manhattan distance within which moveTo walks it locally instead of asking MapServer for a path.
+--
+-- Sized to the base: the storage row, the dock tower and the craft spots all sit within a dozen
+-- blocks of each other, and that traffic is almost all of the pathfinder's load — the same few
+-- short hops, re-requested by eight drones, continuously. Beyond this a real route may need the
+-- surveyed map (round an unmapped hill, down a shaft), so the server keeps that work.
+--
+-- Deliberately modest. flyTo is greedy: it gains altitude to clear obstacles, which is cheap over
+-- a few blocks and wasteful over fifty. If the hop turns out to be harder than it looked, flyTo
+-- fails inside PATH_LOCAL_STEPS and the original GetPath runs anyway.
+local PATH_LOCAL_RADIUS = 12
+local PATH_LOCAL_STEPS  = 48
+
+-- Try to cover a short hop locally. True if we arrived; false means "ask MapServer after all".
+--
+-- A function rather than two lines inline because moveTo is already one of the largest things in
+-- this file and every branch there is charged against the complexity gate. Declared here, above
+-- moveTo, because a `local` used above its declaration is a nil GLOBAL in Lua -- silently -- which
+-- is the single most expensive mistake in this codebase.
+local function localHop(p_X, p_Y, p_Z, p_Dist)
+    if p_Dist > PATH_LOCAL_RADIUS then return false end
+    return flyTo(p_X, p_Y, p_Z, PATH_LOCAL_STEPS) ~= false
+end
+
 -- Path ONE short hop. Renamed from moveTo: this asks MapServer to plan the entire route in a
 -- single a_star, which is fine over a chunk and hopeless over a hundred blocks -- see moveTo below.
 -- p_Dig: may this leg cut through ordinary rock? The route still comes from the pathfinder either
@@ -1781,6 +1869,27 @@ local function moveLeg(_targetX, _targetY, _targetZ, _targetDir, changeDir, disc
             s_Stalls = 0
         end
         s_LastDist = s_Dist
+        -- DO NOT ASK A SERVER HOW TO TAKE A STEP YOU CAN SEE.
+        --
+        -- Every iteration of this loop was a GetPath round trip to MapServer, and MapServer is one
+        -- single-threaded computer holding 425,267 cells and 261,824 named blocks for the whole
+        -- fleet. Eight drones replanning short hops around the bay saturated it: 153 timeouts were
+        -- logged in a single session, bursting at 17 a minute, each one costing the full request
+        -- timeout and then surfacing as "could not reach -479,65,78" — an EMPTY block four steps
+        -- away, verified air by rcon at the time.
+        --
+        -- Everything downstream followed from that. Drones could not reach storage, so they could
+        -- not deposit; not depositing meant not refuelling; gathers never started, so wood never
+        -- arrived and the charcoal chain stayed at 2 logs all session. It also explains why the
+        -- fleet always worked for a few minutes after a reboot and then decayed — drones start
+        -- scattered with short paths and then converge on the bay, where every request contends.
+        --
+        -- A* over a surveyed map earns its cost across a settlement. It earns nothing for a hop the
+        -- drone could walk blind: flyTo is greedy, local, and asks nobody. So try that first for
+        -- anything close, and keep MapServer for the routes that actually need routing. On failure
+        -- we fall through to the request exactly as before, so nothing that used to work stops.
+        if localHop(_targetX, _targetY, _targetZ, s_Dist) then return true end
+
         --TODO: NETWORK
         -- Slot 8 is `priority`, which this caller does not use; slot 9 is the dig mode. Positional
         -- because that is the shape OnGetPath already reads.
@@ -2332,6 +2441,9 @@ function setLocationFromGPS()
                 -- if it drove the loop; it never did. The loop counts 0..3 by itself, and `tries`
                 -- is already the number of left turns taken, which is what line 1599 needs to undo
                 -- them.
+                --
+                -- lua-hygiene: allow (cachedDir was cleared to nil above so this probe can re-derive
+                -- it from GPS; the turns are counted by `tries` and undone by turnTo afterwards.)
                 turtle.turnLeft()
             end
         end

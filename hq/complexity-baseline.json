@@ -19,7 +19,7 @@
         21,
         21,
         21,
-        21,
+        20,
         20,
         20,
         19,
@@ -42,9 +42,9 @@
         "TravelTo",
         "RunJobNow",
         "stageFromChest",
-        "heartbeat",
         "veinFrom",
         "gpsRelay",
+        "heartbeat",
         "refixLoop",
         "harvestAround",
         "DescribeJob",
@@ -125,7 +125,7 @@
     },
     "lua/pgps.lua": {
       "cc": [
-        37,
+        38,
         29,
         23,
         23,

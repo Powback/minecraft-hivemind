@@ -30,8 +30,31 @@ const at = (call: string) => {
 describe('supply tick ordering', () => {
   it('checks storage before any phase that can return early', () => {
     const storage = at('await expandStorageIfFull(');
-    expect(storage).toBeLessThan(at('await replanShortfalls('));
-    expect(storage).toBeLessThan(at('await topUpQueue('));
+    expect(storage).toBeLessThan(at('await materialPhases('));
+  });
+
+  // THE FUEL GATE IS A PHASE-ORDER RULE TOO, AND IT WAS THE ONE THAT GOT THIS WRONG.
+  //
+  // fuelCritical was computed at the BOTTOM of the tick, below replanShortfalls and topUpQueue.
+  // On a settlement with one failing wood gather the replan returned early every single pass --
+  // six identical notes in six minutes -- so the fuel check was never reached at all. Coal sat at
+  // zero throughout while the loop re-planned oak logs. The protection read as present and was
+  // unreachable, which is worse than absent.
+  it('decides the fuel emergency before any phase that can return early', () => {
+    expect(at('fuelRunway(')).toBeLessThan(at('await materialPhases('));
+  });
+
+  // materialPhases exists to keep the tick's branch count down, NOT to give these two phases a
+  // second way in. If either is ever called directly again the ordering guarantees above stop
+  // meaning anything, because the source-order check would not see it.
+  it('only reaches the material phases through the gated helper', () => {
+    const helper = src.slice(src.indexOf('async function materialPhases'));
+    const body = helper.slice(0, helper.indexOf('\n}\n'));
+    expect(body).toContain('replanShortfalls(');
+    expect(body).toContain('topUpQueue(');
+    const calls = (n: string) => (src.match(new RegExp(`await ${n}\\(`, 'g')) ?? []).length;
+    expect(calls('replanShortfalls')).toBe(1);
+    expect(calls('topUpQueue')).toBe(1);
   });
 
   it('checks storage before dispatching any rule', () => {
@@ -43,7 +66,7 @@ describe('supply tick ordering', () => {
     // Reading it halfway down is why the storage rule had to guard itself with a timer instead of
     // a fact -- and a timer expires while the previous build is still running.
     expect(at('await buildQueuedSet(')).toBeLessThan(at('await expandStorageIfFull('));
-    expect(at('await buildQueuedSet(')).toBeLessThan(at('await topUpQueue('));
+    expect(at('await buildQueuedSet(')).toBeLessThan(at('await materialPhases('));
   });
 
   it('will not queue a second storage expansion while one is outstanding', () => {
@@ -56,7 +79,7 @@ describe('supply tick ordering', () => {
 
   it('acts on the storage result rather than discarding it', () => {
     // A phase whose result is ignored is the same as one that never ran.
-    const after = tick.slice(at('await expandStorageIfFull('), at('await replanShortfalls('));
+    const after = tick.slice(at('await expandStorageIfFull('), at('await materialPhases('));
     expect(after).toMatch(/if \(expanded\) return expanded;/);
   });
 });

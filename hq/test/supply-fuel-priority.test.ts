@@ -6,7 +6,7 @@
  * stock), so the loop round-robins regardless of whether the fleet can still move.
  */
 import { describe, it, expect } from 'vitest';
-import { ruleSkipReason, type SupplyRule } from '../src/agent/supply.js';
+import { ruleSkipReason, fuelRunway, producesFuel, type SupplyRule } from '../src/agent/supply.js';
 
 const FUEL_PRIORITY_BELOW = 4000;
 
@@ -87,5 +87,80 @@ describe('fleet fuel counts only drones that can spend it', () => {
 
   it('an offline flag counts as unreachable even when the status looks fine', () => {
     expect(liveFuel([{ fuel: 9000, offline: true, status: 'working' }])).toBe(0);
+  });
+});
+
+/**
+ * THE GATE HAS NOW MEASURED THE WRONG NUMBER THREE TIMES.
+ *
+ * First it summed fuel inside drones nobody could reach: 41,234 phantom fuel in five silent drones
+ * while eleven reachable ones sat at zero. Then it trusted stock that could not be read. Then it
+ * counted only what was already in the tanks and ignored the warehouse that refills them -- 7,078
+ * fuel onboard against 50 coal in storage read as comfortable, and the queue held eleven
+ * tower-building tasks against a single coal gather while the settlement starved.
+ *
+ * The failure is always the same shape and never the same input, so the check is on the QUANTITY:
+ * what the fleet can still burn, tanks plus warehouse.
+ */
+describe('fuel runway counts the warehouse, not just the tanks', () => {
+  const carried = {} as Record<string, number>;
+
+  it('declares an emergency when the tanks look fine but there is no coal to refill from', () => {
+    // The exact numbers measured at the collapse.
+    const r = fuelRunway([{ name: 'minecraft:coal', count: 50 }], carried, 7078);
+    expect(r.coalReserve).toBe(50);
+    expect(r.runway).toBe(7078 + 50 * 80);
+    expect(r.critical).toBe(true);
+  });
+
+  it('stays calm when the warehouse is genuinely stocked', () => {
+    const r = fuelRunway([{ name: 'minecraft:coal', count: 704 }], carried, 12_000);
+    expect(r.critical).toBe(false);
+  });
+
+  it('still fires on empty tanks even with coal in the chest -- the drone has to reach it', () => {
+    const r = fuelRunway([{ name: 'minecraft:coal', count: 704 }], carried, 100);
+    expect(r.critical).toBe(true);
+  });
+
+  it('counts charcoal as fuel', () => {
+    const r = fuelRunway([{ name: 'minecraft:charcoal', count: 300 }], carried, 1000);
+    expect(r.coalReserve).toBe(300);
+  });
+
+  it('does NOT count coal_ore -- substring matching is what made this wrong before', () => {
+    const r = fuelRunway([{ name: 'minecraft:coal_ore', count: 900 }], carried, 5000);
+    expect(r.coalReserve).toBe(0);
+    expect(r.critical).toBe(true);
+  });
+
+  it('counts fuel held in drones, which is stock the warehouse cannot see', () => {
+    const r = fuelRunway([], { 'minecraft:coal': 256 }, 5000);
+    expect(r.coalReserve).toBe(256);
+  });
+});
+
+/**
+ * A FUEL EMERGENCY MUST NOT FORBID THE ONLY FUEL THE FLEET CAN REACH.
+ *
+ * The gate tested `/coal/`, which assumes reachable coal. This settlement's coal is all mapped
+ * between y=27 and y=58 -- inside the operating circle, but ten to forty blocks underground where
+ * there is no GPS. Three drones stranded trying to get to it. The 1,069 oak_log at y=64-70 are on
+ * the surface and burn, via charcoal, just as well.
+ */
+describe('a fuel emergency permits everything that burns, not just coal', () => {
+  it('permits coal and charcoal', () => {
+    expect(producesFuel('coal_ore')).toBe(true);
+    expect(producesFuel('minecraft:charcoal')).toBe(true);
+  });
+
+  it('permits wood, which is the reachable half of the fuel supply', () => {
+    expect(producesFuel('oak_log')).toBe(true);
+  });
+
+  it('still refuses ore the fleet cannot burn', () => {
+    for (const m of ['iron_ore', 'copper_ore', 'zinc_ore', 'redstone_ore', 'gold_ore', 'dirt']) {
+      expect(producesFuel(m), m).toBe(false);
+    }
   });
 });

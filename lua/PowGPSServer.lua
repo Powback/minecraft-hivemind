@@ -555,6 +555,30 @@ function save()
 
     local s_Failed = nil
     for c, keys in pairs(s_Buckets) do
+        -- YIELD ONCE PER CHUNK, NOT ONLY EVERY 512 LINES.
+        --
+        -- The sink inside writeLines yields every 512 buffered lines, which covers a big chunk and
+        -- does NOTHING for a small one: a chunk holding two hundred cells never reaches the
+        -- threshold, so it is written start to finish without a single yield. A save touching many
+        -- small dirty chunks is therefore a long run of fs.open / write / close with no yield
+        -- anywhere in it, and CC:T terminates a coroutine that goes ~10s without one.
+        --
+        -- That is not theoretical. MapServer died exactly here:
+        --
+        --   last-run.txt: module=MapServer ok=false
+        --   err=/PowGPSServer:372: Too long without yielding
+        --
+        -- line 372 being `fs.open` -- CC blames wherever execution happened to be, which is why it
+        -- reads like a file error rather than a scheduling one. The module then stayed POWERED OFF,
+        -- and `hive.nodes` still reported 7/7 up because its probe does not reach the module. With
+        -- MapServer gone the fleet lost pathfinding: drones logged "pathfinder did not answer",
+        -- could not reach storage four blocks away, could not deposit, could not refuel, and the
+        -- whole settlement wound down. Every symptom chased for hours traced back to this yield.
+        --
+        -- queueEvent/pullEvent, not os.sleep(0): it satisfies the watchdog and resumes in the SAME
+        -- tick, so a save of hundreds of chunks costs no wall clock. The same pair is used for this
+        -- reason everywhere this codebase walks a large structure.
+        os.queueEvent("mapsave") os.pullEvent("mapsave")
         -- Header carries WHEN this ground was last observed, so staleness is readable straight off
         -- the file without decoding a single cell.
         local s_Header = {"seen=" .. tostring(m_Seen[c] or 0)}

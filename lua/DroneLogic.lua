@@ -1042,13 +1042,74 @@ function Role()
     return "miner"
 end
 
--- How many candidates in a row may be unreachable before a gather gives up.
+-- How much FUEL a gather may burn on candidates that return nothing, before giving up.
 --
--- Candidates are sorted NEAREST-FIRST, so consecutive misses mean the remaining ones are further
--- and almost certainly worse. Each miss costs a digTo budget plus a flyTo budget and returns
--- nothing, so proving the point six times over is how a drone arrives at a chest with no fuel.
--- Three is enough to distinguish "one awkward target" from "this whole area is out of reach".
-local GATHER_MAX_MISS_RUN = 3
+-- This was a COUNT — three consecutive unreachable candidates ended the job — and the reasoning was
+-- that candidates are sorted nearest-first, so consecutive misses mean the rest are further and
+-- certainly worse. That holds for ore buried in rock. It is simply false for anything on the
+-- SURFACE: trees are scattered, and reachability does not decrease with distance. A log high in a
+-- canopy fails while one at ground level twenty blocks further is trivial.
+--
+-- The consequence was total. The first miss collapsed the check budget to three, so a gather that
+-- happened to start on two awkward targets abandoned the job with twenty good ones still queued.
+-- oak_log sat at 2 in storage for an entire session — with 1,071 logs mapped and 19 of the 40
+-- nearest inside the operating circle — while `gather:oak_log` was dispatched over and over and
+-- returned "took nothing from 2 candidates (2 unreachable)" every time. That is what starved the
+-- charcoal chain, which is the settlement's only renewable fuel.
+--
+-- What the original comment actually cared about is right here in its own words: "several hundred
+-- fuel spent to gather zero ore, and the drone then goes dry". So bound THAT, directly. A miss that
+-- cost nothing (a surface target the drone could not path to from where it stood) may be skipped
+-- freely; a miss that burned a digTo budget through rock counts heavily against the allowance. Same
+-- protection against the fuel spiral, without assuming the world is sorted.
+local GATHER_MISS_FUEL_BUDGET = 600
+
+-- Account for one unreachable candidate and decide whether the gather should stop.
+--
+-- Returns the updated miss-spend total and the updated check cap. Written as a helper taking and
+-- returning both so the CALL SITE gains no branches: the gather body is the largest function in
+-- this file and sits directly on the complexity gate, and the accounting has to live somewhere.
+--
+-- Stopping is expressed by returning s_Checked as the new cap, which trips the loop's existing
+-- `s_Checked < s_MaxChecks` guard -- no second exit condition to keep in sync.
+-- Record what we can actually SEE of the column at x,z while hovering one block above y.
+--
+-- Called after arriving at a gather target that turned out to be wrong. Three cells are genuinely
+-- observable from that position and each is a real reading:
+--   y+1  our own cell -- we are standing in it, so it is air by definition
+--   y+2  inspectUp
+--   y    inspectDown is the caller's business (it already noted it); we skip it here
+--
+-- A GLOBAL because the gather body sits far below and this file's convention for anything crossing
+-- that distance is a global -- a `local` moved above its declaration by a later edit becomes a
+-- silent nil lookup, which has cost nine outages here.
+--
+-- Every branch lives in here rather than at the call site: the gather body is the largest function
+-- in the file and sits on the complexity gate.
+function NoteSeenColumn(p_X, p_Y, p_Z)
+    -- Our own cell: we are occupying it, so it is air. This is the cheapest true fact available
+    -- and it is exactly the one a felled trunk leaves behind as a ghost.
+    pcall(pgps.noteObservation, p_X .. ":" .. (p_Y + 1) .. ":" .. p_Z, 0)
+
+    local s_Ok, s_Blk = turtle.inspectUp()
+    local s_Key = p_X .. ":" .. (p_Y + 2) .. ":" .. p_Z
+    if s_Ok and s_Blk and s_Blk.name then
+        pcall(pgps.noteObservation, s_Key, 1, {true, {name = s_Blk.name}})
+    else
+        pcall(pgps.noteObservation, s_Key, 0)
+    end
+end
+
+function GatherMissBudget(p_FuelBefore, p_Spent, p_Checked, p_MaxChecks)
+    local s_Now = turtle.getFuelLevel()
+    local s_Cost = 0
+    if type(p_FuelBefore) == "number" and type(s_Now) == "number" and p_FuelBefore > s_Now then
+        s_Cost = p_FuelBefore - s_Now
+    end
+    local s_Total = (p_Spent or 0) + s_Cost
+    if s_Total >= GATHER_MISS_FUEL_BUDGET then return s_Total, p_Checked end
+    return s_Total, p_MaxChecks
+end
 
 -- SAVE / UPDATE / RESUME
 --
@@ -3675,7 +3736,11 @@ function OnGather(p_ID, p_Message)
         local s_Queue  = {}
         local s_Seen   = {}
         local s_Got, s_Missed = 0, 0
-        local s_MissRun = 0        -- consecutive unreachable candidates; see GATHER_MAX_MISS_RUN
+        -- Fuel burned on candidates that returned nothing. See GATHER_MISS_FUEL_BUDGET: this
+        -- replaced a consecutive-miss counter, which assumed reachability falls off with distance
+        -- and so aborted surface gathers -- wood above all -- after two awkward targets.
+        local s_MissFuel = 0
+        local s_FuelBeforeCandidate = turtle.getFuelLevel()
 
         local function key(x, y, z) return x .. ":" .. y .. ":" .. z end
         local function push(x, y, z)
@@ -3740,6 +3805,10 @@ function OnGather(p_ID, p_Message)
                 end
             end
             local t = table.remove(s_Queue, s_Idx)
+            -- Re-read per candidate: the miss budget charges what THIS attempt cost, so the mark
+            -- has to move with the loop. Read once at job start it would charge every miss with all
+            -- the fuel spent successfully mining beforehand, and the first miss would end the job.
+            s_FuelBeforeCandidate = turtle.getFuelLevel()
 
             -- WORK A VEIN, DO NOT TOUR THE SITE.
             --
@@ -3871,7 +3940,6 @@ function OnGather(p_ID, p_Message)
                 end
 
                 if s_At ~= false then
-                    s_MissRun = 0            -- reached one: the streak is broken
                     local s_Ok, s_Blk = turtle.inspectDown()
                     -- One line per candidate. There are only ever a few dozen, and without this the
                     -- counters say "checked 4, took 0, missed 0" without ever saying what was found
@@ -3916,6 +3984,24 @@ function OnGather(p_ID, p_Message)
                         else
                             pcall(pgps.noteObservation, s_Idx, 0)   -- air: it is simply gone
                         end
+                        -- PRUNE THE WHOLE COLUMN WE CAN SEE, NOT ONE CELL.
+                        --
+                        -- A felled tree leaves a COLUMN of ghosts -- four to six log cells stacked
+                        -- at one x,z -- and this pruned exactly one of them per visit. Each of the
+                        -- others then costs its own approach to re-discover the same absence, and
+                        -- candidates are sorted nearest-first, so the drone works through its own
+                        -- old clearings before ever reaching a standing tree.
+                        --
+                        -- Measured: 1,071 oak_log entries indexed, oak_log stuck at 2 in storage
+                        -- for a whole session, and a single gather that ran 657 SECONDS to check
+                        -- three candidates and returned "took nothing (1 unreachable)" -- meaning
+                        -- two were reached and simply were not there.
+                        --
+                        -- The drone is hovering at t.y+1 looking down, so three cells are directly
+                        -- observable right now: the target below it, its own cell (occupied by the
+                        -- drone, therefore air), and whatever is above. All three are real readings,
+                        -- not inferences -- nothing is fabricated for cells it cannot see.
+                        pcall(NoteSeenColumn, t.x, t.y, t.z)
                     end
 
                     if s_Ok and s_Blk and wanted(s_Blk.name) then
@@ -3952,15 +4038,14 @@ function OnGather(p_ID, p_Message)
                     --
                     -- Consecutive, not total: a run that is succeeding and hits one awkward target
                     -- should carry on, which is why this resets on every success below.
-                    s_MissRun = s_MissRun + 1
-                    -- SPEND THE CHECK BUDGET, DON'T ADD A BRANCH.
+                    -- CHARGE THE MISS TO A FUEL BUDGET, NOT TO A COUNTER.
                     --
-                    -- Each consecutive miss shrinks s_MaxChecks so the loop's EXISTING
-                    -- `s_Checked < s_MaxChecks` guard stops us -- no second exit condition to keep
-                    -- in sync, and no extra decision point in a function that is already the
-                    -- largest in the file.
-                    s_MaxChecks = math.min(s_MaxChecks,
-                                           s_Checked + (GATHER_MAX_MISS_RUN - s_MissRun))
+                    -- See GATHER_MISS_FUEL_BUDGET. A miss that cost nothing does not move us any
+                    -- closer to giving up; one that burned through rock does. The helper returns
+                    -- s_Checked as the new cap when the budget is gone, which trips the loop's
+                    -- existing guard.
+                    s_MissFuel, s_MaxChecks =
+                        GatherMissBudget(s_FuelBeforeCandidate, s_MissFuel, s_Checked, s_MaxChecks)
                 end
             end
         end
@@ -5239,6 +5324,70 @@ function OnHandover(p_ID, p_Message)
     end)
 end
 
+-- ARRIVING AT THE COORDINATE IS NOT THE SAME AS ARRIVING AT THE DRONE.
+--
+-- Where to look when the casualty is not directly below: its own block first, then the ring around
+-- it, then one level down. Nearest-first, so the common one-block miss costs a single move rather
+-- than a survey, and the whole search is bounded -- a rescuer that wanders is a second casualty.
+-- THE ERROR IS MOSTLY VERTICAL, BECAUSE THE DRONES WE RESCUE ARE MOSTLY IN HOLES.
+--
+-- A first version searched a flat ring and one level down, which is the right shape for a casualty
+-- on the surface and the wrong one for every casualty we actually have. A drone that runs dry does
+-- it in a shaft or a mine, GPS does not reach underground, so its height is dead-reckoned and its
+-- height is what drifts. D20 sat at zero fuel reporting -486,71,95 against a recorded -486,67,95:
+-- four blocks out in y, nothing in x or z, and the rescuer hovered over empty air four times.
+--
+-- So: the exact spot, then straight up and down the column -- a shaft is vertical and so is the
+-- doubt -- and only then the horizontal ring for the surface case.
+local RELIEF_SEARCH = {
+    {0,0,0},
+    {0,1,0}, {0,-1,0}, {0,2,0}, {0,-2,0}, {0,3,0}, {0,-3,0}, {0,4,0}, {0,-4,0},
+    {1,0,0}, {-1,0,0}, {0,0,1}, {0,0,-1},
+    {1,0,1}, {1,0,-1}, {-1,0,1}, {-1,0,-1},
+}
+
+-- A turtle is the only thing we are willing to hand fuel to. PutDown refuses to drop into thin air
+-- -- correctly, since loose items are lost -- so this is the test that decides whether the trip
+-- succeeded, and it must be asked BEFORE the drop rather than inferred from its failure.
+function FuelRecipientBelow()
+    local s_Ok, s_Det = turtle.inspectDown()
+    return s_Ok and type(s_Det) == "table" and type(s_Det.name) == "string"
+        and s_Det.name:find("turtle", 1, true) ~= nil
+end
+
+-- Hunt for a casualty that is close to, but not exactly at, its last reported position.
+--
+-- Every rescue in the fleet's history failed as "arrived but dropped nothing": the reliever flew to
+-- the recorded coordinate, found air beneath it, and correctly declined to throw coal on the floor.
+-- The recorded coordinate was usually WRONG rather than stale -- a drone reports the position it
+-- believes, and a wrong heading makes that belief drift -- so the rescue depended on the casualty's
+-- own broken navigation being accurate. It never was.
+-- A RESCUER MUST NOT BECOME A CASUALTY.
+--
+-- Widening this search from ten candidates to seventeen made every FAILED rescue proportionally
+-- more expensive, and the failures are the common case for exactly the drones worth rescuing. D15
+-- refuelled to 2,540, spent the entire tank quartering the air around a casualty it could not find,
+-- and hit zero itself -- converting one stranded drone into two and handing the next rescuer a
+-- longer trip. A search with no fuel bound is a way of losing the fleet one drone at a time.
+--
+-- So the search stops while the rescuer can still get home. FuelFloorNow is the same reserve the
+-- fuel watchdog enforces, and giving up with fuel in the tank is strictly better than arriving
+-- empty: the casualty is no worse off, and the rescuer lives to try again once it has topped up.
+function FindCasualtyNearby(p_X, p_Y, p_Z)
+    for _, o in ipairs(RELIEF_SEARCH) do
+        local s_Fuel = turtle.getFuelLevel()
+        if s_Fuel ~= "unlimited" and s_Fuel < FuelFloorNow() then
+            trace(("relief search broken off at %d fuel -- not enough left to get home"):format(s_Fuel))
+            return false
+        end
+        local x, y, z = p_X + o[1], p_Y + o[2], p_Z + o[3]
+        if TravelTo(x, y + 1, z, y + 4) and FuelRecipientBelow() then
+            return true, x, y, z
+        end
+    end
+    return false
+end
+
 function OnRelieve(p_ID, p_Message)
     return RunJob("Relieve", p_Message.data,
         {status = "hauling", travel = false, settle = false, deposit = false}, function(d)
@@ -5255,12 +5404,37 @@ function OnRelieve(p_ID, p_Message)
             return nil, "could not reach the stranded drone"
         end
 
+        -- SAY THE CASUALTY IS MISSING, DO NOT SAY THE DROP FAILED.
+        --
+        -- "arrived but dropped nothing" described the symptom and hid the cause, so four identical
+        -- round trips read as a broken PutDown rather than a drone that was not there. Look around
+        -- before giving up, and if it really is absent, name that -- the fix for a missing casualty
+        -- is a fresh position, which is a different repair entirely.
+        -- No "is it already below?" test here on purpose: RELIEF_SEARCH starts at {0,0,0}, so the
+        -- search answers that on its first step. The extra branch bought nothing and this is one of
+        -- the largest functions in the file -- see the complexity gate.
+        if not FindCasualtyNearby(s_X, s_Y, s_Z) then
+            return nil, ("no drone at or around %d,%d,%d -- %s is not where it was last seen")
+                :format(s_X, s_Y, s_Z, tostring(d.drone or "the casualty"))
+        end
+
         local s_Dropped = 0
         for i = 1, 16 do
             local s_N = turtle.getItemCount(i)
             if s_N > 0 then
                 turtle.select(i)
-                if isFuelSelected(i) and PutDown() then s_Dropped = s_Dropped + s_N end
+                -- HandTo, NOT PutDown. PutDown refuses to drop unless ContainerBelow() says there
+                -- is a chest or barrel underneath -- and what is underneath a rescue is a DRONE, so
+                -- it returned false every single time. Fuel relief has therefore never delivered
+                -- anything in the history of this fleet: the rescuer flew out with 64 coal, hovered
+                -- over the casualty, refused its own handover, and flew home still carrying it,
+                -- reporting "arrived but dropped nothing" -- which read as a navigation fault and
+                -- sent us looking at positions for hours.
+                --
+                -- HandTo exists for exactly this case and its own comment claims "the fuel relief
+                -- already solved this shape". It did not; HandTo was generalised from a manoeuvre
+                -- that was broken. This is the call site that was supposed to be using it.
+                if isFuelSelected(i) and HandTo() then s_Dropped = s_Dropped + s_N end
             end
         end
         turtle.select(1)
@@ -6395,45 +6569,32 @@ function RefuelAtStorage()
     local s_Res = PowNet.sendAndWaitForResponse("StorageMan",
         PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "DepositPoint", {}), PowNet.SERVER_PROTOCOL)
     if type(s_Res) == "table" and s_Res.pos ~= nil then m_HomePos = s_Res.pos end
-    if type(s_Res) ~= "table" or s_Res.pos == nil then
-        trace("refuel: storage would not give a point")
-        return false
-    end
+    -- THE SIXTH COPY OF "LOOK FOR THE COAL WHERE THE COAL IS".
+    --
+    -- CollectFuel carries that fix. This function never got it, and it is the one every drone uses
+    -- to feed ITSELF. It asked StorageMan for the DEPOSIT point -- the chest with the most FREE
+    -- SPACE, so by construction the one least likely to hold what we came for -- flew there, sucked
+    -- at it, and reported "storage had nothing burnable". D19 did exactly that five blocks from the
+    -- bay while 563 coal sat in the other five chests: it ran itself to zero making the trip, then
+    -- logged "MOVE REFUSED: Out of fuel" 113 times in a single minute. Three more drones went the
+    -- same way within the hour, and the settlement starved on top of a full larder.
+    --
+    -- The deposit point is still worth asking for, but ONLY to keep m_HomePos fresh -- FuelFloorNow
+    -- scales the reserve by the distance to it. The withdrawal itself goes through the primitive
+    -- that asks where the coal actually is and sweeps the other chests when the answer is wrong.
     m_Status = "hauling"
     SendHeartBeat()
-    -- Cheap route first: this is the trip the drone may not be able to afford twice.
-    local s_Ceiling = (s_Res.pos.y or 64) + 4
-    local s_At = FlyHome(s_Res.pos.x, s_Res.pos.y + 1, s_Res.pos.z, s_Ceiling)
-    if s_At then
-        pgps.verifyPosition(true)
-        local cx, cy, cz = pgps.getCachedPosition()
-        if cx ~= nil and not (cx == s_Res.pos.x and cy == s_Res.pos.y + 1 and cz == s_Res.pos.z) then
-            s_At = ArriveAt(s_Res.pos.x, s_Res.pos.y + 1, s_Res.pos.z, s_Ceiling)
-        end
-    else
-        s_At = ArriveAt(s_Res.pos.x, s_Res.pos.y + 1, s_Res.pos.z, s_Ceiling)
-    end
-    if s_At == false then
-        Distress("cannot reach storage to refuel",
-            s_Res.pos.x .. "," .. s_Res.pos.y .. "," .. s_Res.pos.z)
-        return false
-    end
-    local s_Before = turtle.getFuelLevel()
 
-    -- One line, because taking things out of a chest is now one function. The old version of this
-    -- was thirty lines that had to independently rediscover the leading-stacks trap.
-    TakeFromChest(function(nm, slot) return isFuelSelected(slot) end)
+    local s_Before = turtle.getFuelLevel()
+    local s_Got, s_Why = CollectFuel()
     pcall(TryRefuel)
-    -- Whatever would not burn goes back; the ledger already heard about what left the chest.
-    for i = 1, 16 do
-        if turtle.getItemCount(i) > 0 then turtle.select(i) PutDown() end
-    end
-    turtle.select(1)
 
     local s_Gained = turtle.getFuelLevel() - s_Before
-    trace(("refuel at storage: %+d fuel (now %d)"):format(s_Gained, turtle.getFuelLevel()))
+    trace(("refuel at storage: %+d fuel (now %d, collected %d)")
+        :format(s_Gained, turtle.getFuelLevel(), s_Got or 0))
     if s_Gained <= 0 then
-        Distress("no fuel in storage", "level " .. turtle.getFuelLevel() .. ", storage had nothing burnable")
+        Distress("no fuel in storage",
+            "level " .. turtle.getFuelLevel() .. ", " .. tostring(s_Why or "storage had nothing burnable"))
         return false
     end
     return true
@@ -6865,10 +7026,59 @@ local LINK_LOST_AFTER = 5
 -- runs is roughly ten minutes of heartbeats that never arrived -- far past any plausible congestion,
 -- and the point at which "the server is busy" stops being a credible explanation for silence.
 local LINK_GIVE_UP_RUN = 4
+
+-- Manhattan distance from the mast inside which loss-of-range is not a possible explanation for
+-- silence, so RecoverLink must not fire. CC:T wireless range is max(64, 384*y/319) — never below
+-- 64 — and this is Manhattan rather than euclidean, so 48 is comfortably conservative: every point
+-- it admits is genuinely in range, and a drone just outside it still gets the old behaviour.
+local LINK_IN_RANGE_RADIUS = 48
+
+-- Are we close enough to the mast that being out of range is not a possible explanation?
+--
+-- A GLOBAL function rather than a local, deliberately: the heartbeat loop that calls it is defined
+-- far below, and a `local function` here would still be in scope — but this file's convention for
+-- anything crossing that distance is a global, because a local moved ABOVE its declaration by a
+-- later edit becomes a silent nil lookup. That mistake has cost nine outages here.
+--
+-- Extracted rather than inlined at the call site so the branches live here instead of inside the
+-- heartbeat function, which is already one of the largest in the file and sits against the
+-- complexity gate.
+function NearMast()
+    if m_HomePos == nil then return false end
+    local cx, cy, cz = pgps.getCachedPosition()
+    if cx == nil then return false end
+    local d = math.abs(m_HomePos.x - cx) + math.abs(m_HomePos.y - cy) + math.abs(m_HomePos.z - cz)
+    return d <= LINK_IN_RANGE_RADIUS
+end
 -- Consecutive link-loss episodes where the lookup still answered. Reset on recovery and on any
 -- successful heartbeat.
 local m_MissRun = 0
 local m_Missed = 0
+
+-- Should we stay where we are instead of walking the breadcrumbs home?
+--
+-- Returns the reason to SAY when staying put, or nil to mean "recover". Owns m_MissRun so the
+-- caller does not have to, which keeps the whole decision — and its branches — out of the
+-- heartbeat loop; that function is already among the largest here and sits on the complexity gate.
+--
+-- Two reasons to stay, in priority order:
+--   1. We are close enough to the mast that range cannot explain the silence. Walking home from
+--      here is a no-op that costs the current job. This one also clears the run counter, because
+--      congestion this close is not evidence of anything cumulative.
+--   2. A lookup still answers and we have not been failing for too long. This is the pre-existing
+--      rule and it keeps its ceiling: a lookup only proves something relayed a broadcast, so it
+--      must not be able to veto recovery for ever.
+local function linkStayPutReason()
+    if NearMast() then
+        m_MissRun = 0
+        return ("DroneMan silent but we are inside %d blocks of the mast -- congestion, not range")
+            :format(LINK_IN_RANGE_RADIUS)
+    end
+    if PowNet.Lookup("DroneMan") ~= nil and m_MissRun < LINK_GIVE_UP_RUN then
+        return "DroneMan is slow, not gone -- staying put (" .. m_MissRun .. ")"
+    end
+    return nil
+end
 
 local function heartbeat()
     while true do
@@ -7010,8 +7220,30 @@ local function heartbeat()
                 -- busy tick -- but it can no longer veto recovery indefinitely. A run of misses
                 -- this long is not a busy server; it is a drone that needs to walk back.
                 m_MissRun = (m_MissRun or 0) + 1
-                if PowNet.Lookup("DroneMan") ~= nil and m_MissRun < LINK_GIVE_UP_RUN then
-                    Say("DroneMan is slow, not gone -- staying put (" .. m_MissRun .. ")")
+                -- WALKING HOME IS NOT A REMEDY WHEN YOU ARE ALREADY HOME.
+                --
+                -- RecoverLink retraces the breadcrumb trail to get back into radio range. That is
+                -- the right answer for a drone that has genuinely wandered out of range, and a pure
+                -- waste for one sitting next to the mast: it abandons the job, walks a trail that
+                -- ends where it already is, and comes back having achieved nothing except taking
+                -- itself out of service for the duration.
+                --
+                -- Measured on this fleet: D20 and D21 were both marked lost at y=65 within a dozen
+                -- blocks of DroneMan, holding 2,000+ fuel, while fourteen tasks sat unassigned and
+                -- only ONE drone was still working. Their heartbeats were being lost to congestion
+                -- -- twenty-one radios share this channel, six of them GPS hosts -- not to range.
+                --
+                -- Distance is the discriminator the lookup cannot be. A lookup only proves that
+                -- SOMETHING relayed a broadcast; the drone's own position against the mast proves
+                -- whether range is even a plausible explanation. CC:T modem range is
+                -- max(64, 384*y/319), so anything inside 64 blocks is unconditionally in range and
+                -- silence there can only be congestion.
+                -- Say it every time it happens: from outside, a drone staying put is
+                -- indistinguishable from one that is merely idle, and the repetition is the
+                -- evidence that the channel — not the range — is the problem.
+                local s_Stay = linkStayPutReason()
+                if s_Stay then
+                    Say(s_Stay)
                 else
                     m_MissRun = 0
                     -- Stop whatever we are doing first. Carrying on digging while out of contact is

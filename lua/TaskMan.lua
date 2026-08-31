@@ -251,6 +251,27 @@ end
 -- of one.
 local RELIEF_FUEL_FLOOR = 1800
 
+-- A RESCUE MUST AIM AT WHERE THE CASUALTY IS NOW, NOT WHERE IT WAS WHEN THE TASK WAS WRITTEN.
+--
+-- The rescue task records the casualty's position at creation time and the dispatch passed that
+-- snapshot through unchanged. But a stranded drone's BELIEF about itself keeps changing even when
+-- the drone cannot move an inch: it re-fixes against GPS and corrects, so the recorded coordinate
+-- goes stale without anything physical happening. D4, sitting at zero fuel and incapable of moving,
+-- was recorded at -478,7,66 while reporting -476,11,64 -- four blocks out in y alone. Every rescuer
+-- flew to the old number, found air beneath it, and came home with the coal still aboard.
+--
+-- The live fleet entry is the freshest belief anyone has. This runs on every re-dispatch, so each
+-- retry aims better than the last instead of repeating the same miss.
+local function livePos(p_Drone, p_Fallback)
+    if p_Drone == nil then return p_Fallback end
+    for _, d in ipairs(fleet()) do
+        if (d.name == p_Drone or d.id == p_Drone) and d.pos ~= nil and d.pos.x ~= nil then
+            return {x = d.pos.x, y = d.pos.y, z = d.pos.z}
+        end
+    end
+    return p_Fallback
+end
+
 local function pickDrone(p_Role, p_Pos, p_Avoid, p_MinFuel)
     local s_Busy, s_Best, s_BestD = nil, nil, nil
     local s_Fallback = nil
@@ -476,9 +497,11 @@ function OnStartTask(p_ID, p_Message)
             -- Not a destination job. The rescuer has to load coal from storage FIRST, so it cannot
             -- just be pointed at the casualty the way a dig-out can.
             s_Verb, s_Payload = "Relieve",
-                {pos = w.pos, drone = w.drone, taskId = s_Task.id}
+                {pos = livePos(w.drone, w.pos), drone = w.drone, taskId = s_Task.id}
         else
-            s_Verb, s_Payload = "GoTo", {pos = w.pos, taskId = s_Task.id}
+            -- Same staleness, same fix: a dig-out aimed at the old coordinate tunnels to an empty
+            -- pocket of rock next to the drone it was sent to free.
+            s_Verb, s_Payload = "GoTo", {pos = livePos(w.drone, w.pos), taskId = s_Task.id}
         end
     elseif s_Task.work.lumber then
         -- Wood gates chests, planks and sticks, and therefore every factory the fleet might
