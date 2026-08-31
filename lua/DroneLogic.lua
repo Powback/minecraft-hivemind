@@ -1122,6 +1122,48 @@ function NoteSeenColumn(p_X, p_Y, p_Z, p_FromBelow)
     end
 end
 
+-- The inspect and the dig that match the face we approached on.
+--
+-- Kept together deliberately: reading one face and breaking another is a silent way to mine the
+-- wrong block, and holding the choice in one place makes that impossible to get half-right.
+function FaceTools(p_FromBelow, p_FromSide)
+    if p_FromSide  then return turtle.inspect,     DigForward end
+    if p_FromBelow then return turtle.inspectUp,   DigUp end
+    return turtle.inspectDown, DigDown
+end
+
+-- Stand beside a target and face back at it. Returns the move result, or false.
+--
+-- Above and below together cannot touch a mid-trunk log: the block over it is more trunk and the
+-- block under it is trunk or the dirt the tree stands in. Only the four horizontal neighbours are
+-- air. That is not an edge case -- of the wood this settlement has indexed, 52% sits at y=62-70,
+-- which is trunk at ground level, against 45% canopy. Approaching only vertically wrote off half
+-- the forest, and wood is the settlement's only renewable fuel.
+--
+-- The heading is the opposite of the offset: standing one block EAST means looking WEST to see it.
+--
+-- Its own function because the gather loop is the largest thing in this file and the complexity
+-- gate is right to refuse to let it grow.
+local SIDE_APPROACHES = {
+    {dx =  1, dz =  0, face = "west"},
+    {dx = -1, dz =  0, face = "east"},
+    {dx =  0, dz =  1, face = "north"},
+    {dx =  0, dz = -1, face = "south"},
+}
+
+function ApproachFromSide(p_Target, p_FlyBudget)
+    for _, s_Side in ipairs(SIDE_APPROACHES) do
+        local x, z = p_Target.x + s_Side.dx, p_Target.z + s_Side.dz
+        local s_Try = pgps.moveTo(x, p_Target.y, z)
+        if s_Try == false then s_Try = pgps.flyTo(x, p_Target.y, z, p_FlyBudget or 64) end
+        if s_Try ~= false then
+            pgps.turnTo(pgps.HEADINGS[s_Side.face])
+            return s_Try
+        end
+    end
+    return false
+end
+
 function GatherMissBudget(p_FuelBefore, p_Spent, p_Checked, p_MaxChecks)
     local s_Now = turtle.getFuelLevel()
     local s_Cost = 0
@@ -4035,6 +4077,7 @@ function OnGather(p_ID, p_Message)
                 local s_At = false
                 -- Which face we ended up on, so the inspect and the dig agree with the approach.
                 local s_FromBelow = false
+                local s_FromSide  = false
                 if s_Cx == nil or s_Near > SHORT_HOP then
                     s_At = pgps.moveTo(t.x, t.y + 1, t.z)
                 end
@@ -4097,8 +4140,24 @@ function OnGather(p_ID, p_Message)
                     if s_At == false then s_FromBelow = false end
                 end
 
+                -- AND FROM THE SIDE, WHICH IS THE ONLY WAY TO REACH A TRUNK.
+                --
+                -- Above and below together still cannot touch a mid-trunk log: the block over it is
+                -- more trunk and the block under it is trunk or the dirt the tree stands in. Only
+                -- the four horizontal neighbours are air. That is not an edge case -- of the wood
+                -- this settlement has indexed, 52% sits at y=62-70, which is trunk at ground level,
+                -- against 45% canopy. Approaching only vertically wrote off half the forest.
+                --
+                -- Stand beside it and face back at it. The heading is the opposite of the offset:
+                -- standing one block EAST means looking WEST to see the target.
+                if s_At == false then
+                    s_At = ApproachFromSide(t, s_FlyBudget)
+                    s_FromSide = (s_At ~= false)
+                end
+
                 if s_At ~= false then
-                    local s_Ok, s_Blk = (s_FromBelow and turtle.inspectUp or turtle.inspectDown)()
+                    local s_Look, s_Cut = FaceTools(s_FromBelow, s_FromSide)
+                    local s_Ok, s_Blk = s_Look()
                     -- One line per candidate. There are only ever a few dozen, and without this the
                     -- counters say "checked 4, took 0, missed 0" without ever saying what was found
                     -- instead -- which is the only fact that distinguishes a stale index from a
@@ -4159,11 +4218,16 @@ function OnGather(p_ID, p_Message)
                         -- observable right now: the target below it, its own cell (occupied by the
                         -- drone, therefore air), and whatever is above. All three are real readings,
                         -- not inferences -- nothing is fabricated for cells it cannot see.
-                        pcall(NoteSeenColumn, t.x, t.y, t.z, s_FromBelow)
+                        -- Only from a vertical approach. Standing beside the target, the
+                        -- cells above and below it are ones this drone never looked at,
+                        -- and inventing them is how the map got its ghosts.
+                        if not s_FromSide then
+                            pcall(NoteSeenColumn, t.x, t.y, t.z, s_FromBelow)
+                        end
                     end
 
                     if s_Ok and s_Blk and wanted(s_Blk.name) then
-                        if (s_FromBelow and DigUp or DigDown)() then
+                        if s_Cut() then
                             s_Got = s_Got + 1
                             -- The vein continues through the faces of what we just took.
                             push(t.x + 1, t.y, t.z)
