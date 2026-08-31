@@ -868,6 +868,67 @@ local function taskProducesFuel(p_Name)
     return s_Name:find("coal") ~= nil or s_Name:find("log") ~= nil or s_Name:find("wood") ~= nil
 end
 
+-- IS THERE ANY FUEL IN STORAGE TO CARRY?
+--
+-- A fuel rescue sends a drone to storage, has it pick up coal, and flies it to a stranded one. With
+-- an empty store there is nothing to pick up, so the rescuer flies out, finds it has nothing to
+-- give, and flies back -- spending the last mobile drone's fuel to accomplish precisely nothing.
+--
+-- Worse than nothing, in fact. Measured: storage held 0 coal, 0 charcoal and 0 logs, D14 sat at
+-- fuel 0, and D31 -- the only miner that could still move -- was pinned to rescue-D14 while
+-- lumber:oak_log went unplaced tick after tick with "every miner is busy". The one job that could
+-- have ENDED the shortage was blocked by a rescue that the shortage made impossible. A deadlock
+-- the fleet could not leave on its own.
+--
+-- So ask before queueing. nil means StorageMan did not answer, and unknown must not block a rescue:
+-- an unanswered query is not evidence that the store is empty, and stranding a drone on silence is
+-- the worse mistake. Only a definite zero stops it.
+--
+-- Deliberately reuses taskProducesFuel rather than growing a second answer to "what counts as
+-- fuel" -- that question has already been answered three different ways in this file, and the
+-- predicate is a plain string test that reads item names as happily as task names.
+local FUEL_STOCK_TTL = 30
+local m_FuelStock, m_FuelStockAt = nil, -1000
+
+local function storageFuelCount()
+    if m_FuelStock ~= nil and (os.clock() - m_FuelStockAt) < FUEL_STOCK_TTL then return m_FuelStock end
+    local s_Res = PowNet.sendAndWaitForResponse("StorageMan",
+        PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "GetStock", {}), PowNet.SERVER_PROTOCOL, 5)
+    if type(s_Res) ~= "table" or type(s_Res.detail) ~= "table" then return nil end
+    local s_Total = 0
+    for _, e in ipairs(s_Res.detail) do
+        if taskProducesFuel(e.name) then s_Total = s_Total + (tonumber(e.count) or 0) end
+    end
+    m_FuelStock, m_FuelStockAt = s_Total, os.clock()
+    return s_Total
+end
+
+-- Does this drone still need rescuing, given what the settlement can actually send?
+--
+-- A fuel rescue with no fuel to carry is worse than no rescue: it occupies the last drone that can
+-- still move, and the job it displaces is the one that would have ended the shortage. See
+-- storageFuelCount for the deadlock this was measured in.
+--
+-- Its own function for the same reason expireAbandonment is one -- rescueNeeded is the most complex
+-- thing in this file and the complexity gate is right to refuse to let it grow.
+local m_ToldDry = {}
+
+local function stillTrapped(p_Drone, p_Trapped, p_Dry)
+    if not p_Trapped or not p_Dry then return p_Trapped end
+    if storageFuelCount() ~= 0 then
+        m_ToldDry[tostring(p_Drone.id)] = nil
+        return p_Trapped
+    end
+    -- Once per drone, not once per tick. This condition persists for as long as the shortage does,
+    -- and TaskMan's log is read to find out what changed.
+    if not m_ToldDry[tostring(p_Drone.id)] then
+        m_ToldDry[tostring(p_Drone.id)] = true
+        Log(("%s is dry but storage has no fuel to bring it -- leaving it parked until there is, "
+             .. "rather than spending a working drone on an empty delivery"):format(tostring(p_Drone.name)))
+    end
+    return false
+end
+
 -- How badly the settlement wants this fuel, not merely whether it is fuel.
 --
 -- taskProducesFuel answers yes for coal AND for wood, so ordering by it alone left the tie to be
@@ -1247,6 +1308,9 @@ local function rescueNeeded()
             abandonDrone(d, s_Tries)
             s_Trapped = false
         end
+
+        -- A FUEL RESCUE WITH NO FUEL TO CARRY IS WORSE THAN NO RESCUE -- see stillTrapped.
+        s_Trapped = stillTrapped(d, s_Trapped, s_Dry)
 
         if s_Trapped and d.pos and d.pos.x and d.pos.y and d.pos.z
                 and not s_Pending[tostring(d.id)] then
