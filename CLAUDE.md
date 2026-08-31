@@ -99,6 +99,28 @@ that deals items into a grid has to treat source == destination as already-satis
 reaches the handler, and the call still succeeds. This swallowed the MapServer bounds push and every
 `Handover`/`Unload` for hours.
 
+**One question, one function — "what counts as fuel" was answered three different ways in TaskMan
+alone.** The emergency filter matched the substring `"coal"`, the queue ordering had its own idea,
+and `preemptable()` kept a third local `producesFuel()` that also only knew coal. So `gather:oak_log`
+— the settlement's only renewable fuel — was banned during fuel emergencies, sorted below coal, and
+preempted mid-run for rescue duty. Three separate bugs, one duplicated concept. When a predicate
+answers a question the whole file cares about, there is exactly one of it.
+
+**For a field that grants permission to SKIP, a stale answer is worse than no answer.**
+`OnDepositPoints` ships each chest's contents and the drone skips every chest "known not to hold it".
+`nil` means unknown, so the drone looks — one hop across the bay. A stale `{}` means *definite*, so it
+never looks again. Measured twice: a drone holding 828 fuel logging "12 of 12 chests are known not to
+hold it" with 64 coal sitting in the pickup chest. The first fix kept a fallback to the last drone
+report for chests off the network, and the bug came straight back through it, because six of twelve
+deposit points have no peripheral name. Live read or nothing.
+
+**A gather approaches its target from ONE face, and the face decides what it can reach.** Every
+approach aimed at `t.y + 1` and dug down — correct for ore in a shaft, and unable to touch a tree
+ever. A canopy log has leaves above; a trunk log has more trunk above and dirt below. Only the sides
+are open. 52% of indexed wood sits at trunk height, 45% canopy — approaching vertically wrote off the
+entire forest, which is why coal at y=40 worked and wood never once did. The inspect and the dig must
+follow the face actually taken, or the drone reads one block and breaks another.
+
 ## Environment invariants
 
 - **Wired modems need BOTH blockstates: `modem=true` AND `peripheral=true`.** For weeks this was
