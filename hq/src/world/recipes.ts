@@ -208,8 +208,29 @@ export const RECIPES: Recipe[] = [
     grid: [IR, IR, IR, null, S, null, null, S, null] },
 
   // Smelting. StorageMan already drives furnaces, so these are plannable today.
+  //
+  // CHARCOAL IS THE ONLY LINE THAT PAYS FOR ITSELF, AND IT WAS THE ONE MISSING.
+  //
+  // Every other recipe here consumes fuel to make a thing. This one consumes fuel to make FUEL, and
+  // it comes out ahead: one coal smelts eight logs into eight charcoal, so a single seed coal
+  // returns eight. It is the entire reason a settlement in a forest never has to mine coal again --
+  // and coal is thirty blocks underground in caves that have stranded three drones, while logs grow
+  // nineteen blocks from base.
+  //
+  // Its absence was not cosmetic. `factory.create minecraft:charcoal` answered "Nothing knows how to
+  // make minecraft:charcoal", so the fuel chain could not be expressed as a production line at all
+  // -- the plant could model computers and pickaxes but not the energy that builds them. The
+  // settlement has run at a permanent fuel deficit for its whole existence with the fix being one
+  // missing row in this table.
+  //
+  // Any log species smelts to charcoal; oak is named here for the same reason it is named in the
+  // planks recipe above -- a table needs a name -- and the drone matches wood by FAMILY.
+  { output: 'minecraft:charcoal', yields: 1, inputs: { 'minecraft:oak_log': 1 }, station: 'furnace' },
   { output: 'minecraft:glass', yields: 1, inputs: { 'minecraft:sand': 1 }, station: 'furnace' },
   { output: 'minecraft:iron_ingot', yields: 1, inputs: { 'minecraft:raw_iron': 1 }, station: 'furnace' },
+  // The settlement has smelted 200+ of these and the recipe graph did not know they existed, so
+  // nothing could ever plan around the copper it was actually producing.
+  { output: 'minecraft:copper_ingot', yields: 1, inputs: { 'minecraft:raw_copper': 1 }, station: 'furnace' },
   { output: 'minecraft:stone', yields: 1, inputs: { 'minecraft:cobblestone': 1 }, station: 'furnace' },
 ];
 
