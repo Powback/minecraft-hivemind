@@ -489,6 +489,24 @@ end
 -- StorageMan can do what the turtle cannot, now that the modems are attached: address the chest
 -- over the wired network and rearrange it. One pushItems into a low slot turns an unreachable stack
 -- into the first thing suckDown hands over.
+-- Clear slot 1 of a chest by pushing whatever is in it anywhere else on the network.
+--
+-- Returns true if slot 1 is now free. Only used when the chest has no free slot of its own -- see
+-- the call site for why that happens and what it costs.
+local function evictLowSlot(p_Inv, p_Names, p_Self)
+    for _, other in ipairs(p_Names) do
+        os.queueEvent("scan") os.pullEvent("scan")
+        if other ~= p_Self then
+            local s_Ok, s_Moved = pcall(p_Inv.pushItems, other, 1, 64)
+            if s_Ok and (tonumber(s_Moved) or 0) > 0 then
+                Log(("cleared slot 1 into %s to make room at the front"):format(other))
+                return true
+            end
+        end
+    end
+    return false
+end
+
 function OnBringToFront(p_ID, p_Message)
     local d = p_Message.data or {}
     local s_Match = tostring(d.match or "")
@@ -547,6 +565,21 @@ function OnBringToFront(p_ID, p_Message)
                             for i = 17, (tonumber(s_Size) or 27) do if l[i] == nil then s_Tail = i break end end
                             if s_Tail then
                                 pcall(inv.pushItems, dep.peripheral, 1, 64, s_Tail)
+                                s_Free = 1
+                            elseif evictLowSlot(inv, s_Names, dep.peripheral) then
+                                -- THE BACK OF THIS CHEST IS FULL TOO. USE SOMEBODY ELSE'S.
+                                --
+                                -- The shuffle above needs a free slot at the BACK of this chest, and
+                                -- with every chest in the bay packed there is not one. So the stack
+                                -- the drone came for sits in slot 23 for ever, unreachable, and the
+                                -- drone reports "charcoal is stuck in slot 23 -- storage could not
+                                -- surface it" -- which is exactly what happened while two drones sat
+                                -- at zero fuel waiting for that charcoal.
+                                --
+                                -- The wired network is the whole point: a low slot can be cleared by
+                                -- pushing its contents into ANY inventory with room, not only into
+                                -- the back of this one. There were 29 free slots across six chests
+                                -- at the time, and none of them were reachable to this code.
                                 s_Free = 1
                             end
                         end
