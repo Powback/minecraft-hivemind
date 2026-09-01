@@ -358,17 +358,19 @@ function SendHeartBeat()
     -- A DETAIL MUST NOT OUTLIVE THE JOB THAT SET IT, WHATEVER THE STATUS SAYS.
     --
     -- This cleared the detail only while the status was "idle". A drone reporting anything else --
-    -- "blocked", most of all -- kept whatever string the last job left behind, for ever.
+    -- "blocked", most of all -- kept whatever string the last job left behind indefinitely, which
+    -- is the same fault the sweep below already fixes for m_Status, left half-done.
     --
-    -- The result is a panel that lies with total confidence. D31 sat reading
-    -- "stranded ... out of fuel -- cannot reach any chest" while holding 2,532 fuel, because that
-    -- Doing() was written during a shortage that had since been relieved. It misled the diagnosis
-    -- of this very problem twice: the number and the sentence beside it disagreed, and the sentence
-    -- is what gets read.
+    -- NOT justified by the case that prompted it, which is worth recording because the mistake was
+    -- mine: D31 read "stranded ... out of fuel" beside a fuel figure of 2,532 and I took the detail
+    -- for the stale half. A probe of the turtle said fuel=0. The DETAIL was right and the NUMBER was
+    -- stale -- fleet.status replays fuel from the last heartbeat that got home, which CLAUDE.md
+    -- states plainly and I did not check before concluding.
     --
-    -- The status field already says whether the drone is stuck, and `stuck` says why -- neither of
-    -- them needs the detail to survive. m_Depositing and m_Refuelling still protect the two
-    -- intervals where work is genuinely happening without a JOB running.
+    -- Kept anyway, on its own merits: the status field says whether the drone is stuck and `stuck`
+    -- says why, so a finished job's description has nothing left to explain. m_Depositing and
+    -- m_Refuelling still protect the two intervals where real work happens with no JOB running --
+    -- which is what the "idle" test was reaching for and got wrong.
     if not executing and not m_Depositing and not m_Refuelling
        and (m_Detail ~= nil or m_Haul ~= nil) then
         m_Detail = nil
