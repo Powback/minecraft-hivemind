@@ -7307,6 +7307,41 @@ local function returnToRegion()
     -- D6 announced "outside the region at -412,63,60 -- returning to -426,60" and was next seen at
     -- -402: ten blocks the wrong way, 78 from base, silent. D1 and D2 were lost exactly like this.
     --
+-- DIG STRAIGHT AT IT. NO MAP, NO SERVER, NO CLEVERNESS.
+--
+-- The last resort for a drone outside the loaded region when the pathfinder will not answer. Turns
+-- toward the target, digs whatever is in the way, and steps -- repeatedly, bounded, stopping the
+-- moment it is back inside where the ordinary movement rules apply again.
+--
+-- It will cut an ugly tunnel and it does not care about terrain it could have walked around. That
+-- is the trade: a drone outside the force-loaded chunks stops ticking and is never seen again, and
+-- against that, ugly is free.
+local CRAWL_MAX = 128
+
+local function crawlHome(p_TX, p_TZ)
+    for _ = 1, CRAWL_MAX do
+        local cx, cy, cz = pgps.getCachedPosition()
+        if cx == nil then return false end
+        if pgps.isWithinReach(cx, cz) then return true end
+        -- Face the bigger of the two gaps, so progress is always toward the region rather than
+        -- along its edge.
+        local dx, dz = p_TX - cx, p_TZ - cz
+        if math.abs(dx) >= math.abs(dz) then
+            pgps.turnTo(pgps.HEADINGS[(dx > 0) and "east" or "west"])
+        else
+            pgps.turnTo(pgps.HEADINGS[(dz > 0) and "south" or "north"])
+        end
+        if turtle.detect() then DigForward() end
+        if not pgps.forward() then
+            -- Blocked by something a pickaxe cannot clear -- bedrock, a protected block, another
+            -- drone. Step up and try again from a different line rather than grinding here.
+            if turtle.detectUp() then DigUp() end
+            if not pgps.up() then return false end
+        end
+    end
+    return false
+end
+
     -- Re-deriving costs one step out and back, and it is the cheapest insurance the fleet has: the
     -- alternative is a drone walking confidently over the horizon.
     pgps.verifyPosition(true)
@@ -7320,9 +7355,24 @@ local function returnToRegion()
     px, py, pz = pgps.getCachedPosition()
     if px == nil then m_Status = "idle" return false end
 
+    -- ALL THREE OF THESE CAN NEED A SERVER, AND THIS IS THE ONE MOMENT ONE MIGHT NOT ANSWER.
+    --
+    -- moveTo and digTo are the same A* request to MapServer with digging allowed or forbidden, so
+    -- when MapServer is busy BOTH fail together -- and flyTo, the only server-free option, "reads
+    -- no map, cannot dig" by its own description. A drone outside the region therefore has no way
+    -- home at exactly the moment it needs one.
+    --
+    -- Measured on D35: outside coverage at -543,56,72 holding 392 items, "could not get back
+    -- inside the region", with "pgps: pathfinder did not answer -- MapServer may be overloaded"
+    -- twenty times in the same minute. Being outside the loaded chunks is how a drone stops
+    -- ticking and is never seen again, so this is the path that must not depend on anything.
+    --
+    -- crawlHome needs nothing but a pickaxe and a heading. It is worse than a route in every way
+    -- except the one that matters here: it always works.
     local ok = pgps.moveTo(tx, py, tz)
     if ok == false then ok = pgps.flyTo(tx, py, tz) end
     if ok == false and CanDig() then ok = pgps.digTo(tx, py, tz) end
+    if ok == false and CanDig() then ok = crawlHome(tx, tz) end
     m_Status = "idle"
     if ok ~= false then trace("back inside the region") return true end
     trace("could not get back inside the region")
