@@ -4503,8 +4503,39 @@ local function dealInto(p_From, p_To, p_Count)
     -- exactly what happens when the drone fetched them itself.
     if p_From == p_To then return math.min(turtle.getItemCount(p_To), p_Count) end
     local s_Before = turtle.getItemCount(p_To)
+    -- The name BEFORE the transfer: a stack that empties leaves getItemDetail(p_From) nil, and the
+    -- search below needs to know what it is looking for.
+    local s_Det = turtle.getItemDetail(p_From)
     turtle.select(p_From)
     turtle.transferTo(p_To, p_Count)
+
+    -- A STACK IS 64 AND A BATCH IS ROUTINELY MORE THAN THAT.
+    --
+    -- Staging records ONE slot per ingredient, so an order needing 128 planks -- which cannot fit
+    -- in one slot and arrives as two stacks of 64 -- could only ever deal 64 of them. The grid
+    -- filled four cells from the staged stack and the fifth got nothing, and the craft died with
+    -- "only 0/16 of minecraft:oak_planks reached slot 6" while 64 more planks sat in the next slot
+    -- of the same turtle. Every chest order failed this way, which is why the settlement has 128
+    -- planks, 0 chests, and nowhere to put anything.
+    --
+    -- So finish the deal from the other stacks of the same item. CRAFT_SLOTS are skipped because
+    -- those are grid cells: cells filled earlier in this same batch hold exactly the right count,
+    -- and robbing one to fill the next would just move the shortfall along the grid.
+    if s_Det and s_Det.name then
+        for i = 1, 16 do
+            local s_Left = p_Count - (turtle.getItemCount(p_To) - s_Before)
+            if s_Left <= 0 then break end
+            local s_Grid = false
+            for _, c in ipairs(CRAFT_SLOTS) do if c == i then s_Grid = true break end end
+            if i ~= p_From and i ~= p_To and not s_Grid then
+                local d = turtle.getItemDetail(i)
+                if d and d.name and SameItem(s_Det.name, d.name) then
+                    turtle.select(i)
+                    turtle.transferTo(p_To, s_Left)
+                end
+            end
+        end
+    end
     return turtle.getItemCount(p_To) - s_Before
 end
 
