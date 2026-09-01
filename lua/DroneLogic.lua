@@ -3172,6 +3172,41 @@ local SKY_FIX_CEILING = 140
 local FUEL_RESERVE = 300
 local FUEL_PER_BLOCK_HOME = 3
 
+-- TAKE ENOUGH TO WORK. DO NOT TAKE THE LARDER.
+--
+-- CollectFuel asked FetchItems for 64 units every time, regardless of how empty the tank actually
+-- was, so the first drone to reach storage during a shortage took everything there was. Measured,
+-- with the settlement at 46 charcoal and three miners stranded at zero fuel:
+--
+--   cc#62 (D38, SCOUT)   refuel at storage: +2476 fuel (now 2619, collected 46)
+--   cc#47 (D4, crafter)  JOB Relieve FAILED no fuel to deliver: storage had nothing burnable
+--
+-- Seconds apart. A scout on 206 fuel topped itself up to 2,619 -- far past anything it needed --
+-- and the relief run for a stranded miner then failed for want of the fuel the scout had just
+-- drained. Worse than merely unfair: a scout carries a geo_scanner in its second slot, so it has no
+-- pickaxe and cannot fell a tree or mine a lump of coal. The fleet's whole fuel supply went to a
+-- drone that is physically unable to produce more of it, while the three that can sat at zero.
+--
+-- The tank deficit is the honest bound. A drone that needs 1,200 asks for 15 units, not 64, and
+-- what it leaves behind is what lets the next drone -- or the relief carrying fuel to someone who
+-- cannot come and get it -- find something in the chest. Same rule as the smelt floor: a preference
+-- decides who goes first, only a limit stops the first taker having it all.
+--
+-- The floor of 8 stays because FetchItems' minimum is 8: below that it returns nothing at all, and
+-- a drone that walked to storage should not come back empty over a rounding decision.
+local REFUEL_TARGET = 1200
+local REFUEL_MAX_UNITS = 24
+-- Coal and charcoal both burn for 80 in CC:T, and CollectFuel asks for nothing else.
+local FUEL_PER_UNIT = 80
+
+function FuelUnitsWanted()
+    local f = turtle.getFuelLevel()
+    -- "unlimited" is a string, and arithmetic on it throws. Nothing to top up in that case anyway.
+    if type(f) ~= "number" then return 8 end
+    local s_Need = math.ceil(math.max(0, REFUEL_TARGET - f) / FUEL_PER_UNIT)
+    return math.max(8, math.min(REFUEL_MAX_UNITS, s_Need))
+end
+
 -- NEVER SPEND THE LAST OF THE FUEL GAINING ALTITUDE.
 --
 -- Climbing to find GPS is worth doing and is NOT worth being stranded for. Every failed deposit
@@ -5954,7 +5989,7 @@ local function CollectFuel()
         -- p_Min is a TABLE of per-item minimums, not a scalar. Passing the number 8 here made
         -- FetchItems do `pairs(8)` and throw "bad argument (table expected, got number)" -- which
         -- failed fuel-D3 outright, in the very function that was rewritten to stop fuel failing.
-        local s_Got = FetchItems({[s_Name] = 64}, {[s_Name] = 8})
+        local s_Got = FetchItems({[s_Name] = FuelUnitsWanted()}, {[s_Name] = 8})
         for _, n in pairs(s_Got or {}) do s_Fuel = s_Fuel + n end
         if s_Fuel > 0 then break end
     end
