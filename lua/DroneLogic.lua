@@ -3633,6 +3633,39 @@ function PlaceCacheHere()
     return s_Pos
 end
 
+-- WILL THERE BE ANYWHERE TO UNLOAD WHERE WE ARE GOING?
+--
+-- Asked BEFORE travelling, because the answer is knowable then and acting on it is nearly free: the
+-- drone is at base when a job starts. Learning it the other way -- mine, fill, fly fifty blocks
+-- home, pick up a chest, fly back -- spends precisely the haul a cache exists to avoid, once per
+-- new site.
+--
+-- The question is about the SITE, not about here, so it asks StorageMan for the point nearest the
+-- work rather than nearest the drone. pickDeposit already takes `near`, so this composes.
+--
+-- Only for drones that can dig: they are the ones that generate spoil. One chest, because a miner
+-- carrying a stack of them is carrying slots it cannot use.
+function EnsureCacheChest(p_Pos)
+    if not CanDig() then return end
+    if p_Pos == nil or p_Pos.x == nil then return end
+    for i = 1, 16 do
+        local det = turtle.getItemDetail(i)
+        if det and det.name == "minecraft:chest" then return end
+    end
+
+    local s_Res = PowNet.sendAndWaitForResponse("StorageMan",
+        PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "DepositPoint",
+            {near = {x = p_Pos.x, y = p_Pos.y or 64, z = p_Pos.z}}), PowNet.SERVER_PROTOCOL, 5)
+    if type(s_Res) ~= "table" or s_Res.pos == nil then return end
+
+    local d = math.abs(s_Res.pos.x - p_Pos.x) + math.abs(s_Res.pos.y - (p_Pos.y or 64))
+            + math.abs(s_Res.pos.z - p_Pos.z)
+    if d < CACHE_WORTH_IT then return end          -- somewhere to unload already; no chest needed
+
+    trace(("kit: %d blocks from the nearest deposit point -- taking a chest for a cache"):format(d))
+    FetchItems({["minecraft:chest"] = 1}, {["minecraft:chest"] = 1})
+end
+
 -- CARRY A CHEST BACK OUT, OR THE CACHE CAN NEVER EXIST.
 --
 -- A miner has no reason to be holding a chest, so the first cache would never be placed however
@@ -4083,6 +4116,17 @@ local function RunJobNow(p_Name, p_Data, p_Opts, p_Body)
         end
         return p_Ok, p_Res
     end
+
+    -- KIT UP BEFORE SETTING OUT, NOT AFTER DISCOVERING THE PROBLEM.
+    --
+    -- The drone is told where it is going. It can ask, before it leaves, whether there is anywhere
+    -- to unload out there -- and if not, take a chest with it on the way. Working it out by filling
+    -- up, flying fifty blocks home, and only then picking one up wastes the exact haul the cache
+    -- exists to prevent, every time a new site is opened.
+    --
+    -- Cheap here and only here: the drone is at base and idle when a job starts, so the detour is a
+    -- few blocks. Once it is at the face, the same errand costs the round trip.
+    pcall(EnsureCacheChest, d.pos)
 
     -- Go to the ordered site, or refuse. Digging "somewhere" is worse than digging nowhere.
     if o.travel ~= false and d.pos and d.pos.x and d.pos.z then
