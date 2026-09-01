@@ -5807,6 +5807,48 @@ function FindCasualtyNearby(p_X, p_Y, p_Z)
     return false
 end
 
+-- A MISSING CASUALTY IS A STALE POSITION, NOT A FAILED DROP.
+--
+-- The comment at the call site already said the fix is "a fresh position, which is a different
+-- repair entirely" -- and then failed the task instead of getting one. So the relief flew to the
+-- coordinate baked into the payload, found nobody, reported it, and the requeued task carried the
+-- same coordinate again.
+--
+-- Measured: relief for D31 went to -534,69,26 repeatedly while DroneMan's registry, fleet.status
+-- and the turtle itself all agreed it was at -483,61,51. It had walked home under its own power --
+-- which is new behaviour, and exactly the kind of thing that makes a position stale mid-task.
+--
+-- One call and one more approach. If it is not there either, THEN say so: this returns nil and the
+-- caller reports the casualty missing exactly as before.
+function ReachCasualty(p_Name, p_X, p_Y, p_Z)
+    if FindCasualtyNearby(p_X, p_Y, p_Z) then return p_X, p_Y, p_Z end
+
+    local s_Res = PowNet.sendAndWaitForResponse("DroneMan",
+        PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "GetDrones", {}), PowNet.SERVER_PROTOCOL, 5)
+    if type(s_Res) ~= "table" or type(s_Res.drones) ~= "table" then return nil end
+
+    local s_Now = nil
+    for _, dr in ipairs(s_Res.drones) do
+        if (dr.name == p_Name or dr.id == p_Name) and dr.pos ~= nil and dr.pos.x ~= nil then
+            s_Now = dr.pos
+        end
+    end
+    -- Unchanged means the registry agrees with the payload and the drone is genuinely not there.
+    -- Chasing the same coordinate a second time is the loop this exists to end.
+    -- One distance rather than three comparisons: same test, and this function sits right on the
+    -- complexity gate.
+    if s_Now == nil then return nil end
+    if math.abs(s_Now.x - p_X) + math.abs(s_Now.y - p_Y) + math.abs(s_Now.z - p_Z) == 0 then
+        return nil
+    end
+
+    trace(("relieve: %s is not at %d,%d,%d any more -- following it to %d,%d,%d")
+          :format(tostring(p_Name), p_X, p_Y, p_Z, s_Now.x, s_Now.y, s_Now.z))
+    if not TravelTo(s_Now.x, s_Now.y + 1, s_Now.z, (s_Now.y or 64) + 4) then return nil end
+    if not FindCasualtyNearby(s_Now.x, s_Now.y, s_Now.z) then return nil end
+    return s_Now.x, s_Now.y, s_Now.z
+end
+
 function OnRelieve(p_ID, p_Message)
     return RunJob("Relieve", p_Message.data,
         {status = "hauling", travel = false, settle = false, deposit = false}, function(d)
@@ -5832,10 +5874,12 @@ function OnRelieve(p_ID, p_Message)
         -- No "is it already below?" test here on purpose: RELIEF_SEARCH starts at {0,0,0}, so the
         -- search answers that on its first step. The extra branch bought nothing and this is one of
         -- the largest functions in the file -- see the complexity gate.
-        if not FindCasualtyNearby(s_X, s_Y, s_Z) then
+        local s_Fx, s_Fy, s_Fz = ReachCasualty(d.drone, s_X, s_Y, s_Z)
+        if s_Fx == nil then
             return nil, ("no drone at or around %d,%d,%d -- %s is not where it was last seen")
                 :format(s_X, s_Y, s_Z, tostring(d.drone or "the casualty"))
         end
+        s_X, s_Y, s_Z = s_Fx, s_Fy, s_Fz
 
         local s_Dropped = 0
         for i = 1, 16 do
