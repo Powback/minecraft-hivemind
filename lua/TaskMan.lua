@@ -2234,6 +2234,23 @@ function Tick()
                             tostring(v.id), tostring(v.assignedTo), s_Saw))
                         if s_Idle then
                             Log("reclaiming task " .. tostring(v.id) .. " from " .. tostring(v.assignedTo) .. " -- never started")
+                            -- TELL THE OLD HOLDER. "NEVER STARTED" IS A GUESS, NOT A FACT.
+                            --
+                            -- The reclaim decides from the drone's reported STATUS, and a drone
+                            -- deep in a gather reports "blocked" while it paths -- for far longer
+                            -- than the ninety-second window. So a job that HAD started was handed
+                            -- to a second drone while the first went on running it, and two of the
+                            -- fleet's three miners spent their fuel on one task.
+                            --
+                            -- Seen on task 7632, the redstone gather: "JOB Gather start
+                            -- {taskId:7632...}" logged by D31 AND D37, with the same eleven
+                            -- targets. The one job standing between this settlement and wired
+                            -- modems, being done twice and finished neither time.
+                            --
+                            -- Abort is idempotent and always clears -- DroneMan's own comment says
+                            -- so -- and a drone that genuinely never started ignores it. One
+                            -- message is a great deal cheaper than a duplicated job.
+                            abortAssigned(v)
                             v.assigned, v.assignedTo, v.assignedAt = nil, nil, nil
                             PowNet.MarkDirty()
                         end
