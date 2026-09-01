@@ -1191,6 +1191,38 @@ local SIDE_APPROACHES = {
 -- in Lua -- the trap this codebase has been caught by nine times.
 local SHORT_HOP = 32
 
+-- ONE APPROACH ATTEMPT, CHEAPEST ROUTE FIRST.
+--
+-- DIG, DO NOT FLY, FOR THE SHORT HOP. flyTo is a greedy axis-walker that cannot remove a block, and
+-- the obstacle around a target worth gathering is nearly always a block: LEAVES, in the case of the
+-- wood this settlement runs on. So the direct attempt failed on every canopy target, the A* request
+-- ran, and A* over leaves is slow precisely because there is no air route through them.
+--
+-- Measured on D14 inside a canopy: candidates 3 to 7 took 21 seconds between them, and candidate 8
+-- -- one block away, the nearest in the queue -- took 222. Nearest-first selection was already
+-- correct; the hop itself was the cost.
+--
+-- TravelTo has done it this way all along ("if CanDig() and pgps.digTo(...)"). This is the same
+-- order, in the function the gather actually calls per candidate.
+--
+-- Its own function so ApproachFromSide keeps its shape and the complexity gate stays quiet.
+local function reachAdjacent(p_X, p_Y, p_Z, p_Budget)
+    local s_Cx, s_Cy, s_Cz = pgps.getCachedPosition()
+    local s_Near = s_Cx ~= nil and
+        (math.abs(s_Cx - p_X) + math.abs(s_Cy - p_Y) + math.abs(s_Cz - p_Z)) <= SHORT_HOP
+    if s_Near and CanDig() then
+        local s_Dug = pgps.digTo(p_X, p_Y, p_Z)
+        if s_Dug ~= false then return s_Dug end
+    end
+    if s_Near then
+        local s_Flew = pgps.flyTo(p_X, p_Y, p_Z, p_Budget or 64)
+        if s_Flew ~= false then return s_Flew end
+    end
+    local s_Mapped = pgps.moveTo(p_X, p_Y, p_Z)
+    if s_Mapped ~= false then return s_Mapped end
+    return pgps.flyTo(p_X, p_Y, p_Z, p_Budget or 64)
+end
+
 function ApproachFromSide(p_Target, p_FlyBudget)
     for _, s_Side in ipairs(SIDE_APPROACHES) do
         local x, z = p_Target.x + s_Side.dx, p_Target.z + s_Side.dz
@@ -1218,13 +1250,7 @@ function ApproachFromSide(p_Target, p_FlyBudget)
             -- Measured: "gather: 32/192 checked" and "33/192 checked" two hundred seconds apart --
             -- one candidate per three minutes, with MapServer dropping out under the load. The
             -- fleet was not slow at cutting wood; it was slow at asking permission to walk.
-            local s_Cx, s_Cy, s_Cz = pgps.getCachedPosition()
-            local s_Near = s_Cx ~= nil and
-                (math.abs(s_Cx - x) + math.abs(s_Cy - p_Target.y) + math.abs(s_Cz - z)) <= SHORT_HOP
-            local s_Try = false
-            if s_Near then s_Try = pgps.flyTo(x, p_Target.y, z, p_FlyBudget or 64) end
-            if s_Try == false then s_Try = pgps.moveTo(x, p_Target.y, z) end
-            if s_Try == false then s_Try = pgps.flyTo(x, p_Target.y, z, p_FlyBudget or 64) end
+            local s_Try = reachAdjacent(x, p_Target.y, z, p_FlyBudget)
             if s_Try ~= false then
                 pgps.turnTo(pgps.HEADINGS[s_Side.face])
                 return s_Try
