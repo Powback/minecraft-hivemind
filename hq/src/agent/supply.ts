@@ -603,7 +603,20 @@ async function dispatchLumber(rule: SupplyRule, have: number, ctx: SupplyCtx): P
 
   await bridge.call('TaskMan', 'Add', {
     name: `lumber:${rule.match}`,
-    priority: 3,
+    // FELLING OUTRANKS GATHERING FOR WOOD, BECAUSE IT IS THE ONE THAT WORKS.
+    //
+    // These two compete for the same miners and lumber was losing every time: order.gather queues
+    // at 2 and this queued at 3, so with lowest-first the fleet ran the gather permanently and the
+    // lumber task sat unassigned for the whole session.
+    //
+    // The gather is not merely second-best, it is close to useless for wood. Measured, repeatedly:
+    // "gather: 1/192 checked, 0 taken" -- it walks scattered individual log blocks, most of which
+    // are canopy it cannot stand beside. A lumber sweep fells whole trunks where they stand and
+    // REPLANTS: one measured run returned 16 logs and put a sapling back.
+    //
+    // So wood is priority 1 like the other fuels, and felling beats gathering outright rather than
+    // depending on a tie-break.
+    priority: 1,
     work: { lumber: { w: SWEEP, l: SWEEP, start: { x: best.x, y: best.y, z: best.z } } },
   }, { timeoutMs: 8000 });
 

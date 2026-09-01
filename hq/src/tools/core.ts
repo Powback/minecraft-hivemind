@@ -751,7 +751,19 @@ registry.register({
     // This is not a preference, it is an ordering constraint. A drone with no fuel cannot gather
     // copper either -- it cannot do ANYTHING, including the rescue that would reach it. Fuel is
     // upstream of every other material by definition, so it belongs above them in the queue.
-    const FUEL_MATCH = /coal|charcoal/;
+    //
+    // WOOD IS FUEL, AND THIS COPY HAD NEVER HEARD OF IT.
+    //
+    // The Lua side settled this argument already: taskProducesFuel matches coal, charcoal, log AND
+    // wood, with a comment explaining that one coal turns eight logs into eight charcoal and that
+    // wood is the only input that ENDS the fuel problem rather than postponing it. This is a second
+    // copy of the same question in a different language, and it disagreed -- so oak_log was queued
+    // as an ordinary material, competing on equal terms with copper and dirt, while the settlement
+    // ran its charcoal down to 7 and drones dropped to zero.
+    //
+    // Fourth copy of "what counts as fuel" this project has been bitten by. Same fix as the others:
+    // one predicate, all the fuels in it.
+    const FUEL_MATCH = /coal|charcoal|log|wood/;
     const res: any = await bridge.call('TaskMan', 'Add', {
       name: `gather:${a.match}`,
       priority: FUEL_MATCH.test(a.match) ? 1 : 2,
