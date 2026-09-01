@@ -1080,6 +1080,33 @@ local function cancelRecoveredRescues(p_Healthy)
     return n
 end
 
+-- DROP A RESCUE THE SETTLEMENT CANNOT PERFORM.
+--
+-- stillTrapped stops a pointless fuel rescue being QUEUED, but says nothing about one already in
+-- the queue -- and the store can empty after the task exists, which is exactly the order it happens
+-- in: the rescue is queued while there is still coal, the coal is burned, and now the fleet's only
+-- mobile drone is committed to delivering something that no longer exists.
+--
+-- It also repairs the mislabelled ones. Both rescue-D14 tasks were named "rescue-" rather than
+-- "fuel-" because the drone's reported fuel was STALE when they were queued -- the heartbeat bug --
+-- so nothing that keys off the task name could ever recognise them. This asks about the drone as it
+-- is now, which is the only thing that was ever true.
+local function dropUnfulfillableRescues(p_Dry)
+    if storageFuelCount() ~= 0 then return 0 end
+    local n = 0
+    for k, v in pairs(DATA["tasks"] or {}) do
+        local w = v.work and v.work.rescue
+        if w and w.id ~= nil and p_Dry[tostring(w.id)] then
+            abortAssigned(v)
+            Log(("rescue for %s dropped -- it is dry and storage has no fuel to bring it, and the "
+                 .. "drone this holds is the one that could go and make some"):format(tostring(w.drone)))
+            DATA["tasks"][k] = nil
+            n = n + 1
+        end
+    end
+    return n
+end
+
 local function rescueNeeded()
     -- One live rescue per drone. Without this the pass creates a fresh task every fifteen seconds
     -- for a drone that stays stuck -- which it will, right up until the miner arrives.
@@ -1153,6 +1180,7 @@ local function rescueNeeded()
     -- their rescues went on consuming D3 afterwards, which defeats the entire point of retiring
     -- them.
     local s_Known = {}
+    local s_DryNow = {}
     for _, d in ipairs(fleet()) do s_Known[tostring(d.id)] = true end
     s_Cancelled = s_Cancelled + dropRescuesForUnknownDrones(s_Known)
 
@@ -1166,6 +1194,9 @@ local function rescueNeeded()
         -- zero. The relief was dispatched correctly and withdrawn before it could be performed.
         local f = tonumber(d.fuel)
         local s_Dry = f ~= nil and f < DISPATCH_FUEL_FLOOR
+        -- Recorded for every drone, not just the dry ones: false is falsy and reads the same at
+        -- the only place that asks, and a branch here would grow the file's largest function.
+        s_DryNow[tostring(d.id)] = s_Dry
         if not (RESCUE_STATES[tostring(d.status)] or d.offline or s_Dry) then
             s_Healthy[tostring(d.id)] = true
             -- Back on its feet: forget the failed attempts, so a drone that gets into trouble again
@@ -1180,6 +1211,7 @@ local function rescueNeeded()
         end
     end
     s_Cancelled = s_Cancelled + cancelRecoveredRescues(s_Healthy)
+    s_Cancelled = s_Cancelled + dropUnfulfillableRescues(s_DryNow)
     if s_Cancelled > 0 then PowNet.MarkDirty() end
 
     local s_Made = 0
