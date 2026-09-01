@@ -1003,6 +1003,31 @@ local function isSmeltableInput(p_Name) return isSmeltable(p_Name) and not isFue
 -- the settlement is mining for. bulk: cobblestone, of which there is no shortage and no demand.
 local SMELT_RANK = { wood = 1, ore = 2, other = 5, bulk = 9 }
 
+-- LEAVE ENOUGH WOOD TO BUILD WITH. THE FURNACES WILL TAKE EVERY LOG OTHERWISE.
+--
+-- Wood is smelt rank 1 -- the fuel-positive smelt, and rightly, since logs to charcoal is the only
+-- conversion that grows the fuel supply. But rank 1 with no floor means EVERY log that reaches
+-- storage goes into a furnace the moment it lands, and oak_log can never rise above zero.
+--
+-- Measured, with the lumber sweep finally running and delivering: charcoal climbing 32 -> 47 -> 51
+-- while oak_log sat at 0 and the crafter reported "craft oak_planks x32" it could not start. Planks
+-- are eight logs. They were never going to exist.
+--
+-- That matters far beyond planks. Planks gate chests, chests gate storage, and order.build queues
+-- the crafting a blueprint needs before the build itself -- so with no planks, every build ever
+-- ordered stalled at its craft step. Eighteen storage plots and two crafting plots sit in
+-- 'clearing' for exactly this reason. The settlement was smelting its own construction material.
+--
+-- So: keep a floor of wood back. Above the floor the furnaces get it and the fuel chain runs as
+-- before; at or below it the wood is left alone for crafting. Only wood, because only wood is both
+-- the fuel input AND a building material -- ore has no competing use.
+local WOOD_CRAFT_RESERVE = 16
+
+local function reservedForCrafting(p_Name, p_Entry)
+    if smeltCategory(p_Name) ~= "wood" then return false end
+    return (tonumber(p_Entry.total) or 0) <= WOOD_CRAFT_RESERVE
+end
+
 local function smeltRank(p_Name)
     return SMELT_RANK[smeltCategory(p_Name) or ""] or 5
 end
@@ -1040,7 +1065,7 @@ local function bestSmeltInput()
     local s_Scarce = fuelInStorage() < SMELT_FUEL_RESERVE
     local s_Best, s_Rank = nil, nil
     for name, e in pairs(m_Index) do
-        if e.at[1] and isSmeltableInput(name) then
+        if e.at[1] and isSmeltableInput(name) and not reservedForCrafting(name, e) then
             local r = smeltRank(name)
             -- Rank 1 is the fuel-positive smelt (logs -> charcoal). When fuel is scarce that is the
             -- only thing allowed in, so a furnace either grows the supply or stays cold.
