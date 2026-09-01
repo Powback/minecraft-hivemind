@@ -2807,6 +2807,71 @@ end
 --
 -- Returns kept, shortfall -- shortfall is nil when everything asked for was found.
 -- p_Min: the least that is still worth having, per item. Defaults to p_Want (all or nothing).
+-- IS ANY OF THIS IN STORAGE AT ALL?
+--
+-- DO NOT FLY NINE CHESTS TO CONFIRM WHAT ONE QUESTION ANSWERS.
+--
+-- The sweep skips chests whose contents are known not to match -- but six of twelve deposit points
+-- have no peripheral name, so their contents are never known, and "unknown" means "go and look".
+-- With the item absent from the settlement entirely, that is nine flights to nine chests, every
+-- attempt, for ever.
+--
+-- It is not merely slow, it is the fuel sink that was eating the whole economy. D31 was relieved to
+-- 2,532 fuel and back to zero within five minutes without ever leaving the bay -- far too many moves
+-- to be doing anything but circling the chests -- then relieved again. Every scrap of charcoal the
+-- furnaces produced went into searching for charcoal.
+--
+-- GetStock, not WhereIs: WhereIs reads DATA["chestAt"], the cached per-chest contents this codebase
+-- has already been bitten by twice, while GetStock rescans. Live read or nothing.
+--
+-- Silence returns true. An unanswered query is not evidence of an empty store, and refusing to look
+-- because a module was busy is the worse failure -- the same rule storageFuelCount follows.
+local function storageHasAnyOf(p_Want)
+    local s_Res = PowNet.sendAndWaitForResponse("StorageMan",
+        PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "GetStock", {}), PowNet.SERVER_PROTOCOL, 5)
+    if type(s_Res) ~= "table" or type(s_Res.detail) ~= "table" then return true end
+    for s_Name in pairs(p_Want or {}) do
+        for _, e in ipairs(s_Res.detail) do
+            if (tonumber(e.count) or 0) > 0 and SameItem(s_Name, e.name) then return true end
+        end
+    end
+    return false
+end
+
+-- WHY THIS SWEEP SHOULD NOT HAPPEN, OR NIL TO GO AHEAD.
+--
+-- A DRONE THAT CANNOT MOVE CANNOT SEARCH, AND NOBODY SHOULD FLY NINE CHESTS TO CONFIRM AN EMPTY
+-- STORE.
+--
+-- Every chest in the sweep is somewhere else. At zero fuel the loop is a list of places that cannot
+-- be reached: each hop is refused, all nine are worked through, and the drone ends where it started.
+-- Worse, it LIES -- Doing() reports "searching 9 chest(s) for charcoal", which reads on every panel
+-- as a drone doing its job. Seen with D31 and D14 both at fuel 0, both reporting a chest search,
+-- when what they needed was for someone to notice they were dry.
+--
+-- And when the item is simply absent, the sweep is nine real flights that cannot succeed. That was
+-- the fuel sink eating the entire economy: D31 relieved to 2,532 and back to zero in five minutes
+-- without leaving the bay -- far too many moves to be doing anything but circling the chests -- then
+-- relieved again. Every scrap of charcoal the furnaces made went into looking for charcoal.
+--
+-- Nothing reachable is given up: the container directly BELOW needs no fuel and is checked before
+-- the loop.
+--
+-- Its own function so FetchItems, already over the complexity gate, carries one decision rather
+-- than three.
+local function sweepPointless(p_HasAny, p_Count)
+    if turtle.getFuelLevel() == 0 then
+        trace("fetch: out of fuel, so the chest sweep is a list of places we cannot go")
+        return "out of fuel -- cannot reach any chest, waiting for relief"
+    end
+    if not p_HasAny then
+        trace(("fetch: storage holds none of it -- not flying %d chest(s) to confirm that")
+              :format(p_Count))
+        return "storage does not have it"
+    end
+    return nil
+end
+
 function FetchItems(p_Want, p_Min)
     local s_Match = function(nm)
         for w in pairs(p_Want) do if SameItem(w, nm) then return true end end
@@ -2930,23 +2995,14 @@ function FetchItems(p_Want, p_Min)
         return true
     end
 
+    -- Asked ONCE, outside the loop: it is a network round trip, and the answer cannot change
+    -- usefully within one sweep. See storageHasAnyOf.
+    local s_HasAny = storageHasAnyOf(p_Want)
+
     for _, pt in ipairs(s_Order) do
-        -- A DRONE THAT CANNOT MOVE CANNOT SEARCH. SAY SO INSTEAD OF PRETENDING.
-        --
-        -- Every chest in this sweep is somewhere else, so at zero fuel the whole loop is a list of
-        -- places that cannot be reached: each hop is refused, the sweep works through all nine, and
-        -- the drone ends up back where it started having achieved nothing. It costs a real amount
-        -- of tick time and, worse, it LIES -- Doing() had already reported "searching 9 chest(s)
-        -- for charcoal", which reads on every panel as a drone doing its job.
-        --
-        -- Measured with D31 and D14 both sitting at fuel 0, both reporting a chest search, while
-        -- what they actually needed was for somebody to notice they were dry and bring coal.
-        --
-        -- The container directly BELOW needs no fuel, and tryChest on the current position is
-        -- checked before this loop -- so nothing reachable is given up by stopping here.
-        if turtle.getFuelLevel() == 0 then
-            Doing("out of fuel -- cannot reach any chest, waiting for relief")
-            trace("fetch: out of fuel, so the chest sweep is a list of places we cannot go")
+        local s_Stop = sweepPointless(s_HasAny, #s_Order)
+        if s_Stop then
+            Doing(s_Stop)
             return s_Got, short(s_Got)
         end
 
