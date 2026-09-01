@@ -229,8 +229,26 @@ function OnSaveWorld(p_ID, p_Message)
     -- powers the computer off without running the module's exit save, so every restart threw away
     -- up to five minutes of observations. The map went 294,713 -> 227,461 cells across one deploy
     -- for exactly that reason.
+    -- DRAIN A BACKLOG, DO NOT WAIT OUT THE CLOCK.
+    --
+    -- save() writes at most CHUNKS_PER_SAVE chunks a pass, which is correct -- an unbounded write
+    -- takes this module past CC's ten-second kill and the whole settlement with it. But the caller
+    -- then waited a full minute before the next pass regardless of how much was queued, so a survey
+    -- that dirties two hundred chunks needed eight minutes to reach disk and mostly did not: a
+    -- redeploy cycles every module, and `computercraft shutdown` powers the computer off without
+    -- running any exit save.
+    --
+    -- That is where the redstone went. The scout descended to y=24 and scanned the band; six
+    -- redstone_ore entries appeared in the index and were gone after the next redeploy, while the
+    -- rest of the band -- written in earlier passes -- survived. A scout's whole purpose is to
+    -- produce observations, and they were being thrown away faster than it could make them.
+    --
+    -- So the interval follows the queue: a big backlog saves on every upload, a small one keeps the
+    -- old minute. Each pass is still bounded, so the ten-second limit is respected either way.
     m_LastSave = m_LastSave or 0
-    if os.clock() - m_LastSave > 60 then
+    local s_Backlog = PowGPSServer.dirtyChunks and PowGPSServer.dirtyChunks() or 0
+    local s_Every = (s_Backlog > 24) and 0 or 60
+    if os.clock() - m_LastSave > s_Every then
         m_LastSave = os.clock()
         PowGPSServer.saveAll()
     end
@@ -1264,6 +1282,11 @@ Init()
 -- reporting. Dropping them before the write-back costs one boot-time rebuild and saves shipping
 -- the entire index across the network every time anything restarts.
 PowNet.SetShutdownHook(function(p_Reason)
+    -- FLUSH BEFORE DROPPING ANYTHING. This hook runs on the INIT stand-down -- how MainFrame cycles
+    -- the fleet -- and it was discarding the index without first writing the observations behind
+    -- it. It cannot help against `computercraft shutdown`, which powers the computer off with no
+    -- warning at all; the adaptive save interval above is what covers that case.
+    pcall(PowGPSServer.saveAll)
     m_BlockAt, m_BlockIndex = nil, nil
     print("dropped the derived block index before write-back (" .. tostring(p_Reason) .. ")")
 end)

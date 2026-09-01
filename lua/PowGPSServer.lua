@@ -283,6 +283,23 @@ end
 -- merge functions rather than at each call site.
 local m_Dirty = {}
 
+-- HOW MUCH IS WAITING TO REACH DISK.
+--
+-- Exposed because the caller decides how often to save, and it was deciding on a fixed timer with
+-- no idea whether there was a backlog. save() writes at most CHUNKS_PER_SAVE chunks a pass -- which
+-- is right, an unbounded write takes the module past CC's ten-second kill -- so a survey that
+-- dirties two hundred chunks needs many passes, and a sixty-second gap between them means most of
+-- it is still in memory when the module next restarts.
+--
+-- That is not hypothetical: it is where the redstone went. The scout descended to y=24, scanned the
+-- band, and the six redstone_ore entries were in the index and gone again after the next redeploy,
+-- while the rest of the band -- written in earlier passes -- survived.
+function dirtyChunks()
+    local n = 0
+    for _ in pairs(m_Dirty) do n = n + 1 end
+    return n
+end
+
 -- ONE DICTIONARY FOR THE WHOLE MAP, not one per chunk.
 --
 -- Interning names per chunk was the first cut and it is wasteful in the way that matters: the same
