@@ -95,8 +95,30 @@ function OnAddTask(p_ID, p_Message)
     for _, v in pairs(DATA["tasks"] or {}) do
         if v.name == s_Task.name and v.assignedTo == nil
            and (v.progress or 0) < 100 and v.enabled ~= false then
-            Log(("refused duplicate task %s -- one is already queued and unassigned")
-                :format(tostring(s_Task.name)))
+            -- SAME NAME, NEW ORDERS: TAKE THE NEW ORDERS.
+            --
+            -- Refusing the duplicate is right -- it is the same job -- but the WORK was silently
+            -- thrown away with it, so re-issuing a job with different parameters quietly kept the
+            -- old ones and reported success.
+            --
+            -- Measured: the ore-depth fix moved the redstone shaft from y=12 to y=-50 and
+            -- order.prospect was re-issued at the new depth. It answered ok with depth -50 and
+            -- shaftTask 7305 -- the EXISTING task, still carrying depth 50. The drone dutifully
+            -- reported "shaft: down to y=50 (target 50)". Every layer had been fixed and checked,
+            -- and the one that decides what the drone is actually told had kept yesterday's number.
+            --
+            -- Safe because this branch only ever runs for a task nobody has started: an assigned
+            -- task is not a duplicate by the test above, so no drone's orders change mid-job.
+            if s_Task.work ~= nil then
+                v.work = s_Task.work
+                v.priority = s_Task.priority or v.priority
+                PowNet.MarkDirty()
+                Log(("duplicate task %s -- kept the queued one and took the new parameters")
+                    :format(tostring(s_Task.name)))
+            else
+                Log(("refused duplicate task %s -- one is already queued and unassigned")
+                    :format(tostring(s_Task.name)))
+            end
             return true, {id = v.id, duplicate = true}
         end
     end
