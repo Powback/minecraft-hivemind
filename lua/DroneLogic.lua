@@ -1184,6 +1184,13 @@ local SIDE_APPROACHES = {
     {dx =  0, dz = -1, face = "south"},
 }
 
+-- Beyond this, a mapped route is worth waiting for. Below it, it never is.
+--
+-- Declared HERE rather than beside TravelTo, which is a thousand lines further down:
+-- ApproachFromSide uses it too now, and a local read above its declaration is a silent nil global
+-- in Lua -- the trap this codebase has been caught by nine times.
+local SHORT_HOP = 32
+
 function ApproachFromSide(p_Target, p_FlyBudget)
     for _, s_Side in ipairs(SIDE_APPROACHES) do
         local x, z = p_Target.x + s_Side.dx, p_Target.z + s_Side.dz
@@ -1199,7 +1206,24 @@ function ApproachFromSide(p_Target, p_FlyBudget)
         -- task. Same trap the vein filter above was written for, one step further along: no single
         -- decision looks wrong, and the drone ends up somewhere it cannot work from.
         if pgps.isWithinReach(x, z) then
-            local s_Try = pgps.moveTo(x, p_Target.y, z)
+            -- DIRECT FIRST FOR A SHORT HOP. THIS IS THE PER-CANDIDATE PATH.
+            --
+            -- The order here was moveTo (an A* request to MapServer) and only then flyTo. TravelTo
+            -- already carries the comment explaining why that is backwards -- "DO NOT ASK THE
+            -- PATHFINDER TO CROSS THE ROOM", 207,574 cells, 5.8 seconds for a small query -- but
+            -- the fix was never applied to this function, which is the one a gather calls ONCE PER
+            -- CANDIDATE. A sweep of 192 targets a couple of blocks apart therefore issued 192 A*
+            -- searches, and every other drone queued behind them.
+            --
+            -- Measured: "gather: 32/192 checked" and "33/192 checked" two hundred seconds apart --
+            -- one candidate per three minutes, with MapServer dropping out under the load. The
+            -- fleet was not slow at cutting wood; it was slow at asking permission to walk.
+            local s_Cx, s_Cy, s_Cz = pgps.getCachedPosition()
+            local s_Near = s_Cx ~= nil and
+                (math.abs(s_Cx - x) + math.abs(s_Cy - p_Target.y) + math.abs(s_Cz - z)) <= SHORT_HOP
+            local s_Try = false
+            if s_Near then s_Try = pgps.flyTo(x, p_Target.y, z, p_FlyBudget or 64) end
+            if s_Try == false then s_Try = pgps.moveTo(x, p_Target.y, z) end
             if s_Try == false then s_Try = pgps.flyTo(x, p_Target.y, z, p_FlyBudget or 64) end
             if s_Try ~= false then
                 pgps.turnTo(pgps.HEADINGS[s_Side.face])
@@ -2212,9 +2236,6 @@ function ReportStorage(p_Verb, p_Items)
             PowNet.SERVER_PROTOCOL, 3)
     end)
 end
-
--- Beyond this, a mapped route is worth waiting for. Below it, it never is.
-local SHORT_HOP = 32
 
 -- A refusal no fallback can fix must STOP the attempt and be reported, not be retried five ways.
 --
