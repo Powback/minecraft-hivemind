@@ -484,7 +484,24 @@ function SendHeartBeat()
         end
     end
 
-    local s_Data = {pos = s_Pos, status = s_Report, detail = m_Detail, fuel = s_Fuel, role = Role(),
+    -- WHOSE HEARTBEAT THIS IS, said explicitly, because the sender is not always the subject.
+    --
+    -- A drone out of radio range hands its heartbeat to a neighbour, which forwards the ORIGINAL
+    -- message from its own computer (see meshForward). DroneMan keyed the record off the rednet
+    -- sender, so a relayed beat wrote the originator's role, fuel, status and POSITION into the
+    -- relayer's record.
+    --
+    -- That is not a small corruption. It is why D31 reported 2,532 fuel while a probe of the turtle
+    -- returned 0; why relief flew to coordinates belonging to a different drone and reported "D31 is
+    -- not where it was last seen"; and why D4's role oscillated crafter/scout on a twenty-second
+    -- sample while the turtle itself never wavered -- caught only by logging the writer:
+    --
+    --   role: cc #47 -> record 4 (D4) scout -> crafter
+    --   role: cc #47 -> record 4 (D4) crafter -> scout
+    --
+    -- The mesh is worth having; it just has to say who it is speaking for.
+    local s_Data = {ccid = os.getComputerID(),
+                    pos = s_Pos, status = s_Report, detail = m_Detail, fuel = s_Fuel, role = Role(),
                     inv = s_Inv,
                     -- What code this drone is running, so a stale fleet is visible instead of
                     -- silently reintroducing bugs that were already fixed. See fileStamp.

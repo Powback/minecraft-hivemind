@@ -100,7 +100,16 @@ function RegisterDrone(p_ID, p_Pos, p_Heading, p_Role)
 end
 
 function OnHeartbeat(p_ID, p_Message)
-    local s_ID = GetDroneIDByCCID(p_ID)
+    -- THE SENDER IS NOT ALWAYS THE SUBJECT. See the note beside s_Data in DroneLogic.
+    --
+    -- meshForward relays a stranded drone's heartbeat from a NEIGHBOUR's computer, so p_ID is the
+    -- relayer. Keying the record off it wrote the originator's fuel, position, status and role over
+    -- the relayer's own -- the source of a whole family of "fleet.status lies" this project has
+    -- been working around instead of fixing.
+    --
+    -- Falls back to p_ID so a drone running older code still reports itself correctly.
+    local s_CC = tonumber(p_Message.data and p_Message.data.ccid) or p_ID
+    local s_ID = GetDroneIDByCCID(s_CC)
     -- A heartbeat from a drone we do not know about used to kill this server outright:
     -- GetDroneIDByCCID returns nil, and DATA["drones"][nil][k] = v is an index-nil error.
     -- It is not a rare case -- any drone that already has a label skips registration in
@@ -108,7 +117,7 @@ function OnHeartbeat(p_ID, p_Message)
     -- world was enough to crash-loop DroneMan forever and keep drones = {} empty.
     -- Answering "you are not registered" instead lets the drone recover on its own.
     if(s_ID == nil or DATA["drones"][s_ID] == nil) then
-        print("Heartbeat from unregistered drone " .. tostring(p_ID))
+        print("Heartbeat from unregistered drone " .. tostring(s_CC))
         return false, "unregistered"
     end
     local s_WasRole = DATA["drones"][s_ID].role
@@ -140,7 +149,18 @@ function OnHeartbeat(p_ID, p_Message)
     -- write volume where it was while making the one field that matters durable.
     --
     -- Verify at the effect: D4 reads role=crafter after this, having read scout for hours.
-    if s_WasRole ~= DATA["drones"][s_ID].role then PowNet.MarkDirty() end
+    if s_WasRole ~= DATA["drones"][s_ID].role then
+        -- SAY WHO CHANGED IT. The role then began OSCILLATING -- D4 sampled three times twenty
+        -- seconds apart read crafter, crafter, scout -- and the drone itself is unambiguous and
+        -- stable: scanner=nil, crafter=true, Role()="crafter", left=modem right=workbench. So a
+        -- record is being written by something that is not the drone it belongs to, and no amount
+        -- of reading source settles which. This line names the writer, the record and both values,
+        -- which is the whole question in one log entry.
+        Log(("role: cc #%s -> record %s (%s) %s -> %s"):format(
+            tostring(p_ID), tostring(s_ID), tostring(DATA["drones"][s_ID].name),
+            tostring(s_WasRole), tostring(DATA["drones"][s_ID].role)))
+        PowNet.MarkDirty()
+    end
     -- WHEN we last heard from it, which is the only way to tell a docked drone from one that no
     -- longer exists. Drones heartbeat every 30s; nothing was recording the arrival, so a drone
     -- that stopped answering stayed "idle" forever. D1 mined D2 out of the world and the registry
