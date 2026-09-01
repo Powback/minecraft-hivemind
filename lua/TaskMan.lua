@@ -2126,6 +2126,28 @@ end
 -- assignments were permanent; the moment stalled assignments began to be reclaimed it became a
 -- loop -- the crafter redid a finished chest order every ninety seconds, correctly reporting it
 -- was short of the planks it had already turned into chests.
+-- A FAILURE THAT SAYS NOTHING ABOUT THE TASK MUST NOT SPEND ONE OF ITS THREE ATTEMPTS.
+--
+-- "busy", "executing" and "refused" were already excluded, for exactly the right reason: the drone
+-- declined to start, so nothing was learned about whether the work is possible. A SHORTAGE is the
+-- same shape and was not excluded -- and it is the worse case, because it clears by itself.
+--
+-- Measured: fuel-D31 failed three times with "no fuel to deliver: storage had nothing burnable",
+-- which was TRUE at the time -- storage held 0 coal, 0 charcoal and 0 logs. The task was then
+-- marked finished for good. Twenty minutes later storage held 270 charcoal, D31 sat at zero fuel,
+-- and all that remained in the queue was rescue-D31: a dig-out, role=miner, that neither miner
+-- could take -- one being the casualty, the other busy. The settlement had the fuel, had a drone
+-- that could carry it, and no path from one to the other, because a temporary shortage had been
+-- written down as a permanent verdict.
+--
+-- Retrying forever is not the risk it looks like: stillTrapped already refuses to queue a fuel
+-- rescue while storage has nothing burnable, so the shortage is gated upstream. This only stops a
+-- shortage that has since ended from counting against the task.
+local function saysNothingAboutTheTask(p_Reason)
+    return (p_Reason:find("busy") or p_Reason:find("executing") or p_Reason:find("refused")
+            or p_Reason:find("nothing burnable") or p_Reason:find("no fuel to deliver")) ~= nil
+end
+
 function OnTaskDone(p_ID, p_Message)
     local d = p_Message.data or {}
     local s_Task = DATA["tasks"][d.id] or DATA["tasks"][tostring(d.id)] or DATA["tasks"][tonumber(d.id or -1)]
@@ -2244,10 +2266,8 @@ function OnTaskDone(p_ID, p_Message)
             return true, {id = d.id, abandoned = true}
         end
 
-        local s_Busy   = s_Reason:find("busy") or s_Reason:find("executing") or s_Reason:find("refused")
-
         s_Task.failure  = s_Reason
-        s_Task.attempts = (s_Task.attempts or 0) + (s_Busy and 0 or 1)
+        s_Task.attempts = (s_Task.attempts or 0) + (saysNothingAboutTheTask(s_Reason) and 0 or 1)
 
         if s_Task.attempts >= 3 then
             -- Out of attempts: this one really is finished, unsuccessfully, and says why.
