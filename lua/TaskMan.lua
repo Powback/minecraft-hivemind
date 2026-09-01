@@ -328,7 +328,43 @@ local function livePos(p_Drone, p_Fallback)
     return p_Fallback
 end
 
+-- DO NOT SPEND THE ONLY DRONE THAT CAN DO A THING ON A JOB ANY DRONE COULD DO.
+--
+-- Fuel relief accepts ANY_ROLE deliberately -- a stranded drone does not care who brings the coal,
+-- and restricting relief to miners is what left casualties sitting while idle crafters watched. But
+-- "any role will do" was read as "all roles are equally spendable", and the nearest drone to a
+-- casualty is frequently the crafter parked at the bay.
+--
+-- Measured: D4 is the settlement's ONLY crafter. It was pulled off craft-chest onto Relieve for D14
+-- three times in a row, so chest stayed at 0 while storage ran down to 31 free slots and every
+-- deposit began to fail for want of anywhere to go. The relief was correct; taking the one drone
+-- that could end the shortage to perform it was not.
+--
+-- So a sole-of-its-role drone is ranked behind every substitutable candidate, whatever the
+-- distance, and is still chosen when nothing else fits -- the casualty is not abandoned to protect
+-- a work queue. For a role-specific task every candidate carries the same penalty and nothing
+-- changes; it only ever reorders a mixed field, which is exactly the ANY_ROLE case.
+local SOLE_ROLE_PENALTY = 100000
+
+local function roleCounts()
+    local t = {}
+    for _, d in ipairs(fleet()) do
+        local r = tostring(d.role or "miner")
+        t[r] = (t[r] or 0) + 1
+    end
+    return t
+end
+
+-- Distance, plus the cost of losing a unique capability. Its own function so pickDrone does not
+-- grow a branch for it.
+local function pickCost(p_Drone, p_Pos, p_Counts)
+    local s_D = distTo(p_Drone, p_Pos)
+    if (p_Counts[tostring(p_Drone.role or "miner")] or 1) <= 1 then return s_D + SOLE_ROLE_PENALTY end
+    return s_D
+end
+
 local function pickDrone(p_Role, p_Pos, p_Avoid, p_MinFuel)
+    local s_Counts = roleCounts()
     local s_Busy, s_Best, s_BestD = nil, nil, nil
     local s_Fallback = nil
     for _, d in ipairs(fleet()) do
@@ -360,7 +396,7 @@ local function pickDrone(p_Role, p_Pos, p_Avoid, p_MinFuel)
                 if p_Avoid ~= nil and d.id == p_Avoid then
                     s_Fallback = s_Fallback or d
                 else
-                    local s_D = distTo(d, p_Pos)
+                    local s_D = pickCost(d, p_Pos, s_Counts)
                     if s_BestD == nil or s_D < s_BestD then s_Best, s_BestD = d, s_D end
                 end
             else
