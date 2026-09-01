@@ -2860,13 +2860,24 @@ end
 --
 -- Silence returns true. An unanswered query is not evidence of an empty store, and refusing to look
 -- because a module was busy is the worse failure -- the same rule storageFuelCount follows.
-local function storageHasAnyOf(p_Want)
+-- ENOUGH TO BE WORTH THE TRIP, not merely "some".
+--
+-- This asked whether storage held ANY of the item, and the sweep it guards needs the MINIMUM --
+-- FetchItems takes p_Min and reports short below it. With 2 coal in storage against a minimum of 8,
+-- the guard said go and look, the drone flew nine chests, collected two, and reported short. Every
+-- sixty seconds, for as long as those two coal existed.
+--
+-- Measured: "dispatch Relieve -> D4" on repeat with charcoal sitting at 99 untouched, because
+-- CollectFuel asks for coal first and never got past it. Four drones at zero, one drone with 8,689
+-- fuel, and a larder it was being sent to the wrong shelf of.
+local function storageHasAnyOf(p_Want, p_Min)
     local s_Res = PowNet.sendAndWaitForResponse("StorageMan",
         PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "GetStock", {}), PowNet.SERVER_PROTOCOL, 5)
     if type(s_Res) ~= "table" or type(s_Res.detail) ~= "table" then return true end
     for s_Name in pairs(p_Want or {}) do
+        local s_Floor = (p_Min and tonumber(p_Min[s_Name])) or 1
         for _, e in ipairs(s_Res.detail) do
-            if (tonumber(e.count) or 0) > 0 and SameItem(s_Name, e.name) then return true end
+            if (tonumber(e.count) or 0) >= s_Floor and SameItem(s_Name, e.name) then return true end
         end
     end
     return false
@@ -3031,7 +3042,7 @@ function FetchItems(p_Want, p_Min)
 
     -- Asked ONCE, outside the loop: it is a network round trip, and the answer cannot change
     -- usefully within one sweep. See storageHasAnyOf.
-    local s_HasAny = storageHasAnyOf(p_Want)
+    local s_HasAny = storageHasAnyOf(p_Want, p_Min)
 
     for _, pt in ipairs(s_Order) do
         local s_Stop = sweepPointless(s_HasAny, #s_Order)
