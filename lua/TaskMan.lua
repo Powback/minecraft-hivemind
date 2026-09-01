@@ -478,9 +478,38 @@ end
 -- casualties are not buried, and arriving with fuel fixes the common case.
 --
 -- Returns nil for anything that is not a rescue, so the caller can use it as a plain fallback.
+-- Below this far under the settlement floor, reaching a casualty means going through rock.
+local UNDERGROUND_BELOW = 8
+
 local function anyoneForRescue(p_Task, p_Where, p_MinFuel, p_Role)
     local w = p_Task.work and p_Task.work.rescue
     if w == nil then return nil end
+
+    -- DO NOT SEND SOMETHING THAT CANNOT DIG DOWN A HOLE.
+    --
+    -- The any-role fallback is right on the surface: most casualties want fuel, and a crafter can
+    -- carry coal even though it cannot cut rock. Underground it inverts. Reaching a drone in a shaft
+    -- means digging, a crafter carries a workbench where a pickaxe would go, and a drone that cannot
+    -- dig cannot get itself out either -- so the rescue risks adding a second casualty in the worst
+    -- possible place.
+    --
+    -- Measured: D4, the settlement's ONLY crafter and the only drone with fuel at the time (8,689),
+    -- was sent after a casualty at y=59 and ended up at y=46 -- twenty blocks under the floor, no
+    -- pickaxe, unable to cut its way back. Losing it would have ended chest and plank production
+    -- outright, which is worse than the casualty it went for.
+    --
+    -- Miners still take these; only the fallback is restricted. If every miner is dry and the
+    -- casualty is underground, no rescue is the correct answer -- it is what "it needs a human"
+    -- already means elsewhere in this file.
+    -- The settlement floor, from the region if pgps is loaded here and 63 if it is not -- which is
+    -- what world.bounds reports for this base's centre. Guarded rather than assumed: TaskMan is a
+    -- computer, not a turtle, and a nil global would take the whole placement pass down with it.
+    local s_Home = pgps and pgps.centre and pgps.centre()
+    local s_Floor = (s_Home and tonumber(s_Home.y)) or 63
+    if w.pos and tonumber(w.pos.y) and tonumber(w.pos.y) < (s_Floor - UNDERGROUND_BELOW) then
+        return nil
+    end
+
     local d = pickDrone(ANY_ROLE, p_Where, w.id, p_MinFuel)
     if d == nil then return nil end
     Log(("rescue for %s going to %s (a %s) -- no %s free, and most casualties want fuel rather "
