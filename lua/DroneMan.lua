@@ -108,7 +108,34 @@ function OnHeartbeat(p_ID, p_Message)
     -- been working around instead of fixing.
     --
     -- Falls back to p_ID so a drone running older code still reports itself correctly.
-    local s_CC = tonumber(p_Message.data and p_Message.data.ccid) or p_ID
+    local s_Stamp = tonumber(p_Message.data and p_Message.data.ccid)
+
+    -- A SENDER THAT STAMPS ITS OWN BEATS IS RELAYING WHEN IT SENDS AN UNSTAMPED ONE.
+    --
+    -- The fallback to p_ID is right for a drone on older code talking DIRECTLY: sender and subject
+    -- are the same computer. It is wrong for a relayed legacy beat, which arrives from a neighbour
+    -- and gets written onto the neighbour's record.
+    --
+    -- The two are distinguishable without any new protocol. Once a computer has been seen stamping,
+    -- every unstamped message from it is somebody else's -- it would have stamped its own.
+    --
+    -- Found the hard way: computer #21 is D2, powered on at -534,69,26 with a geo_scanner, running
+    -- pre-ccid code, 66 blocks out and unable to reach base for fourteen hours. Its relayed beats
+    -- were writing its role, fuel and POSITION onto whichever drone carried them:
+    --
+    --   role: sender #47 stamp #47  -> record 4 (D4) scout -> crafter
+    --   role: sender #47 stamp #nil -> record 4 (D4) crafter -> scout
+    --
+    -- -534,69,26 is the coordinate that appeared in rescue after rescue for drones that were
+    -- nowhere near it, and D2's fuel is where the impossible readings came from. Dropping the
+    -- envelope loses one stranded legacy drone's telemetry; keeping it corrupts a working drone's.
+    DATA["stamps"] = DATA["stamps"] or {}
+    if s_Stamp ~= nil then DATA["stamps"][tostring(p_ID)] = true end
+    if s_Stamp == nil and DATA["stamps"][tostring(p_ID)] then
+        return false, "unattributable relay -- no ccid from a sender that stamps"
+    end
+
+    local s_CC = s_Stamp or p_ID
     local s_ID = GetDroneIDByCCID(s_CC)
     -- A heartbeat from a drone we do not know about used to kill this server outright:
     -- GetDroneIDByCCID returns nil, and DATA["drones"][nil][k] = v is an index-nil error.
@@ -156,8 +183,12 @@ function OnHeartbeat(p_ID, p_Message)
         -- record is being written by something that is not the drone it belongs to, and no amount
         -- of reading source settles which. This line names the writer, the record and both values,
         -- which is the whole question in one log entry.
-        Log(("role: cc #%s -> record %s (%s) %s -> %s"):format(
-            tostring(p_ID), tostring(s_ID), tostring(DATA["drones"][s_ID].name),
+        -- BOTH IDENTITIES, because the whole question is whether they agree. Printing only the
+        -- sender made a stamped message and an unstamped one look identical in the log, which is
+        -- the distinction this line exists to draw.
+        Log(("role: sender #%s stamp #%s -> record %s (%s) %s -> %s"):format(
+            tostring(p_ID), tostring(p_Message.data and p_Message.data.ccid),
+            tostring(s_ID), tostring(DATA["drones"][s_ID].name),
             tostring(s_WasRole), tostring(DATA["drones"][s_ID].role)))
         PowNet.MarkDirty()
     end
