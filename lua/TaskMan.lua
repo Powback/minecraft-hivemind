@@ -991,6 +991,11 @@ end
 -- Deliberately reuses taskProducesFuel rather than growing a second answer to "what counts as
 -- fuel" -- that question has already been answered three different ways in this file, and the
 -- predicate is a plain string test that reads item names as happily as task names.
+-- Burnable items in storage above which the settlement is not in a fuel emergency and fuel work
+-- stops outranking everything else. 64 charcoal is a little over 5,000 fuel -- two full tanks --
+-- which is enough that interrupting a gather cannot strand anybody.
+local FUEL_COMFORTABLE = 64
+
 local FUEL_STOCK_TTL = 30
 local m_FuelStock, m_FuelStockAt = nil, -1000
 
@@ -1627,7 +1632,29 @@ local function preemptable(p_Task, p_DroneId)
     --
     -- That is now THREE copies of "what counts as fuel" this file has had to be corrected on today
     -- (the emergency filter, the queue ordering, and this). One function, used everywhere.
-    return not taskProducesFuel(p_Task.name)
+    --
+    -- WHILE THE LARDER IS EMPTY. The exemption was unconditional, and that turned a guard against
+    -- one deadlock into the cause of another.
+    --
+    -- There is ALWAYS a fuel gather running -- wood and coal are both wanted permanently, and both
+    -- match taskProducesFuel -- so with the exemption always on, a fuel task can never be preempted
+    -- and therefore a blocker can never take a drone off one. placeBlockers has no other way to
+    -- find a body when every drone is busy.
+    --
+    -- Measured: shaft-mine_head-01, the ONLY route to redstone and therefore to wired modems,
+    -- storage and everything above it, sat "queued: no miner free" for hours across four fleet
+    -- configurations, while D35 ran gather:oak_log and D31 ran gather:coal_ore. Neither could be
+    -- interrupted, both restart the moment they finish, and the shaft never once reached a drone.
+    -- It never even appeared in this log, because blockers do not go through the placement loop
+    -- that reports "could not place".
+    --
+    -- So the exemption applies when it means something: fuel work is protected while the settlement
+    -- is short of fuel, and is ordinary work when it is not. An unanswered StorageMan reads as
+    -- short, which keeps the protective behaviour on silence.
+    if taskProducesFuel(p_Task.name) then
+        return (storageFuelCount() or 0) >= FUEL_COMFORTABLE
+    end
+    return true
 end
 
 local function placeBlockers()
