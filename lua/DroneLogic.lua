@@ -3645,8 +3645,16 @@ end
 --
 -- Only for drones that can dig: they are the ones that generate spoil. One chest, because a miner
 -- carrying a stack of them is carrying slots it cannot use.
-function EnsureCacheChest(p_Pos)
-    if not CanDig() then return end
+-- A GATHER HAS NO `pos` -- ITS SITE IS ITS FIRST TARGET.
+--
+-- Mine and dig jobs carry pos; a gather carries `targets` and no pos at all. Taking only pos meant
+-- this returned immediately for every gather, which is most of the work the fleet does and exactly
+-- the work that fills a drone with spoil. Takes the whole job and works the site out itself, so no
+-- caller has to know the difference.
+function EnsureCacheChest(p_Job)
+    if not CanDig() or p_Job == nil then return end
+    local p_Pos = p_Job.pos
+    if p_Pos == nil and type(p_Job.targets) == "table" then p_Pos = p_Job.targets[1] end
     if p_Pos == nil or p_Pos.x == nil then return end
     for i = 1, 16 do
         local det = turtle.getItemDetail(i)
@@ -4126,7 +4134,7 @@ local function RunJobNow(p_Name, p_Data, p_Opts, p_Body)
     --
     -- Cheap here and only here: the drone is at base and idle when a job starts, so the detour is a
     -- few blocks. Once it is at the face, the same errand costs the round trip.
-    pcall(EnsureCacheChest, d.pos)
+    pcall(EnsureCacheChest, d)
 
     -- Go to the ordered site, or refuse. Digging "somewhere" is worse than digging nowhere.
     if o.travel ~= false and d.pos and d.pos.x and d.pos.z then
