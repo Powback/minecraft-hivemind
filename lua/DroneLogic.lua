@@ -3692,6 +3692,10 @@ end
 -- A GLOBAL, deliberately. depositIfFull is defined above the fuel watchdog and both need this; a
 -- `local function` here would be invisible to everything declared before it, which is the single
 -- most expensive mistake in this codebase -- six outages and counting.
+-- What a drone needs IN HAND once it reaches storage, to actually find the fuel there. Roughly four
+-- hops between deposit points with the re-routing a congested bay forces. See FuelFloorNow.
+local FUEL_SEARCH_ALLOWANCE = 400
+
 local FUEL_DRY_MARGIN = 120
 function FuelFloorNow()
     if m_HomePos == nil then return FUEL_RESERVE end
@@ -3700,7 +3704,24 @@ function FuelFloorNow()
     local d = math.abs(m_HomePos.x - cx) + math.abs(m_HomePos.y - cy) + math.abs(m_HomePos.z - cz)
     local s_Trip = d * FUEL_PER_BLOCK_HOME
     if StorageKnownDry(turtle.getFuelLevel()) then return s_Trip + FUEL_DRY_MARGIN end
-    return FUEL_RESERVE + s_Trip
+    -- ARRIVING IS NOT FINDING. RESERVE FOR THE SEARCH AT THE OTHER END TOO.
+    --
+    -- s_Trip buys the journey home and FUEL_RESERVE is a flat 300 on top. That is enough to REACH
+    -- the bay and nothing more -- but a drone that gets there still has to find the fuel, and
+    -- finding it means hopping between deposit points, up to twelve of them, through the busiest
+    -- airspace in the settlement where a failed hop is re-routed rather than free.
+    --
+    -- So the drone lands with 300, spends it looking, and strands ON TOP OF the larder. Measured on
+    -- D31 twice over: "fuel at 0 (floor 468 for this position) -- breaking off to refuel", then
+    -- "refuel: heading to storage", then "MOVE REFUSED: Out of fuel [x119 more in the last 60s]".
+    -- It had broken off at exactly the right moment and still ended at zero, because the floor was
+    -- never sized for what happens after arrival. Each of those cost a relief run by another drone,
+    -- which is far more fuel than the allowance being saved.
+    --
+    -- Deliberately a separate constant rather than a bigger FUEL_RESERVE: the reserve is "do not
+    -- strand in the field", this is "do not strand in the bay", and they are sized by different
+    -- things. FUEL_RESERVE was cut from 900 to 300 for good reasons and should stay there.
+    return FUEL_RESERVE + FUEL_SEARCH_ALLOWANCE + s_Trip
 end
 
 local function depositIfFull()
