@@ -7030,6 +7030,30 @@ local function inStorageColumn()
     return cy > m_HomePos.y and (cy - m_HomePos.y) <= 8
 end
 
+-- OUTSIDE THE REGION, COME BACK. NOBODY ELSE CAN FIX THIS ONE FOR YOU.
+--
+-- A drone whose own position fails the reach check reports "blocked" -- and blocked is not idle, so
+-- the parking logic never runs, pickDrone will not give it work, and TaskMan queues a dig-out
+-- rescue. None of that helps. It is not buried, it has fuel, and every step toward base is ALREADY
+-- legal: mayStep's escape hatch exists precisely so that getting out of bounds is not a one-way
+-- door. The drone was simply never told to take one.
+--
+-- Measured on D31: blocked at -525,78,30 holding 1,896 fuel, 64 blocks out against a reach of 56,
+-- sitting on the lumber task -- the one job the settlement actually needed -- while a rescue party
+-- was queued for a drone that could have walked home unaided. The rescue could not have helped
+-- either: a dig-out tunnels to a drone that is not walled in.
+--
+-- TravelTo, not FlyHome: this is a route home, not a reason to climb.
+local function goHomeIfOutside()
+    if executing or m_Refuelling then return end
+    local px, py, pz = pgps.getCachedPosition()
+    if px == nil or pgps.isWithinReach(px, pz) then return end
+    local hx, hy, hz = HomeXYZ()
+    trace(("outside the region at %d,%d,%d -- heading home rather than waiting for a rescue")
+          :format(px, py, pz))
+    pcall(TravelTo, hx, hy, hz)
+end
+
 local function idleDockLoop()
     local s_IdleSince = nil
     while true do
@@ -7082,6 +7106,9 @@ local function idleDockLoop()
                 pgps.turnRight()
             end
         end
+
+        -- Drifted outside the region? Walk back. See goHomeIfOutside.
+        goHomeIfOutside()
 
         local s_Free = (not executing) and (not m_Refuelling) and (m_Status == "idle") and (not m_Docked)
         if not s_Free then

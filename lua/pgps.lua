@@ -510,6 +510,22 @@ function boundsReason(x, y, z)
     -- inAny on the new shape iterates a list of hosts as though they were boxes and always says no.
     -- A diagnostic that blames the wrong constraint is worse than none.
     if not gpsOk(m_Gps, x, y, z)    then return "no gps coverage" end
+    -- THE REACH CIRCLE, WHICH IS THE CONSTRAINT THAT ACTUALLY REFUSES MOST OFTEN.
+    --
+    -- mayStep tests three things -- loaded chunk, gps coverage, and withinReach -- and this named
+    -- only the first two. So a drone stopped by the reach circle got "outside coverage: unknown",
+    -- which is the useless half of the message the comment above is about: a diagnostic that blames
+    -- nothing is no better than one that blames the wrong thing.
+    --
+    -- Measured on D31, blocked at -525,78,30 with 1,896 fuel, reporting "outside coverage: unknown"
+    -- while the chunk was loaded and GPS was fine. It was 64 blocks out against a reach of 56, and
+    -- nothing anywhere said so -- TaskMan queued a dig-out rescue for a drone that was not buried,
+    -- could move perfectly well, and only needed telling to come back.
+    if not withinReach(x, z) then
+        local dx, dz = x - m_Centre.x, z - m_Centre.z
+        return ("%d blocks from base, past the reach of %d")
+            :format(math.floor(math.sqrt(dx * dx + dz * dz)), m_Reach)
+    end
     return nil
 end
 
