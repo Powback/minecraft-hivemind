@@ -1106,6 +1106,18 @@ local function fuelRank(p_Name)
     --
     -- The ranking's only job is preference AMONG fuels; membership belongs to one function.
     if not taskProducesFuel(s_Name) then return 0 end
+    -- ...AND ONLY WHILE FUEL IS ACTUALLY SHORT.
+    --
+    -- The promotion was unconditional, so a fuel task outranked everything for ever at equal
+    -- priority -- and there is ALWAYS a fuel task queued, because wood and coal are wanted
+    -- permanently. Anything that ties with one therefore never runs.
+    --
+    -- Measured: gather:redstone_ore, queued at the same priority as gather:oak_log and OLDER, never
+    -- once dispatched -- while 446 charcoal sat in storage and redstone is the single item gating
+    -- wired modems, therefore storage, therefore every craft above it. The same shape as the
+    -- preempt guard beside it, which was corrected for the same reason: a rule that protects fuel
+    -- during a shortage must not keep applying once the shortage is over.
+    if (storageFuelCount() or 0) >= FUEL_COMFORTABLE then return 0 end
     -- Wood outranks coal: coal is finite and thirty blocks underground where drones strand, while
     -- wood is on the surface, regrows, and one coal turns eight logs into eight charcoal.
     if s_Name:find("log") or s_Name:find("wood") then return 2 end
