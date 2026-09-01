@@ -1234,11 +1234,46 @@ end
 -- later it has recovered by itself -- but the rescue outlives it. Rescues are placed BEFORE all
 -- other work by design, so stale ones crowd out everything real: two of the fleet's three assigned
 -- tasks were rescues for drones that were both working perfectly at the time.
+-- How many consecutive passes a condition must hold before the queue acts on it. Distress
+-- oscillates, so both directions wait: see settledTrapped and settledHealthy.
+--
+-- Declared HERE, above both readers. It lived below them, which is the local-used-above-its-
+-- declaration trap -- a silent nil global, and `s_N >= nil` would have thrown inside the rescue
+-- pass. Caught by lua-traps, which exists because this codebase has been bitten nine times.
+local RESCUE_SETTLE = 3
+
+-- CANCELLING NEEDS THE SAME PATIENCE AS QUEUEING, OR A FLICKERING DRONE NEVER KEEPS A RESCUE.
+--
+-- settledTrapped requires RESCUE_SETTLE consecutive trapped passes before a rescue is created --
+-- deliberately, because distress oscillates. This cancelled on a SINGLE healthy reading. The
+-- asymmetry means a drone whose status flickers is queued only after three bad passes and
+-- un-queued by the first good one, so its rescue can never survive long enough to be placed.
+--
+-- Measured on D4, walled in at y=46 and genuinely unable to move: "rescue queued for D4 (stuck) at
+-- -496,46,68" followed within a minute by "rescue for D4 cancelled -- it recovered on its own",
+-- three times over, while the drone had not moved a block. It reports blocked as it fails to climb
+-- and something else in between, and the health sweep kept catching it in between.
+--
+-- Same counter shape as settledTrapped, and the same threshold, so the two are symmetrical by
+-- construction rather than by luck.
+local m_HealthyFor = {}
+
+local function settledHealthy(p_Id, p_Healthy)
+    local s_Key = tostring(p_Id)
+    if not p_Healthy[s_Key] then
+        m_HealthyFor[s_Key] = nil
+        return false
+    end
+    local s_N = (m_HealthyFor[s_Key] or 0) + 1
+    m_HealthyFor[s_Key] = s_N
+    return s_N >= RESCUE_SETTLE
+end
+
 local function cancelRecoveredRescues(p_Healthy)
     local n = 0
     for k, v in pairs(DATA["tasks"] or {}) do
         local w = v.work and v.work.rescue
-        if w and (v.progress or 0) < 100 and p_Healthy[tostring(w.id)] then
+        if w and (v.progress or 0) < 100 and settledHealthy(w.id, p_Healthy) then
             abortAssigned(v)
             Log(("rescue for %s cancelled -- it recovered on its own"):format(tostring(w.drone)))
             DATA["tasks"][k] = nil
@@ -1293,8 +1328,6 @@ end
 -- merely between attempts does not. Forty-five seconds of delay on a real rescue is nothing set
 -- against a drone that has already been immobile for minutes -- and rescueTries, which escalates to
 -- writing a drone off, only counts attempts that were actually made.
-local RESCUE_SETTLE = 3
-
 local function settledTrapped(p_Drone, p_Trapped)
     local s_Key = tostring(p_Drone.id)
     DATA["blockedFor"] = DATA["blockedFor"] or {}
