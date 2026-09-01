@@ -805,8 +805,27 @@ try {
     const wanted = idleCount - open;
     if (wanted > 0) {
       // Cycled, so one plentiful material cannot crowd out the rest of the economy.
+      //
+      // ONLY MATERIALS THE RULE TABLE SAYS TO *GATHER*.
+      //
+      // This list called order.gather directly, which quietly overrode how a material is meant to
+      // be obtained. oak_log's rule says action: 'lumber' -- fell the tree, take the whole trunk,
+      // replant -- and this queued a gather for it anyway every time a drone went idle, which is
+      // constantly. The rule was never wrong; it was just never consulted here.
+      //
+      // The cost was the settlement's fuel supply. A wood gather walks scattered individual log
+      // blocks, most of them canopy with no standable face: "gather: 1/192 checked, 0 taken",
+      // measured repeatedly across four drones. A lumber sweep on the same trees returned 16 logs
+      // and put a sapling back. The fleet ran the useless one for the entire session because this
+      // loop kept queueing it and it outranked nothing else in the way.
+      //
+      // Two places decided how to obtain a material and they disagreed. Now there is one: the rule
+      // table decides, and anything it does not mark for gathering is left to the rule that owns it.
+      const gatherable = new Set(
+        supply.rules.filter((r) => (r.action ?? 'gather') === 'gather').map((r) => r.match));
       const MATERIALS = ['oak_log', 'coal_ore', 'iron_ore', 'copper_ore',
-                         'zinc_ore', 'lapis_ore', 'sand', 'gravel'];
+                         'zinc_ore', 'lapis_ore', 'sand', 'gravel']
+        .filter((m) => gatherable.has(m));
 
       // ONE LIVE GATHER PER MATERIAL.
       //
