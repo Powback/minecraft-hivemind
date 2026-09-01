@@ -810,6 +810,14 @@ function OnGetTasks(p_ID, p_Message)
             enabled = v.enabled, paused = v.paused,
             assigned = v.assigned, assignedTo = v.assignedTo,
             role = RoleForWork(v.work),
+            -- THE FIELD THAT DECIDES THE ORDER WAS THE ONE FIELD NOBODY COULD SEE.
+            --
+            -- priority governs which task a freed drone is offered next, and this serialisation --
+            -- the only way anything outside the world learns about a task -- omitted it. So "why is
+            -- the shaft never picked up" could be answered only by reading source and reasoning
+            -- about a number that could not be observed from anywhere. It produced two wrong
+            -- theories in one session, including "it is never stored at all", which it is not.
+            priority = v.priority,
             -- THE REASON A TASK IS STUCK IS THE MOST USEFUL FIELD ON IT, AND IT WAS NOT SENT.
             --
             -- dependsOn is what makes the queue a TREE rather than a list: order.build queues the
@@ -1713,6 +1721,19 @@ local function placeBlockers()
                 PowNet.MarkDirty()
                 return s_Placed          -- place it on the next tick, once the drone is idle
             end
+
+            -- SAY WHY A BLOCKER IS GOING NOWHERE. THIS PATH WAS ENTIRELY SILENT.
+            --
+            -- The ordinary placement loop reports "could not place X (role): reason" every tick.
+            -- Blockers bypass it, and when placeBlockers could neither start nor preempt it simply
+            -- fell through and tried again next tick, for ever, saying nothing.
+            --
+            -- shaft-mine_head-01 -- the only route to redstone -- sat unplaced for hours and never
+            -- appeared in this log ONCE. Every diagnosis of it was therefore guesswork against
+            -- hive.plan's "no miner free", which is HQ describing the fleet, not TaskMan explaining
+            -- its own decision. Two separate wrong theories came out of that gap.
+            Log(("blocker %s could not be placed: no free %s, and nothing preemptable on %d drone(s)")
+                :format(tostring(v.name), tostring(s_Role), #fleet()))
         end
     end
     return s_Placed

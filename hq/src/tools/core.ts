@@ -1146,6 +1146,15 @@ function describeTask(t: any) {
     assignedTo: typeof t.assignedTo === 'number' ? t.assignedTo : null,
     assigned: t.assigned ?? null,
     progress: t.progress ?? null,
+    // THE FIELD THAT DECIDES THE ORDER WAS THE ONE FIELD NOBODY COULD SEE.
+    //
+    // priority governs which task a freed drone is offered next, and it appeared in no tool output
+    // anywhere -- not here, not hive.plan, not the map. So "why is the shaft never picked up" could
+    // only be answered by reading TaskMan's source and reasoning about a number that could not be
+    // observed, which produced two wrong theories before this was added.
+    // Passed through raw rather than defaulted: absent means "TaskMan never stored one", which is
+    // a different fact from "it is set to null" and is exactly the fact that mattered here.
+    priority: t.priority,
     paused: t.paused === true,
     enabled: t.enabled !== false,
     region, targets,
