@@ -6286,6 +6286,34 @@ local function burnFrom(p_DenseOnly)
     end
 end
 
+-- A DRONE AT ZERO CAN STILL TURN, AND THE FUEL IS RARELY IN FRONT OF IT.
+--
+-- turtle.suck() takes only from the block the turtle is FACING. suckUp and suckDown cover the other
+-- two of six directions, so relief that lands on any of the remaining four sides is invisible --
+-- and it lands wherever it lands: the deliverer drops from above, the casualty's own block is
+-- occupied by the casualty, and the items scatter to a neighbour.
+--
+-- Probed on D14 after hours at zero and several logged deliveries ("relieve: dropped 64 fuel onto
+-- D14"): suckDown=false, suck=false, suckUp=false, three slots used out of sixteen. Room to spare
+-- and nothing within reach. Meanwhile it held 72 items of cargo it could not deliver, and every
+-- relief run cost another drone a round trip that changed nothing.
+--
+-- Turning costs no fuel in CC, so this is the one recovery a completely empty drone can still
+-- perform for itself. pgps.turnRight rather than turtle.turnRight, so the heading stays tracked --
+-- a raw turn silently desynchronises position for everything afterwards.
+--
+-- lua-hygiene: allow (collects delivered fuel lying in the world, not a chest)
+local function sweepAllSidesForFuel()
+    if turtle.getFuelLevel() ~= 0 then return end
+    for _ = 1, 4 do
+        for _ = 1, 4 do
+            if not turtle.suck(8) then break end
+        end
+        if turtle.getFuelLevel() ~= 0 then return end
+        pgps.turnRight()
+    end
+end
+
 function TryRefuel()
     local s_Level = turtle.getFuelLevel()
     if s_Level == "unlimited" then return false end
@@ -6297,6 +6325,7 @@ function TryRefuel()
             if not suck(8) then break end
         end
     end
+    sweepAllSidesForFuel()
 
     -- BURN WHAT IS NEEDED. KEEP THE REST.
     --
