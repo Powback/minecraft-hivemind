@@ -7387,6 +7387,22 @@ local function surfaceIfBuried()
         s_Rose = s_Rose + 1
     end
     trace(("climbed %d block(s) toward the surface"):format(s_Rose))
+
+    -- A DRONE THAT CANNOT MOVE IS NOT IDLE, WHATEVER IT HAS IN THE TANK.
+    --
+    -- Climbing zero blocks from under the floor means the way up is solid: the drone is walled in,
+    -- and if it cannot dig it is not getting out alone. But with fuel aboard and no job it reports
+    -- "idle" -- because idle is what a drone with nothing to do says -- so every recovery path
+    -- declines it. recover.dispatch answered "#47 is idle, not stranded or lost" for a crafter
+    -- entombed at y=46 with 8,634 fuel, while the settlement's whole chest and plank chain waited
+    -- on it.
+    --
+    -- Same principle the heartbeat already states for the other direction: this field is about
+    -- AVAILABILITY. Say blocked, say why, and let the dig-out that exists for this do its job.
+    if s_Rose == 0 and not CanDig() then
+        Distress("buried", ("walled in at %d,%d,%d with %s fuel -- no pickaxe, needs a dig-out")
+                 :format(px, py, pz, tostring(turtle.getFuelLevel())))
+    end
 end
 
 local function goHomeIfOutside()
