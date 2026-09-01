@@ -355,7 +355,22 @@ function SendHeartBeat()
     -- mid-haul rather than one with nothing to do, and sends whoever is looking at the wrong
     -- problem. Cleared where idle is actually DECIDED, not where one particular path happens to
     -- pass through.
-    if not executing and m_Status == "idle" and (m_Detail ~= nil or m_Haul ~= nil) and not m_Depositing then
+    -- A DETAIL MUST NOT OUTLIVE THE JOB THAT SET IT, WHATEVER THE STATUS SAYS.
+    --
+    -- This cleared the detail only while the status was "idle". A drone reporting anything else --
+    -- "blocked", most of all -- kept whatever string the last job left behind, for ever.
+    --
+    -- The result is a panel that lies with total confidence. D31 sat reading
+    -- "stranded ... out of fuel -- cannot reach any chest" while holding 2,532 fuel, because that
+    -- Doing() was written during a shortage that had since been relieved. It misled the diagnosis
+    -- of this very problem twice: the number and the sentence beside it disagreed, and the sentence
+    -- is what gets read.
+    --
+    -- The status field already says whether the drone is stuck, and `stuck` says why -- neither of
+    -- them needs the detail to survive. m_Depositing and m_Refuelling still protect the two
+    -- intervals where work is genuinely happening without a JOB running.
+    if not executing and not m_Depositing and not m_Refuelling
+       and (m_Detail ~= nil or m_Haul ~= nil) then
         m_Detail = nil
         m_Haul = nil
     end
