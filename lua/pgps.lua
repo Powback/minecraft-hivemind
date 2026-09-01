@@ -172,7 +172,31 @@ end
 -- HARD means no fallback will ever help: the answer is the same from every square, in every
 -- direction, until a human changes something. It must stop the attempt and be reported, loudly.
 -- SOFT is an ordinary obstruction, which is what the fallbacks are actually for.
-local HARD_MOVE_ERRORS = { "protected", "fuel" }
+-- "lava" joins these because it is unfixable BY RETRYING, which is what hard means here. Retrying a
+-- step into lava is not merely futile; it is the one mistake that ends with no drone.
+local HARD_MOVE_ERRORS = { "protected", "fuel", "lava" }
+
+-- LAVA IS THE ONE THING A TURTLE CANNOT SURVIVE, AND NOTHING IN THIS CODEBASE HAS EVER LOOKED FOR IT.
+--
+-- A grep for "lava" across the whole of DroneLogic and pgps found exactly one hit: lava_bucket, in
+-- the list of things that can be burned as fuel. Every move primitive stepped wherever it was told.
+--
+-- That cost nothing while the fleet worked at y=40 and above, where there is essentially none. It
+-- becomes the deciding risk the moment anything mines deep -- and it has to, because redstone gates
+-- the wired modems that make a chest visible to StorageMan, and redstone's dense band is around
+-- y=-50. The fleet has never been below about y=-10.
+--
+-- With three drones left, losing one to lava costs more than the redstone is worth, so the check
+-- comes first and the depth change second.
+local LETHAL_BLOCKS = { ["minecraft:lava"] = true, ["minecraft:flowing_lava"] = true }
+
+-- p_Inspect is turtle.inspect / inspectUp / inspectDown. It returns false for air, and a table for
+-- any block including fluids, so lava is genuinely visible here.
+local function lavaAt(p_Inspect)
+    local s_Ok, s_Block = p_Inspect()
+    if not s_Ok or type(s_Block) ~= "table" then return false end
+    return LETHAL_BLOCKS[s_Block.name] == true
+end
 
 local m_LastMoveError = nil
 -- Seconds between forced re-fixes triggered by a surprising move failure. See forward().
@@ -1490,6 +1514,26 @@ function ensureHeading(p_Force)
     return false, "could not determine heading"
 end
 
+-- EVERY REASON A STEP CAN BE REFUSED BEFORE IT IS ATTEMPTED, IN ONE PLACE.
+--
+-- Policy first, because it is free -- coordinates only. Then the world, which costs an inspect.
+-- Its own function so forward(), already the most complex thing here, does not carry four decisions
+-- that are not about moving.
+--
+-- "out of bounds" is not in HARD_MOVE_ERRORS, so routing it through moveFailed is the same
+-- false, "out of bounds" it returned before -- no log, no yield.
+local function stepRefusal(p_Dir, p_X, p_Y, p_Z)
+    if p_Dir ~= nil and p_X ~= nil then
+        local F = deltas[p_Dir]
+        if not mayStep(p_X + F[1], p_Y + F[2], p_Z + F[3]) then
+            m_BoundsStops = m_BoundsStops + 1
+            return "out of bounds"
+        end
+    end
+    if lavaAt(turtle.inspect) then return "lava ahead" end
+    return nil
+end
+
 function forward()
     -- Facing is as necessary as position, and is NOT implied by it.
     if cachedDir == nil then
@@ -1508,14 +1552,9 @@ function forward()
         return false, "position unverified"
     end
 
-    -- Refuse rather than step out of the world we can operate in.
-    if cachedDir and cachedX then
-        local F = deltas[cachedDir]
-        if not mayStep(cachedX + F[1], cachedY + F[2], cachedZ + F[3]) then
-            m_BoundsStops = m_BoundsStops + 1
-            return false, "out of bounds"
-        end
-    end
+    -- Refuse rather than step out of the world we can operate in, or into something lethal.
+    local s_Refusal = stepRefusal(cachedDir, cachedX, cachedY, cachedZ)
+    if s_Refusal then return moveFailed(s_Refusal) end
     local D = deltas[cachedDir]--if north, D = {0, 0, -1}
     local x, y, z = cachedX + D[1], cachedY + D[2], cachedZ + D[3]--adds corisponding delta to direction
     local idx_pos = x..":"..y..":"..z
@@ -1654,6 +1693,8 @@ function up()
     local x, y, z = cachedX + D[1], cachedY + D[2], cachedZ + D[3]
     local idx_pos = x..":"..y..":"..z
 
+    if lavaAt(turtle.inspectUp) then return moveFailed("lava above") end
+
     local s_Moved, s_MoveErr = turtle.up()
     if s_Moved then
         cachedX, cachedY, cachedZ = x, y, z
@@ -1683,6 +1724,9 @@ function down()
     local D = deltas[Down]
     local x, y, z = cachedX + D[1], cachedY + D[2], cachedZ + D[3]
     local idx_pos = x..":"..y..":"..z
+
+    -- The one that matters most: a shaft descends, and a lava lake is a floor you fall into.
+    if lavaAt(turtle.inspectDown) then return moveFailed("lava below") end
 
     local s_Moved, s_MoveErr = turtle.down()
     if s_Moved then
