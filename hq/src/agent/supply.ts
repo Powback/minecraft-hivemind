@@ -81,17 +81,43 @@ export const DEFAULT_RULES: SupplyRule[] = [
   // 256 is a little under an hour of headroom at the measured burn: enough that a failed or slow
   // gather does not immediately strand anyone, without hoarding into a warehouse that has 6 free
   // slots. Revisit if the burn rate changes -- the number is derived from it, not chosen.
+  //
+  // THESE DEPTHS WERE CALIBRATED FOR A MINECRAFT THAT NO LONGER EXISTS.
+  //
+  // Before 1.18, redstone and diamond lived below y=16 and gold below y=32, and the numbers here
+  // match that world exactly. Caves & Cliffs moved every one of them: the deep ores now follow a
+  // triangle distribution whose peak is near the world floor, and the old depths sit at the sparse
+  // top edge of the band rather than in it.
+  //
+  // Redstone is the one that matters, because it is the binding constraint on storage itself -- a
+  // chest is invisible to StorageMan without a wired modem, a modem is 8 stone and a redstone, and
+  // the base has sixteen crafted chests it cannot attach for want of one. Prospecting for it at
+  // y=12 is prospecting at the emptiest part of its range.
+  //
+  // Confirmed against what the fleet has actually observed, rather than from memory. world.query
+  // over the whole base region, by band:
+  //
+  //   y  40..64   71% mapped   coal 196, copper 173, zinc 34
+  //   y  16..40   34% mapped   coal 132, copper 100, iron 79, zinc 57, lapis 8
+  //   y -10..16   14% mapped   copper 46, iron 45, coal 23, zinc 19, deepslate_iron 14
+  //   y -40..-10   0% mapped   nothing -- 164 cells seen, ever
+  //   y -64..-40   0% mapped   nothing -- 94 cells seen, ever
+  //
+  // Deepslate appears at the bottom of the third band, so the boundary is where it should be, and
+  // the fleet has simply never gone below it. Not one redstone, gold, diamond or lapis has ever
+  // been observed, which is consistent: every one of them is now mostly below where anyone looked.
+  //
+  // Copper (peak y=48), coal (abundant y=0..192) and zinc are left alone -- theirs were already in
+  // range, which is why those three are the only ores the settlement has ever accumulated.
   { match: 'coal_ore', min: 256, action: 'gather', limit: 256, depth: 50 },
-  { match: 'iron_ore', min: 32, action: 'gather', limit: 64, depth: 35 },
+  { match: 'iron_ore', min: 32, action: 'gather', limit: 64, depth: 16 },
   { match: 'copper_ore', min: 32, action: 'gather', limit: 64, depth: 45 },
   { match: 'zinc_ore', min: 32, action: 'gather', limit: 64, depth: 40 },
-  // Redstone is the binding constraint on storage itself: a chest is invisible to StorageMan
-  // without a wired modem, and a modem is 8 stone and a redstone. The base filled to 21 free slots
-  // with sixteen unplaced chests in inventory for exactly this reason.
-  { match: 'redstone_ore', min: 32, action: 'gather', limit: 64, depth: 12 },
-  { match: 'lapis_ore', min: 16, action: 'gather', limit: 32, depth: 20 },
-  { match: 'gold_ore', min: 16, action: 'gather', limit: 32, depth: 20 },
-  { match: 'diamond_ore', min: 8, action: 'gather', limit: 32, depth: 0 },
+  // See the note above: the modem chain, and the reason it has never started.
+  { match: 'redstone_ore', min: 32, action: 'gather', limit: 64, depth: -50 },
+  { match: 'lapis_ore', min: 16, action: 'gather', limit: 32, depth: 0 },
+  { match: 'gold_ore', min: 16, action: 'gather', limit: 32, depth: -16 },
+  { match: 'diamond_ore', min: 8, action: 'gather', limit: 32, depth: -50 },
   { match: 'dirt', min: 64, action: 'gather', limit: 64 },
   // GATHER, NOT LUMBER -- because `lumber` was never implemented in the dispatcher.
   //

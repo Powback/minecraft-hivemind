@@ -1830,7 +1830,12 @@ registry.register({
     'so ordinary gather orders can collect it afterwards. Use when a material is short and the ' +
     'survey has never seen any of it.',
   params: z.object({
-    depth: z.number().int().min(-40).max(120).default(35).describe('Target Y. Coal ~50, iron ~35.'),
+    // MIN IS THE WORLD FLOOR, NOT A GUESS. Bedrock occupies y=-64..-60, so -59 is the lowest a
+    // turtle can stand. The old floor of -40 silently rejected the only depths at which 1.21
+    // redstone and diamond are common -- so the supply loop could not have asked for them even
+    // once the rule table was right. See the ore-depth note in agent/supply.ts.
+    depth: z.number().int().min(-59).max(120).default(35)
+      .describe('Target Y. Coal ~50, copper ~48, iron ~16, gold ~-16, redstone and diamond ~-50.'),
     length: z.number().int().min(4).max(64).default(24),
     branches: z.number().int().min(1).max(8).default(4),
     /**
