@@ -25,6 +25,7 @@ import { bridge } from '../bridge/ws.js';
 import { registry } from '../tools/registry.js';
 import { luaList } from '../lua-table.js';
 import { settlement, withinReach } from '../world/settlement.js';
+import { queueLumberSweep } from '../world/lumber.js';
 
 export interface SupplyRule {
   /** The BLOCK to go and mine, e.g. "coal_ore". */
@@ -580,52 +581,19 @@ async function dispatchLumber(rule: SupplyRule, have: number, ctx: SupplyCtx): P
     return false;
   }
 
-  const found: any = await bridge.call('MapServer', 'FindBlocks',
-    { match: rule.match, limit: 400 }, { timeoutMs: 15000 });
-  const hits = found?.hits ?? found?.data?.hits ?? [];
-  const all: any[] = (Array.isArray(hits) ? hits : Object.values(hits ?? {}))
-    .filter((h: any) => h && typeof h.x === 'number' && withinReach(h));
-
-  if (!all.length) {
-    note(`${rule.match}: ${have}/${rule.min}, no trees known inside the operating circle -> survey`);
+  const sweep = await queueLumberSweep(bridge, rule.match);
+  if (sweep.reason) {
+    note(`${rule.match}: ${have}/${rule.min}, ${sweep.reason} -> survey`);
     return dispatchSurvey(rule, have, ctx);
   }
-
-  // Densest first: count how many other known trunks sit inside the sweep this start would cover.
-  const SWEEP = 8;
-  let best = all[0];
-  let bestN = -1;
-  for (const h of all) {
-    const n = all.filter((o) =>
-      Math.abs(o.x - h.x) <= SWEEP && Math.abs(o.z - h.z) <= SWEEP).length;
-    if (n > bestN) { best = h; bestN = n; }
-  }
-
-  await bridge.call('TaskMan', 'Add', {
-    name: `lumber:${rule.match}`,
-    // FELLING OUTRANKS GATHERING FOR WOOD, BECAUSE IT IS THE ONE THAT WORKS.
-    //
-    // These two compete for the same miners and lumber was losing every time: order.gather queues
-    // at 2 and this queued at 3, so with lowest-first the fleet ran the gather permanently and the
-    // lumber task sat unassigned for the whole session.
-    //
-    // The gather is not merely second-best, it is close to useless for wood. Measured, repeatedly:
-    // "gather: 1/192 checked, 0 taken" -- it walks scattered individual log blocks, most of which
-    // are canopy it cannot stand beside. A lumber sweep fells whole trunks where they stand and
-    // REPLANTS: one measured run returned 16 logs and put a sapling back.
-    //
-    // So wood is priority 1 like the other fuels, and felling beats gathering outright rather than
-    // depending on a tie-break.
-    priority: 1,
-    work: { lumber: { w: SWEEP, l: SWEEP, start: { x: best.x, y: best.y, z: best.z } } },
-  }, { timeoutMs: 8000 });
 
   supply.cooldowns[rule.match] = ctx.now + COOLDOWN_MS;
   ctx.minerFree = false;
   supply.dispatched++;
-  supply.lastAction = `lumber at ${best.x},${best.y},${best.z}`;
-  note(`${rule.match}: ${have}/${rule.min} -> lumber sweep at ${best.x},${best.y},${best.z} `
-     + `(${bestN} trunks in range, fells and replants)`);
+  const at = sweep.at!;
+  supply.lastAction = `lumber at ${at.x},${at.y},${at.z}`;
+  note(`${rule.match}: ${have}/${rule.min} -> lumber sweep at ${at.x},${at.y},${at.z} `
+     + `(${sweep.trunks} trunks in range, fells and replants)`);
   ctx.did.push(`lumber ${rule.match}`);
   return true;
 }

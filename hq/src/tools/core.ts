@@ -11,6 +11,7 @@
  * silently, because a limit the model knows about becomes a plan; a limit it
  * discovers becomes a retry loop.
  */
+import { queueLumberSweep } from '../world/lumber.js';
 import { z } from 'zod';
 import { registry, ToolError } from './registry.js';
 import { state, STALE_MS, type Vec3, type DroneStatus } from '../world/state.js';
@@ -686,6 +687,20 @@ registry.register({
     return { enabled: supply.enabled, rules: supply.rules, tick: tick ?? null };
   },
 });
+
+/**
+ * Queue a real lumber sweep for a plan step whose action is 'lumber', or null if there is nothing
+ * to fell. Its own function because the executor it serves is already far over the complexity gate.
+ */
+async function sweepForLumberStep(
+  step: { action: string; item: string; runs: number },
+  after: number | undefined,
+): Promise<{ item: string; runs: number; action: string; task: number; after: number | undefined } | null> {
+  if (step.action !== 'lumber') return null;
+  const sweep = await queueLumberSweep(bridge, step.item.replace(/^[a-z0-9_]+:/, ''));
+  if (sweep.task === undefined) return null;
+  return { item: step.item, runs: step.runs, action: 'lumber', task: sweep.task, after };
+}
 
 // ── order.gather ───────────────────────────────────────────────────────────
 // The consuming half of surveying. world.find already knows where things are; without this the
@@ -1718,7 +1733,26 @@ registry.register({
       // order.gather is region-filtered and nearest-first, so this is safe to fire automatically.
       // Anything it cannot source (no known deposits) still comes back as needsSite for a human.
       if (step.action !== 'craft') {
-        if (step.action === 'gather' || step.action === 'lumber') {
+        // A LUMBER STEP IS NOT A GATHER STEP, AND TURNING IT INTO ONE COST THE WHOLE ECONOMY.
+        //
+        // This recognised 'lumber' by name and then queued a GATHER for it anyway. So the craft
+        // chain itself -- chest needs planks, planks need logs -- kept ordering the one wood job
+        // that does not work, within seconds of anyone clearing it. Measured repeatedly across four
+        // drones: "gather: 1/192 checked, 0 taken", because a gather visits individual mapped log
+        // blocks and most of them are canopy with no standable face. A sweep over the same trees
+        // returned 16 logs and replanted.
+        //
+        // Wood is the only renewable fuel, so this is why the settlement stayed fuel-starved, why
+        // the plank chain never started, and therefore why nothing was ever BUILT: order.build
+        // allocates a plot and queues the crafting it needs, and that crafting never completed for
+        // want of planks. Eighteen storage plots sit in 'clearing' behind exactly this.
+        const felled = await sweepForLumberStep(step, previous);
+        if (felled) { queued.push(felled); previous = felled.task; continue; }
+        // A lumber step that could not be felled falls through to the reporting below as needsSite.
+        // It deliberately does NOT fall back to a gather: that is the job measured at
+        // "1/192 checked, 0 taken", and answering "there are no trees in reach" honestly is worth
+        // more than dispatching a drone to prove it.
+        if (step.action === 'gather') {
           try {
             const g: any = await registry.invoke('order.gather',
               { match: step.item.replace(/^[a-z0-9_]+:/, ''), limit: 64 }, ctx);

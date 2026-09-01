@@ -233,8 +233,21 @@ describe('wood is harvested by lumber, not gather', () => {
   });
 
   it('aims at the densest cluster, since a sweep is paid for by trees-per-trip', () => {
-    const fn = /async function dispatchLumber\(([\s\S]*?)\n\}/.exec(SRC2)![1];
-    expect(fn).toMatch(/bestN/);
-    expect(fn, 'the task must carry a sweep area and a start').toMatch(/lumber:\s*\{\s*w:/);
+    // The sweep moved into world/lumber.ts so the plan executor could share it -- see the note
+    // there. It queued a GATHER for lumber steps, which is how the fleet ended up running the
+    // useless wood job no matter how often the rule table said otherwise.
+    const src = readFileSync(path.resolve(__dirname, '../src/world/lumber.ts'), 'utf8');
+    expect(src, 'densest cluster, not nearest tree').toMatch(/bestN/);
+    expect(src, 'the task must carry a sweep area and a start').toMatch(/lumber:\s*\{\s*w:/);
+  });
+
+  it('every path that wants wood goes through the one sweep', () => {
+    // THREE places decided how to obtain oak_log and two of them queued a gather: the idle top-up
+    // loop and the plan executor, the latter even for steps whose action was already 'lumber'.
+    // That is why clearing gather:oak_log by hand did nothing -- it was recreated within seconds.
+    const core = readFileSync(path.resolve(__dirname, '../src/tools/core.ts'), 'utf8');
+    expect(core, "a lumber step must not be turned into a gather")
+      .not.toMatch(/step\.action === 'gather' \|\| step\.action === 'lumber'/);
+    expect(core, 'the plan executor should queue a real sweep').toMatch(/queueLumberSweep/);
   });
 });
