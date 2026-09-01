@@ -7365,6 +7365,25 @@ local function idleDockLoop()
     end
 end
 
+-- Stop working and get home while there is still fuel to do it with. See the call site.
+--
+-- Deliberately does NOT set m_Refuelling: there is nothing to refuel with, and marking the drone
+-- unavailable would only hide it from the relief that is its actual way out.
+local function parkForFuel(p_Fuel, p_Floor)
+    local hx, hy, hz = HomeXYZ()
+    local cx, _, cz = pgps.getCachedPosition()
+    if cx == nil then return end
+    -- Already home: nothing to spend the tank on. Sit still and wait for the furnaces.
+    if math.abs(cx - hx) + math.abs(cz - hz) <= 4 then return end
+    trace(("fuel at %d (floor %d) and storage is dry -- heading home to wait rather than "
+           .. "stranding in the field"):format(p_Fuel, p_Floor))
+    executing = false
+    pgps.BreakExec()
+    os.sleep(2)
+    pgps.StartExec()
+    pcall(TravelTo, hx, hy, hz)
+end
+
 local function fuelLoop()
     while true do
         os.sleep(FUEL_WATCH_EVERY)
@@ -7374,6 +7393,29 @@ local function fuelLoop()
             s_Fuel = turtle.getFuelLevel()
         end
         local s_Floor = FuelFloorNow()
+
+        -- AN EMPTY LARDER IS A REASON TO COME HOME, NOT A REASON TO KEEP WORKING UNTIL ZERO.
+        --
+        -- StorageKnownDry suppresses the break-off below, and rightly: a drone that walks to empty
+        -- chests, finds nothing, and immediately does it again gridlocks the bay for everyone. But
+        -- suppressing the break-off and nothing else means the drone carries on working until it
+        -- hits exactly 0 -- wherever it happens to be, which is by definition away from base.
+        --
+        -- That is the most expensive place to run out. A drone parked ON the chest can refuel itself
+        -- the moment the furnaces produce anything, for nothing; a drone stranded in the field needs
+        -- another drone to fly out with coal, and that flight costs more fuel than it delivers.
+        --
+        -- Measured on D14, repeatedly: "fuel at 0 (floor 477 for this position) -- breaking off to
+        -- refuel", the message arriving only once the dry flag expired and the tank was already
+        -- empty. Every occurrence cost D4 -- the settlement's only crafter -- a relief run.
+        --
+        -- So: still no thrashing at the chests, but spend the last of the tank getting home rather
+        -- than on work that cannot be finished. goHomeIfOutside does the same thing for a different
+        -- reason; this is the fuel case.
+        if s_Fuel ~= "unlimited" and s_Fuel < s_Floor and StorageKnownDry(s_Fuel) and not m_Docked then
+            parkForFuel(s_Fuel, s_Floor)
+        end
+
         if s_Fuel ~= "unlimited" and s_Fuel < s_Floor and not StorageKnownDry(s_Fuel) then
             trace(("fuel at %d (floor %d for this position) -- breaking off to refuel")
                 :format(s_Fuel, s_Floor))
