@@ -70,6 +70,12 @@ local executing = false
 -- undone by the very line it used to interrupt the job.
 local m_Refuelling = false
 
+-- Walled in: the way up is solid and this drone has no pickaxe. Set by surfaceIfBuried, cleared the
+-- moment a climb succeeds. Kept as state rather than a one-shot Distress because the fleet's rescue
+-- machinery samples status over several passes, and a condition that flickers is one it discards --
+-- see settledHealthy in TaskMan.
+local m_Buried = false
+
 -- ONE ANSWER TO "CAN THIS DRONE TAKE WORK".
 --
 -- Three places decided this. RunJob and OnSurvey both refused while m_Refuelling; SendHeartBeat --
@@ -86,6 +92,13 @@ local m_Refuelling = false
 -- Returns the REASON rather than a boolean, because "busy" and "refuelling" want different
 -- responses and the log has to name which one it was.
 local function unavailableReason()
+    -- A WALLED-IN DRONE MUST NOT KEEP ACCEPTING WORK.
+    --
+    -- D4 sat entombed at y=46 taking job after job it could not begin, so its status flickered
+    -- between "stuck" and "hauling" -- and TaskMan's health sweep kept catching it in a hauling
+    -- moment and cancelling the dig-out that had just been queued for it. Refusing work holds the
+    -- status still, which is what lets the rescue survive long enough to be placed.
+    if m_Buried then return "buried" end
     if m_Refuelling then return "refuelling" end
     if executing then return "busy" end
     return nil
@@ -7376,7 +7389,10 @@ local function surfaceIfBuried()
     local px, py, pz = pgps.getCachedPosition()
     if px == nil or py == nil then return end
     local _, hy = HomeXYZ()
-    if py >= ((hy or 63) - UNDERGROUND_BELOW_HOME) then return end
+    if py >= ((hy or 63) - UNDERGROUND_BELOW_HOME) then
+        m_Buried = false            -- back at working height; whatever it was, it is over
+        return
+    end
     trace(("idle and buried at %d,%d,%d -- climbing toward the surface to get a fix back")
           :format(px, py, pz))
     local s_Rose = 0
@@ -7399,7 +7415,8 @@ local function surfaceIfBuried()
     --
     -- Same principle the heartbeat already states for the other direction: this field is about
     -- AVAILABILITY. Say blocked, say why, and let the dig-out that exists for this do its job.
-    if s_Rose == 0 and not CanDig() then
+    m_Buried = (s_Rose == 0 and not CanDig())
+    if m_Buried then
         Distress("buried", ("walled in at %d,%d,%d with %s fuel -- no pickaxe, needs a dig-out")
                  :format(px, py, pz, tostring(turtle.getFuelLevel())))
     end
