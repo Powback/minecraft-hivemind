@@ -196,6 +196,28 @@ local function moveFailed(p_Err)
         -- Printed as well as returned: a hard error means the drone is going nowhere at all, and
         -- that deserves to be visible without anyone having to ask the right question first.
         ptrace("MOVE REFUSED: " .. tostring(p_Err))
+
+        -- YIELD. A DRONE THAT CANNOT MOVE MUST NOT SPIN LEARNING THAT.
+        --
+        -- Every other way a step ends goes through turtle.forward/up/down, which is a server round
+        -- trip and therefore yields on its own. This branch does not: pgps refuses the move itself,
+        -- before any turtle call, so the caller's retry loop is pure Lua with nothing in it that
+        -- ever gives up the coroutine. CC:T kills a coroutine that runs ~10s without yielding, and
+        -- the kill is uncatchable -- the computer ends up OFF with a clean-looking last-run.
+        --
+        -- Measured on D14 at zero fuel: "MOVE REFUSED: Out of fuel [x211 more in the last 60s]",
+        -- and then gather:gold_ore failing with "/pgps:2359: Too long without yielding". The line
+        -- number pointed at a file write, because that is merely where the axe happened to fall.
+        --
+        -- os.sleep(0) rather than the queueEvent/pullEvent trick used elsewhere: that one resumes in
+        -- the SAME tick, which keeps CC happy but leaves the drone spinning at full tick rate over a
+        -- condition only another drone can fix. A hard refusal cannot clear faster than a tick, so
+        -- waiting one costs nothing and turns a busy loop into an idle one.
+        --
+        -- lua-hygiene: allow (the tick IS the point here. That rule exists for hot loops that need
+        -- to satisfy the watchdog without paying a tick per iteration; this is the opposite case --
+        -- a refusal only another drone can clear, where spinning at full tick rate is the bug.)
+        os.sleep(0)
     end
     return false, p_Err
 end
