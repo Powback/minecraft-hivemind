@@ -440,6 +440,55 @@ end
 -- that no longer exists -- heartbeats fire only at boot and shutdown -- so a drone that is mined
 -- out of the world stays "idle" forever. D1 dug up D2, and D2 was still being offered work
 -- afterwards: a slab of the site would simply never be dug and the task would never complete.
+-- PLACING A BLOCK NEEDS NO SPECIAL HARDWARE.
+--
+-- Digging needs a pickaxe and scanning needs a geo scanner, so those jobs genuinely belong to one
+-- role. Building needs neither -- every turtle can place -- and routing it to "miner" left a build
+-- queued indefinitely while a crafter and a loader sat idle on their docks.
+--
+-- Its own function so it reads as the sibling of anyoneForRescue below, which is what it is: both
+-- are "prefer that role, but do not make it a requirement".
+local function anyoneForBuild(p_Task, p_Where)
+    if p_Task.work == nil or p_Task.work.build == nil then return nil end
+    for _, alt in ipairs({"crafter", "loader", "scout"}) do
+        local d = pickDrone(alt, p_Where)
+        if d ~= nil then
+            Log("build going to a " .. alt .. " -- no miner free")
+            return d
+        end
+    end
+    return nil
+end
+
+-- A RESCUE THAT ONLY A MINER MAY PERFORM IS NO RESCUE WHEN THE MINERS ARE THE CASUALTIES.
+--
+-- A dig-out is named for the casualty's own role, so rescue-D31 comes out role=miner. That is the
+-- right PREFERENCE -- freeing a buried drone needs a pickaxe and a crafter has none. It is the
+-- wrong REQUIREMENT, because the situation in which no miner is available is usually the situation
+-- in which the miners are the ones needing rescue.
+--
+-- Measured, and it deadlocked the settlement: rescue-D31 and rescue-D36 both sat unassigned at
+-- role=miner while all three miners read fuel 0 and D4, a crafter, idled at 6,363 fuel beside 238
+-- charcoal in storage. Nothing moved for nine minutes. The one drone able to help was refused on a
+-- technicality about which tool it carries.
+--
+-- This file already argues the same point about the other half of the guess: "calling a TRAPPED
+-- drone dry sends someone with coal, which any drone can carry -- if that was the wrong guess the
+-- attempt fails cheaply and rescueTries escalates." A crafter cannot dig anyone out, but most
+-- casualties are not buried, and arriving with fuel fixes the common case.
+--
+-- Returns nil for anything that is not a rescue, so the caller can use it as a plain fallback.
+local function anyoneForRescue(p_Task, p_Where, p_MinFuel, p_Role)
+    local w = p_Task.work and p_Task.work.rescue
+    if w == nil then return nil end
+    local d = pickDrone(ANY_ROLE, p_Where, w.id, p_MinFuel)
+    if d == nil then return nil end
+    Log(("rescue for %s going to %s (a %s) -- no %s free, and most casualties want fuel rather "
+         .. "than a tunnel"):format(tostring(w.drone), tostring(d.name), tostring(d.role),
+                                    tostring(p_Role)))
+    return d
+end
+
 local function pickDrones(p_Role)
     local s_Free, s_Busy = {}, nil
     for _, d in ipairs(fleet()) do
@@ -539,15 +588,10 @@ function OnStartTask(p_ID, p_Message)
     -- one role. Building needs neither -- every turtle can place -- and routing it to "miner" left
     -- a build queued indefinitely while a crafter and a loader sat idle on their docks. Prefer a
     -- miner, then take whoever is free.
-    if s_Drone == nil and s_Task.work and s_Task.work.build then
-        for _, alt in ipairs({"crafter", "loader", "scout"}) do
-            s_Drone = pickDrone(alt, s_Where)
-            if s_Drone ~= nil then
-                Log("build going to a " .. alt .. " -- no miner free")
-                break
-            end
-        end
-    end
+    s_Drone = s_Drone or anyoneForBuild(s_Task, s_Where)
+
+    -- A rescue prefers a miner but must not REQUIRE one -- see anyoneForRescue.
+    s_Drone = s_Drone or anyoneForRescue(s_Task, s_Where, s_MinFuel, s_Role)
     if s_Drone == nil then
         if s_Busy then
             return false, "every " .. s_Role .. " is busy (" .. tostring(s_Busy.name) .. ")"
