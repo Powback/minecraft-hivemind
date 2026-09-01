@@ -1023,6 +1023,9 @@ local SMELT_RANK = { wood = 1, ore = 2, other = 5, bulk = 9 }
 -- the fuel input AND a building material -- ore has no competing use.
 local WOOD_CRAFT_RESERVE = 16
 
+-- The most a furnace takes from one input in a tick. Was written inline as 32.
+local SMELT_BATCH = 32
+
 local function reservedForCrafting(p_Name, p_Entry)
     if smeltCategory(p_Name) ~= "wood" then return false end
     return (tonumber(p_Entry.total) or 0) <= WOOD_CRAFT_RESERVE
@@ -1063,18 +1066,34 @@ local function bestSmeltInput()
     -- the same reason the supply loop refuses to gather dirt during a fuel emergency: everything
     -- else the settlement wants is downstream of being able to move.
     local s_Scarce = fuelInStorage() < SMELT_FUEL_RESERVE
-    local s_Best, s_Rank = nil, nil
+    local s_Best, s_Rank, s_Name = nil, nil, nil
     for name, e in pairs(m_Index) do
         if e.at[1] and isSmeltableInput(name) and not reservedForCrafting(name, e) then
             local r = smeltRank(name)
             -- Rank 1 is the fuel-positive smelt (logs -> charcoal). When fuel is scarce that is the
             -- only thing allowed in, so a furnace either grows the supply or stays cold.
             if (not s_Scarce) or r == 1 then
-                if s_Rank == nil or r < s_Rank then s_Best, s_Rank = e, r end
+                if s_Rank == nil or r < s_Rank then s_Best, s_Rank, s_Name = e, r, name end
             end
         end
     end
-    return s_Best
+    return s_Best, s_Name
+end
+
+-- HOW MANY OF IT A FURNACE MAY TAKE THIS TICK.
+--
+-- reservedForCrafting decides WHETHER wood may be smelted; this decides HOW MUCH, and without it
+-- the reserve does nothing. The check runs before an input is chosen and the transfer then moves a
+-- whole batch, so a delivery of 32 logs went into the first furnace in one push -- 32 is above the
+-- floor, therefore allowed, therefore all of it -- and the floor never got the chance to bite.
+--
+-- Measured: the crafter hauled oak_log x32 home, and the very next plank craft threw "short of
+-- minecraft:oak_log x32". The wood arrived and was burned between one job and the next.
+local function smeltAllowance(p_Name, p_Entry)
+    if p_Entry == nil then return 0 end
+    if smeltCategory(tostring(p_Name)) ~= "wood" then return SMELT_BATCH end
+    local n = tonumber(p_Entry.total) or 0
+    return math.max(0, math.min(SMELT_BATCH, n - WOOD_CRAFT_RESERVE))
 end
 
 local function drainTo(p_Fur, p_Slot)
@@ -1171,7 +1190,10 @@ end
 
 -- The one thing this face is for.
 local function fillFor(p_IsInputFace)
-    if p_IsInputFace then return bestSmeltInput(), 32 end
+    if p_IsInputFace then
+        local e, name = bestSmeltInput()
+        return e, smeltAllowance(name, e)
+    end
     return firstInStorage(isFuel), 16
 end
 
