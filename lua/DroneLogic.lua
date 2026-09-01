@@ -6173,6 +6173,25 @@ local FUEL_LOW = 4000
 -- so there is something left over to carry to storage.
 local FUEL_KEEP = 2500
 
+-- Burn from the inventory, optionally restricted to the dense fuels. Its own function so TryRefuel
+-- can make two passes without carrying the loop twice, and so the complexity gate stays quiet.
+--
+-- refuel(1) burns a SINGLE item and silently ignores anything that is not fuel, so the drone can
+-- stop the moment it has enough and carry the remainder home. A fuel economy needs a surplus, and
+-- a surplus needs somebody to stop eating.
+local function burnFrom(p_DenseOnly)
+    for i = 1, 16 do
+        if turtle.getFuelLevel() >= FUEL_KEEP then return end
+        local s_Det = turtle.getItemDetail(i)
+        if s_Det ~= nil and ((not p_DenseOnly) or FUEL_NAMES[s_Det.name]) then
+            turtle.select(i)
+            while turtle.getItemCount(i) > 0 and turtle.getFuelLevel() < FUEL_KEEP do
+                if not turtle.refuel(1) then break end
+            end
+        end
+    end
+end
+
 function TryRefuel()
     local s_Level = turtle.getFuelLevel()
     if s_Level == "unlimited" then return false end
@@ -6196,17 +6215,22 @@ function TryRefuel()
     -- refuel(1) burns a single item, so the drone can stop the moment it has enough and carry the
     -- remainder home. A fuel economy needs a surplus, and a surplus needs somebody to stop eating.
     local s_Before = turtle.getFuelLevel()
-    for i = 1, 16 do
-        if turtle.getFuelLevel() >= FUEL_KEEP then break end
-        if turtle.getItemCount(i) > 0 then
-            turtle.select(i)
-            -- refuel(1) silently ignores anything that is not fuel, so this is safe to try on
-            -- every slot rather than needing to identify fuel items first.
-            while turtle.getItemCount(i) > 0 and turtle.getFuelLevel() < FUEL_KEEP do
-                if not turtle.refuel(1) then break end   -- not fuel: leave the slot alone
-            end
-        end
-    end
+    -- DENSE FUEL FIRST. A LOG BURNED RAW IS WORTH A FIFTH OF THE SAME LOG SMELTED.
+    --
+    -- This walked the slots in order and burned the first thing that would light, so a drone
+    -- holding coal in slot 9 and freshly cut logs in slot 2 ate the logs. A log is 15 fuel; smelted
+    -- to charcoal it is 80. Burning the cargo raw does not merely waste it -- it is the reason the
+    -- settlement never accumulates anything, because the wood is destroyed on the way home at a
+    -- fifth of the value it was gathered for.
+    --
+    -- Measured on D14 mid-gather: "gather: 23/192 checked, 5 taken" and, in the same minute,
+    -- "refuelled +15 [x3 more in the last 60s]" -- four of the five logs it had just cut, burned
+    -- before they could reach a furnace. oak_log in storage: 0, for hours.
+    --
+    -- Two passes. Coal and charcoal first, then anything -- so a drone with no dense fuel still
+    -- burns wood rather than stranding. Survival is unchanged; only the ORDER is.
+    burnFrom(true)
+    burnFrom(false)
     turtle.select(1)
     local s_Gained = turtle.getFuelLevel() - s_Before
     if s_Gained > 0 then
