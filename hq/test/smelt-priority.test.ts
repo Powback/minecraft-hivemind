@@ -95,14 +95,38 @@ describe('furnace input priority', () => {
  *
  * Below the reserve, only the fuel-POSITIVE smelt is allowed in: a furnace either grows the fuel
  * supply or stays cold.
+ *
+ * That one emergency line turned out to be too late to help. It protects the LAST 32 fuel and says
+ * nothing about the fuel before it, so once the ore ran out -- all of it already ingots -- and no
+ * logs were in stock, cobblestone became the only smeltable thing in storage and the furnaces spent
+ * everything down to the line on it: 3,450 stone, charcoal 446 -> 0, nothing else able to move.
+ *
+ * So the gate is a floor PER RANK now. Rank 1 keeps floor 0 and still runs on the last log, because
+ * it is the smelt that makes fuel; every other rank has to leave its own floor behind, which lets
+ * the ranking say "not worth it yet" rather than only "not right now".
  */
 describe('furnaces during a fuel shortage', () => {
-  it('smelts only rank-1 (fuel-positive) input when storage fuel is scarce', () => {
-    const body = /local function bestSmeltInput\(\)([\s\S]*?)\nend/.exec(CODE);
+  it('gates every candidate on a floor, and lets only rank 1 run to empty', () => {
+    const body = /local function bestSmeltInput\(\)([\s\S]*?)\nend\n/.exec(CODE);
     expect(body, 'bestSmeltInput must exist').toBeTruthy();
-    // The scarcity test must be present AND must gate the candidate, not merely be computed.
-    expect(body![1]).toMatch(/fuelInStorage\(\)\s*<\s*SMELT_FUEL_RESERVE/);
-    expect(body![1], 'scarcity must restrict the choice to rank 1').toMatch(/r\s*==\s*1/);
+    // The fuel level must gate the candidate, not merely be computed next to it.
+    expect(body![1], 'the chooser must consult the fuel level').toMatch(/fuelInStorage\(\)/);
+    expect(body![1], 'the floor must gate the candidate').toMatch(/s_Fuel\s*>=\s*smeltFloor\(r\)/);
+  });
+
+  it('only the fuel-positive smelt may run the tank to empty', () => {
+    // Rank 1 is logs -> charcoal. If its floor were ever raised above 0 the settlement could not
+    // restart from a dead stop: with no fuel and no charcoal, the one smelt that MAKES fuel would
+    // be the one thing refused, and nothing downstream could ever run again.
+    const floors = /local SMELT_FLOOR = \{([^}]*)\}/.exec(CODE);
+    expect(floors, 'SMELT_FLOOR must exist').toBeTruthy();
+    expect(floors![1], 'rank 1 must have floor 0 -- it is what refills the tank')
+      .toMatch(/\[1\]\s*=\s*0\b/);
+    // Bulk is the rank that caused this: no demand for stone, and a furnace-hour and a coal each.
+    const bulk = /\[9\]\s*=\s*(\d+)/.exec(floors![1]);
+    expect(bulk, 'rank 9 (cobblestone) must have a floor').toBeTruthy();
+    expect(Number(bulk![1]), 'bulk must need a real surplus, not just "not an emergency"')
+      .toBeGreaterThan(64);
   });
 
   it('counts fuel by the same predicate the furnaces load with', () => {

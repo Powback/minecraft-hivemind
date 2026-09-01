@@ -1053,6 +1053,32 @@ end
 -- the fleet moving again, which is the only thing worth spending the last of it on.
 local SMELT_FUEL_RESERVE = 32
 
+-- A RANK IS A PREFERENCE. A PREFERENCE IS NOT A LIMIT.
+--
+-- SMELT_RANK puts cobblestone last, and last among the available inputs is still FIRST when it is
+-- the only input left. That is exactly what happened once the ore ran out: raw copper, iron and zinc
+-- had all been smelted into ingots, no logs were in stock, and cobblestone was the only smeltable
+-- thing in storage. So the furnaces smelted cobblestone -- for as long as there was fuel to do it
+-- with. Measured at the end of it: 3,450 stone, and charcoal 446 -> 0.
+--
+-- The scarcity gate above did fire, and did its job: it protected the LAST 32 fuel. It just has
+-- nothing to say about the 414 before that, and 414 charcoal is the settlement's entire renewable
+-- fuel supply for several hours of felling. Stone has no consumer here; charcoal is the constraint
+-- on everything that moves.
+--
+-- So the floor is per rank, not one global emergency line. Each smelt must leave this much fuel in
+-- storage behind it, which makes the ranking say "not worth it yet" instead of only "not right now":
+--
+--   1  wood -> charcoal. Floor 0: this is the smelt that MAKES fuel, so it runs on the last log.
+--   2  raw ore. The reserve. Worth spending on, never worth the last of it.
+--   5  everything else -- food, sand. Cheap, but it waits for a real surplus.
+--   9  cobblestone and deepslate. Four full stacks of spare fuel or it does not happen at all.
+local SMELT_FLOOR = { [1] = 0, [2] = SMELT_FUEL_RESERVE, [5] = 64, [9] = 256 }
+
+local function smeltFloor(p_Rank)
+    return SMELT_FLOOR[p_Rank] or 64
+end
+
 local function bestSmeltInput()
     -- DO NOT SPEND THE LAST FUEL ON SOMETHING THAT DOES NOT MAKE FUEL.
     --
@@ -1065,14 +1091,15 @@ local function bestSmeltInput()
     -- Smelting ore is worth doing when there is fuel to spare and is never worth the LAST of it, for
     -- the same reason the supply loop refuses to gather dirt during a fuel emergency: everything
     -- else the settlement wants is downstream of being able to move.
-    local s_Scarce = fuelInStorage() < SMELT_FUEL_RESERVE
+    local s_Fuel = fuelInStorage()
     local s_Best, s_Rank, s_Name = nil, nil, nil
     for name, e in pairs(m_Index) do
         if e.at[1] and isSmeltableInput(name) and not reservedForCrafting(name, e) then
             local r = smeltRank(name)
-            -- Rank 1 is the fuel-positive smelt (logs -> charcoal). When fuel is scarce that is the
-            -- only thing allowed in, so a furnace either grows the supply or stays cold.
-            if (not s_Scarce) or r == 1 then
+            -- Rank 1 is the fuel-positive smelt (logs -> charcoal) and has floor 0, so a furnace
+            -- either grows the fuel supply or stays cold. Everything else has to leave the tank
+            -- above its own floor, so the cheap smelts stop long before the fuel runs out.
+            if s_Fuel >= smeltFloor(r) then
                 if s_Rank == nil or r < s_Rank then s_Best, s_Rank, s_Name = e, r, name end
             end
         end
