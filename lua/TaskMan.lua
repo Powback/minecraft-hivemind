@@ -51,6 +51,8 @@ function OnAddTask(p_ID, p_Message)
     local s_Task = {
         id = s_TaskID,
         name = p_Message.data.name,
+        -- Unset means least urgent. Kept as -1 rather than 9 so tasks stored by older code read
+        -- back the same; priorityOf normalises both to "last".
         priority = p_Message.data.priority or -1,
         -- Percentage of the blocker at which this task becomes workable. nil means "wait for done",
         -- which is right for a real prerequisite and wrong for collaborative work -- see
@@ -1888,15 +1890,37 @@ end
 -- states: every other thing the settlement wants is downstream of being able to move. Ties then go
 -- to the oldest task, so nothing starves behind a stream of new arrivals -- which is a real risk
 -- here, because rescues are generated continuously.
+-- LOWER IS MORE URGENT. THE SORT HAD IT THE OTHER WAY UP.
+--
+-- Every definition of priority in this system says one is the top: order.issue documents "1 is
+-- highest -- issuing at 1 pushes existing work down", and the supply loop's own comments say
+-- support work is "queued at priority 1, AHEAD of exploration" and that "these tasks sit at
+-- priority 1, so a stale one outranks" the rest. The sort below compared them the other way, so
+-- every priority anybody set did the exact opposite of what it says on the tin.
+--
+-- Measured: the redstone shaft is created at priority 2 and the wood gathers at 3, so the gathers
+-- won -- permanently. shaft-mine_head-01 sat "queued: no miner free" through four miners working,
+-- and redstone stayed at 0, which is the one item gating wired modems, therefore storage, therefore
+-- everything. Reading priority at all is recent (the comment above says it was stored and read by
+-- nothing for most of this project's life), so this was wrong from the moment it started mattering.
+--
+-- Anything unset, or stored under the old `or -1` default, sorts LAST -- under the old comparison
+-- -1 meant "least urgent", and it has to keep meaning that or every legacy task jumps the queue.
+local function priorityOf(p_Task)
+    local n = tonumber(p_Task.priority)
+    if n == nil or n < 1 then return 9 end
+    return n
+end
+
 local function orderedTasks()
     local s_List = {}
     for k, v in pairs(DATA["tasks"] or {}) do
         s_List[#s_List + 1] = {key = k, task = v}
     end
     table.sort(s_List, function(a, b)
-        local pa = tonumber(a.task.priority) or -1
-        local pb = tonumber(b.task.priority) or -1
-        if pa ~= pb then return pa > pb end
+        local pa = priorityOf(a.task)
+        local pb = priorityOf(b.task)
+        if pa ~= pb then return pa < pb end
         local fa = fuelRank(a.task.name)
         local fb = fuelRank(b.task.name)
         if fa ~= fb then return fa > fb end
