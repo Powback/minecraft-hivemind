@@ -3598,6 +3598,15 @@ end
 -- No wired modem required. StorageMan's stock is OBSERVED -- a drone standing on a chest reports
 -- its contents -- so a cache is visible to the fleet the moment its position is registered as a
 -- deposit point, which is what makes this possible before redstone exists.
+-- Things a cache is never worth destroying to make room for itself. Its own predicate so the
+-- placement stays readable and the list can grow without touching it.
+local function tooValuableToDig(p_Name)
+    if p_Name == nil then return false end
+    return p_Name:find("chest", 1, true) ~= nil or p_Name:find("barrel", 1, true) ~= nil
+        or p_Name:find("furnace", 1, true) ~= nil or p_Name:find("computer", 1, true) ~= nil
+        or p_Name:find("turtle", 1, true) ~= nil or IsProtected(p_Name)
+end
+
 local CACHE_WORTH_IT = 32          -- blocks of haul that justify spending a chest
 
 function PlaceCacheHere()
@@ -3609,6 +3618,18 @@ function PlaceCacheHere()
     if s_Slot == nil then return nil end
     local cx, cy, cz = pgps.getCachedPosition()
     if cx == nil then return nil end
+
+    -- NEVER DIG AWAY SOMETHING THAT MATTERS TO PUT A CHEST THERE.
+    --
+    -- This digs the block below and drops a chest into the hole, which is right in a shaft and
+    -- catastrophic in the bay: the block under a drone parked at storage is frequently a CHEST, and
+    -- one full of the settlement's ore. Placing a cache is never worth destroying a container, a
+    -- module, or another drone.
+    local s_Ok, s_Below = turtle.inspectDown()
+    if s_Ok and s_Below and tooValuableToDig(s_Below.name) then
+        trace(("cache: refusing to dig %s to place a chest"):format(tostring(s_Below.name)))
+        return nil
+    end
 
     -- Into the floor, so the drone ends up standing ON it: that is what unloadHere and
     -- ContainerBelow already understand, and it needs no new deposit path.
@@ -3693,6 +3714,23 @@ local function TakeCacheChest()
     TakeFromChest(function(n) return n == "minecraft:chest" end)
 end
 
+-- WHERE TO UNLOAD, INCLUDING "NOWHERE YET".
+--
+-- When every deposit point is full, DepositTarget returns nil and the drone simply failed -- while
+-- holding a chest, with a full load, and nothing to do about it. That is the state the settlement
+-- has spent most of its life in: six chests reading 0/0/1/5/7/0 free slots, deposits failing
+-- fleet-wide, and cobblestone falling 612 -> 117 because it could not be put away rather than
+-- because anything used it.
+--
+-- Storage capacity does NOT require redstone, which is the thing that was never noticed. StorageMan
+-- reads stock by OBSERVATION -- a drone standing on a chest reports its contents -- and its own
+-- free-space logic already has a branch for "chests whose deposit entries have no peripheral name
+-- at all". Six of the current deposit points are exactly that. So a plain chest, placed and
+-- registered, is real capacity today, with no wired modem and no redstone.
+local function depositTargetOrNewChest()
+    return DepositTarget() or PlaceCacheHere()
+end
+
 -- Worth a chest only if the alternative is a real haul. Near the bay, the bay is fine.
 local function cacheIfFar(p_Point)
     if p_Point == nil then return nil end
@@ -3729,7 +3767,7 @@ function DepositNow()
         end
     end
 
-    local s_Point = DepositTarget()
+    local s_Point = depositTargetOrNewChest()
     if s_Point == nil then return false end
     -- Far from anywhere and carrying a chest? Put it down here rather than fly the rock home.
     s_Point = cacheIfFar(s_Point) or s_Point
