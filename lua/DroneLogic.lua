@@ -7346,6 +7346,49 @@ end
 -- either: a dig-out tunnels to a drone that is not walled in.
 --
 -- TravelTo, not FlyHome: this is a route home, not a reason to climb.
+-- How far below the settlement floor counts as buried. Declared above its reader: a local used
+-- above its declaration is a silent nil global, and `py >= (hy - nil)` would throw on the one path
+-- that only runs for a drone already in trouble.
+local UNDERGROUND_BELOW_HOME = 8
+
+-- BURIED WITH A FULL TANK IS STILL STRANDED, AND CLIMBING IS FREE.
+--
+-- goHomeIfOutside covers the drone that has drifted outside the reach circle. It does nothing for
+-- one that is INSIDE it horizontally and twenty blocks under the floor -- which is the other way a
+-- drone becomes useless, and the more expensive one, because it happens where GPS does not reach.
+--
+-- Measured on D4, the settlement's only crafter: idle at y=46 holding 8,634 fuel, reporting
+-- "mesh: no GPS fix -- the fleet places us at -496,46,67". Not out of fuel. Out of ROUTE: the
+-- pathfinder cannot plan from a position nobody has verified, and a crafter carries a workbench
+-- where a pickaxe would go, so it cannot cut its way out either. It sat there through every craft
+-- task the settlement queued.
+--
+-- Going UP needs no pathfinder and no fix -- one block at a time, through the hole it came down.
+-- The moment it surfaces GPS returns, the position verifies, and it can route normally again. If
+-- the way up is blocked the climb simply stops, which is no worse than standing still.
+--
+-- Bounded and cheap: only fires below the floor, stops the instant a step fails, and a drone
+-- already at the surface never enters the loop.
+local CLIMB_MAX = 96
+
+local function surfaceIfBuried()
+    if executing or m_Refuelling then return end
+    local px, py, pz = pgps.getCachedPosition()
+    if px == nil or py == nil then return end
+    local _, hy = HomeXYZ()
+    if py >= ((hy or 63) - UNDERGROUND_BELOW_HOME) then return end
+    trace(("idle and buried at %d,%d,%d -- climbing toward the surface to get a fix back")
+          :format(px, py, pz))
+    local s_Rose = 0
+    while s_Rose < CLIMB_MAX do
+        local _, cy = pgps.getCachedPosition()
+        if cy == nil or cy >= (hy or 63) then break end
+        if not pgps.up() then break end
+        s_Rose = s_Rose + 1
+    end
+    trace(("climbed %d block(s) toward the surface"):format(s_Rose))
+end
+
 local function goHomeIfOutside()
     if executing or m_Refuelling then return end
     local px, py, pz = pgps.getCachedPosition()
@@ -7411,6 +7454,7 @@ local function idleDockLoop()
 
         -- Drifted outside the region? Walk back. See goHomeIfOutside.
         goHomeIfOutside()
+        surfaceIfBuried()
 
         local s_Free = (not executing) and (not m_Refuelling) and (m_Status == "idle") and (not m_Docked)
         if not s_Free then
