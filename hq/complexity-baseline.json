@@ -1,7 +1,7 @@
 {
   "note": "Cyclomatic-complexity debt. This file may only ever SHRINK -- see test/complexity.test.ts.",
   "max": 15,
-  "total": 76,
+  "total": 75,
   "files": {
     "lua/DroneLogic.lua": {
       "cc": [
@@ -60,7 +60,6 @@
         18,
         17,
         17,
-        17,
         16
       ],
       "names": [
@@ -73,7 +72,6 @@
         "workPos",
         "pickDrone",
         "placeBlockers",
-        "releaseStalledAssignments",
         "blockers"
       ]
     },

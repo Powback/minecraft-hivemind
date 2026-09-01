@@ -1976,29 +1976,60 @@ end
 -- Sustained, never momentary, and for the same reason as the orphan pass: there is a real window
 -- between dispatch and the drone reporting itself working, and clearing inside it would cancel work
 -- that was about to start. `status` comes from heartbeats and therefore lags.
-local m_IdleAssignedSince = nil
+-- WHY THIS TASK IS BEING HELD FOR NOTHING, OR nil IF IT IS NOT.
+--
+-- THE TEST FOR KEEPING WORK MUST BE THE TEST FOR BEING GIVEN IT. hasFuel decides who may be
+-- dispatched; nothing decided who may HOLD. So a drone below the floor was refused new work by
+-- pickDrone and simultaneously allowed to sit on the work it already had, for ever. Those two rules
+-- have to agree or the queue wedges, and it wedged.
+--
+-- This was a deadlock rather than a delay because of WHICH task it caught. D37 ran dry holding
+-- lumber:oak_log -- the settlement's ONLY renewable fuel -- and stranded. Storage was at 0 coal,
+-- 0 charcoal and 0 logs, so nothing could refuel it; the task stayed "running", so nobody else
+-- could take it; and D4 and D31 sat idle with 6,064 fuel between them, which is several trees'
+-- worth. The fleet had the fuel to end its own fuel emergency and could not reach the job.
+--
+-- "idle" alone could never catch that: a stranded drone does not report idle, it reports stranded.
+-- The condition that matters is not what the drone calls itself, it is whether it can finish.
+--
+-- RELEASING IS NOT ABORTING. The drone keeps its job, its distress and its place in the rescue
+-- queue -- the warning in freeOrphanedDrones about never aborting a dry drone is about the DRONE,
+-- and this is about the QUEUE. All this does is let somebody who can do the work have it.
+-- Takes the drone or nil, so the caller does not have to ask twice: "nobody holds this" and "the
+-- holder is offline" are both just "no reason to release it", and testing them at the call site is
+-- what made this the third-most branchy function in the file.
+local function heldForNothing(p_Drone)
+    if p_Drone == nil or p_Drone.offline then return nil end
+    if p_Drone.status == "idle" then return "reports idle" end
+    if not hasFuel(p_Drone) then return "has no fuel to finish it" end
+    return nil
+end
+
+local m_StalledAssignedSince = nil
 local function releaseStalledAssignments()
     local s_By = {}
     for _, d in ipairs(fleet()) do s_By[tostring(d.id)] = d end
-    m_IdleAssignedSince = m_IdleAssignedSince or {}
+    m_StalledAssignedSince = m_StalledAssignedSince or {}
     local s_Freed = 0
 
     for _, v in pairs(DATA["tasks"] or {}) do
         local s_Key = tostring(v.id)
         local d = v.assignedTo ~= nil and s_By[tostring(v.assignedTo)] or nil
-        local s_Stalled = d ~= nil and not d.offline and d.status == "idle"
-                          and (v.progress or 0) < 100 and v.enabled ~= false
+        local s_Why = heldForNothing(d)
+        local s_Stalled = s_Why ~= nil and (v.progress or 0) < 100 and v.enabled ~= false
         if s_Stalled then
-            m_IdleAssignedSince[s_Key] = m_IdleAssignedSince[s_Key] or os.epoch("utc")
-            if (os.epoch("utc") - m_IdleAssignedSince[s_Key]) > 60000 then
-                Log(("%s is assigned to %s which reports idle -- putting it back in the queue")
-                    :format(tostring(v.name), tostring(d.name or d.id)))
+            m_StalledAssignedSince[s_Key] = m_StalledAssignedSince[s_Key] or os.epoch("utc")
+            if (os.epoch("utc") - m_StalledAssignedSince[s_Key]) > 60000 then
+                -- SAY WHICH REASON. "reports idle" and "has no fuel" want opposite responses from
+                -- whoever reads the log, and one message for both hid the fuel case entirely.
+                Log(("%s is assigned to %s which %s -- putting it back in the queue")
+                    :format(tostring(v.name), tostring(d.name or d.id), s_Why))
                 v.assignedTo = nil
-                m_IdleAssignedSince[s_Key] = nil
+                m_StalledAssignedSince[s_Key] = nil
                 s_Freed = s_Freed + 1
             end
         else
-            m_IdleAssignedSince[s_Key] = nil
+            m_StalledAssignedSince[s_Key] = nil
         end
     end
     if s_Freed > 0 then PowNet.MarkDirty() end
