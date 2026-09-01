@@ -107,6 +107,16 @@ end
 -- The status the SCHEDULER is allowed to see. Lives next to the predicate it defers to, because
 -- the whole fault was these two drifting apart: keeping them adjacent is the cheap part.
 local function reportableStatus(p_Status)
+    -- BURIED OVERRIDES WHATEVER THE LAST JOB LEFT BEHIND. A drone that cannot move is not hauling.
+    --
+    -- Refusing work stopped D4 taking NEW jobs, but the status string from the last one it started
+    -- outlived it, and "hauling" is not in TaskMan's RESCUE_STATES -- so the health sweep read a
+    -- walled-in crafter as fine and cancelled its dig-out on the pass after it was queued, over and
+    -- over, while a miner was already on its way.
+    --
+    -- Every other status describes what the drone is doing. This one describes what it CANNOT do,
+    -- which outranks all of them.
+    if m_Buried then return "blocked" end
     if p_Status ~= "idle" then return p_Status end
     return unavailableReason() or p_Status
 end
