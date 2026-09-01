@@ -2889,19 +2889,42 @@ function FetchItems(p_Want, p_Min)
             :format(#s_List - #s_Order, #s_List))
     end
     Doing(("searching %d chest(s) for %s"):format(#s_Order, tostring(s_First):gsub("^minecraft:", "")))
-    for _, pt in ipairs(s_Order) do
-        local pos = pt.pos or pt
+    -- One chest, as its own function: it carried four of the decisions in FetchItems, which is
+    -- already over the complexity gate, and none of them are about the SWEEP -- they are about a
+    -- single chest. Returns true when the order is complete and the sweep should stop.
+    local function sweepOne(p_Pt)
+        local pos = p_Pt.pos or p_Pt
         -- Once we hold enough to be useful, only chests we have actually SEEN the item in are worth
         -- the flight. An unobserved chest is a gamble, and the bay is too busy to gamble in.
-        if belowMinimum(s_Got) ~= nil or type(pt.items) == "table" then
-            if tryChest(pos) then
-                s_Got = tally()
-                if short(s_Got) == nil then
-                    trace(("fetch: found it at %d,%d,%d"):format(pos.x, pos.y, pos.z))
-                    return s_Got, nil
-                end
-            end
+        if belowMinimum(s_Got) == nil and type(p_Pt.items) ~= "table" then return false end
+        if not tryChest(pos) then return false end
+        s_Got = tally()
+        if short(s_Got) ~= nil then return false end
+        trace(("fetch: found it at %d,%d,%d"):format(pos.x, pos.y, pos.z))
+        return true
+    end
+
+    for _, pt in ipairs(s_Order) do
+        -- A DRONE THAT CANNOT MOVE CANNOT SEARCH. SAY SO INSTEAD OF PRETENDING.
+        --
+        -- Every chest in this sweep is somewhere else, so at zero fuel the whole loop is a list of
+        -- places that cannot be reached: each hop is refused, the sweep works through all nine, and
+        -- the drone ends up back where it started having achieved nothing. It costs a real amount
+        -- of tick time and, worse, it LIES -- Doing() had already reported "searching 9 chest(s)
+        -- for charcoal", which reads on every panel as a drone doing its job.
+        --
+        -- Measured with D31 and D14 both sitting at fuel 0, both reporting a chest search, while
+        -- what they actually needed was for somebody to notice they were dry and bring coal.
+        --
+        -- The container directly BELOW needs no fuel, and tryChest on the current position is
+        -- checked before this loop -- so nothing reachable is given up by stopping here.
+        if turtle.getFuelLevel() == 0 then
+            Doing("out of fuel -- cannot reach any chest, waiting for relief")
+            trace("fetch: out of fuel, so the chest sweep is a list of places we cannot go")
+            return s_Got, short(s_Got)
         end
+
+        if sweepOne(pt) then return s_Got, nil end
     end
 
     if belowMinimum(s_Got) == nil then
