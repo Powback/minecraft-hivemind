@@ -3396,8 +3396,14 @@ end
 -- itself. Walking back toward base restores the link that answers the question -- so a failed
 -- lookup schedules a step home instead of a retry in place. It converges; retrying does not.
 function DepositTarget()
+    -- SAY WHERE WE ARE. StorageMan cannot send a drone to the nearest chest without knowing which
+    -- chest is nearest to it -- and until it did, it answered with the EMPTIEST in the settlement,
+    -- which is the wrong answer the moment a deposit point exists anywhere but the bay. See
+    -- pickDeposit: a miner at the shaft face should unload at the shaft face.
+    local cx, cy, cz = pgps.getCachedPosition()
     local s_Res = PowNet.sendAndWaitForResponse("StorageMan",
-        PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "DepositPoint", {}), PowNet.SERVER_PROTOCOL)
+        PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "DepositPoint",
+            {near = (cx ~= nil) and {x = cx, y = cy, z = cz} or nil}), PowNet.SERVER_PROTOCOL)
     if type(s_Res) == "table" and s_Res.pos ~= nil then
         m_HomePos = s_Res.pos
         return s_Res.pos
@@ -3576,6 +3582,86 @@ function Deposit()
     return a, b
 end
 
+-- A CACHE AT THE WORK SITE, BECAUSE SPOIL BELONGS WHERE THE WORK IS.
+--
+-- A shaft fills twelve of sixteen slots with cobblestone in a couple of hundred blocks, and the
+-- drone then climbs fifty blocks home to put rock into a warehouse holding 2,463 stone and 612
+-- cobblestone already. Measured on one run: 489 spoil against 33 ore -- 6.3% of the load was worth
+-- carrying -- and the descent went y=65 to y=17 and straight back up to y=35.
+--
+-- Dropping the spoil would be faster and is not on: nothing should be left on the ground to
+-- despawn, and the settlement genuinely wants stone (a wired modem is eight stone and a redstone).
+-- So put a CHEST down instead. The spoil stays where it was cut, the miner keeps mining, and a
+-- hauler can move it later -- or not at all, since a cache is a perfectly good place for rock to
+-- live until something needs it.
+--
+-- No wired modem required. StorageMan's stock is OBSERVED -- a drone standing on a chest reports
+-- its contents -- so a cache is visible to the fleet the moment its position is registered as a
+-- deposit point, which is what makes this possible before redstone exists.
+local CACHE_WORTH_IT = 32          -- blocks of haul that justify spending a chest
+
+function PlaceCacheHere()
+    local s_Slot = nil
+    for i = 1, 16 do
+        local det = turtle.getItemDetail(i)
+        if det and det.name == "minecraft:chest" then s_Slot = i break end
+    end
+    if s_Slot == nil then return nil end
+    local cx, cy, cz = pgps.getCachedPosition()
+    if cx == nil then return nil end
+
+    -- Into the floor, so the drone ends up standing ON it: that is what unloadHere and
+    -- ContainerBelow already understand, and it needs no new deposit path.
+    turtle.select(s_Slot)
+    if turtle.detectDown() then DigDown() end
+    if not turtle.placeDown() then
+        turtle.select(1)
+        trace("cache: nowhere to put a chest here")
+        return nil
+    end
+    turtle.select(1)
+
+    local s_Pos = {x = cx, y = cy - 1, z = cz}
+    -- Register it, or it is a hole with a chest in it that nobody will ever visit again.
+    pcall(function()
+        PowNet.sendAndWaitForResponse("StorageMan",
+            PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "deposit", {pos = s_Pos}),
+            PowNet.SERVER_PROTOCOL, 5)
+    end)
+    trace(("cache: placed a chest at %d,%d,%d -- spoil stays at the work site")
+          :format(s_Pos.x, s_Pos.y, s_Pos.z))
+    return s_Pos
+end
+
+-- CARRY A CHEST BACK OUT, OR THE CACHE CAN NEVER EXIST.
+--
+-- A miner has no reason to be holding a chest, so the first cache would never be placed however
+-- good the idea is. The drone is already standing on storage with its load gone, which is the one
+-- moment in its cycle when picking one up is free -- so it takes a chest on the way out and places
+-- it on the next descent. The loop bootstraps itself: trip one hauls the rock home and collects a
+-- chest, trip two leaves the rock at the face.
+--
+-- Only drones that can dig, because only they cut the shafts that generate spoil. One at a time,
+-- because a miner carrying a stack of chests is carrying nine slots of nothing it can use.
+local function TakeCacheChest()
+    if not CanDig() then return end
+    for i = 1, 16 do
+        local d = turtle.getItemDetail(i)
+        if d and d.name == "minecraft:chest" then return end
+    end
+    TakeFromChest(function(n) return n == "minecraft:chest" end)
+end
+
+-- Worth a chest only if the alternative is a real haul. Near the bay, the bay is fine.
+local function cacheIfFar(p_Point)
+    if p_Point == nil then return nil end
+    local cx, cy, cz = pgps.getCachedPosition()
+    if cx == nil then return nil end
+    local d = math.abs(p_Point.x - cx) + math.abs(p_Point.y - cy) + math.abs(p_Point.z - cz)
+    if d < CACHE_WORTH_IT then return nil end
+    return PlaceCacheHere()
+end
+
 function DepositNow()
     -- THE CHEST YOU ARE STANDING ON IS A DEPOSIT POINT.
     --
@@ -3604,6 +3690,8 @@ function DepositNow()
 
     local s_Point = DepositTarget()
     if s_Point == nil then return false end
+    -- Far from anywhere and carrying a chest? Put it down here rather than fly the rock home.
+    s_Point = cacheIfFar(s_Point) or s_Point
     local s_Res = { pos = s_Point }
     local hx, hy, hz = pgps.getCachedPosition()
     m_Status = "hauling"
@@ -3628,6 +3716,7 @@ function DepositNow()
     if s_Arrived then
         trace("deposit: arrived, unloading")
         UnloadInto()
+        pcall(TakeCacheChest)          -- leave with a chest for the next work site
         if hx then
             if pgps.moveTo(hx, hy, hz) == false and CanDig() then pgps.digTo(hx, hy, hz) end
         end

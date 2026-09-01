@@ -801,6 +801,51 @@ function OnDepositPoints(p_ID, p_Message)
     return true, {points = s_Out, count = #s_Out}
 end
 
+-- How much further than the closest deposit point is still "the same place". Inside this, the
+-- emptiest chest wins and drones spread out; beyond it, the closer chest wins and a miner stops
+-- flying its spoil fifty blocks up a shaft.
+local DEPOSIT_NEAR = 16
+
+-- LOCALITY FIRST, THEN EMPTIEST. A CACHE AT THE WORK SITE IS THE POINT OF HAVING ONE.
+--
+-- Ranking purely on free slots is right for a bay where every chest is a few blocks apart. It is
+-- badly wrong the moment a deposit point exists somewhere else: a freshly placed cache is by
+-- definition the emptiest chest in the settlement, so EVERY drone would be sent to it -- a crafter
+-- at the surface told to fly down a mineshaft to put away eight planks.
+--
+-- So: among points close to the ASKING drone, keep the old emptiest-wins rule and everything the
+-- comment at the call site argues for. Only when nothing is close does distance decide, which is
+-- what sends a miner at the shaft face to the chest at the shaft face instead of home.
+--
+-- p_Near is the caller's position. Absent -- an older drone, or one with no fix -- every point
+-- counts as near and the behaviour is exactly what it was.
+--
+-- Its own function because OnDepositPoint is already over the complexity gate, and because
+-- "which chest should this drone use" is a question worth being able to read in one place.
+local function pickDeposit(p_Usable, p_Near, p_FreeOf)
+    local function dist(d)
+        if p_Near == nil or d.pos == nil then return 0 end
+        return math.abs(d.pos.x - p_Near.x) + math.abs(d.pos.y - p_Near.y)
+             + math.abs(d.pos.z - p_Near.z)
+    end
+    local s_Closest = nil
+    for _, d in ipairs(p_Usable) do
+        local dd = dist(d)
+        if s_Closest == nil or dd < s_Closest then s_Closest = dd end
+    end
+    local s_Pick, s_Best = nil, nil
+    for _, d in ipairs(p_Usable) do
+        local f = p_FreeOf(d)
+        -- "Close" means within a short walk of the nearest option, not a fixed radius of base: the
+        -- drone may legitimately be working a long way from anything.
+        if f ~= nil and f > 0 and dist(d) <= (s_Closest + DEPOSIT_NEAR)
+           and (s_Best == nil or f > s_Best) then
+            s_Pick, s_Best = d, f
+        end
+    end
+    return s_Pick
+end
+
 function OnDepositPoint(p_ID, p_Message)
     Rescan()
     local s_Usable = {}
@@ -837,11 +882,7 @@ function OnDepositPoint(p_ID, p_Message)
         if rec == nil or rec.used == nil then return nil end
         return math.max(0, (tonumber(rec.size) or 27) - tonumber(rec.used))
     end
-    local s_Pick, s_Best = nil, nil
-    for _, d in ipairs(s_Usable) do
-        local f = freeOf(d)
-        if f ~= nil and f > 0 and (s_Best == nil or f > s_Best) then s_Pick, s_Best = d, f end
-    end
+    local s_Pick = pickDeposit(s_Usable, p_Message.data and p_Message.data.near, freeOf)
     -- Nothing with known free space: fall back to a point of unknown fullness rather than refuse,
     -- but skip the ones we KNOW are full.
     if s_Pick == nil then
