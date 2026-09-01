@@ -190,6 +190,42 @@ function RoleFits(p_Drone, p_Role)
 end
 
 -- What kind of drone does this work need? Digging needs a tool; surveying needs a scanner.
+-- Below this far under the settlement floor, reaching a casualty means going through rock.
+--
+-- Declared ABOVE RoleForWork, which is the first thing to read it: a local used above its
+-- declaration is a silent nil global in Lua, and `s_Y < (s_Floor - nil)` would throw inside the
+-- function every placement pass depends on.
+local UNDERGROUND_BELOW = 8
+
+-- WHO MAY ANSWER THIS RESCUE. One function, because two places ask and they must not drift.
+--
+-- Handing coal to a dry drone needs no upgrade -- that is why fuel relief is ANY_ROLE, and pinning
+-- it to "miner" deadlocked the fleet: whatever empties one miner's tank has usually emptied all of
+-- them, so demanding a miner to rescue a miner asks for the one thing the emergency guarantees is
+-- missing. D9, D12 and D21 sat at zero with their relief permanently unassignable while D4, a
+-- crafter holding 2,254 fuel, was parked at base and excluded.
+--
+-- UNDERGROUND IT INVERTS. Reaching a casualty in a shaft means digging, and a drone that cannot dig
+-- to it cannot dig its way back out either, so the relief risks a second casualty in the worst
+-- place to have one. Measured: D4 -- the only crafter, and at the time the only drone holding any
+-- fuel at all (8,689) -- took relief for a casualty at y=59 and ended up at y=46, twenty blocks
+-- under the floor, carrying a workbench where a pickaxe would go. Losing it ends chest and plank
+-- production, which costs more than the drone it went to save.
+--
+-- If every miner is dry and the casualty is underground, no rescue is the right answer. That is
+-- what "it needs a human" already means in this file.
+local function rescueRole(p_Rescue)
+    if not p_Rescue.fuel then return "miner" end
+    -- The settlement floor, from the region when pgps is loaded here and 63 when it is not, which
+    -- is what world.bounds reports for this base. Guarded rather than assumed: TaskMan is a
+    -- computer, not a turtle, and a nil global would take the whole placement pass with it.
+    local s_Home = pgps and pgps.centre and pgps.centre()
+    local s_Floor = (s_Home and tonumber(s_Home.y)) or 63
+    local s_Y = p_Rescue.pos and tonumber(p_Rescue.pos.y)
+    if s_Y ~= nil and s_Y < (s_Floor - UNDERGROUND_BELOW) then return "miner" end
+    return ANY_ROLE
+end
+
 function RoleForWork(p_Work)
     if p_Work == nil then return "miner" end
     -- Digging someone out is miner work by definition: a scout carries a geo scanner where a
@@ -205,10 +241,7 @@ function RoleForWork(p_Work)
     -- unassignable, while D4 -- a crafter holding 2,254 fuel and an empty inventory, parked at
     -- base, idle -- was excluded because its role did not match. The settlement had the fuel, the
     -- casualties, and the task, and could not put the three together.
-    if p_Work["rescue"] then
-        if p_Work["rescue"].fuel then return ANY_ROLE end
-        return "miner"
-    end
+    if p_Work["rescue"] then return rescueRole(p_Work["rescue"]) end
     if p_Work["survey"] or p_Work["scan"] then return "scout" end
     -- Crafting needs a crafting-table upgrade, which is a different turtle entirely: turtle.craft
     -- simply does not exist on a miner, so routing a craft to one wastes the trip and fails at the
@@ -478,37 +511,14 @@ end
 -- casualties are not buried, and arriving with fuel fixes the common case.
 --
 -- Returns nil for anything that is not a rescue, so the caller can use it as a plain fallback.
--- Below this far under the settlement floor, reaching a casualty means going through rock.
-local UNDERGROUND_BELOW = 8
-
 local function anyoneForRescue(p_Task, p_Where, p_MinFuel, p_Role)
     local w = p_Task.work and p_Task.work.rescue
     if w == nil then return nil end
 
-    -- DO NOT SEND SOMETHING THAT CANNOT DIG DOWN A HOLE.
-    --
-    -- The any-role fallback is right on the surface: most casualties want fuel, and a crafter can
-    -- carry coal even though it cannot cut rock. Underground it inverts. Reaching a drone in a shaft
-    -- means digging, a crafter carries a workbench where a pickaxe would go, and a drone that cannot
-    -- dig cannot get itself out either -- so the rescue risks adding a second casualty in the worst
-    -- possible place.
-    --
-    -- Measured: D4, the settlement's ONLY crafter and the only drone with fuel at the time (8,689),
-    -- was sent after a casualty at y=59 and ended up at y=46 -- twenty blocks under the floor, no
-    -- pickaxe, unable to cut its way back. Losing it would have ended chest and plank production
-    -- outright, which is worse than the casualty it went for.
-    --
-    -- Miners still take these; only the fallback is restricted. If every miner is dry and the
-    -- casualty is underground, no rescue is the correct answer -- it is what "it needs a human"
-    -- already means elsewhere in this file.
-    -- The settlement floor, from the region if pgps is loaded here and 63 if it is not -- which is
-    -- what world.bounds reports for this base's centre. Guarded rather than assumed: TaskMan is a
-    -- computer, not a turtle, and a nil global would take the whole placement pass down with it.
-    local s_Home = pgps and pgps.centre and pgps.centre()
-    local s_Floor = (s_Home and tonumber(s_Home.y)) or 63
-    if w.pos and tonumber(w.pos.y) and tonumber(w.pos.y) < (s_Floor - UNDERGROUND_BELOW) then
-        return nil
-    end
+    -- The same question rescueRole answers, so it answers it here too rather than growing a second
+    -- copy: a non-digger has no business underground, whether it arrives by the role or the
+    -- fallback.
+    if rescueRole(w) ~= ANY_ROLE then return nil end
 
     local d = pickDrone(ANY_ROLE, p_Where, w.id, p_MinFuel)
     if d == nil then return nil end
