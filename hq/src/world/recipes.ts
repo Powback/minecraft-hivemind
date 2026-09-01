@@ -67,6 +67,7 @@ export const SOURCES: Record<string, { action: 'gather' | 'lumber' | 'smelt'; bl
 const P = 'minecraft:oak_planks';
 const S = 'minecraft:stick';
 const ST = 'minecraft:stone';
+const SB = 'minecraft:stone_bricks';
 const IR = 'minecraft:iron_ingot';
 const RD = 'minecraft:redstone';
 const GP = 'minecraft:glass_pane';
@@ -104,6 +105,30 @@ export const RECIPES: Recipe[] = [
     grid: [P, P, null, P, P, null, null, null, null] },
   { output: 'minecraft:furnace', yields: 1, inputs: { 'minecraft:cobblestone': 8 }, station: 'inventory',
     grid: Array(9).fill('minecraft:cobblestone').map((v, i) => (i === 4 ? null : v)) },
+  // ── The tower's brick palette ────────────────────────────────────────────
+  //
+  // WITHOUT THESE, SMELTED STONE IS A DEAD END, AND THE FURNACES MAKE IT BY THE THOUSAND.
+  //
+  // The tower has three palettes and every one of them is a stone product: cobble builds from
+  // cobblestone straight out of a shaft, brick from stone_bricks. Nothing anywhere builds from
+  // plain `minecraft:stone` -- it is purely an intermediate, and until now an intermediate with no
+  // second step, because the graph knew how to make stone and not what to do with it.
+  //
+  // So the settlement smelted 3,450 cobblestone into 3,450 stone and thereby converted its entire
+  // tier-0 building material into an item no blueprint, palette or recipe could consume. order.tower
+  // keeps only blocks it has stock for, so a cobble floor went from affordable to impossible while
+  // storage filled with the very thing the floor was made of. It cost 414 charcoal to do.
+  //
+  // stone -> stone_bricks is a bare 2x2 with no station and no fuel, so this is the cheapest
+  // possible way to make that stock mean something: it is 1:1, it unlocks the brick palette the
+  // fleet had no route to, and it empties the chests that are jamming everything else.
+  { output: SB, yields: 4, inputs: { [ST]: 4 }, station: 'inventory',
+    grid: [ST, ST, null, ST, ST, null, null, null, null] },
+  { output: 'minecraft:stone_brick_stairs', yields: 4, inputs: { [SB]: 6 }, station: 'inventory',
+    grid: [SB, null, null, SB, SB, null, SB, SB, SB] },
+  { output: 'minecraft:stone_brick_wall', yields: 6, inputs: { [SB]: 6 }, station: 'inventory',
+    grid: [null, null, null, SB, SB, SB, SB, SB, SB] },
+
   { output: 'minecraft:torch', yields: 4, inputs: { [S]: 1, 'minecraft:coal': 1 }, station: 'inventory',
     grid: ['minecraft:coal', null, null, S, null, null, null, null, null] },
   { output: 'minecraft:hopper', yields: 1, inputs: { 'minecraft:iron_ingot': 5, 'minecraft:chest': 1 },

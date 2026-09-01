@@ -2190,7 +2190,27 @@ registry.register({
     // material there are ten thousand of. Build what is affordable now and reface later; that is
     // exactly what the palette ladder is for.
     const stock = await readStock('throw');
-    const affordable = blocks.filter((b) => (stock[b.item] ?? 0) > 0);
+
+    // CRAFT WHAT THE PALETTE NEEDS. SKIPPING IS FOR WHAT CANNOT BE MADE, NOT FOR WHAT CAN.
+    //
+    // The affordable-filter below is right about glass and wrong about everything craftable, and
+    // the difference is what stalled the building. order.build has always expanded its cost through
+    // the recipe graph and queued the crafting first; the tower -- the largest thing the settlement
+    // will ever make -- only ever asked "is it already in a chest".
+    //
+    // That is how 3,450 stone became unspendable. Stone is in no palette: cobble builds from
+    // cobblestone, brick from stone_bricks, and stone is the intermediate between them. So the
+    // furnaces turned the tier-0 material into the tier-1 material's INPUT, and the tower, which
+    // could not craft, saw no cobblestone and no stone bricks and declared a floor impossible while
+    // standing on 3,450 blocks of it.
+    //
+    // Missing-from-the-graph still falls through to the skip path, so glass keeps behaving as it
+    // did: build what is affordable now and reface when the smelters run.
+    // `cannot` is deliberately ignored here -- see queueCrafting. A floor short of glass is a floor
+    // without windows, which is the whole point of the palette ladder.
+    const { crafted, willHave, last: lastCraftTask } = await queueCrafting(cost, stock);
+
+    const affordable = blocks.filter((b) => (stock[b.item] ?? 0) > 0 || willHave.has(b.item));
     const skipped = blocks.length - affordable.length;
     if (!affordable.length) throw new ToolError(
       `Nothing in stock for a ${a.palette} level ${a.level}.`,
@@ -2255,6 +2275,12 @@ registry.register({
         priority: 2,
         // (superseded) ONE. The settlement should be building its base before it gathers more ore
         // -- which it will otherwise do for ever, because there is always another material short.
+        //
+        // A COMMON ANCESTOR IS NOT A CHAIN. Every patch waits on the same craft task rather than on
+        // the patch before it, so the parallelism the note above insists on is untouched: the
+        // moment the bricks exist, all thirteen patches are runnable at once. Without this they
+        // start immediately, find no bricks, and abandon a half-laid floor.
+        dependsOn: lastCraftTask,
         work: { build: { origin, blocks: part } },
       }, { timeoutMs: 12000 });
       if (typeof res === 'string') break;      // TaskMan refused; stop rather than queue a gap
@@ -2263,7 +2289,7 @@ registry.register({
 
     ctx.log('order.tower', { level: a.level, palette: a.palette, tasks: queued.length });
     return {
-      level: a.level, name: LEVELS.find((l) => l.index === a.level)?.name ?? String(a.level),
+      crafted, level: a.level, name: LEVELS.find((l) => l.index === a.level)?.name ?? String(a.level),
       origin, cost, affordable: affordable.length, skippedForMaterials: skipped,
       tasks: queued,
       note: skipped
@@ -2275,6 +2301,48 @@ registry.register({
 
 
 // ── order.build ────────────────────────────────────────────────────────────
+/**
+ * QUEUE THE CRAFTING A COST NEEDS, AND SAY WHAT COULD NOT BE MADE.
+ *
+ * ONE QUESTION, ONE FUNCTION. "What has to be crafted before this can be built" is asked by
+ * order.build and order.tower, and for a long time only order.build could answer it -- which is why
+ * the tower stood at zero floors on top of 3,450 stone it could have turned into bricks. Copying
+ * the loop into the tower was the obvious fix and the wrong one: this codebase has been bitten four
+ * times by a predicate that existed twice and drifted, most expensively by three different answers
+ * to "what counts as fuel" inside a single file.
+ *
+ * `cannot` is returned rather than thrown because the two callers legitimately disagree about what
+ * an unmakeable material means. A blueprint short of one item is a build that must not start.
+ * A tower floor short of glass is a floor built without windows, refaced when the smelters run.
+ */
+async function queueCrafting(
+  p_Need: Record<string, number>, p_Stock: Record<string, number>,
+): Promise<{ crafted: any[]; cannot: string[]; willHave: Set<string>; last?: number }> {
+  const crafted: any[] = [];
+  const cannot: string[] = [];
+  const willHave = new Set<string>();
+  let last: number | undefined;
+  for (const [item, count] of Object.entries(p_Need)) {
+    if ((p_Stock[item] ?? 0) >= count) continue;
+    const plan = expand(item, count, (i) => p_Stock[i] ?? 0);
+    if (plan.missing.length) { cannot.push(`${item} (needs ${plan.missing.join(', ')})`); continue; }
+    for (const step of plan.steps) {
+      if (step.action !== 'craft') continue;
+      const res: any = await bridge.call('TaskMan', 'Add', {
+        name: `craft-${step.item.replace('minecraft:', '')}`,
+        priority: 2,
+        work: { craft: { item: step.item, runs: step.runs, grid: step.grid, inputs: recipeInputs(step.item) } },
+      }, { timeoutMs: 8000 });
+      if (typeof res !== 'string') {
+        crafted.push({ item: step.item, runs: step.runs, task: res?.id });
+        last = res?.id;
+        willHave.add(step.item);
+      }
+    }
+  }
+  return { crafted, cannot, willHave, last };
+}
+
 registry.register({
   name: 'order.build',
   summary: 'Build a blueprint on a plot, crafting whatever it needs first.',
@@ -2337,23 +2405,7 @@ registry.register({
     } catch { stock = {}; }
 
     const need = materials(bp);
-    const crafted: any[] = [];
-    const cannot: string[] = [];
-    let lastCraftTask: number | undefined;
-    for (const [item, count] of Object.entries(need)) {
-      if ((stock[item] ?? 0) >= count) continue;
-      const plan = expand(item, count, (i) => stock[i] ?? 0);
-      if (plan.missing.length) { cannot.push(`${item} (needs ${plan.missing.join(', ')})`); continue; }
-      for (const step of plan.steps) {
-        if (step.action !== 'craft') continue;
-        const res: any = await bridge.call('TaskMan', 'Add', {
-          name: `craft-${step.item.replace('minecraft:', '')}`,
-          priority: 2,
-          work: { craft: { item: step.item, runs: step.runs, grid: step.grid, inputs: recipeInputs(step.item) } },
-        }, { timeoutMs: 8000 });
-        if (typeof res !== 'string') { crafted.push({ item: step.item, runs: step.runs, task: res?.id }); lastCraftTask = res?.id; }
-      }
-    }
+    const { crafted, cannot, last: lastCraftTask } = await queueCrafting(need, stock);
     if (cannot.length) throw new ToolError(
       `Cannot build ${bp.name}: ${cannot.join('; ')}.`,
       'Obtain those materials first — order.prospect for ore, order.issue lumber for wood.');
