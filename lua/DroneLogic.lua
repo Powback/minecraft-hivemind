@@ -4539,6 +4539,46 @@ local function dealInto(p_From, p_To, p_Count)
     return turtle.getItemCount(p_To) - s_Before
 end
 
+-- HOW MANY RUNS THE INGREDIENTS ACTUALLY ABOARD WILL SUPPORT.
+--
+-- VERIFY AT THE EFFECT, NEVER AT THE CALL. The run count was scaled from s_Got -- FetchItems' own
+-- account of what it collected -- and that account said 128 planks while the turtle held 64. The
+-- grid then filled four cells from the one stack it had and the fifth got nothing:
+--
+--   craft staged: [minecraft:oak_planks@13x64 ] wanted minecraft:oak_planksx128
+--   JOB Craft THREW only 0/16 of minecraft:oak_planks reached slot 6
+--
+-- Every chest order, on a loop, for hours -- while the settlement had nowhere left to put anything.
+-- The inventory is the truth and it is one API call away, so ask it rather than a report about it.
+--
+-- Counts EVERY slot holding the item, not the one staging happened to record: a batch that needs
+-- more than 64 of something necessarily arrives as several stacks.
+-- Returns the run count AND the per-item totals that go with it, so the caller re-derives nothing.
+-- OnCraft's body is the most complex function in this file and the complexity gate is right to
+-- refuse to let it grow for bookkeeping that belongs here.
+local function batchAboard(p_Inputs, p_Cap)
+    local s_Fit = nil
+    for want, per in pairs(p_Inputs) do
+        local s_Have = 0
+        for i = 1, 16 do
+            local det = turtle.getItemDetail(i)
+            if det and det.name and SameItem(want, det.name) then
+                s_Have = s_Have + turtle.getItemCount(i)
+            end
+        end
+        local s_Can = math.floor(s_Have / math.max(1, tonumber(per) or 1))
+        if s_Fit == nil or s_Can < s_Fit then s_Fit = s_Can end
+    end
+    if s_Fit == nil or s_Fit > p_Cap then s_Fit = p_Cap end
+    if s_Fit < p_Cap then
+        trace(("craft: holding enough for %d of %d runs -- making %d"):format(s_Fit, p_Cap, s_Fit))
+    end
+    if s_Fit < 1 then error("nothing aboard to craft with", 0) end
+    local s_Want = {}
+    for name, per in pairs(p_Inputs) do s_Want[name] = per * s_Fit end
+    return s_Fit, s_Want
+end
+
 -- lua-hygiene: allow (a craft is transactional -- it either produced the item or it did not, and
 -- ingredients are re-collected from the chest on the way in. Resuming half a craft would mean
 -- reasoning about a grid the drone can no longer see, so starting over is the correct behaviour
@@ -4756,6 +4796,9 @@ function OnCraft(p_ID, p_Message)
                 end
             end
         end
+
+        -- The batch is only as big as what is genuinely aboard -- see batchAboard.
+        s_Runs, s_Wanted = batchAboard(s_Inputs, s_Runs)
 
         -- Slot -> exactly how many it must hold when turtle.craft() is called. Recorded as the grid
         -- is dealt, because the clean-up below needs to know the difference between an ingredient
