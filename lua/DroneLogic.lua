@@ -1187,11 +1187,24 @@ local SIDE_APPROACHES = {
 function ApproachFromSide(p_Target, p_FlyBudget)
     for _, s_Side in ipairs(SIDE_APPROACHES) do
         local x, z = p_Target.x + s_Side.dx, p_Target.z + s_Side.dz
-        local s_Try = pgps.moveTo(x, p_Target.y, z)
-        if s_Try == false then s_Try = pgps.flyTo(x, p_Target.y, z, p_FlyBudget or 64) end
-        if s_Try ~= false then
-            pgps.turnTo(pgps.HEADINGS[s_Side.face])
-            return s_Try
+        -- THE BLOCK WE STAND ON HAS TO BE LEGAL TOO, NOT JUST THE ONE WE CUT.
+        --
+        -- The gather reach-filters its seeds and its vein neighbours -- both are about the TARGET.
+        -- This picks where the drone puts itself, one block to the side of it, and checked nothing.
+        -- A target sitting on the boundary therefore parks the drone just outside, where mayStep
+        -- refuses every move and the status goes to "blocked": pickDrone stops offering it work and
+        -- TaskMan queues a dig-out for a drone that is not buried.
+        --
+        -- Measured on D31 at -525,78,30, 64 blocks out against a reach of 56, holding the lumber
+        -- task. Same trap the vein filter above was written for, one step further along: no single
+        -- decision looks wrong, and the drone ends up somewhere it cannot work from.
+        if pgps.isWithinReach(x, z) then
+            local s_Try = pgps.moveTo(x, p_Target.y, z)
+            if s_Try == false then s_Try = pgps.flyTo(x, p_Target.y, z, p_FlyBudget or 64) end
+            if s_Try ~= false then
+                pgps.turnTo(pgps.HEADINGS[s_Side.face])
+                return s_Try
+            end
         end
     end
     return false

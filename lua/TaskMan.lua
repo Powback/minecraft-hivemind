@@ -1143,6 +1143,38 @@ local function dropUnfulfillableRescues(p_Dry)
     return n
 end
 
+-- A FLICKER IS NOT A FAULT. LET IT SETTLE FIRST.
+--
+-- Distress oscillates. D14 alternated blocked / moving on every single pass, so a rescue was queued
+-- and cancelled every fifteen seconds, indefinitely:
+--
+--   rescue queued for D14 (blocked) at -534,69,26
+--   rescue for D14 cancelled -- it recovered on its own
+--   rescue queued for D14 (blocked) at -534,69,26
+--
+-- Each pair costs a placement pass, churns the task table, and -- because rescues are placed BEFORE
+-- all other work by design -- puts itself in front of every real job for the fifteen seconds it
+-- exists. cancelRecoveredRescues was written to clean these up and does so correctly; not creating
+-- them is cheaper than cancelling them.
+--
+-- Three consecutive passes, because a drone that is genuinely stuck stays stuck and one that is
+-- merely between attempts does not. Forty-five seconds of delay on a real rescue is nothing set
+-- against a drone that has already been immobile for minutes -- and rescueTries, which escalates to
+-- writing a drone off, only counts attempts that were actually made.
+local RESCUE_SETTLE = 3
+
+local function settledTrapped(p_Drone, p_Trapped)
+    local s_Key = tostring(p_Drone.id)
+    DATA["blockedFor"] = DATA["blockedFor"] or {}
+    if not p_Trapped then
+        DATA["blockedFor"][s_Key] = nil
+        return false
+    end
+    local s_N = (DATA["blockedFor"][s_Key] or 0) + 1
+    DATA["blockedFor"][s_Key] = s_N
+    return s_N >= RESCUE_SETTLE
+end
+
 local function rescueNeeded()
     -- One live rescue per drone. Without this the pass creates a fresh task every fifteen seconds
     -- for a drone that stays stuck -- which it will, right up until the miner arrives.
@@ -1376,6 +1408,9 @@ local function rescueNeeded()
             abandonDrone(d, s_Tries)
             s_Trapped = false
         end
+
+        -- A DISTRESS THAT CLEARS BY ITSELF NEXT TICK IS NOT ONE -- see settledTrapped.
+        s_Trapped = settledTrapped(d, s_Trapped)
 
         -- A FUEL RESCUE WITH NO FUEL TO CARRY IS WORSE THAN NO RESCUE -- see stillTrapped.
         s_Trapped = stillTrapped(d, s_Trapped, s_Dry)
