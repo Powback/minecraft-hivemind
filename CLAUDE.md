@@ -54,6 +54,24 @@ matter least. Measured side by side in one minute:
 | D21 position | -534,69,26 | -481,65,55 (**53 blocks out**) |
 | D14 position | -439,109,56 | -369,64,60 (**70 blocks out**) |
 
+**The cause was found and fixed.** `meshForward` relays a stranded drone's heartbeat from a
+NEIGHBOUR's computer, and `OnHeartbeat` keyed the registry off the rednet sender -- so a relayed
+beat wrote the ORIGINATOR's fuel, cargo, position and role into the RELAYER's record. The numbers
+above were not stale; they belonged to a different drone. It went unseen for months because nothing
+logged which computer wrote which record, and it was found only by adding that one line:
+
+```
+role: cc #47 -> record 4 (D4) scout -> crafter
+role: cc #47 -> record 4 (D4) crafter -> scout
+```
+
+Same computer, same record, alternating -- one drone's own beat and a relayed one landing together.
+The heartbeat now carries `ccid` and DroneMan believes it over the sender.
+
+Keep verifying at the effect anyway: a heartbeat is periodic, so these fields still lag by up to an
+interval, and a drone that cannot reach base still has an old one replayed. What should no longer
+happen is a field belonging to somebody else.
+
 Two hours went into planning around fuel that did not exist: `storage.recall` cheerfully reported
 "D21 held 32, asked: true" for coal nobody had, and the drone was written off as stranded 74 blocks
 away when it was sitting 22 blocks from home. `computercraft dump` gives true positions, and
