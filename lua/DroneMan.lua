@@ -111,9 +111,39 @@ function OnHeartbeat(p_ID, p_Message)
         print("Heartbeat from unregistered drone " .. tostring(p_ID))
         return false, "unregistered"
     end
+    local s_WasRole = DATA["drones"][s_ID].role
     for k,v in pairs(p_Message.data) do
         DATA["drones"][s_ID][k] = v
     end
+
+    -- ROLE IS DERIVED FROM HARDWARE, AND IT HAS TO SURVIVE A RESTART.
+    --
+    -- The merge above updates the registry in memory, and OnHeartbeat -- alone among the handlers
+    -- that mutate DATA -- never marks it dirty. For the fields that change every beat that is the
+    -- right call: persisting fuel and position for every drone every thirty seconds is a great many
+    -- writes for numbers that are stale the moment they land.
+    --
+    -- Role is not one of those. It changes when a turtle's UPGRADES change, which is close to never
+    -- -- and when DroneMan restarts it reloads the last SAVED snapshot, so a role only ever
+    -- corrected in memory reverts to whatever was persisted, possibly hours earlier.
+    --
+    -- NOT A FIX FOR THE BUG THAT PROMPTED IT, AND THAT IS WORTH WRITING DOWN.
+    --
+    -- D4, probed against the turtle itself, reports "scanner=nil crafter=true role=crafter" while
+    -- this registry says "scout" -- so the settlement has NO drone routed as a crafter, and
+    -- craft-oak_planks and craft-chest can never be placed. The factory chain is dead at the
+    -- scheduler while the hardware to run it sits idle in the bay. The same registry answered both
+    -- "no scout in the fleet" and "every scout is busy (D4)" inside one minute.
+    --
+    -- Persisting the change was the obvious suspect and it is NOT the cause: with this in place, a
+    -- freshly restarted DroneMan still reported scout after two minutes of heartbeats. A heartbeat
+    -- carrying {role="crafter"} was accepted (reply true) and did not change the stored value
+    -- either, which means p_Message.data.role is not reaching the merge above at all. Where it is
+    -- lost is not yet known and needs DroneMan instrumented to answer.
+    --
+    -- Kept regardless, on its own merits: a role corrected only in memory reverts to the last saved
+    -- snapshot on restart, and that is a real defect whatever else is going on.
+    if s_WasRole ~= DATA["drones"][s_ID].role then PowNet.MarkDirty() end
     -- WHEN we last heard from it, which is the only way to tell a docked drone from one that no
     -- longer exists. Drones heartbeat every 30s; nothing was recording the arrival, so a drone
     -- that stopped answering stayed "idle" forever. D1 mined D2 out of the world and the registry
