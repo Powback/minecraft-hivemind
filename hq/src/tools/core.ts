@@ -2328,9 +2328,20 @@ async function queueCrafting(
     if (plan.missing.length) { cannot.push(`${item} (needs ${plan.missing.join(', ')})`); continue; }
     for (const step of plan.steps) {
       if (step.action !== 'craft') continue;
+      // CHAIN THE STEPS. expand() returns them in dependency order and queueing them
+      // independently threw that order away.
+      //
+      // Measured: a tower floor needs stone_bricks (from stone) and then stone_brick_wall (from
+      // those bricks). Both were queued at once, the crafter picked up the WALL first, and it can
+      // never finish -- its input is what the other task exists to produce. craft-stone_bricks sat
+      // unassigned behind a job waiting on its own output, and the whole floor waited on that.
+      //
+      // Chaining serialises the crafter, which costs nothing real: there is one crafter, and a
+      // recipe graph is a sequence by construction.
       const res: any = await bridge.call('TaskMan', 'Add', {
         name: `craft-${step.item.replace('minecraft:', '')}`,
         priority: 2,
+        dependsOn: last,
         work: { craft: { item: step.item, runs: step.runs, grid: step.grid, inputs: recipeInputs(step.item) } },
       }, { timeoutMs: 8000 });
       if (typeof res !== 'string') {
