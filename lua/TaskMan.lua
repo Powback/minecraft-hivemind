@@ -555,7 +555,8 @@ local function pickDrones(p_Role)
             -- heartbeats, so `offline` already answers the question the ping was asking, for free
             -- and without blocking anything. The worst case is dispatching to a drone that died in
             -- the last ninety seconds -- and that task is reclaimed on the next sweep anyway.
-            if d.status == "idle" and not d.offline and hasFuel(d) then
+            if d.status == "idle" and not d.offline and hasFuel(d)
+               and not tooManyMissedStarts(d) then
                 s_Free[#s_Free + 1] = d
             else
                 s_Busy = s_Busy or d
@@ -2044,6 +2045,29 @@ local function heldForNothing(p_Drone)
     return nil
 end
 
+-- HOW MANY TIMES IN A ROW A DRONE HAS BEEN GIVEN WORK AND NOT STARTED IT.
+--
+-- A drone that reports idle, is not offline and has fuel passes every test pickDrones makes, so it
+-- is picked again the moment its last assignment is released -- and if the reason it never starts
+-- is physical, that loop is infinite. D35 ran it for hours: buried at y=1 a hundred blocks out with
+-- 3,874 fuel, accepting task after task, each one freed sixty seconds later by
+-- releaseStalledAssignments and handed straight back to it.
+--
+-- The damage is not just the wasted assignments. The placement pass writes a role off after
+-- TRIES_PER_ROLE failures, so this one drone consumed the miner budget every pass and the tower
+-- patches -- lower priority, later in the order -- were never attempted at all. There is no "could
+-- not place tower" line anywhere in the log, because it never got that far.
+--
+-- Availability is not what a drone says about itself; it is whether work given to it gets done. So
+-- count the misses, and stop offering to a drone that keeps failing to start. The count resets the
+-- moment it completes anything, so a drone that recovers rejoins the pool by itself.
+local m_MissedStarts = {}
+local MAX_MISSED_STARTS = 3
+
+local function tooManyMissedStarts(p_Drone)
+    return (m_MissedStarts[tostring(p_Drone.id)] or 0) >= MAX_MISSED_STARTS
+end
+
 local m_StalledAssignedSince = nil
 local function releaseStalledAssignments()
     local s_By = {}
@@ -2061,6 +2085,12 @@ local function releaseStalledAssignments()
             if (os.epoch("utc") - m_StalledAssignedSince[s_Key]) > 60000 then
                 -- SAY WHICH REASON. "reports idle" and "has no fuel" want opposite responses from
                 -- whoever reads the log, and one message for both hid the fuel case entirely.
+                local dk = tostring(v.assignedTo)
+                m_MissedStarts[dk] = (m_MissedStarts[dk] or 0) + 1
+                if m_MissedStarts[dk] == MAX_MISSED_STARTS then
+                    Log(("%s has failed to start %d assignments in a row -- not offering it more "
+                         .. "until it finishes something"):format(tostring(d.name or d.id), MAX_MISSED_STARTS))
+                end
                 Log(("%s is assigned to %s which %s -- putting it back in the queue")
                     :format(tostring(v.name), tostring(d.name or d.id), s_Why))
                 v.assignedTo = nil
@@ -2461,6 +2491,12 @@ function OnTaskDone(p_ID, p_Message)
     local d = p_Message.data or {}
     local s_Task = DATA["tasks"][d.id] or DATA["tasks"][tostring(d.id)] or DATA["tasks"][tonumber(d.id or -1)]
     if s_Task == nil then return false, "No task " .. tostring(d.id) end
+
+    -- IT FINISHED SOMETHING, SO IT IS WORKING AGAIN. Clear the missed-start count -- a drone that
+    -- was buried and has dug itself out, or been rescued, must rejoin the pool without anyone
+    -- intervening. The count exists to stop an endless loop, not to retire a drone.
+    m_MissedStarts[tostring(p_ID)] = nil
+    if s_Task.assignedTo ~= nil then m_MissedStarts[tostring(s_Task.assignedTo)] = nil end
 
     if d.ok then
         -- VERIFY A SURVEY AGAINST THE MAP INSTEAD OF BELIEVING IT.
