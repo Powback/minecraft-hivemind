@@ -2272,8 +2272,22 @@ registry.register({
         // original comment actually wanted. Same class of inversion as fuel relief preempting the
         // coal gather it depended on: work that CONSUMES fuel must never outrank the work that
         // PRODUCES it.
-        priority: 2,
-        // (superseded) ONE. The settlement should be building its base before it gathers more ore
+        // ONE, BECAUSE PRIORITY 2 IS NOT A LOWER PRIORITY -- IT IS NEVER.
+        //
+        // The note below is right that a tower burning fuel must not outrank the mining that makes
+        // it, and it drew the wrong conclusion. The supply loop re-queues lumber, haul and coal
+        // every tick, so priority-1 miner work is ALWAYS present; the placement pass writes a role
+        // off after TRIES_PER_ROLE failures, and the tower sits behind that permanently. Measured
+        // over hours: 1,276 bricks crafted, 30 patches queued, dispatch lines for Lumber, Haul and
+        // Craft, and not one attempt at a tower patch -- ever.
+        //
+        // At equal priority they interleave: some miners take fuel work, some take a patch, which
+        // is what the original note actually wanted. The condition it was protecting against --
+        // fuel starving because the tower took every drone -- is a real risk only when the fleet is
+        // down to one or two workers, and that is now guarded properly by the missed-start
+        // exclusion rather than by making the build unreachable.
+        priority: 1,
+        // (superseded) TWO, then ONE. The settlement should be building its base before it gathers more ore
         // -- which it will otherwise do for ever, because there is always another material short.
         //
         // A COMMON ANCESTOR IS NOT A CHAIN. Every patch waits on the same craft task rather than on
