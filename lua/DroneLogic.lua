@@ -7689,10 +7689,29 @@ local function surfaceIfBuried()
     --
     -- Same principle the heartbeat already states for the other direction: this field is about
     -- AVAILABILITY. Say blocked, say why, and let the dig-out that exists for this do its job.
-    m_Buried = (s_Rose == 0 and not CanDig())
+    -- TRUST THE MEASUREMENT, NOT THE CAPABILITY.
+    --
+    -- This was `s_Rose == 0 and not CanDig()`: a drone that owns a pickaxe was never marked buried,
+    -- on the reasoning that it can cut its own way out. D35 disproved that -- a MINER, 100 blocks
+    -- from base at y=1, logging "climbed 0 block(s) toward the surface" over and over for an hour:
+    --
+    --   idle and buried at -462,1,42 -- climbing toward the surface to get a fix back
+    --   climbed 0 block(s) toward the surface  [x3 more in the last 60s]
+    --
+    -- Having a pickaxe is not the same as getting out. It reported "idle" the whole time -- idle is
+    -- what a drone with no job says -- so TaskMan counted it as an available miner, assigned it
+    -- work, the release pass freed the work 60s later when it never started, and TaskMan assigned
+    -- it again. Meanwhile "every miner is busy (D40)" kept 13 tower patches unplaced with another
+    -- miner sitting idle.
+    --
+    -- So: zero progress is the fact that matters. Say blocked either way, and let the reason
+    -- distinguish what kind of help it needs -- a dig-out for one, a look at why digging is not
+    -- working for the other.
+    m_Buried = (s_Rose == 0)
     if m_Buried then
-        Distress("buried", ("walled in at %d,%d,%d with %s fuel -- no pickaxe, needs a dig-out")
-                 :format(px, py, pz, tostring(turtle.getFuelLevel())))
+        Distress("buried", ("walled in at %d,%d,%d with %s fuel -- %s")
+                 :format(px, py, pz, tostring(turtle.getFuelLevel()),
+                         CanDig() and "has a pickaxe and still rose 0" or "no pickaxe, needs a dig-out"))
     end
 end
 
