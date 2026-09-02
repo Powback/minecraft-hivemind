@@ -5783,10 +5783,30 @@ function OnBuild(p_ID, p_Message)
         if type(s_Hand) ~= "table" or s_Hand.pos == nil then
             error("storage would not hand over materials", 0)
         end
+        -- PLACE WHAT WE HAVE. A PARTLY BUILT WALL IS PROGRESS; A REFUSAL IS NOT.
+        --
+        -- This threw the moment storage could not fill the whole order, which is the same mistake
+        -- FetchItems and Craft were both corrected for: "partial progress beats waiting for the
+        -- full order" is the rule this file already states, and build was the one job still
+        -- ignoring it.
+        --
+        -- It matters most exactly when the settlement is building its own material. A tower floor
+        -- is 2,310 stone bricks made a few hundred at a time, so for hours EVERY patch asked for
+        -- more than existed and every one threw:
+        --
+        --   JOB Build THREW short of minecraft:stone_bricks x160
+        --   JOB Build THREW short of minecraft:stone_bricks x96
+        --
+        -- Nothing was ever placed, the floor stayed at zero blocks, and the log read as a broken
+        -- builder when the builder was fine and the order was simply bigger than the larder.
+        --
+        -- Blocks whose material did not arrive are skipped below rather than placed wrong, and the
+        -- patch is re-issued by order.tower, so the floor converges instead of stalling.
         if s_Hand.complete == false then
             local s_Miss = ""
             for _, m in ipairs(s_Hand.short or {}) do s_Miss = s_Miss .. m.name .. " x" .. m.count .. " " end
-            error("short of " .. s_Miss, 0)
+            trace(("build: short of %s -- placing what arrived and leaving the rest for the next pass")
+                  :format(s_Miss))
         end
 
         -- ArriveOrAskToMove, not a bare ArriveAt -- see the note on the crafting pickup above.
