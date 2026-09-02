@@ -2682,6 +2682,22 @@ local m_ServerEvents = { -- Runs on a different thread so that we can interrupt 
                 description = true,
                 type = "int"
             },
+            -- DECLARED, OR IT NEVER ARRIVES. PowNet drops any field not named here, silently, and
+            -- the call still returns success.
+            --
+            -- order.build has passed dependsOn since it was written, and its own comment says what
+            -- it is for: "The build waits for the last craft step. Without that it would start,
+            -- find the chest short, and abandon a half-finished structure on a plot now marked
+            -- active." That is exactly what has been happening -- the field was dropped in
+            -- transport every single time, so no build has ever waited for its materials.
+            --
+            -- Caught when order.tower queued 13 patches for a floor whose 2,310 stone bricks had
+            -- not been crafted yet and every one of them came back dependsOn=None.
+            dependsOn = {
+                optional = true,
+                description = true,
+                type = "int"
+            },
             work = {
                 optional = false,
                 type = "option", -- single decision
