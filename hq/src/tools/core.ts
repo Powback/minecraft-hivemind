@@ -2301,6 +2301,9 @@ registry.register({
 
 
 // ── order.build ────────────────────────────────────────────────────────────
+/** Ten stacks. A turtle has twelve usable slots and needs room for the grid and the output. */
+const CRAFT_CARRY_ITEMS = 640;
+
 /**
  * QUEUE THE CRAFTING A COST NEEDS, AND SAY WHAT COULD NOT BE MADE.
  *
@@ -2328,6 +2331,19 @@ async function queueCrafting(
     if (plan.missing.length) { cannot.push(`${item} (needs ${plan.missing.join(', ')})`); continue; }
     for (const step of plan.steps) {
       if (step.action !== 'craft') continue;
+      // SIZE THE JOB TO THE DRONE, NOT TO THE ORDER.
+      //
+      // A tower floor needs 2,310 stone bricks, so the planner produced a single craft of 578 runs
+      // and the drone dutifully asked storage for 4 x 578 = 2,312 stone. A turtle has twelve usable
+      // slots -- 768 items at the absolute most -- so the request can never be met, and the job
+      // limps along on partial progress: measured at ~32 bricks per trip against a 2,310 target.
+      //
+      // Capping runs to one carryable load turns that into a few hundred per trip, and the leftover
+      // is simply the next task: order.tower re-queues what is still missing every time it runs.
+      const perRun = Object.values(recipeInputs(step.item) ?? {})
+        .reduce((n: number, v: any) => n + (Number(v) || 0), 0) || 1;
+      const carryable = Math.max(1, Math.floor(CRAFT_CARRY_ITEMS / perRun));
+      const runs = Math.min(step.runs, carryable);
       // CHAIN THE STEPS. expand() returns them in dependency order and queueing them
       // independently threw that order away.
       //
@@ -2352,10 +2368,10 @@ async function queueCrafting(
         // depended on: work that PRODUCES an input cannot rank below work that CONSUMES it.
         priority: 1,
         dependsOn: last,
-        work: { craft: { item: step.item, runs: step.runs, grid: step.grid, inputs: recipeInputs(step.item) } },
+        work: { craft: { item: step.item, runs, grid: step.grid, inputs: recipeInputs(step.item) } },
       }, { timeoutMs: 8000 });
       if (typeof res !== 'string') {
-        crafted.push({ item: step.item, runs: step.runs, task: res?.id });
+        crafted.push({ item: step.item, runs, task: res?.id });
         last = res?.id;
         willHave.add(step.item);
       }
