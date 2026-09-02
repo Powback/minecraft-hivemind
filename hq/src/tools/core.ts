@@ -2340,7 +2340,17 @@ async function queueCrafting(
       // recipe graph is a sequence by construction.
       const res: any = await bridge.call('TaskMan', 'Add', {
         name: `craft-${step.item.replace('minecraft:', '')}`,
-        priority: 2,
+        // ONE ABOVE THE BUILD IT FEEDS.
+        //
+        // Crafting and building were both priority 2, so they competed -- and the builds won. The
+        // tower had 16 patches handed out to drones with nothing to place while
+        // craft-stone_bricks, the job that turns 3,346 stone into the 2,310 bricks those patches
+        // need, sat unassigned. Every patch then failed on "short of minecraft:stone_bricks".
+        //
+        // A craft only exists because something downstream needs its output, so it must be picked
+        // up first. This is the same inversion as fuel relief being preempted by the gather it
+        // depended on: work that PRODUCES an input cannot rank below work that CONSUMES it.
+        priority: 1,
         dependsOn: last,
         work: { craft: { item: step.item, runs: step.runs, grid: step.grid, inputs: recipeInputs(step.item) } },
       }, { timeoutMs: 8000 });
