@@ -1,5 +1,6 @@
 Bridge 16
 DockingMan 15
+DroneLogic 20
 DroneMan 11
 MainFrame 10
 MapServer 13

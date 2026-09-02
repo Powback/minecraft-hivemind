@@ -556,6 +556,122 @@ local function pickDrones(p_Role)
     return s_Free, s_Busy
 end
 
+-- WHICH VERB, AND WHAT TRAVELS WITH IT.
+--
+-- Lifted out of OnStartTask, which had grown into the largest function in the file: the selection
+-- is a self-contained question -- given a task and the role that took it, what does the drone need
+-- to be told -- and keeping it inline meant every new work type made the dispatcher harder to read
+-- and harder to change.
+--
+-- Returns verb, payload. Nil verb is not possible: the final branch is a Dig, which is what an
+-- unrecognised work shape has always fallen back to.
+local function verbFor(s_Task, s_Role)
+-- Dig, not GoTo. GoTo only moves a drone to a coordinate -- dispatching mining work with it
+-- sent a miner to stand next to the ore and do nothing.
+local s_Verb, s_Payload
+if s_Role == "scout" then
+    local w = s_Task.work.survey or {}
+    local s_Pos, s_W, s_H = w.pos, w.w, w.h
+    local s_R = tonumber(w.radius) or 8
+
+    -- A REGION IS NOT A DESTINATION UNTIL SOMEBODY TURNS IT INTO ONE.
+    --
+    -- order.issue{kind="explore"} records a region -- {min, max} -- and nothing else. This
+    -- passed w.pos straight through, so `pos` was nil, and OnSurvey only travels `if d.pos`.
+    -- Every explore order therefore told a scout to survey a box on the other side of the base
+    -- and the scout scanned where it was already standing, indefinitely, reporting "scanning"
+    -- the whole time. Four scouts sat in four unrelated places rescanning ground they had
+    -- already covered while nine tiles over the base went untouched.
+    --
+    -- The region has everything needed to fix that: start in a corner, one scan-diameter in so
+    -- the first sphere lands inside the box, and take as many steps as it takes to tile it.
+    if s_Pos == nil and w.min and w.max then
+        -- NO Y. The scout supplies its own.
+        --
+        -- Aiming at w.max.y sends it to the top of the box -- y=95, well into open sky -- which
+        -- is wrong twice over. It burns a long vertical climb to reach a height the survey
+        -- immediately gives back by settling to the ground, and over unmapped terrain the climb
+        -- often cannot be pathed at all, so the task fails with "could not reach the survey
+        -- start", requeues, and the next scout repeats it. Scouts going idle in place is what
+        -- that looks like from outside.
+        --
+        -- The scout already knows a workable altitude: the one it is flying at. Travel across
+        -- at that height and let settle() find the ground once it arrives.
+        s_Pos = {x = w.min.x + s_R, z = w.min.z + s_R}
+        local s_Step = s_R * 2
+        s_W = s_W or math.max(1, math.ceil((w.max.x - w.min.x) / s_Step))
+        s_H = s_H or math.max(1, math.ceil((w.max.z - w.min.z) / s_Step))
+    end
+
+    s_Verb, s_Payload = "Survey", {w = s_W, h = s_H, radius = w.radius, pos = s_Pos,
+                                   taskId = s_Task.id}
+elseif s_Task.work.build then
+    -- The layout arrives as data. HQ costed it, checked it against the plot registry and
+    -- ordered it bottom-up before any of this was dispatched.
+    local w = s_Task.work.build
+    s_Verb, s_Payload = "Build", {origin = w.origin, blocks = w.blocks, taskId = s_Task.id}
+elseif s_Task.work.mine then
+    -- Prospecting: sink a shaft and drive branches, inspecting what gets exposed. The only job
+    -- that can find ore the map has never seen.
+    local w = s_Task.work.mine
+    s_Verb, s_Payload = "Mine", {pos = w.pos, depth = w.depth, length = w.length,
+                                 branches = w.branches, spacing = w.spacing, taskId = s_Task.id}
+elseif s_Task.work.craft then
+    -- The output of the recipe planner, executed. grid and inputs travel with the task because
+    -- the drone has no recipe book: turtle.craft reads the inventory layout and infers what is
+    -- being made, so the layout has to arrive with the order.
+    local w = s_Task.work.craft
+    s_Verb, s_Payload = "Craft", {item = w.item, runs = w.runs, grid = w.grid, inputs = w.inputs, taskId = s_Task.id}
+elseif s_Task.work.gather then
+    -- Targeted collection: the survey already knows where these blocks are.
+    local w = s_Task.work.gather
+    s_Verb, s_Payload = "Gather", {targets = w.targets, match = w.match, limit = w.limit, taskId = s_Task.id}
+elseif s_Task.work.rescue then
+    -- A RESCUE IS A GoTo. THAT IS THE WHOLE TRICK.
+    --
+    -- OnGoTo already falls back moveTo -> flyTo -> digTo, and digTo carves a two-high walkable
+    -- tunnel. So a miner told to go and stand where a trapped scout is standing will cut its way
+    -- there through whatever is in between -- and the tunnel it leaves behind is the way out.
+    -- Nothing new has to know how to dig; the rescue is just a destination that happens to have
+    -- a drone sitting at it.
+    local w = s_Task.work.rescue
+    if w.fuel then
+        -- Not a destination job. The rescuer has to load coal from storage FIRST, so it cannot
+        -- just be pointed at the casualty the way a dig-out can.
+        s_Verb, s_Payload = "Relieve",
+            {pos = livePos(w.drone, w.pos), drone = w.drone, taskId = s_Task.id}
+    else
+        -- Same staleness, same fix: a dig-out aimed at the old coordinate tunnels to an empty
+        -- pocket of rock next to the drone it was sent to free.
+        s_Verb, s_Payload = "GoTo", {pos = livePos(w.drone, w.pos), taskId = s_Task.id}
+    end
+elseif s_Task.work.lumber then
+    -- Wood gates chests, planks and sticks, and therefore every factory the fleet might
+    -- build. Nothing else produces it.
+    local w = s_Task.work.lumber
+    s_Verb, s_Payload = "Lumber", {w = w.w, l = w.l, drop = w.drop, pos = w.start, taskId = s_Task.id}
+elseif s_Task.work.haul then
+    -- GO AND EMPTY A FIELD CACHE. WITHOUT THIS, CACHING LOSES THE MATERIAL IT SAVES.
+    --
+    -- A drone working far from base places a chest and leaves its spoil in it rather than
+    -- flying eighty blocks per load -- which is correct, and PlaceCacheHere even registers the
+    -- chest with StorageMan so it can be found again. Nothing ever went back for it. OnHaul was
+    -- written for exactly this and TaskMan had no work type that could reach it, so the verb
+    -- existed on the drone and could not be dispatched.
+    --
+    -- Measured: a lumber sweep reported "JOB Lumber done" with oak_log still 0 in storage. The
+    -- wood was in a cache 81 blocks out. Every downstream thing -- planks, chests, and so every
+    -- blueprint in the settlement -- waits on wood, so the whole build chain stalled on
+    -- material that had already been cut and was sitting in a box nobody was going to open.
+    local w = s_Task.work.haul
+    s_Verb, s_Payload = "Haul", {pos = w.pos, taskId = s_Task.id}
+else
+    local w = s_Task.work.dig or {}
+    s_Verb, s_Payload = "Dig", {w = w.w, l = w.l, depth = w.depth, pos = w.start, taskId = s_Task.id}
+end
+    return s_Verb, s_Payload
+end
+
 function OnStartTask(p_ID, p_Message)
     local s_Id = p_Message.data and p_Message.data.id
     if s_Id == nil then return false, "Missing id" end
@@ -641,94 +757,8 @@ function OnStartTask(p_ID, p_Message)
                (s_Role == "scout" and "geo scanner" or "pickaxe")
     end
 
-    -- Dig, not GoTo. GoTo only moves a drone to a coordinate -- dispatching mining work with it
-    -- sent a miner to stand next to the ore and do nothing.
-    local s_Verb, s_Payload
-    if s_Role == "scout" then
-        local w = s_Task.work.survey or {}
-        local s_Pos, s_W, s_H = w.pos, w.w, w.h
-        local s_R = tonumber(w.radius) or 8
+    local s_Verb, s_Payload = verbFor(s_Task, s_Role)
 
-        -- A REGION IS NOT A DESTINATION UNTIL SOMEBODY TURNS IT INTO ONE.
-        --
-        -- order.issue{kind="explore"} records a region -- {min, max} -- and nothing else. This
-        -- passed w.pos straight through, so `pos` was nil, and OnSurvey only travels `if d.pos`.
-        -- Every explore order therefore told a scout to survey a box on the other side of the base
-        -- and the scout scanned where it was already standing, indefinitely, reporting "scanning"
-        -- the whole time. Four scouts sat in four unrelated places rescanning ground they had
-        -- already covered while nine tiles over the base went untouched.
-        --
-        -- The region has everything needed to fix that: start in a corner, one scan-diameter in so
-        -- the first sphere lands inside the box, and take as many steps as it takes to tile it.
-        if s_Pos == nil and w.min and w.max then
-            -- NO Y. The scout supplies its own.
-            --
-            -- Aiming at w.max.y sends it to the top of the box -- y=95, well into open sky -- which
-            -- is wrong twice over. It burns a long vertical climb to reach a height the survey
-            -- immediately gives back by settling to the ground, and over unmapped terrain the climb
-            -- often cannot be pathed at all, so the task fails with "could not reach the survey
-            -- start", requeues, and the next scout repeats it. Scouts going idle in place is what
-            -- that looks like from outside.
-            --
-            -- The scout already knows a workable altitude: the one it is flying at. Travel across
-            -- at that height and let settle() find the ground once it arrives.
-            s_Pos = {x = w.min.x + s_R, z = w.min.z + s_R}
-            local s_Step = s_R * 2
-            s_W = s_W or math.max(1, math.ceil((w.max.x - w.min.x) / s_Step))
-            s_H = s_H or math.max(1, math.ceil((w.max.z - w.min.z) / s_Step))
-        end
-
-        s_Verb, s_Payload = "Survey", {w = s_W, h = s_H, radius = w.radius, pos = s_Pos,
-                                       taskId = s_Task.id}
-    elseif s_Task.work.build then
-        -- The layout arrives as data. HQ costed it, checked it against the plot registry and
-        -- ordered it bottom-up before any of this was dispatched.
-        local w = s_Task.work.build
-        s_Verb, s_Payload = "Build", {origin = w.origin, blocks = w.blocks, taskId = s_Task.id}
-    elseif s_Task.work.mine then
-        -- Prospecting: sink a shaft and drive branches, inspecting what gets exposed. The only job
-        -- that can find ore the map has never seen.
-        local w = s_Task.work.mine
-        s_Verb, s_Payload = "Mine", {pos = w.pos, depth = w.depth, length = w.length,
-                                     branches = w.branches, spacing = w.spacing, taskId = s_Task.id}
-    elseif s_Task.work.craft then
-        -- The output of the recipe planner, executed. grid and inputs travel with the task because
-        -- the drone has no recipe book: turtle.craft reads the inventory layout and infers what is
-        -- being made, so the layout has to arrive with the order.
-        local w = s_Task.work.craft
-        s_Verb, s_Payload = "Craft", {item = w.item, runs = w.runs, grid = w.grid, inputs = w.inputs, taskId = s_Task.id}
-    elseif s_Task.work.gather then
-        -- Targeted collection: the survey already knows where these blocks are.
-        local w = s_Task.work.gather
-        s_Verb, s_Payload = "Gather", {targets = w.targets, match = w.match, limit = w.limit, taskId = s_Task.id}
-    elseif s_Task.work.rescue then
-        -- A RESCUE IS A GoTo. THAT IS THE WHOLE TRICK.
-        --
-        -- OnGoTo already falls back moveTo -> flyTo -> digTo, and digTo carves a two-high walkable
-        -- tunnel. So a miner told to go and stand where a trapped scout is standing will cut its way
-        -- there through whatever is in between -- and the tunnel it leaves behind is the way out.
-        -- Nothing new has to know how to dig; the rescue is just a destination that happens to have
-        -- a drone sitting at it.
-        local w = s_Task.work.rescue
-        if w.fuel then
-            -- Not a destination job. The rescuer has to load coal from storage FIRST, so it cannot
-            -- just be pointed at the casualty the way a dig-out can.
-            s_Verb, s_Payload = "Relieve",
-                {pos = livePos(w.drone, w.pos), drone = w.drone, taskId = s_Task.id}
-        else
-            -- Same staleness, same fix: a dig-out aimed at the old coordinate tunnels to an empty
-            -- pocket of rock next to the drone it was sent to free.
-            s_Verb, s_Payload = "GoTo", {pos = livePos(w.drone, w.pos), taskId = s_Task.id}
-        end
-    elseif s_Task.work.lumber then
-        -- Wood gates chests, planks and sticks, and therefore every factory the fleet might
-        -- build. Nothing else produces it.
-        local w = s_Task.work.lumber
-        s_Verb, s_Payload = "Lumber", {w = w.w, l = w.l, drop = w.drop, pos = w.start, taskId = s_Task.id}
-    else
-        local w = s_Task.work.dig or {}
-        s_Verb, s_Payload = "Dig", {w = w.w, l = w.l, depth = w.depth, pos = w.start, taskId = s_Task.id}
-    end
     -- Say what was sent and to whom. "reclaiming task N -- never started" is the only symptom of a
     -- dispatch that did not arrive, and it says nothing about which verb went where.
     Log(("dispatch %s -> %s (task %s)"):format(tostring(s_Verb), tostring(s_Drone.name or s_Drone.id),

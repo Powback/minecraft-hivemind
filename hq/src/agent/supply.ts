@@ -1127,6 +1127,100 @@ async function storageHasNoRoom(): Promise<boolean> {
   return true;
 }
 
+/**
+ * A drone is live only if it is neither FLAGGED offline nor REPORTING an offline-ish status.
+ * Checking the flag alone let a dead drone count as "busy", and one dead drone stalled the whole
+ * loop -- the supply tick concluded somebody was already working and did nothing, for hours.
+ */
+function offlineish(d: any): boolean {
+  return d.offline === true || d.status === 'offline' || d.status === 'lost';
+}
+
+/**
+ * KEEPING THE PLACE RUNNING, BEFORE ANY NEW WORK IS CONSIDERED.
+ *
+ * Both of these are about material the settlement ALREADY has and cannot use: somewhere to put
+ * things, and going to fetch what was left in the field. Neither produces anything new, and both
+ * must beat speculative gathering -- there is no point mining more ore into a full bay, or felling
+ * more trees while the last load sits in a box nobody opened.
+ *
+ * First one to act wins the tick, which is the same rule the rest of the loop follows.
+ */
+async function maintenancePhases(
+  live: any[], queued: Set<string>,
+): Promise<{ acted: boolean; reason: string } | null> {
+  return (await expandStorageIfFull(live, queued)) ?? (await collectFieldCaches(live, queued));
+}
+
+/**
+ * MAY THIS PERIODIC ACTION RUN RIGHT NOW?
+ *
+ * Two rules govern every one of them and they were written out twice, which is how they drift: an
+ * OUTSTANDING TASK is the real answer to "did I already do this" -- a fact rather than a guess --
+ * and the cooldown only covers the window between queueing and the task appearing in the list.
+ * Getting that order wrong once queued five duplicate chest-rows at 0 free slots.
+ */
+function mayQueue(queued: Set<string>, prefix: string, cooldownKey: string): boolean {
+  if ([...queued].some((n) => n.startsWith(prefix))) return false;
+  return (supply.cooldowns[cooldownKey] ?? 0) <= Date.now();
+}
+
+/**
+ * GO AND EMPTY THE FIELD CACHES. OTHERWISE CACHING LOSES THE MATERIAL IT SAVES.
+ *
+ * A drone working far from base places a chest and leaves its spoil in it rather than flying the
+ * haul once per load. That is right, and PlaceCacheHere registers the chest with StorageMan so it
+ * can be found again -- its own comment says "register it, or it is a hole with a chest in it that
+ * nobody will ever visit again". Nobody ever visited it.
+ *
+ * Measured: a lumber sweep logged "JOB Lumber done" with oak_log still 0 in storage, because the
+ * wood was in a cache 81 blocks out. Planks come from logs, chests come from planks, and every
+ * blueprint in the settlement costs planks or chests -- so the entire build chain was stalled on
+ * material that had already been cut and was sitting in a box.
+ *
+ * A cache is a deposit point with NO peripheral: it has no wired modem, which is exactly why
+ * storage cannot see into it and why nothing noticed it was full. That absence is the marker.
+ *
+ * One at a time, and behind a cooldown, because a haul is a long round trip and the alternative --
+ * queueing every cache at once -- takes the whole fleet off work to fetch boxes that may be empty.
+ */
+async function collectFieldCaches(
+  live: any[], queued: Set<string>,
+): Promise<{ acted: boolean; reason: string } | null> {
+  // No !live.length guard on purpose: a queued haul costs nothing and waits for whoever frees up.
+  if (!mayQueue(queued, 'haul:', '__haul')) return null;
+
+  // luaList, not Array.isArray -- an empty deposit list serialises to {} rather than [], the same
+  // trap that once made a fresh world refuse to dispatch anything at all.
+  const r: any = await bridge.call('StorageMan', 'DepositPoints', {}, { timeoutMs: 8000 })
+    .catch(() => null);
+  const points = luaList<any>(r?.points ?? r?.data?.points) ?? [];
+
+  // No peripheral == off the wired network == a field cache rather than a bay chest.
+  const caches = points.filter((q: any) => q?.pos && !q.peripheral && withinReach(q.pos));
+  if (!caches.length) return null;
+
+  // Furthest first: those are the ones a drone would otherwise refuse to haul from, and the ones
+  // holding the most by the time anyone gets there.
+  const b = settlement.base;
+  const far = (q: any) => Math.abs(q.x - b.x) + Math.abs(q.y - b.y) + Math.abs(q.z - b.z);
+  const at = caches.sort((x: any, y: any) => far(y.pos) - far(x.pos))[0].pos;
+
+  const where = `${at.x},${at.y},${at.z}`;
+  note(`field cache at ${where} has never been collected -- sending a drone`);
+  // A refusal comes back as a STRING, not an exception -- see buildQueuedSet. Treat both alike.
+  const added: any = await bridge.call('TaskMan', 'Add', {
+    name: `haul:${where}`,
+    priority: 1,
+    work: { haul: { pos: { x: at.x, y: at.y, z: at.z } } },
+  }, { timeoutMs: 8000 }).catch(() => null);
+  if (!added || typeof added === 'string') return null;
+
+  supply.cooldowns['__haul'] = Date.now() + 3 * 60_000;
+  saveSupply();
+  return { acted: true, reason: `queued a haul from the cache at ${where}` };
+}
+
 async function expandStorageIfFull(
   live: any[], queued: Set<string>,
 ): Promise<{ acted: boolean; reason: string } | null> {
@@ -1144,9 +1238,7 @@ async function expandStorageIfFull(
   //
   // The cooldown stays as a second line of defence for the window between queueing and the task
   // appearing in the list.
-  if ([...queued].some((n) => n.startsWith('build-chest-row'))) return null;
-  const until = supply.cooldowns['__storage'] ?? 0;
-  if (until > Date.now()) return null;
+  if (!mayQueue(queued, 'build-chest-row', '__storage')) return null;
 
   const free = await observedFreeSlots();
   if (free === null || free > FREE_SLOTS_FLOOR) return null;
@@ -1176,10 +1268,7 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
   // Never stack speculative work: if anything is already mining, this loop waits.
   const fleet: any = await bridge.call('DroneMan', 'GetDrones', {}, { timeoutMs: 5000 });
   const drones = fleet?.drones ?? fleet?.data?.drones ?? [];
-  // A drone is live only if it is neither flagged offline nor REPORTING an offline-ish status.
-  // Checking the flag alone let a dead drone count as "busy" and stalled the whole loop.
-  const dead = (d: any) => d.offline === true || d.status === 'offline' || d.status === 'lost';
-  const live = drones.filter((d: any) => !dead(d));
+  const live = drones.filter((d: any) => !offlineish(d));
   // Gate per ROLE, not across the fleet.
   //
   // This used to bail whenever any drone was working at all, which sounded conservative and was
@@ -1206,8 +1295,8 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
   if ('refuse' in q) return { acted: false, reason: q.refuse };
   const queued = q.queued;
 
-  const expanded = await expandStorageIfFull(live, queued);
-  if (expanded) return expanded;
+  const maintained = await maintenancePhases(live, queued);
+  if (maintained) return maintained;
 
 
   const idleMiner = idle('miner');

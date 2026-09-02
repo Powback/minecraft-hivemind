@@ -29,7 +29,7 @@ const at = (call: string) => {
 
 describe('supply tick ordering', () => {
   it('checks storage before any phase that can return early', () => {
-    const storage = at('await expandStorageIfFull(');
+    const storage = at('await maintenancePhases(');
     expect(storage).toBeLessThan(at('await materialPhases('));
   });
 
@@ -58,28 +58,51 @@ describe('supply tick ordering', () => {
   });
 
   it('checks storage before dispatching any rule', () => {
-    expect(at('await expandStorageIfFull(')).toBeLessThan(at('for (const rule of supply.rules)'));
+    expect(at('await maintenancePhases(')).toBeLessThan(at('for (const rule of supply.rules)'));
   });
 
   it('reads the queue before any phase that can add to it', () => {
     // Every phase below can queue work, so every one needs to know what is already outstanding.
     // Reading it halfway down is why the storage rule had to guard itself with a timer instead of
     // a fact -- and a timer expires while the previous build is still running.
-    expect(at('await buildQueuedSet(')).toBeLessThan(at('await expandStorageIfFull('));
+    expect(at('await buildQueuedSet(')).toBeLessThan(at('await maintenancePhases('));
     expect(at('await buildQueuedSet(')).toBeLessThan(at('await materialPhases('));
   });
 
   it('will not queue a second storage expansion while one is outstanding', () => {
     // Guarded on the FACT of an outstanding build, not on elapsed time. Cooldown-only produced
     // build-chest-row-storage-03, -05, -06, -07 and -08 for the same shortage.
+    //
+    // The check now lives in mayQueue, shared with the field-cache collector, because two copies of
+    // one rule is how they drift. Pin the CALLER passes its prefix, and separately that mayQueue
+    // still asks about outstanding tasks BEFORE the cooldown -- that order is the whole lesson.
     const fn = src.slice(src.indexOf('async function expandStorageIfFull'));
     const body = fn.slice(0, fn.indexOf('\n}\n'));
-    expect(body).toMatch(/queued\].some\(\(n\) => n\.startsWith\('build-chest-row'\)\)/);
+    expect(body).toMatch(/mayQueue\(queued, 'build-chest-row', '__storage'\)/);
+
+    const guard = src.slice(src.indexOf('function mayQueue('));
+    const guardBody = guard.slice(0, guard.indexOf('\n}\n'));
+    expect(guardBody, 'an outstanding task must veto before the cooldown is consulted')
+      .toMatch(/startsWith\(prefix\)[\s\S]*cooldowns\[cooldownKey\]/);
+  });
+
+  it('collects field caches, or caching loses the material it saves', () => {
+    // A lumber sweep reported done with oak_log still 0: the wood was in a cache 81 blocks out and
+    // nothing ever went back for it. Planks gate chests and chests gate every blueprint, so the
+    // whole build chain stalled on material already cut.
+    expect(src).toMatch(/async function collectFieldCaches\(/);
+    const fn = src.slice(src.indexOf('async function collectFieldCaches'));
+    const body = fn.slice(0, fn.indexOf('\n}\n'));
+    // A cache is a deposit point with no peripheral -- that absence is what identifies it.
+    expect(body, 'a field cache is identified by having NO peripheral').toMatch(/!\w+\.peripheral/);
+    expect(body, 'must queue work TaskMan can dispatch').toMatch(/work: \{ haul:/);
+    // And the tick must act on it rather than discarding the result.
+    expect(src).toMatch(/await collectFieldCaches\(live, queued\)/);
   });
 
   it('acts on the storage result rather than discarding it', () => {
     // A phase whose result is ignored is the same as one that never ran.
-    const after = tick.slice(at('await expandStorageIfFull('), at('await materialPhases('));
-    expect(after).toMatch(/if \(expanded\) return expanded;/);
+    const after = tick.slice(at('await maintenancePhases('), at('await materialPhases('));
+    expect(after).toMatch(/if \(maintained\) return maintained;/);
   });
 });
