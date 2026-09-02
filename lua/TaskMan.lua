@@ -114,6 +114,15 @@ function OnAddTask(p_ID, p_Message)
             if s_Task.work ~= nil then
                 v.work = s_Task.work
                 v.priority = s_Task.priority or v.priority
+                -- AND ITS DEPENDENCIES. Same lesson as the work field above, one line down.
+                --
+                -- Re-issuing a job to attach a prerequisite is exactly the case this branch exists
+                -- for, and dropping dependsOn made that impossible: order.tower was re-run so its
+                -- 13 build patches would wait for the 2,310 stone bricks being crafted, and every
+                -- patch came back dependsOn=None again -- the new orders were taken, minus the only
+                -- part that had changed. `after` goes with it for the same reason.
+                v.dependsOn = s_Task.dependsOn
+                v.after = s_Task.after
                 PowNet.MarkDirty()
                 Log(("duplicate task %s -- kept the queued one and took the new parameters")
                     :format(tostring(s_Task.name)))
