@@ -2325,58 +2325,59 @@ async function queueCrafting(
   const cannot: string[] = [];
   const willHave = new Set<string>();
   let last: number | undefined;
+
+  // AGGREGATE PER ITEM BEFORE QUEUEING. THE SAME INTERMEDIATE APPEARS IN SEVERAL PLANS.
+  //
+  // A tower floor needs 2,310 stone bricks AND 32 stone brick walls, and a wall is made OF bricks.
+  // So expand() legitimately yields stone_bricks twice: 578 runs for the floor, 1 run for the
+  // walls. Both queue under the name craft-stone_bricks, TaskMan treats the second as a duplicate
+  // and takes its parameters -- so the 578-run job was overwritten by the 1-run one and the drone
+  // crafted four bricks a trip against a 2,310 target.
+  //
+  // First-seen order is kept because expand() already returns steps in dependency order, and that
+  // ordering is what stops the crafter picking up a job whose input another job has not made yet.
+  const steps = new Map<string, { runs: number; grid: unknown }>();
   for (const [item, count] of Object.entries(p_Need)) {
     if ((p_Stock[item] ?? 0) >= count) continue;
     const plan = expand(item, count, (i) => p_Stock[i] ?? 0);
     if (plan.missing.length) { cannot.push(`${item} (needs ${plan.missing.join(', ')})`); continue; }
     for (const step of plan.steps) {
       if (step.action !== 'craft') continue;
-      // SIZE THE JOB TO THE DRONE, NOT TO THE ORDER.
-      //
-      // A tower floor needs 2,310 stone bricks, so the planner produced a single craft of 578 runs
-      // and the drone dutifully asked storage for 4 x 578 = 2,312 stone. A turtle has twelve usable
-      // slots -- 768 items at the absolute most -- so the request can never be met, and the job
-      // limps along on partial progress: measured at ~32 bricks per trip against a 2,310 target.
-      //
-      // Capping runs to one carryable load turns that into a few hundred per trip, and the leftover
-      // is simply the next task: order.tower re-queues what is still missing every time it runs.
-      const perRun = Object.values(recipeInputs(step.item) ?? {})
-        .reduce((n: number, v: any) => n + (Number(v) || 0), 0) || 1;
-      const carryable = Math.max(1, Math.floor(CRAFT_CARRY_ITEMS / perRun));
-      const runs = Math.min(step.runs, carryable);
-      // CHAIN THE STEPS. expand() returns them in dependency order and queueing them
-      // independently threw that order away.
-      //
-      // Measured: a tower floor needs stone_bricks (from stone) and then stone_brick_wall (from
-      // those bricks). Both were queued at once, the crafter picked up the WALL first, and it can
-      // never finish -- its input is what the other task exists to produce. craft-stone_bricks sat
-      // unassigned behind a job waiting on its own output, and the whole floor waited on that.
-      //
-      // Chaining serialises the crafter, which costs nothing real: there is one crafter, and a
-      // recipe graph is a sequence by construction.
-      const res: any = await bridge.call('TaskMan', 'Add', {
-        name: `craft-${step.item.replace('minecraft:', '')}`,
-        // ONE ABOVE THE BUILD IT FEEDS.
-        //
-        // Crafting and building were both priority 2, so they competed -- and the builds won. The
-        // tower had 16 patches handed out to drones with nothing to place while
-        // craft-stone_bricks, the job that turns 3,346 stone into the 2,310 bricks those patches
-        // need, sat unassigned. Every patch then failed on "short of minecraft:stone_bricks".
-        //
-        // A craft only exists because something downstream needs its output, so it must be picked
-        // up first. This is the same inversion as fuel relief being preempted by the gather it
-        // depended on: work that PRODUCES an input cannot rank below work that CONSUMES it.
-        priority: 1,
-        dependsOn: last,
-        work: { craft: { item: step.item, runs, grid: step.grid, inputs: recipeInputs(step.item) } },
-      }, { timeoutMs: 8000 });
-      if (typeof res !== 'string') {
-        crafted.push({ item: step.item, runs, task: res?.id });
-        last = res?.id;
-        willHave.add(step.item);
-      }
+      const seen = steps.get(step.item);
+      steps.set(step.item, { runs: (seen?.runs ?? 0) + step.runs, grid: step.grid });
     }
   }
+
+  for (const [item, step] of steps) {
+    // SIZE THE JOB TO THE DRONE, NOT TO THE ORDER.
+    //
+    // 578 runs meant asking storage for 4 x 578 = 2,312 stone. A turtle has twelve usable slots --
+    // 768 items at most -- so the request can never be met and the job limps on partial progress.
+    // Capping to one carryable load makes it a few hundred per trip; order.tower re-queues whatever
+    // is still missing, so the floor converges instead of crawling.
+    const perRun = Object.values(recipeInputs(item) ?? {})
+      .reduce((n: number, v: any) => n + (Number(v) || 0), 0) || 1;
+    const runs = Math.max(1, Math.min(step.runs, Math.floor(CRAFT_CARRY_ITEMS / perRun)));
+
+    const res: any = await bridge.call('TaskMan', 'Add', {
+      name: `craft-${item.replace('minecraft:', '')}`,
+      // ONE ABOVE THE BUILD IT FEEDS. Crafting and building were both priority 2, so they competed
+      // and the builds won: 16 patches went to drones with nothing to place while the job that
+      // makes the bricks sat unassigned. Work that PRODUCES an input cannot rank below work that
+      // CONSUMES it.
+      priority: 1,
+      // Chain them: expand() returns dependency order and queueing independently threw it away, so
+      // the crafter took stone_brick_wall (needs bricks) ahead of stone_bricks (makes them).
+      dependsOn: last,
+      work: { craft: { item, runs, grid: step.grid, inputs: recipeInputs(item) } },
+    }, { timeoutMs: 8000 });
+    if (typeof res !== 'string') {
+      crafted.push({ item, runs, task: res?.id });
+      last = res?.id;
+      willHave.add(item);
+    }
+  }
+
   return { crafted, cannot, willHave, last };
 }
 
