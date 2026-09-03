@@ -548,6 +548,13 @@ local function pickCost(p_Drone, p_Pos, p_Counts)
     return s_D
 end
 
+-- A PARKED DRONE IS A FREE DRONE. A drone that has nothing to do parks on a dock and reports
+-- "docking" for up to 90 s before it clears itself to "idle", then parks again -- so for most of
+-- its idle life it is not "idle", and every place here that asked for exactly that word skipped
+-- it. Measured 2026-09-04: TaskMan logged "every crafter is busy (D4)" every 15 s for an hour while
+-- D4 sat docked with 1,600 fuel and 818 stone waiting to become the bricks the tower needed.
+-- NOT_AN_ORPHAN already knew this; dispatch did not.
+local FREE_STATES = { idle = true, docking = true }
 local function pickDrone(p_Role, p_Pos, p_Avoid, p_MinFuel)
     local s_Counts = roleCounts()
     local s_Busy, s_Best, s_BestD = nil, nil, nil
@@ -577,7 +584,7 @@ local function pickDrone(p_Role, p_Pos, p_Avoid, p_MinFuel)
             s_Enough = (f == nil) or (f >= s_Need)
         end
         if RoleFits(d, p_Role) then
-            local s_Free = d.status == "idle" and not committed(d.id)
+            local s_Free = FREE_STATES[d.status] == true and not committed(d.id)
             if s_Free and s_Enough then
                 if p_Avoid ~= nil and d.id == p_Avoid then
                     s_Fallback = s_Fallback or d
@@ -755,7 +762,7 @@ local function pickDrones(p_Role)
             -- heartbeats, so `offline` already answers the question the ping was asking, for free
             -- and without blocking anything. The worst case is dispatching to a drone that died in
             -- the last ninety seconds -- and that task is reclaimed on the next sweep anyway.
-            if d.status == "idle" and not d.offline and hasFuel(d)
+            if FREE_STATES[d.status] and not d.offline and hasFuel(d)
                and not tooManyMissedStarts(d) then
                 s_Free[#s_Free + 1] = d
             else

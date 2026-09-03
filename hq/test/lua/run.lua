@@ -103,6 +103,14 @@ test("TaskMan.pickDrone refuses a drone that cannot afford the round trip, and s
     contains(why, "588", "reason names the number")
 end)
 
+test("TaskMan.pickDrone treats a docked drone as free", function()
+    local _, T = taskManWithFleet({
+        { id = 1, name = "D4", role = "miner", status = "docking", fuel = 1200, pos = { x = 0, y = 64, z = 0 } },
+    })
+    local drone, busy = T.pickDrone("miner", { x = 10, y = 64, z = 0 }, nil, 100)
+    truthy(drone, "picked") eq(drone and drone.name, "D4", "the docked drone") eq(busy, nil, "not busy")
+end)
+
 test("TaskMan.pickDrone offers the job to a drone that can afford it", function()
     local _, T = taskManWithFleet({
         { id = 1, name = "D1", role = "miner", status = "idle", fuel = 1000, pos = { x = 0, y = 64, z = 0 } },
