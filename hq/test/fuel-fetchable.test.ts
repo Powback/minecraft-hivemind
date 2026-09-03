@@ -125,9 +125,9 @@ describe('the tower stops while the settlement is out of fuel', () => {
     expect(fn).toMatch(/fuel emergency -- tower paused/);
   });
 
-  it('an unreadable stock is not an emergency', () => {
+  it('an unreadable stock keeps the last answer instead of ending the emergency', () => {
     const fn = slice('fuelEmergency');
-    expect(fn).toMatch(/if \(burnable === null\) return null/);
+    expect(fn).toMatch(/if \(burnable === null\) return lastEmergency/);
     // null means 'could not read the stock'; the pause helper treats only a real true as an emergency
     expect(slice('towerPausedForFuel')).toMatch(/if \(!emergency\) return false/);
   });

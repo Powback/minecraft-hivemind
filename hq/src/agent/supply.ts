@@ -1648,14 +1648,22 @@ const FUEL_EMERGENCY_BELOW = 160;
  * Is the settlement out of fuel? `null` when storage could not be read -- which must NOT read as an
  * emergency, or one unreadable poll stops the tower for a cooldown.
  */
+// AN UNREADABLE SHELF DOES NOT END AN EMERGENCY. One tick at 23:32 got no answer from
+// StorageMan.stock; every caller read the null as "no emergency", and in that tick HQ queued a
+// haul of a cache at y=8 -- 56 blocks underground -- which went to the crafter carrying the
+// fleet's last tank (2026-09-04). The last answer we did get is the honest fallback; null still
+// goes back to callers that want to know the read failed.
+let lastEmergency: boolean | null = null;
 async function fuelEmergency(): Promise<boolean | null> {
   const burnable = await readStockWhere((n) => BURNABLE.test(n),
-    (why) => note(`tower: cannot read fuel stock (${why}) -- not treating it as an emergency`));
-  if (burnable === null) return null;
+    (why) => note(`tower: cannot read fuel stock (${why}) -- keeping the last answer (${lastEmergency ?? 'none'})`));
+  if (burnable === null) return lastEmergency;
   if (burnable < FUEL_EMERGENCY_BELOW) {
     note(`fuel emergency: ${burnable} burnable in storage (below ${FUEL_EMERGENCY_BELOW})`);
+    lastEmergency = true;
     return true;
   }
+  lastEmergency = false;
   return false;
 }
 
