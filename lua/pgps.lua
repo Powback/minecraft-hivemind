@@ -2698,6 +2698,7 @@ end
 
 function setLocationFromLAMA()
     if isLama then
+        local d
         cachedX, cachedY, cachedZ, d = lama.getPosition() --last resort if gps fails, get direction from Lama
         -- By NAME, never by number: LAMA rotates the opposite way round. HEADINGS is the seam.
         cachedDir = HEADINGS[d]

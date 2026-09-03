@@ -5149,6 +5149,11 @@ function OnGather(p_ID, p_Message)
                     end
                     s_At = pgps.digTo(t.x, t.y + 1, t.z, math.min(96, s_D * 2 + 16))
                 end
+                -- Declared here, above the branch that computes it: the "from underneath" and "from
+                -- the side" branches below read it too, and as a `local` inside the first branch it
+                -- was nil there -- every one of those flights fell through to the `or 64` default.
+                -- luacheck found it on its first run; nothing else had in months.
+                local s_FlyBudget = 64
                 if s_At == false then
                     -- BUDGET THE FLIGHT TOO. A CANDIDATE IS OPTIONAL; 400 SECONDS IS NOT.
                     --
@@ -5160,7 +5165,6 @@ function OnGather(p_ID, p_Message)
                     --
                     -- There are hundreds of candidates and they are sorted nearest-first, so giving
                     -- up on a hard one is nearly free and trying forever is what costs the fleet.
-                    local s_FlyBudget = 64
                     if s_Cx then
                         s_FlyBudget = math.min(128, (Blocks(t.x, t.y, t.z, s_Cx, s_Cy, s_Cz)) * 3 + 16)
                     end

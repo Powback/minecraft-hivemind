@@ -68,7 +68,7 @@ end
 --
 
 function drawMap(ox, oy, oz, block, empty, floor, none)
-    resx, resy = term.getSize()
+    local resx, resy = term.getSize()
     ox = ox - math.floor(resx/2)--west = negx
     oz = oz - math.floor(resy/2)--north = negz
     block = block or "@"
@@ -328,6 +328,7 @@ end
 -- or renumbered. Names are only ever added.
 local m_Names = {}      -- id -> name
 local m_NameId = {}     -- name -> id
+local m_DictDirty = false   -- a name was added since the dictionary was last written
 
 local function nameId(p_Name)
     if p_Name == nil then return 0 end
@@ -920,7 +921,6 @@ end
 
 function SetDronePos(idx, y, z)
     idx = coordsOrKey(idx, y, z)
-    d = d or 0
     if cachedWorld[idx] == nil then noteWorldKey(idx) end
     cachedWorld[idx] = 2
     return true
@@ -937,7 +937,6 @@ end
 function setExclusion(idx, y, z)
     local x
     idx, x, y, z = coordsOrKey(idx, y, z)
-    d = d or 0
     exclusions[idx] = {x, y, z}
     if exclusions[idx] ~= nil then
         return true

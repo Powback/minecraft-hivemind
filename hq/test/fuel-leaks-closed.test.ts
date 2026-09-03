@@ -148,7 +148,7 @@ describe('the four fuel leaks stay closed', () => {
     expect(supply).toMatch(/allocate\(city, 'forestry', 'grove-01'\)/);
     expect(supply).toMatch(/const planted = await plantForestry\(queued\);/);
     const taskman = lua('TaskMan.lua');
-    expect(taskman).toMatch(/if p_Work\["plant"\] then return ANY_ROLE end/);
+    expect(taskman).toMatch(/if p_Work\["plant"\] or p_Work\["haul"\] then return ANY_ROLE end/);
     expect(taskman).toMatch(/s_Verb, s_Payload = "Plant", \{spots = s_Task\.work\.plant\.spots, pos = s_Task\.work\.plant\.pos,/);
     expect(logic).toMatch(/^function OnPlant\(p_ID, p_Message\)/m);
     expect(logic).toMatch(/Plant = \{\s*\n\s*func = OnPlant,/);

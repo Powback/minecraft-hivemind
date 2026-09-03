@@ -31,7 +31,21 @@ which every drone treats as a shutdown. That is by design and fine — jobs surv
 `Resumable(d)` — but it interrupts everything, so do not do it casually and do not reboot a drone
 that is carrying something you care about. Prefer redeploying the single module you changed.
 
-Run `cd hq && npx vitest run` before deploying anything. It includes the Lua guards.
+Run `cd hq && npx vitest run` before deploying anything. It includes the Lua guards, `luac -p` on
+every file, and **luacheck** (`.luacheckrc` at the root; `brew install luacheck` -- the luarocks build
+under Lua 5.5 cannot load itself). luacheck's W113 "accessing undefined variable" is zero tolerance:
+it is the local-declared-below-its-use bug this file counts nine outages for, and its first run
+found 29 of them that months of regex "guards" had not -- the GPS relay's position read in nine
+places, a fly budget computed and then read out of scope, a bare `dig` that would have thrown the
+moment a multi-miner dig was placed. Every other warning ratchets per file in
+`hq/luacheck-baseline.json`; `node hq/scripts/luacheck.mjs --update` banks a win. A deliberate
+runtime global goes in `read_globals`/`globals` in `.luacheckrc` with a reason, never a `local`
+added to a file at the 200-local limit.
+
+**A test that greps the source for a line is a comment with a CI bill.** Most of the older guards
+here are that. They break on every rename while the behaviour stands, and pass when the behaviour is
+wrong. Prefer: luacheck for scope, `luac -p` for syntax, and tests that RUN the Lua under `lua` with
+stubbed `turtle`/`peripheral`/`rednet` and assert on what a function returns.
 
 ## Verify at the effect, never at the call
 

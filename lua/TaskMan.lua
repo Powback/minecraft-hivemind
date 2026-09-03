@@ -49,13 +49,11 @@ end
 
 
 
+-- TaskMan runs no job of its own, so there is nothing here to abort. This used to be the drone's
+-- OnAbort pasted in -- it read `executing` and `pgps`, neither of which exists in this module, so
+-- it always returned false and never said why. Aborting a TASK is AbortTask.
 function OnAbort()
-    if(not executing) then
-        return false
-    end
-    print("Aborting...")
-    pgps.BreakExec()
-    return true, "Aborted"
+    return false, "TaskMan has no job of its own to abort -- use AbortTask {id}"
 end
 
 function OnAddTask(p_ID, p_Message)
@@ -270,8 +268,10 @@ function RoleForWork(p_Work)
     -- simply does not exist on a miner, so routing a craft to one wastes the trip and fails at the
     -- last step rather than the first.
     if p_Work["craft"] then return "crafter" end
-    -- Planting a sapling needs no upgrade at all; whoever is idle and fuelled does it.
-    if p_Work["plant"] then return ANY_ROLE end
+    -- Planting a sapling needs no upgrade at all; whoever is idle and fuelled does it. Neither does
+    -- hauling a cache home -- fly there, take, fly back -- and pinning it to miners left a scout with
+    -- 482 fuel idle beside a 45-block haul of 26 logs and 11 coal that no miner could afford.
+    if p_Work["plant"] or p_Work["haul"] then return ANY_ROLE end
     if p_Work["mine"] then return "miner" end
     -- Any turtle can place a block; miners are the general workers.
     if p_Work["build"] then return "miner" end

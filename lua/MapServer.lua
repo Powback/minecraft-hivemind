@@ -190,6 +190,9 @@ local m_BlockAt, m_BlockIndex = {}, {}
 -- Pinned key ordering for BlockAt's paginator; rebuilt whenever a walk starts at offset 0.
 local m_BlockKeys = nil
 
+-- When the map was last written. Declared here, above the one function that reads it: as an
+-- undeclared global it worked by accident and luacheck could not tell it from a typo.
+local m_LastSave = 0
 function OnSaveWorld(p_ID, p_Message)
     -- Was `mergeData(p_Message.data)`, and mergeData is defined nowhere in this codebase -- so
     -- the one endpoint named after saving the world crashed on "attempt to call a nil value" the
