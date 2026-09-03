@@ -2708,7 +2708,7 @@ local function riseToCeiling(p_Ceiling)
     return true
 end
 
-function TravelTo(p_X, p_Y, p_Z, p_Ceiling)
+local function travelToBody(p_X, p_Y, p_Z, p_Ceiling)
     -- DO NOT ASK THE PATHFINDER TO CROSS THE ROOM.
     --
     -- moveTo is an A* request to MapServer, which is holding 207,574 cells: a 1,331-cell region
@@ -2759,6 +2759,39 @@ function TravelTo(p_X, p_Y, p_Z, p_Ceiling)
     -- else's. See RequestClearance -- and CanDig, because `turtle.dig == nil` is never true.
     if not CanDig() then RequestClearance(p_X, p_Y, p_Z) end
     return false
+end
+
+-- ONE COROUTINE MOVES THE TURTLE AT A TIME.
+--
+-- The job loop, the fuel watchdog's refuel trip, the idle dock loop and the region-return loop all
+-- call TravelTo, and nothing stopped two of them from doing it at once. D31's last minute alive:
+-- "moveTo: no progress toward" four DIFFERENT targets in ten seconds -- the dock, the chest, the
+-- lumber site and back -- each coroutine undoing the other's steps, at full fuel cost, two blocks
+-- from a chest that held coal. That fight is a large part of the measured 2.7 fuel per block of
+-- progress. The first routine to start a journey owns the turtle until it returns; anyone else
+-- asking is told "travel busy" at once and decides what that means for them (the fuel watchdog
+-- breaks the job first, exactly so this hand-over is orderly).
+-- A global, not a `local`: DroneLogic is at Lua's 200-local limit for the main chunk.
+TravelOwner = nil
+-- Is somebody ELSE moving the drone right now? Callers that would otherwise escalate a failed
+-- arrival -- ask others to make way, climb, dig -- must ask this first: "travel busy" is not
+-- terrain, and treating it as terrain is how D40 went 235 -> 56 fuel forcing a route to a chest
+-- while another routine was already flying it there.
+function TravelIsBusy()
+    return TravelOwner ~= nil and TravelOwner ~= coroutine.running()
+        and coroutine.status(TravelOwner) ~= "dead"
+end
+function TravelTo(p_X, p_Y, p_Z, p_Ceiling)
+    if TravelIsBusy() then
+        trace(("travel: another routine is already moving the drone -- not also heading to %s,%s,%s")
+            :format(tostring(p_X), tostring(p_Y), tostring(p_Z)))
+        return false, "travel busy"
+    end
+    TravelOwner = coroutine.running()
+    local ok, a, b = pcall(travelToBody, p_X, p_Y, p_Z, p_Ceiling)
+    TravelOwner = nil
+    if not ok then error(a, 0) end
+    return a, b
 end
 
 -- TRAVEL, THEN CHECK YOU ACTUALLY GOT THERE.
@@ -2812,6 +2845,8 @@ end
 
 function ArriveAt(p_X, p_Y, p_Z, p_Ceiling)
     if not TravelTo(p_X, p_Y, p_Z, p_Ceiling) then
+        -- Unless another routine has the turtle: then nothing is in the way, so ask nobody to move.
+        if TravelIsBusy() then return false end
         -- ASK BEFORE GIVING UP. THE OBSTRUCTION IS USUALLY A DRONE.
         --
         -- Yielding was wired only into Deposit, so it covered one caller out of many -- and the
@@ -4252,6 +4287,12 @@ function DepositNow()
         pcall(TakeCacheChest)          -- leave with a chest for the next work site
         return resumeAtFace(hx, hy, hz)
     end
+    -- A failed arrival because ANOTHER routine is flying the drone is not a blocked route: climbing
+    -- and digging toward the chest on top of that flight is what took D40 from 235 to 56 fuel.
+    if TravelIsBusy() then
+        trace("deposit: another routine is moving the drone -- deferring, not forcing a route")
+        return false
+    end
     local ok = ReachByAnyMeans(
         s_Res.pos.x, s_Res.pos.y + 1, s_Res.pos.z, (s_Res.pos.y or 64) + 4, "deposit")
     if ok == false then
@@ -4777,7 +4818,7 @@ local function isLog(p_Name)
     return WoodFamily(p_Name) == "log"
 end
 local function isLeaf(p_Name)     return p_Name ~= nil and string.find(p_Name, "_leaves", 1, true) end
-local function isSapling(p_Name)  return p_Name ~= nil and string.find(p_Name, "_sapling", 1, true) end
+local function isSapling(p_Name)  return WoodFamily(p_Name) == "sapling" end
 
 local function selectMatching(p_Pred)
     for i = 1, 16 do
@@ -6669,7 +6710,7 @@ local function isFuelSelected(p_Slot)
         if FUEL_NAMES[n] then return true end
         -- Logs and planks burn too, and there are dozens of wood types.
         -- Anything WoodFamily recognises burns: logs, planks and the nether stems alike.
-        if WoodFamily(n) ~= nil then return true end
+        if IsBurnableWood(n) then return true end
     end
     local ok, is = pcall(turtle.refuel, 0)
     return ok and is == true
@@ -6760,7 +6801,18 @@ function WoodFamily(p_Name)
     -- own idea of what wood is, and they did not agree on the nether.
     if p_Name:find("_log", 1, true) or p_Name:find("_wood", 1, true)
        or p_Name:find("_stem", 1, true) then return "log" end
+    -- Saplings are a family too, so FetchItems for "a sapling" takes birch as happily as oak. They
+    -- are NOT fuel to the callers that ask "does this burn": those name the log and planks families.
+    if p_Name:find("_sapling", 1, true) then return "sapling" end
     return nil
+end
+
+-- DOES THIS WOOD BURN. Logs and planks do; saplings and sticks are wood the fuel code must not eat.
+-- One predicate, because "what counts as fuel" has been answered three different ways in this file
+-- before and the fourth would have been saplings.
+function IsBurnableWood(p_Name)
+    local s_Family = WoodFamily(p_Name)
+    return s_Family == "log" or s_Family == "planks"
 end
 
 function SameItem(p_Want, p_Have)
@@ -7075,6 +7127,49 @@ end
 --
 -- p_ID is the sending computer. It costs nothing to keep and it is the difference between a
 -- diagnosis and an evening of elimination.
+-- PLANT THE FOREST WHERE THE FLEET LIVES.
+--
+-- Every tree the fleet knows is forty to sixty blocks out, and at the measured 2.7 fuel per block
+-- of progress a run that fells eight logs costs about what the logs are worth as charcoal. The
+-- fleet already carries saplings home from every felling (leaves are cleared so they drop); this
+-- puts them in the ground on the forestry plot HQ allocates beside the bay, so the next round of
+-- lumber is a ten-block walk. Spots come from HQ: ground y and a grid. A sapling goes on TOP of
+-- soil, so the drone checks the block from one above the ground, then rises one and places down.
+function OnPlant(p_ID, p_Message)
+    return RunJob("Plant", p_Message.data, {status = "planting"}, function(d)   -- dup: allow (the RunJob call is the job convention; a handler that does not look like this is the bug)
+        local s_Spots = type(d.spots) == "table" and d.spots or {}
+        if #s_Spots == 0 then return nil, "no spots to plant" end
+        local s_Got = FetchItems({["minecraft:oak_sapling"] = #s_Spots}, {["minecraft:oak_sapling"] = 1})
+        local s_Have = 0
+        for _, n in pairs(s_Got or {}) do s_Have = s_Have + n end
+        if s_Have == 0 then return nil, "no saplings in storage" end
+
+        local s_Planted, s_Skipped = 0, 0
+        for _, s in ipairs(s_Spots) do
+            if s_Planted >= s_Have then break end
+            if PlantSaplingAt(s) then s_Planted = s_Planted + 1 else s_Skipped = s_Skipped + 1 end
+        end
+        turtle.select(1)
+        trace(("plant: %d sapling(s) planted, %d spot(s) skipped, of %d"):format(
+            s_Planted, s_Skipped, #s_Spots))
+        if s_Planted == 0 then return nil, "planted nothing -- no soil at any spot, or none reachable" end
+        return {message = ("planted %d"):format(s_Planted), planted = s_Planted}
+    end)
+end
+
+-- One spot: stand in the air block above the ground, confirm soil, rise one, place down. False when
+-- the spot is unreachable, not soil, or already occupied. A global: DroneLogic is at the 200-local limit.
+function PlantSaplingAt(p_S)
+    if not ArriveAt(p_S.x, p_S.y + 1, p_S.z, p_S.y + 4) then return false end
+    local ok, blk = turtle.inspectDown()
+    local s_Soil = ok and blk and (blk.name == "minecraft:grass_block" or blk.name == "minecraft:dirt")
+    if not s_Soil then return false end
+    if not pgps.up() then return false end
+    local s_Placed = selectMatching(isSapling) and turtle.placeDown()
+    pgps.down()
+    return s_Placed == true
+end
+
 function OnAbort(p_ID)
     -- ALWAYS CLEAR, even when nothing is running.
     --
@@ -7183,6 +7278,9 @@ m_DroneEvents = {
     },
     Lumber = {
         func = OnLumber,
+    },
+    Plant = {
+        func = OnPlant,
     },
     Gather = {
         func = OnGather,
@@ -7373,7 +7471,7 @@ function TryRefuel()
         eachCarriedSlot(function(i, n)   -- dup: allow (this IS the helper the idiom counter wants adopted; a call is not a copy)
             local d = turtle.getItemDetail(i)
             if d and FUEL_NAMES[d.name] then s_Total = s_Total + n * FUEL_PER_UNIT
-            elseif d and WoodFamily(d.name) then s_Total = s_Total + n * FUEL_PER_WOOD end
+            elseif d and IsBurnableWood(d.name) then s_Total = s_Total + n * FUEL_PER_WOOD end
         end)
         return s_Total
     end

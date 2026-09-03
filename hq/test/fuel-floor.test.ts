@@ -59,7 +59,8 @@ describe('fuel floor', () => {
     // pickDrone charges the round trip on top, per block from where the candidate actually is
     expect(taskman).toMatch(/s_Need = p_MinFuel \+ RELIEF_PER_BLOCK \* distTo\(d, p_Pos\)/);
     // and an idle drone that cannot afford it is reported as exactly that, not as "busy"
-    expect(taskman).toMatch(/no %s can afford it/);
+    expect(taskman).toMatch(/UNAFFORDABLE = "can afford it"/);
+    expect(taskman).toMatch(/"no %s " \.\. UNAFFORDABLE \.\. ":/);
   });
 
   it('keeps StorageKnownDry declared above FuelFloorNow', () => {

@@ -21,7 +21,7 @@ const drone = readFileSync(join(__dirname, '../../lua/DroneLogic.lua'), 'utf8');
  */
 describe('adjacent moves bypass the pathfinder', () => {
   it('tries a direct step before any A* call', () => {
-    const fn = drone.slice(drone.indexOf('function TravelTo(p_X, p_Y, p_Z, p_Ceiling)'));
+    const fn = drone.slice(drone.indexOf('function travelToBody(p_X, p_Y, p_Z, p_Ceiling)'));
     const body = fn.slice(0, fn.indexOf('\nend\n') + 5);
     const direct = body.indexOf('stepStraightTo(p_X, p_Y, p_Z)');
     const astar = body.indexOf('pgps.digTo(p_X, p_Y, p_Z)');

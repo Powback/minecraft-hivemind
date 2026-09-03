@@ -270,6 +270,8 @@ function RoleForWork(p_Work)
     -- simply does not exist on a miner, so routing a craft to one wastes the trip and fails at the
     -- last step rather than the first.
     if p_Work["craft"] then return "crafter" end
+    -- Planting a sapling needs no upgrade at all; whoever is idle and fuelled does it.
+    if p_Work["plant"] then return ANY_ROLE end
     if p_Work["mine"] then return "miner" end
     -- Any turtle can place a block; miners are the general workers.
     if p_Work["build"] then return "miner" end
@@ -296,27 +298,29 @@ local function committed(p_DroneId)
 end
 
 -- WHERE IS THIS WORK? Assignment has to know, or it cannot be sensible about who goes.
+-- Where each kind of work happens: the work key and the field that holds its site. A table rather
+-- than a ladder of `if w.x and w.x.pos` -- the ladder had reached CC 24 for what is a lookup, and
+-- every new verb made it longer.
+local WORK_SITE = {
+    mine = "pos", build = "origin", gather = "pos", rescue = "pos",
+    lumber = "start", haul = "pos", plant = "pos", survey = "pos",
+}
+local function midpoint(p_Box)
+    return {x = (p_Box.min.x + p_Box.max.x) / 2,
+            y = (p_Box.min.y + p_Box.max.y) / 2,
+            z = (p_Box.min.z + p_Box.max.z) / 2}
+end
 local function workPos(p_Task)
     local w = p_Task and p_Task.work
     if type(w) ~= "table" then return nil end
-    if w.mine and w.mine.pos then return w.mine.pos end
-    if w.build and w.build.origin then return w.build.origin end
-    if w.gather and w.gather.pos then return w.gather.pos end
-    if w.rescue and w.rescue.pos then return w.rescue.pos end
-    if w.lumber and w.lumber.start then return w.lumber.start end
-    if w.haul and w.haul.pos then return w.haul.pos end
-    if w.survey then
-        if w.survey.pos then return w.survey.pos end
-        if w.survey.min and w.survey.max then
-            return {x = (w.survey.min.x + w.survey.max.x) / 2,
-                    y = (w.survey.min.y + w.survey.max.y) / 2,
-                    z = (w.survey.min.z + w.survey.max.z) / 2}
-        end
+    for key, field in pairs(WORK_SITE) do
+        local s = w[key]
+        if type(s) == "table" and s[field] then return s[field] end
     end
-    if w.dig and w.dig.min and w.dig.max then
-        return {x = (w.dig.min.x + w.dig.max.x) / 2,
-                y = (w.dig.min.y + w.dig.max.y) / 2,
-                z = (w.dig.min.z + w.dig.max.z) / 2}
+    -- Area work has no single site; its middle is the honest answer.
+    for _, key in ipairs({"survey", "dig"}) do
+        local s = w[key]
+        if type(s) == "table" and s.min and s.max then return midpoint(s) end
     end
     return nil
 end
@@ -428,24 +432,32 @@ local RELIEF_FUEL_FLOOR = 300
 -- distance (a route is not a straight line), plus the work, plus a margin. Deliberately rough --
 -- being 30% wrong costs one refuel trip; not asking cost every job that failed this way.
 local JOB_FUEL_MARGIN = 100
+-- Fuel for the WORK itself, by kind, before any travel. One small function per verb so the table
+-- reads as the price list it is; a new verb adds a line here and nowhere else.
+local WORK_COST = {
+    lumber = function(w) return (tonumber(w.w) or 8) * (tonumber(w.l) or 8) * 2 + 60 end,
+    dig    = function(w) return (tonumber(w.w) or 8) * (tonumber(w.l) or 8) * (tonumber(w.depth) or 4) end,
+    gather = function(w) return (tonumber(w.limit) or 64) * 4 end,
+    plant  = function(w) return (type(w.spots) == "table" and #w.spots or 8) * 8 + 40 end,
+    build  = function() return 200 end,
+    rescue = function() return 40 end,
+    haul   = function() return 40 end,
+}
 local function workCost(p_Task)
     local w = (p_Task and p_Task.work) or {}
-    if w.lumber then
-        return (tonumber(w.lumber.w) or 8) * (tonumber(w.lumber.l) or 8) * 2 + 60
+    for key, cost in pairs(WORK_COST) do
+        if type(w[key]) == "table" then return cost(w[key]) end
     end
-    if w.dig then
-        return (tonumber(w.dig.w) or 8) * (tonumber(w.dig.l) or 8) * (tonumber(w.dig.depth) or 4)
-    end
-    if w.gather then return (tonumber(w.gather.limit) or 64) * 4 end
-    if w.build then return 200 end
-    if w.rescue or w.haul then return 40 end
     return 100
 end
 -- Why nobody took the job, in the words that send a reader to the right place. "Cannot afford it"
 -- used to be reported as "busy", which sent people looking for a stuck job that did not exist.
+-- The phrase the tick loop recognises as "this task is too big", as opposed to "no drone". One
+-- constant so the two cannot drift apart.
+UNAFFORDABLE = "can afford it"
 local function noDroneReason(p_Role, p_Busy, p_Poor, p_PoorNeed)
     if p_Poor then
-        return ("no %s can afford it: %s has %s fuel, the job needs ~%d from there")
+        return ("no %s " .. UNAFFORDABLE .. ": %s has %s fuel, the job needs ~%d from there")
             :format(p_Role, tostring(p_Poor.name), tostring(p_Poor.fuel), p_PoorNeed or 0)
     end
     if p_Busy then return "every " .. p_Role .. " is busy (" .. tostring(p_Busy.name) .. ")" end
@@ -836,6 +848,9 @@ elseif s_Task.work.lumber then
     local w = s_Task.work.lumber
     s_Verb, s_Payload = "Lumber", {w = w.w, l = w.l, drop = w.drop, pos = w.start,
                                    targets = w.targets, taskId = s_Task.id}
+elseif s_Task.work.plant then
+    s_Verb, s_Payload = "Plant", {spots = s_Task.work.plant.spots, pos = s_Task.work.plant.pos,
+                                  taskId = s_Task.id}
 elseif s_Task.work.haul then
     -- GO AND EMPTY A FIELD CACHE. WITHOUT THIS, CACHING LOSES THE MATERIAL IT SAVES.
     --
@@ -2398,7 +2413,13 @@ local PLACE_BACKOFF_MS = 60000
 -- and the one it is hardest to read a scheduling decision out of. One question, one function.
 local function notPlaceableNow(p_Task, p_Role, p_NoDrone)
     if fleetFuelLow() then
-        local s_IsFuelWork = (p_Task.work and p_Task.work.rescue ~= nil)
+        -- Hauling a cache home and planting saplings are fuel work too, whatever the name says.
+        -- With the fleet low, six idle drones holding 300-900 each sat beside a queued haul of a
+        -- cache with 8 logs in it (40 fuel of work, 22 blocks away) because its name carried no
+        -- fuel word: the cache had never been read by a drone. The way out of a shortage was
+        -- unplaceable BECAUSE of the shortage.
+        local w = p_Task.work or {}
+        local s_IsFuelWork = w.rescue ~= nil or w.haul ~= nil or w.plant ~= nil
             or taskProducesFuel(p_Task.name)
         if not s_IsFuelWork then return true end
     end
@@ -2612,6 +2633,24 @@ local m_Passes = {
     {"rescueNeeded", rescueNeeded}, {"placeRescues", placeRescues},
     {"placeBlockers", placeBlockers},
 }
+
+-- Count a placement failure against its role and say why -- once per role per pass, so the log
+-- does not repeat itself, and every time for an unaffordable task, because that reason names a
+-- specific drone and a specific number.
+--
+-- "CANNOT AFFORD IT" IS ABOUT THIS TASK, NOT THE ROLE. It does not spend the role's tries: one big
+-- lumber run nobody could afford wrote the miners off for the pass, and the 140-fuel haul behind it
+-- in the same role was never tried. A genuine shortage of drones ("busy", "none in the fleet") does.
+local function notePlaceFailure(p_Fails, p_Role, p_Task, p_Why)
+    local s_Unaffordable = tostring(p_Why or ""):find(UNAFFORDABLE, 1, true) ~= nil
+    if not s_Unaffordable then p_Fails[p_Role] = (p_Fails[p_Role] or 0) + 1 end
+    if s_Unaffordable or p_Fails[p_Role] == 1 then
+        Log(("could not place %s (%s): %s"):format(
+            tostring(p_Task.name), tostring(p_Role), tostring(p_Why or "OnStartTask gave no reason")))
+    end
+    -- True once the role has spent its tries for this pass.
+    return (p_Fails[p_Role] or 0) >= TRIES_PER_ROLE
+end
 
 function Tick()
     while true do
@@ -2833,12 +2872,7 @@ function Tick()
                             --
                             -- One line per role per pass: enough to name the blocker, not enough to
                             -- turn a busy fleet's log into a wall of refusals.
-                            s_Fails[s_Role] = (s_Fails[s_Role] or 0) + 1
-                            if s_Fails[s_Role] == 1 then
-                                Log(("could not place %s (%s): %s"):format(
-                                    tostring(v.name), tostring(s_Role),
-                                    tostring(s_Why or "OnStartTask gave no reason")))
-                            end
+                            local s_Exhausted = notePlaceFailure(s_Fails, s_Role, v, s_Why)
                             -- AND THE SAME FOUR TASKS MUST NOT BURN THE BUDGET EVERY PASS.
                             --
                             -- The role budget above is a sound circuit-breaker and a terrible
@@ -2856,7 +2890,7 @@ function Tick()
                             -- to whatever is behind it. The task is not cancelled or deprioritised;
                             -- it is simply not allowed to keep paying for the same answer.
                             m_PlaceBackoff[tostring(v.id)] = os.epoch("utc")
-                            if s_Fails[s_Role] >= TRIES_PER_ROLE then s_NoDrone[s_Role] = true end
+                            if s_Exhausted then s_NoDrone[s_Role] = true end
                         end
                     end
                 end

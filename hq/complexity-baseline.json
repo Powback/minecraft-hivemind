@@ -1,7 +1,7 @@
 {
   "note": "Cyclomatic-complexity debt. This file may only ever SHRINK -- see test/complexity.test.ts.",
   "max": 15,
-  "total": 65,
+  "total": 64,
   "files": {
     "lua/DroneLogic.lua": {
       "cc": [
@@ -38,7 +38,7 @@
         "refixLoop",
         "DescribeJob",
         "stageFromChest",
-        "TravelTo",
+        "travelToBody",
         "(anonymous)",
         "meshForward"
       ]
@@ -46,12 +46,11 @@
     "lua/TaskMan.lua": {
       "cc": [
         53,
-        43,
+        40,
         33,
         28,
         25,
-        22,
-        18,
+        19,
         18,
         18,
         17,
@@ -63,9 +62,8 @@
         "OnTaskDone",
         "placeRescues",
         "OnStartTask",
-        "workPos",
-        "pickDrone",
         "verbFor",
+        "pickDrone",
         "freeOrphanedDrones",
         "placeBlockers",
         "releaseStalledAssignments"
@@ -175,14 +173,6 @@
         "(anonymous)"
       ]
     },
-    "hq/src/agent/supply.ts": {
-      "cc": [
-        26
-      ],
-      "names": [
-        "runSupplyTick"
-      ]
-    },
     "lua/StorageMan.lua": {
       "cc": [
         26,
@@ -197,6 +187,14 @@
         "OnBringToFront",
         "OnChestContents",
         "ServiceFurnaces"
+      ]
+    },
+    "hq/src/agent/supply.ts": {
+      "cc": [
+        25
+      ],
+      "names": [
+        "runSupplyTick"
       ]
     },
     "lua/DroneMan.lua": {

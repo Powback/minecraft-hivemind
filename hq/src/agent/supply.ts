@@ -20,7 +20,8 @@
  */
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { factories, saveCity } from '../world/city.js';
+import { city, factories, saveCity } from '../world/city.js';
+import { allocate } from '../world/plots.js';
 import { join, dirname } from 'node:path';
 import { bridge } from '../bridge/ws.js';
 import { registry } from '../tools/registry.js';
@@ -427,7 +428,15 @@ async function callTool(name: string, args: unknown) {
  * a task, then top the queue up. Both RETURN EARLY the moment they do anything, which is why the
  * fuel gate must sit above them rather than below -- see the note at the call site.
  */
-async function materialPhases(live: any[]): Promise<{ acted: boolean; reason: string } | null> {
+/**
+ * Planting runs whatever the fuel state -- it is the one action that shortens every future run --
+ * and the material phases only when fuel is not critical, because they are what spends it.
+ */
+async function materialPhases(
+  live: any[], fuelCritical: boolean, queued: Set<string>,
+): Promise<{ acted: boolean; reason: string } | null> {
+  const planted = await plantForestry(queued);
+  if (planted || fuelCritical) return planted;
   return (await replanShortfalls()) ?? (await topUpQueue(live));
 }
 
@@ -1996,6 +2005,62 @@ function mayQueue(queued: Set<string>, prefix: string, cooldownKey: string): boo
  * One at a time, and behind a cooldown, because a haul is a long round trip and the alternative --
  * queueing every cache at once -- takes the whole fleet off work to fetch boxes that may be empty.
  */
+/**
+ * PLANT THE FOREST WHERE THE FLEET LIVES.
+ *
+ * Every tree the fleet knows is forty to sixty blocks out. At the measured 2.7 fuel per block of
+ * progress a run that fells eight logs costs roughly what the logs return as charcoal, so lumber
+ * cannot be fuel-positive from there whatever else is fixed. The drones already carry saplings home
+ * from every felling; this puts them in the ground on a forestry plot beside the bay, so the next
+ * generation of lumber is a ten-block walk. Runs in an emergency too -- it is cheap, and it is the
+ * only thing that changes the distance term.
+ */
+const FORESTRY_MIN_SAPLINGS = 2;
+const FORESTRY_SPACING = 3;
+async function plantForestry(queued: Set<string>): Promise<{ acted: boolean; reason: string } | null> {
+  if (!mayQueue(queued, 'plant:', '__plant')) return null;
+  const saplings = await readStockWhere((n) => /_sapling$/.test(n), () => undefined);
+  if (saplings == null || saplings < FORESTRY_MIN_SAPLINGS) return null;
+
+  let plot: any = (city.plots as any[]).find((p) => p.purpose === 'forestry');
+  if (!plot) {
+    const r = allocate(city, 'forestry', 'grove-01');
+    if ('error' in r) { note(`forestry: ${r.error}`); return null; }
+    plot = r;
+    saveCity();
+    note(`forestry: allocated ${plot.name} at ${plot.min.x},${plot.ground},${plot.min.z}`);
+  }
+  const spots: Array<{ x: number; y: number; z: number }> = [];
+  for (let x = plot.min.x + 1; x <= plot.max.x - 1; x += FORESTRY_SPACING) {
+    for (let z = plot.min.z + 1; z <= plot.max.z - 1; z += FORESTRY_SPACING) {
+      spots.push({ x, y: plot.ground, z });
+    }
+  }
+  const n = Math.min(spots.length, saplings);
+  const ok = await queueTask({
+    name: `plant:${plot.name}`,
+    work: { plant: { pos: { x: plot.min.x, y: plot.ground, z: plot.min.z }, spots: spots.slice(0, n) } },
+  }, `forestry: plant at ${plot.name}`);
+  if (!ok) return null;
+  supply.cooldowns.__plant = Date.now() + COOLDOWN_MS;
+  note(`forestry: planting ${n} sapling(s) at ${plot.name}`);
+  return { acted: true, reason: `forestry: planting ${n} sapling(s) at ${plot.name}` };
+}
+
+/**
+ * Queue one task with TaskMan and say so if it did not take. A refusal comes back as a STRING, not
+ * an exception (see buildQueuedSet), and a dead bridge as a rejection -- both are "not queued".
+ */
+async function queueTask(task: { name: string; work: unknown }, what: string): Promise<boolean> {
+  const added: any = await bridge.call('TaskMan', 'Add', { ...task, priority: 1 }, { timeoutMs: 8000 })
+    .catch((err) => `queue unreachable -- ${(err as Error)?.message ?? err}`);
+  if (!added || typeof added === 'string') {
+    note(`${what}: NOT queued -- ${added || 'no answer from TaskMan'}`);
+    return false;
+  }
+  return true;
+}
+
 async function collectFieldCaches(
   live: any[], queued: Set<string>,
 ): Promise<{ acted: boolean; reason: string } | null> {
@@ -2037,30 +2102,30 @@ async function collectFieldCaches(
   const burnableIn = (q: any) =>
     q.items ? Object.entries(q.items as Record<string, unknown>)
       .some(([n, c]) => BURNABLE.test(n) && Number(c) > 0) : false;
-  const at = usable.sort((x: any, y: any) => {
+  const chosen = usable.sort((x: any, y: any) => {
     if (emergency) {
       const bx = burnableIn(x) ? 0 : 1, by = burnableIn(y) ? 0 : 1;
       if (bx !== by) return bx - by;
       return far(x.pos) - far(y.pos);
     }
     return far(y.pos) - far(x.pos);
-  })[0].pos;
+  })[0];
+  const at = chosen.pos;
+  // A HAUL OF FUEL IS FUEL WORK. TaskMan ranks fuel-producing tasks first during a shortage by
+  // their NAME, so a haul from a cache holding 26 logs and 11 coal queued behind every lumber run
+  // while the fleet died -- 3,000 fuel-equivalent 45 blocks away, one 250-fuel trip from the
+  // network. The suffix ranks it where it belongs; the prefix still matches mayQueue and stops.
+  const suffix = burnableIn(chosen) ? ':log' : '';
 
   const where = `${at.x},${at.y},${at.z}`;
-  note(`field cache at ${where} has never been collected -- sending a drone`);
-  // A refusal comes back as a STRING, not an exception -- see buildQueuedSet. Treat both alike.
-  const added: any = await bridge.call('TaskMan', 'Add', {
-    name: `haul:${where}`,
-    priority: 1,
+  note(`field cache at ${where} has never been collected -- sending a drone${suffix ? ' (it holds fuel)' : ''}`);
+  // Both shapes of failure say WHY (queueTask). The note above already promised a drone was being
+  // sent; a silent return here left that promise standing in the log as if it had happened.
+  const ok = await queueTask({
+    name: `haul:${where}${suffix}`,
     work: { haul: { pos: { x: at.x, y: at.y, z: at.z } } },
-  }, { timeoutMs: 8000 })
-    .catch((err) => `queue unreachable -- ${(err as Error)?.message ?? err}`);
-  // Both shapes of failure say WHY now. The note above already promised a drone was being sent; a
-  // silent return here left that promise standing in the log as if it had happened.
-  if (!added || typeof added === 'string') {
-    note(`field cache at ${where}: haul NOT queued -- ${added || 'no answer from TaskMan'}`);
-    return null;
-  }
+  }, `field cache at ${where}: haul`);
+  if (!ok) return null;
 
   supply.cooldowns['__haul'] = Date.now() + 3 * 60_000;
   saveSupply();
@@ -2199,7 +2264,7 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
   // settlement does when it can afford to move. During a fuel emergency they are what stops it
   // moving, so they are skipped and the tick falls through to the rule loop, where the same
   // fuelCritical flag allows coal and nothing else.
-  const phases = fuelCritical ? null : await materialPhases(live);
+  const phases = await materialPhases(live, fuelCritical, queued);
   if (phases) return phases;
   const held = (m: string) => {
     const inChests = detail

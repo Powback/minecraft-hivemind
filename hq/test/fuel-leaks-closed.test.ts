@@ -121,6 +121,45 @@ describe('the four fuel leaks stay closed', () => {
     expect(storage).toMatch(/return not \(KEEP_AS_FUEL\[p_Item\.name\] or isWoodFuel\(p_Item\.name\)\)/);
   });
 
+  // Four coroutines could each call TravelTo; D31's last minute was "no progress toward" four
+  // different targets in ten seconds. The first to start a journey owns the turtle until it returns.
+  it('one coroutine moves the turtle at a time', () => {
+    expect(logic).toMatch(/^local function travelToBody\(p_X, p_Y, p_Z, p_Ceiling\)/m);
+    const fn = logic.slice(logic.indexOf('function TravelTo('), logic.indexOf('-- TRAVEL, THEN CHECK YOU ACTUALLY GOT THERE'));
+    expect(logic).toMatch(/^function TravelIsBusy\(\)/m);
+    expect(fn).toMatch(/return false, "travel busy"/);
+    expect(fn).toMatch(/TravelOwner = coroutine\.running\(\)\s*\n\s*local ok, a, b = pcall\(travelToBody, p_X, p_Y, p_Z, p_Ceiling\)\s*\n\s*TravelOwner = nil/);
+    // and "busy" is not terrain: neither the arrival helper nor the deposit escalates on it
+    const arrive = logic.slice(logic.indexOf('function ArriveAt('), logic.indexOf('function ArriveAt(') + 400);
+    expect(arrive).toMatch(/if TravelIsBusy\(\) then return false end/);
+    const deposit = logic.slice(logic.indexOf('function DepositNow('), logic.indexOf('function DepositNow(') + 6000);
+    expect(deposit).toMatch(/if TravelIsBusy\(\) then\s*\n\s*trace\("deposit: another routine is moving the drone/);
+  });
+
+  // A haul from a cache that holds burnable is fuel work and must rank as such.
+  it('a haul from a cache holding fuel is named as fuel work', () => {
+    expect(supply).toMatch(/const suffix = burnableIn\(chosen\) \? ':log' : ''/);
+    expect(supply).toMatch(/name: `haul:\$\{where\}\$\{suffix\}`/);
+  });
+
+  // Trees forty to sixty blocks out cannot be fuel-positive at 2.7 fuel per block. Saplings the
+  // fleet already carries home go into a forestry plot beside the bay.
+  it('saplings get planted on a forestry plot beside the bay', () => {
+    expect(supply).toMatch(/allocate\(city, 'forestry', 'grove-01'\)/);
+    expect(supply).toMatch(/const planted = await plantForestry\(queued\);/);
+    const taskman = lua('TaskMan.lua');
+    expect(taskman).toMatch(/if p_Work\["plant"\] then return ANY_ROLE end/);
+    expect(taskman).toMatch(/s_Verb, s_Payload = "Plant", \{spots = s_Task\.work\.plant\.spots, pos = s_Task\.work\.plant\.pos,/);
+    expect(logic).toMatch(/^function OnPlant\(p_ID, p_Message\)/m);
+    expect(logic).toMatch(/Plant = \{\s*\n\s*func = OnPlant,/);
+    // a sapling is placed on TOP of soil: check from one above the ground, then rise and place down
+    const fn = logic.slice(logic.indexOf('function PlantSaplingAt('), logic.indexOf('function OnAbort('));
+    expect(fn).toMatch(/turtle\.inspectDown\(\)[\s\S]*pgps\.up\(\)[\s\S]*turtle\.placeDown\(\)/);
+    // and saplings are a family for fetching but never fuel for burning
+    expect(logic).toMatch(/^function IsBurnableWood\(p_Name\)/m);
+    expect(logic).toMatch(/if IsBurnableWood\(n\) then return true end/);
+  });
+
   it('HQ does not send a miner underground during a fuel emergency', () => {
     expect(supply).toMatch(/\/_ore\$\/\.test\(rule\.match\) && \(await fuelEmergency\(\)\) === true/);
   });

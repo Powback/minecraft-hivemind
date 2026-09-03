@@ -380,6 +380,22 @@ cross its plane. What changed, and the rule each change encodes:
   moved every minute; `/brief` carries income, burn and fuel per block over 20 minutes, and raises
   `NO INCOME` when drones work and nothing arrives. That is the fault the whole evening needed.
 
+Three more, from the hour after (each with a check in `fuel-leaks-closed.test.ts`):
+
+- **One coroutine moves the turtle at a time.** `TravelTo` is owned by the first coroutine to start
+  a journey (`TravelOwner`); the fuel watchdog, dock loop and region-return loop are told "travel
+  busy" instead of undoing each other's steps. D31's last minute alive was four targets in ten seconds.
+- **A haul from a cache holding fuel is named `haul:<pos>:log`** so TaskMan's name-based fuel ranking
+  puts it ahead of lumber. 26 logs and 11 coal sat 45 blocks away behind every lumber run.
+- **Saplings get planted.** `plantForestry` allocates a `forestry` plot beside the bay and queues a
+  `Plant` job (any role; from one above the ground, confirm soil, rise, place down). The distance term
+  is the one the other fixes cannot touch: at 2.7 fuel per block, trees 40-60 blocks out can never
+  be fuel-positive.
+- Also: the deposit registry held every base chest twice (bound and unbound twins), so the unbound
+  twin posed as a field cache and was hauled into itself; `dedupeDeposits` runs before both deposit
+  answers. And the fetch minimum of 8 left 7 coal and 5 charcoal unfetchable by rule while a drone
+  died two blocks from them -- it is 1 on both sides now.
+
 Two measurement lessons from the same night. A drone log that shows only distress lines while fuel
 falls is not idle -- **dump its position every two seconds**; the movement that costs fuel is the
 movement nothing traces. And an ore gather is underground: no GPS, so no clears, so the index only
