@@ -3743,6 +3743,15 @@ end
 -- screen and nowhere else, so the one fact that would have identified this bug days ago was being
 -- written where only somebody standing in the world could read it.
 function ConfirmHeading()
+    -- THE PROBE STEPS THE TURTLE. Under a travelling coroutine that is a second driver on one wheel:
+    -- its forward/back land between the traveller's steps, the GPS delta it reads includes theirs,
+    -- and the heading it "re-establishes" is whatever that sum happened to point at. D54 was
+    -- re-established to N, E, S and W in turn, 45 s apart, while flying straight. The travel audit
+    -- (pgps.correctFromTravel) already corrects a wrong heading from what the fix says we really did.
+    if TravelIsBusy() then
+        trace("heading check skipped -- another routine is moving the drone; the travel audit will catch a wrong heading")
+        return false
+    end
     local _, _, _, s_Was = pgps.getCachedPosition()
     local s_Ok = pcall(pgps.ensureHeading, true)
     local _, _, _, s_Now = pgps.getCachedPosition()
@@ -7952,6 +7961,7 @@ end
 -- what GPS keeps repairing, heading is what nothing did.
 local HEADING_MARGIN = 0.6      -- how much the best candidate must beat the runner-up by
 function HeadingFromPeers()
+    if TravelIsBusy() then return nil end     -- the probe steps; one driver at a time (see ConfirmHeading)
     local cx, cy, cz = pgps.getCachedPosition()
     if cx == nil then return nil end
 
@@ -7981,8 +7991,16 @@ function HeadingFromPeers()
         -- forward; put that in the position layer so the next fix does not read it as drift.
         -- cachedDir may be the wrong heading -- that is what this probe is testing -- but the
         -- audit's job is to compare INTENT against reality, and this is honestly our intent.
+        -- But THIS PROBE RUNS BECAUSE THE HEADING IS UNKNOWN, so headingDelta() is nil more
+        -- often than not, and "if hx" silently skipped the record: one block of drift per probe
+        -- that could not back up, which in the crowded bay is most of them. A GPS fix re-anchors
+        -- us when there is one; when there is not, say so instead of pretending.
         local hx, hy, hz = pgps.headingDelta()
-        if hx then pgps.noteExternalStep(hx, hy, hz) end
+        if hx then
+            pgps.noteExternalStep(hx, hy, hz)
+        elseif not pgps.verifyPosition(true) then
+            trace("heading probe: stepped forward with no heading and no GPS -- position is now one block off")
+        end
     end
 
     local s_Best, s_BestErr, s_NextErr = scoreHeadings(cx, cy, cz, s_Before, s_After)

@@ -931,11 +931,23 @@ local m_IntDX, m_IntDY, m_IntDZ    = 0, 0, 0         -- displacement we believe 
 local m_TurnsSinceFix              = 0
 local m_StraightFwd                = 0               -- forward steps, if nothing else happened
 local m_HeadingSuspect             = false
+-- EVERY CHANGE TO WHERE WE THINK WE ARE BUMPS THIS. verifyPosition and the heading probe run in
+-- coroutines of their own (refixLoop, the fuel watchdog, heartbeats), and gps.locate yields while
+-- the hosts answer. If the travel coroutine steps the turtle meanwhile, the hosts measured a turtle
+-- that was in two places during one fix, and the cache moved on besides -- and the difference was
+-- logged as "position corrected by N" and ADOPTED; then "drift too big -- re-checking the heading"
+-- sent a probe step under the traveller's feet, and the drone was re-established to N, E, S and W
+-- in turn, 45 s apart, while flying straight (D54, 2026-09-04). Measured the same night on three
+-- stationary drones: identical fixes 12 of 12 times, cache == GPS == the server's own dump.
+-- GPS does not drift. Races do.
+local m_MoveSeq = 0
+
 
 function headingSuspect() return m_HeadingSuspect end
 
 -- Called by every move that advances the cache, and by the turns. Cheap: three adds.
 function notePlannedStep(dx, dy, dz, p_Straight)
+    m_MoveSeq = m_MoveSeq + 1
     m_IntDX, m_IntDY, m_IntDZ = m_IntDX + dx, m_IntDY + dy, m_IntDZ + dz
     if p_Straight then m_StraightFwd = m_StraightFwd + 1 else m_StraightFwd = -1 end
 end
@@ -1033,8 +1045,6 @@ end
 
 -- How many consecutive fixes must disagree with the bookkeeping by exactly one block before the
 -- fix wins. See verifyPosition. Declared above it: a `local` below its use is a nil global.
-local SMALL_DRIFT_CONFIRM = 3
-local m_SmallDriftRuns = 0
 function verifyPosition(p_Force)
     if not p_Force and m_FixFailedAt and (os.clock() - m_FixFailedAt) < GPS_RETRY_AFTER then
         return nil, "no gps fix (backing off)"
@@ -1044,7 +1054,17 @@ function verifyPosition(p_Force)
     -- tight timeout turns "busy" into "out of coverage" -- which then freezes the drone, because
     -- movement is gated on having a fix. D3 sat unable to move with all four hosts up and 50-65
     -- blocks away, well inside range.
+    local s_Seq = m_MoveSeq
     local x, y, z = gps.locate(5, false)
+    if m_MoveSeq ~= s_Seq then
+        -- ANOTHER COROUTINE MOVED THE TURTLE WHILE THE HOSTS WERE ANSWERING. The fix describes a
+        -- turtle that was between two blocks (the hosts' distances were not even measured at one
+        -- place) and the cache describes where it is now; comparing them manufactures drift, and
+        -- adopting it moved the bookkeeping BEHIND the drone by however far it travelled during
+        -- the locate. Not a GPS failure, so no back-off: the mover re-fixes itself between steps
+        -- (moveLeg), where nothing can move under it.
+        return nil, "moved during the fix"
+    end
     if x == nil then
         m_FixFailedAt = os.clock()
         return nil, "no gps fix"
@@ -1063,24 +1083,12 @@ function verifyPosition(p_Force)
     x, y, z = math.floor(x), math.floor(y), math.floor(z)
     if cachedX ~= nil then
         m_Drift = math.abs(x - cachedX) + math.abs(y - cachedY) + math.abs(z - cachedZ)
-        -- ONE BLOCK OF DISAGREEMENT IS GPS NOISE UNTIL IT PERSISTS.
-        --
-        -- Measured on a drone that had not moved: six fixes in two seconds read -496, -496, -496,
-        -- -496, -497, -497. The trilateration lands within a fraction of a block and the floor
-        -- above flips it. Every flip was adopted as a correction, the audit then found the
-        -- bookkeeping "disagreed" with a fix that was simply wrong, and re-checked the heading by
-        -- stepping forward and back: two fuel and a replan per flip, forty-eight flips in two
-        -- hundred log lines on D37 and D35. A turtle's own move count is exact when forward()
-        -- returns true; it outranks a one-block fix until three fixes in a row say otherwise. Two
-        -- blocks or more is a real discrepancy (a missed move, a push) and is adopted at once.
-        if m_Drift == 1 then
-            m_SmallDriftRuns = m_SmallDriftRuns + 1
-            if m_SmallDriftRuns < SMALL_DRIFT_CONFIRM then
-                m_LastFix = os.clock()        -- still a fix: the position is confirmed to within one
-                return true, 0
-            end
-        end
-        m_SmallDriftRuns = 0
+        -- A DISAGREEMENT IS ADOPTED AT ONCE, ONE BLOCK OR TEN. There is no GPS noise to filter: the
+        -- hosts are fixed computers at exact coordinates and the distances are exact, so a
+        -- stationary turtle reads the same block every time (12 of 12 on three drones, 2026-09-04).
+        -- The "six fixes read -496, -496, -496, -496, -497, -497" that once justified a three-fix
+        -- hysteresis here were taken on a drone that was STEPPING for a heading probe. What looked
+        -- like sensor noise was the race guarded against above, and the hysteresis only hid it.
         if m_Drift > 0 then
             ptrace(("position corrected by %d: %d,%d,%d -> %d,%d,%d")
                 :format(m_Drift, cachedX, cachedY, cachedZ, x, y, z))
@@ -1458,6 +1466,7 @@ function ensureHeading(p_Force)
     -- standing in a scanned-empty 9x9 of open air. One propagated string would have said it outright.
     local function probe()
         for _ = 1, 4 do
+            local s_Seq = m_MoveSeq
             local s_Ok, s_Err = turtle.forward()
             if not s_Ok and classifyMove(s_Err) == "hard" then
                 moveFailed(s_Err)
@@ -1496,6 +1505,12 @@ function ensureHeading(p_Force)
                     -- itself -- a failed probe guaranteed the next one.
                     resetAudit(cachedX, cachedY, cachedZ)
                     savePose()
+                end
+                if m_MoveSeq ~= s_Seq then
+                    -- The traveller stepped, or was stepped, while our probe was out: the GPS delta
+                    -- is theirs plus ours and a heading read off it is a coin toss. Keep what we had.
+                    ptrace("heading probe: something else moved us during the probe -- not trusting the step")
+                    return false, "moved during the probe"
                 end
                 cachedDir = dirFromStep(nx, nz) or cachedDir
                 if cachedDir ~= nil then
@@ -2430,6 +2445,7 @@ function setHeading(p_Dir)
 end
 
 function setLocation(x, y, z, d)
+    m_MoveSeq = m_MoveSeq + 1
     -- AN ASSERTION IS NOT A MOVE, AND THE AUDIT MUST BE TOLD.
     --
     -- The audit measures "displacement we believe we made SINCE THE LAST FIX" against what GPS
@@ -2608,6 +2624,7 @@ function setLocationFromGPS()
         local s_PrevDir = cachedDir
         local d = cachedDir or nil
         cachedDir = nil
+        local s_Turns = 0                 -- raw left turns made below, so a kept heading can be corrected
 
         -- determine the current direction
         for tries = 0, 3 do  -- try to move in one direction
@@ -2671,12 +2688,20 @@ function setLocationFromGPS()
                 -- lua-hygiene: allow (cachedDir was cleared to nil above so this probe can re-derive
                 -- it from GPS; the turns are counted by `tries` and undone by turnTo afterwards.)
                 turtle.turnLeft()
+                s_Turns = s_Turns + 1
             end
         end
 
+        -- THE TURTLE HAS TURNED SINCE "THE ONE WE HAD". The comment above says the turns are undone
+        -- by turnTo afterwards -- only on the SUCCESS path. When the loop broke out ("moved but could
+        -- not deduce heading") after k raw turtle.turnLeft() calls, restoring s_PrevDir as-is left the
+        -- drone facing k quarter-turns away from what it believed, and the next leg walked the wrong
+        -- way until GPS caught it: "heading was W, we actually travelled E". A left turn is +1 in
+        -- HEADINGS (north 0, west 1, south 2, east 3), the same as turnAndTrack.
         if cachedDir == nil and s_PrevDir ~= nil then
-            cachedDir = s_PrevDir
-            ptrace("could not re-derive heading -- keeping the one we had")
+            cachedDir = (s_PrevDir + s_Turns) % 4
+            ptrace(("could not re-derive heading -- keeping the one we had, corrected for %d raw turn(s)")
+                :format(s_Turns))
         end
 
         if cachedDir == nil then

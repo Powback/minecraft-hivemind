@@ -353,28 +353,58 @@ test("pgps.setLocation with no heading keeps the heading it has", function()
     eq(d2, env.HEADINGS.north, "still north")
 end)
 
-test("pgps.verifyPosition treats a one-block GPS disagreement as noise until it persists", function()
+test("pgps.verifyPosition adopts a one-block disagreement at once -- there is no GPS noise to filter", function()
     local env = loadModule("pgps.lua")
     env.setLocation(0, 64, 0, "north")
-    env.__world.gps = { x = 1, y = 64, z = 0 }                 -- the fix flips one block east
-    for i = 1, 2 do
-        local ok, drift = env.verifyPosition(true)
-        truthy(ok, "fix " .. i .. " accepted") eq(drift, 0, "fix " .. i .. " drift reported")
-        local x = env.getCachedPosition()
-        eq(x, 0, "fix " .. i .. ": bookkeeping kept")
-    end
+    env.__world.gps = { x = 1, y = 64, z = 0 }
     local ok, drift = env.verifyPosition(true)
-    truthy(ok, "third fix") eq(drift, 1, "third consecutive disagreement is adopted")
-    eq((env.getCachedPosition()), 1, "position corrected on the third fix")
+    truthy(ok, "fix") eq(drift, 1, "drift")
+    eq((env.getCachedPosition()), 1, "adopted on the first fix")
 end)
 
-test("pgps.verifyPosition adopts a two-block disagreement at once", function()
+test("pgps.verifyPosition discards a fix taken while something else moved the turtle", function()
     local env = loadModule("pgps.lua")
     env.setLocation(0, 64, 0, "north")
-    env.__world.gps = { x = 2, y = 64, z = 0 }
-    local ok, drift = env.verifyPosition(true)
-    truthy(ok, "fix") eq(drift, 2, "drift")
-    eq((env.getCachedPosition()), 2, "adopted immediately")
+    env.__world.gps = { x = 0, y = 64, z = 0 }
+    -- The hosts answer while another coroutine steps us one block south: the race D54 lived in.
+    local realLocate = env.gps.locate
+    env.gps.locate = function(...) env.noteExternalStep(0, 0, 1) return realLocate(...) end
+    local ok, why = env.verifyPosition(true)
+    eq(ok, nil, "not a fix") eq(why, "moved during the fix", "and it says so")
+    local x, y, z = env.getCachedPosition()
+    eq(z, 1, "the step that really happened is kept; the stale fix is not adopted")
+    truthy(not env.positionVerified(), "a discarded fix does not count as a fix")
+    env.gps.locate = realLocate
+    env.__world.gps = { x = 0, y = 64, z = 1 }
+    truthy(env.verifyPosition(true), "the next undisturbed fix is accepted")
+    truthy(env.positionVerified(), "and counts")
+end)
+
+test("pgps.ensureHeading reads the heading from a clean probe step and refuses one disturbed by another mover", function()
+    local env = loadModule("pgps.lua")
+    env.setLocation(0, 64, 0, "north")
+    env.__world.gps = { x = 1, y = 64, z = 0 }                 -- the step out lands one block east
+    truthy(env.ensureHeading(true), "clean probe")
+    local _, _, _, d = env.getCachedPosition()
+    eq(d, env.HEADINGS.east, "heading read from the step")
+    local realLocate = env.gps.locate
+    env.gps.locate = function(...) env.noteExternalStep(0, 1, 0) return realLocate(...) end
+    local ok, why = env.ensureHeading(true)
+    eq(ok, false, "disturbed probe refused") eq(why, "moved during the probe", "and it says why")
+    local _, _, _, d2 = env.getCachedPosition()
+    eq(d2, env.HEADINGS.east, "the heading we had is kept")
+end)
+
+test("DroneLogic.ConfirmHeading does not step the turtle while another coroutine owns travel", function()
+    local env = loadModule("DroneLogic.lua")
+    local probes = 0
+    env.pgps.ensureHeading = function() probes = probes + 1 return true end
+    env.TravelOwner = coroutine.create(function() coroutine.yield() end)   -- alive, not us
+    eq(env.ConfirmHeading(), false, "refused under a traveller")
+    eq(probes, 0, "no probe step")
+    env.TravelOwner = nil
+    env.ConfirmHeading()
+    eq(probes, 1, "probes once the drone is ours to move")
 end)
 
 -- ================================================================================================
