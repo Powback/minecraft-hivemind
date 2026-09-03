@@ -461,12 +461,40 @@ their true coordinates. The drift came from **two coroutines driving one turtle*
   probe. The `not executing` gate did not help: `executing` means a JOB is running, and docking,
   refuelling and flying home all move the drone outside one.
 
-The rule, now in pgps: **a fix or a heading probe during which anything else moved the turtle is
-discarded** (`m_MoveSeq`, bumped by every tracked step and `setLocation`; `verifyPosition` returns
-`nil, "moved during the fix"` with no back-off), and `ConfirmHeading`/`HeadingFromPeers` do nothing
-while `TravelIsBusy()`. The hysteresis is gone. The earlier "six fixes read -496 ×4, -497 ×2 on a
-drone that had not moved" was taken on a drone that WAS moving -- for a heading probe. Before
-calling any sensor noisy, measure it on something that is provably still, against the world.
+The rule, now in pgps, in two layers: **a fix or a heading probe during which anything else moved
+the turtle is discarded**. `m_MoveSeq` catches a step that COMMITTED during the fix; `m_Moving`
+(every move goes through `timedMove`, DroneLogic's raw probe brackets itself with
+`holdFixes`/`releaseFixes`) catches one that was UNDER WAY -- `turtle.forward()` puts the turtle in
+the next block at once and returns only when the eight-tick animation ends, so a fix in that
+window reads one block of drift. The first layer alone left 18 corrections in ten minutes on one
+drone; with both, the fleet logged **zero corrections, zero heading rotations and zero bookkeeping
+disagreements in the next ten minutes**, against 41-90 before. `verifyPosition` returns
+`nil, "moving"` / `nil, "moved during the fix"` with no back-off; the mover re-fixes between its own
+steps. `ConfirmHeading`/`HeadingFromPeers` do nothing while `TravelIsBusy()`. The hysteresis is
+gone. The earlier "six fixes read -496 ×4, -497 ×2 on a drone that had not moved" was taken on a
+drone that WAS moving -- for a heading probe. Before calling any sensor noisy, measure it on
+something that is provably still, against the world.
+
+**A JOB'S APPROACH IS THE MOVEMENT NOTHING TRACES, AND IT MUST BE ABORTABLE AND BOUNDED.** With drift
+gone, D35 still died at a leftover-canopy site: 433 fuel to zero in five minutes, no logs, one log
+line. `ReachSite` fell through to `ApproachFromSide`, four sides times four movers against leaves,
+none looking at the tank, none checking that the fuel watchdog had set `executing = false`; and
+the loop held the travel lock, so the watchdog's own trip home was refused every 20 s until the
+tank read zero. Now: a target is given up after 40 fuel (`approach: ... giving it up`), `ReachSite`
+and `FellTargets` stop at an abort and `FellTargets` leaves targets it cannot afford on top of the
+trip home, a miner digs the last stretch to a canopy target instead of bouncing on leaves, and the
+watchdog repeats the abort (`AbortJobAndWait`) until the job lets go of the lock before it flies.
+When a drone's fuel falls with one log line per minute, it is inside a loop like this one.
+
+**WOOD INSIDE THE OPERATING CIRCLE IS EXHAUSTED (2026-09-04).** HQ's supply notes: "no standing
+trees known -- 88 recorded log(s) are all leftover canopy". The densest wood left (48 logs in one
+16-block cell) is 67 blocks from base, outside the 56-block circle; everything inside is single
+leftover logs 37-57 blocks out. During a fuel emergency the lumber picker now harvests those
+leftovers, several per trip (`chooseSweep(all, leftovers)`), and their canopies still drop
+saplings. That is a bridge, not an economy: the settlement needs either the grove within a short
+walk of the bay (`grove-01` sits 45 blocks from the chests because the plot spiral measures from
+the tower, not the deposit point), a longer reach toward the forest, or both. Neither is a code
+fix to make quietly.
 
 ## Environment invariants
 
