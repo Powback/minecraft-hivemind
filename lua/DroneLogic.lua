@@ -7191,6 +7191,11 @@ function OnHaul(p_ID, p_Message)
         local s_Before = CarriedCount()
         TakeFromChest(function() return true end)
         local s_After = CarriedCount()
+        -- REPORT WHAT IS LEFT. HQ decides whether a cache is worth another trip from the contents
+        -- StorageMan has on record, and a cache nobody has ever reported reads as "unknown, might
+        -- be fuel" -- so a chest of stone 33 blocks out was hauled 64 at a time, trip after trip,
+        -- through a fuel emergency (2026-09-04). The reading is what makes the next decision honest.
+        Tried("report the cache", ReportChest)
         trace(("haul: took %d item(s) from the cache"):format(s_After - s_Before))
         return {message = ("hauled %d"):format(s_After - s_Before), taken = s_After - s_Before}
     end)

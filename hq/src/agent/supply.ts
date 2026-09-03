@@ -2103,9 +2103,10 @@ async function collectFieldCaches(
   // the shelf at zero, HQ re-queued haul:-469,64,41 four times in a row because the cache still
   // "held something" -- 64 stone a trip, ~150 fuel a cycle with the shelf check afterwards -- and
   // the scout carrying the fleet's last tank flew it from 1,698 down to 642 while every miner was
-  // dead. Surface caches only, as before; burnable only, now. Unread contents (nil) still earn one
-  // look, since they might be the fuel.
-  const holdsFuel = (q: any) => q.items == null || Object.entries(q.items as Record<string, unknown>)
+  // dead. Surface caches only, as before; KNOWN burnable only, now. "Unread, might be fuel" was
+  // tried and re-queued the same stone chest because nothing had ever reported it; the haul job
+  // now reports what it leaves, so a cache worth a trip becomes known the first time it is read.
+  const holdsFuel = (q: any) => q.items != null && Object.entries(q.items as Record<string, unknown>)
     .some(([n, c]) => BURNABLE.test(n) && Number(c) > 0);
   const usable = emergency ? caches.filter((q: any) => q.pos.y >= b.y - 4 && holdsFuel(q)) : caches;
   if (!usable.length) return null;
