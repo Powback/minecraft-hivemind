@@ -942,6 +942,29 @@ local m_HeadingSuspect             = false
 -- GPS does not drift. Races do.
 local m_MoveSeq = 0
 
+-- A FIX TAKEN WHILE A MOVE IS IN FLIGHT IS A FIX OF A TURTLE THAT IS IN TWO PLACES. turtle.forward()
+-- puts the turtle in the next block at once and returns only when the eight-tick animation ends, so
+-- for that window the world says "there" and the cache still says "here". A fix landing in it read
+-- as one block of drift and was ADOPTED, and the mover then committed its own step on top -- which is
+-- the "audit matched (0,0,2) yet the fix moved us 1 -- both cannot be right" line, 18 times in ten
+-- minutes on D58 after the sequence guard above alone had shipped. The sequence catches a step that
+-- COMMITTED during the fix; this catches one that was under way. Every move here, tracked or probe,
+-- goes through timedMove; DroneLogic's own raw probe brackets itself with holdFixes/releaseFixes.
+local m_Moving, m_MovingSince = 0, nil
+local MOVE_HOLD_MAX_S = 60                      -- a hold older than this is a leak, not a move
+function holdFixes()
+    if m_Moving == 0 then m_MovingSince = os.clock() end
+    m_Moving = m_Moving + 1
+end
+function releaseFixes() m_Moving = math.max(0, m_Moving - 1) end
+local function timedMove(p_Fn)
+    holdFixes()
+    local ok, a, b = pcall(p_Fn)
+    releaseFixes()
+    if not ok then error(a, 0) end
+    return a, b
+end
+
 
 function headingSuspect() return m_HeadingSuspect end
 
@@ -1050,19 +1073,29 @@ function verifyPosition(p_Force)
         return nil, "no gps fix (backing off)"
     end
     if not startGPS() then return nil, "no modem for gps" end
+    if m_Moving > 0 then
+        if m_MovingSince and (os.clock() - m_MovingSince) > MOVE_HOLD_MAX_S then
+            ptrace(("a move has been in flight for %ds -- that is a leaked hold, releasing it")
+                :format(math.floor(os.clock() - m_MovingSince)))
+            m_Moving, m_MovingSince = 0, nil
+        else
+            return nil, "moving"
+        end
+    end
     -- Five seconds, not two. The hosts are ordinary computers serving the whole fleet, and a
     -- tight timeout turns "busy" into "out of coverage" -- which then freezes the drone, because
     -- movement is gated on having a fix. D3 sat unable to move with all four hosts up and 50-65
     -- blocks away, well inside range.
     local s_Seq = m_MoveSeq
     local x, y, z = gps.locate(5, false)
-    if m_MoveSeq ~= s_Seq then
+    if m_MoveSeq ~= s_Seq or m_Moving > 0 then
         -- ANOTHER COROUTINE MOVED THE TURTLE WHILE THE HOSTS WERE ANSWERING. The fix describes a
         -- turtle that was between two blocks (the hosts' distances were not even measured at one
         -- place) and the cache describes where it is now; comparing them manufactures drift, and
         -- adopting it moved the bookkeeping BEHIND the drone by however far it travelled during
         -- the locate. Not a GPS failure, so no back-off: the mover re-fixes itself between steps
         -- (moveLeg), where nothing can move under it.
+        ptrace("fix discarded: we moved while the hosts were answering")
         return nil, "moved during the fix"
     end
     if x == nil then
@@ -1467,7 +1500,7 @@ function ensureHeading(p_Force)
     local function probe()
         for _ = 1, 4 do
             local s_Seq = m_MoveSeq
-            local s_Ok, s_Err = turtle.forward()
+            local s_Ok, s_Err = timedMove(turtle.forward)
             if not s_Ok and classifyMove(s_Err) == "hard" then
                 moveFailed(s_Err)
                 return false, s_Err
@@ -1490,7 +1523,7 @@ function ensureHeading(p_Force)
                 -- fiction. That drift is not weather; it is this line.
                 --
                 -- If we cannot come back, adopt the position we actually reached.
-                local s_Back = turtle.back()
+                local s_Back = timedMove(turtle.back)
                 if not s_Back then
                     if nx ~= nil then
                         cachedX, cachedY, cachedZ = math.floor(nx), math.floor(ny), math.floor(nz)
@@ -1556,7 +1589,7 @@ function ensureHeading(p_Force)
     -- so nothing else has to know this happened.
     local s_Risen = 0
     for _ = 1, 4 do
-        local s_Up, s_UpErr = turtle.up()
+        local s_Up, s_UpErr = timedMove(turtle.up)
         if not s_Up then
             if classifyMove(s_UpErr) == "hard" then moveFailed(s_UpErr) return false, s_UpErr end
             break
@@ -1583,12 +1616,12 @@ function ensureHeading(p_Force)
             -- lua-hygiene: allow (unwinding our own climb: a refused descent needs no reason, it
             -- just means we stay higher -- and noteExternalStep only records the step when
             -- turtle.down() actually returned true, so cache and audit stay together either way)
-            for _ = 1, s_Risen do if turtle.down() then noteExternalStep(0, -1, 0) end end
+            for _ = 1, s_Risen do if timedMove(turtle.down) then noteExternalStep(0, -1, 0) end end
             return true
         end
     end
     -- lua-hygiene: allow (unwinding our own climb, as above)
-    for _ = 1, s_Risen do if turtle.down() then noteExternalStep(0, -1, 0) end end
+    for _ = 1, s_Risen do if timedMove(turtle.down) then noteExternalStep(0, -1, 0) end end
 
     -- Still boxed: dig a peephole. Only a drone with a pickaxe can do this, which is fine -- it is
     -- also the only kind of drone that can bury itself in the first place.
@@ -1682,7 +1715,7 @@ function forward()
     local x, y, z = cachedX + D[1], cachedY + D[2], cachedZ + D[3]--adds corisponding delta to direction
     local idx_pos = x..":"..y..":"..z
 
-    local s_Moved, s_MoveErr = turtle.forward()
+    local s_Moved, s_MoveErr = timedMove(turtle.forward)
     if s_Moved then
         stepTaken(x, y, z, D[1], D[2], D[3], true)   -- see auditHeading
         return true
@@ -1778,7 +1811,7 @@ function back()
     local x, y, z = cachedX - D[1], cachedY - D[2], cachedZ - D[3]
     local idx_pos = x..":"..y..":"..z
 
-    local s_Moved, s_MoveErr = turtle.back()
+    local s_Moved, s_MoveErr = timedMove(turtle.back)
     if s_Moved then
         -- D, not (x - cachedX): the cache is assigned inside stepTaken from the same x,y,z, so that
         -- difference is always zero and back() recorded NO intent while the cache advanced -- the
@@ -2632,7 +2665,7 @@ function setLocationFromGPS()
                 ptrace("Out of fuel")
                 return
             end
-            local s_Fwd, s_FwdErr = turtle.forward()
+            local s_Fwd, s_FwdErr = timedMove(turtle.forward)
             if not s_Fwd and classifyMove(s_FwdErr) == "hard" then
                 -- Same lesson as ensureHeading: a refusal that applies everywhere must be named,
                 -- not retried in the other three directions and then reported as "boxed in".
@@ -2645,7 +2678,7 @@ function setLocationFromGPS()
                 -- the drone one block from where it believes it is, every time something is behind
                 -- it, and the error accumulates until the drone is tens of blocks adrift and still
                 -- confident. This copy runs at BOOT, so it drifts a fresh block on every restart.
-                local s_Back = turtle.back()
+                local s_Back = timedMove(turtle.back)
                 if not s_Back then
                     if newX ~= nil then
                         cachedX, cachedY, cachedZ = math.floor(newX), math.floor(newY), math.floor(newZ)

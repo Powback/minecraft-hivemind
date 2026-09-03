@@ -7971,6 +7971,7 @@ function HeadingFromPeers()
     for _ in pairs(s_Before) do n = n + 1 end
     if n < 2 then return nil end            -- one range cannot distinguish four directions
 
+    pgps.holdFixes()                        -- raw steps: no fix may land between them (see pgps.timedMove)
     -- Step, measure, step back. Raw moves, because pgps.forward() would apply the very heading we
     -- are trying to check -- and it is put back exactly as ensureHeading does it, with the return
     -- move CHECKED, because an unchecked back() is what started this whole class of bug.
@@ -7978,9 +7979,10 @@ function HeadingFromPeers()
     -- displacement is zero and there is nothing to report. The case where the return move fails is
     -- the case that moved us, and that branch calls noteExternalStep.)
     local s_Fwd = turtle.forward()
-    if not s_Fwd then return nil end
+    if not s_Fwd then pgps.releaseFixes() return nil end
     local s_After = pingPeers(s_Nonce .. "b", 2)
     local s_Back, s_BackErr = turtle.back()
+    pgps.releaseFixes()
     if not s_Back then
         -- We are one block forward of where the caller thinks. Say so, WITH the reason, and let the
         -- position layer deal with it rather than silently carrying an error -- an unchecked back()

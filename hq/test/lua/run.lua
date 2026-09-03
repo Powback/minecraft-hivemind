@@ -380,6 +380,26 @@ test("pgps.verifyPosition discards a fix taken while something else moved the tu
     truthy(env.positionVerified(), "and counts")
 end)
 
+test("pgps.verifyPosition refuses a fix while a move is in flight, whoever asks", function()
+    local env = loadModule("pgps.lua")
+    env.setLocation(0, 64, 0, "north")
+    env.__world.gps = { x = 0, y = 64, z = 0 }
+    local inner
+    -- turtle.forward() puts the turtle in the next block and only then yields for eight ticks; the
+    -- refix loop's fix lands in that window. Here the stub is the window.
+    env.turtle.forward = function()
+        env.__world.gps = { x = 0, y = 64, z = -1 }
+        inner = { env.verifyPosition(true) }
+        return true
+    end
+    truthy(env.forward(), "tracked step")
+    eq(inner[1], nil, "the mid-move fix is refused") eq(inner[2], "moving", "and says why")
+    local _, _, z = env.getCachedPosition()
+    eq(z, -1, "the step is committed once, by the mover")
+    local ok, drift = env.verifyPosition(true)
+    truthy(ok, "a fix between moves is accepted") eq(drift, 0, "and agrees with the bookkeeping")
+end)
+
 test("pgps.ensureHeading reads the heading from a clean probe step and refuses one disturbed by another mover", function()
     local env = loadModule("pgps.lua")
     env.setLocation(0, 64, 0, "north")

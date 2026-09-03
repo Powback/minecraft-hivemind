@@ -284,7 +284,7 @@ function M.makeEnv(p_Opts)
         cachedWorld = {}, cachedWorldDetail = {}, centre = function() return world.pos.x, world.pos.z end,
         getBounds = function() return nil end, setBounds = noop, loadRegion = noop,
         setLocation = yes, setLocationFromGPS = yes, setHeading = yes, ensureHeading = yes,
-        headingDelta = function() return 0 end, isProtectedBlock = no, clearMoveError = noop,
+        headingDelta = function() return 0 end, holdFixes = noop, releaseFixes = noop, isProtectedBlock = no, clearMoveError = noop,
         lastMoveError = function() return nil end, trailBack = function() return nil end, trailLength = function() return 0 end,
     }
     env.pgps = pgps
