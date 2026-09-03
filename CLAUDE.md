@@ -509,6 +509,25 @@ fix to make quietly.
 - **In a fuel emergency HQ hauls only caches KNOWN to hold burnable, and the haul reports what it
   leaves.** A never-reported chest of stone 33 blocks out was hauled 64 at a time, trip after trip,
   by the scout carrying the fleet's last tank.
+- **Work with no site costs no trip.** A craft has no position; `distTo(d, nil)` answered
+  `math.huge`, so since the round-trip pricing landed no crafter could afford any craft -- "D4 has
+  1252 fuel, the job needs an unknown amount" for every craft in the queue, all night. The `%d`
+  crash on that very message had hidden it.
+- **A fuel emergency holds the miners' non-fuel work, not everyone's; the tower pauses only while a
+  miner could be felling; a failed craft does not hold the crafter out of building; the any-role
+  build fallback prices the job like the first choice** (it did not, and sent a 384-fuel patch to
+  scouts holding 290 and 270, who burned to the watchdog's floor).
+
+**Why the tower still has 67 blocks (2026-09-04, 01:35).** With every gate above opened, three
+builds ran and placed nothing: `short hop of 19 failed direct -- falling back to the map`,
+`pathfinder did not answer -- MapServer may be overloaded` (136 times across the fleet that night),
+`blocked by something unidentified at -480,64,64 -- asking it to move`. The tower's origin column IS
+where idle drones park -- `docks-01` was never built, so "park on a dock" means the base of the
+tower -- and by then two dead drones sat inside the footprint and one on top of the storage chest.
+A builder cannot route into its own square, and a drone at 0 fuel cannot be asked to move. 295
+tower patches were queued at once. Until the docks are built away from the footprint and the dead
+drones are relieved, ordering the tower spends the last tank on replans. Stopped and dispatch
+paused; D4 holds 905 fuel, the rest hold 117 and five zeros.
 
 ## Environment invariants
 
