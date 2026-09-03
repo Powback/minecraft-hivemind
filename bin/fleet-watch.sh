@@ -39,6 +39,24 @@ read_faults() {
   " 2>/dev/null | sort -u
 }
 
+# Which faults are worth interrupting a person for. Everything else is in the log above.
+ALARM="${ALARM:-FUEL TRAP|FUEL SPIRAL|NO INCOME|RESCUE TREADMILL|IDLE WITH WORK|OUT OF FUEL|HQ CONTAINER NOT RUNNING|HQ UNREACHABLE|HQ SEES NO FLEET}"
+MC_DIR="${MC_DIR:-$HOME/Projects/minecraft-create121}"
+NOTIFY_GAME="${NOTIFY_GAME:-1}"
+NOTIFY_MAC="${NOTIFY_MAC:-1}"
+
+alarm() {
+  # $1 is one fault line. Strip quotes and backslashes: it goes into JSON and into AppleScript.
+  msg=$(printf '%s' "$1" | tr -d '"\\' | cut -c1-200)
+  if [ "$NOTIFY_GAME" = "1" ] && [ -d "$MC_DIR" ]; then
+    (cd "$MC_DIR" && docker compose exec -T mc rcon-cli \
+      "tellraw @a {\"text\":\"[HiveMind] $msg\",\"color\":\"red\"}" >/dev/null 2>&1 </dev/null) || true
+  fi
+  if [ "$NOTIFY_MAC" = "1" ] && command -v osascript >/dev/null 2>&1; then
+    osascript -e "display notification \"$msg\" with title \"HiveMind\"" >/dev/null 2>&1 || true
+  fi
+}
+
 TMP="${TMPDIR:-/tmp}/fleet-watch.$$"
 mkdir -p "$TMP" || exit 1
 trap 'rm -rf "$TMP"' EXIT INT TERM
@@ -55,6 +73,11 @@ while true; do
     comm -13 "$TMP/prev" "$TMP/cur" | sed 's/^/[FAULT] /'
     comm -23 "$TMP/prev" "$TMP/cur" | sed 's/^/[CLEARED] /'
     if [ ! -s "$TMP/cur" ] && [ -s "$TMP/prev" ]; then echo "[ALL CLEAR] no faults reported"; fi
+    # A MONITOR THAT PRINTS TO A FILE IS NOT A MONITOR. This logged 79 fault changes in one evening
+    # -- FUEL SPIRAL, six drones OUT OF FUEL -- into a background file nobody was reading. The faults
+    # that change what a person does go to where the person is: the game (tellraw) and the desk
+    # (a macOS notification). Per-drone "low on fuel" lines flap and stay in the log only.
+    comm -13 "$TMP/prev" "$TMP/cur" | grep -E "$ALARM" | while IFS= read -r line; do alarm "$line"; done
     cp "$TMP/cur" "$TMP/prev"
   fi
   sleep "$POLL"

@@ -11,7 +11,10 @@ cost hours at least once.
 | `lua/` | Code that runs on in-world computers. `DroneLogic.lua` (drones), `TaskMan`, `DroneMan`, `MapServer`, `StorageMan`, `DockingMan`, `MainFrame`, `pgps` (movement/position), `PowNet` (messaging) |
 | `hq/` | TypeScript. Tools, the agent loop, the `/map` page, and every test |
 | `bootstrap/` | Shell recipes for placing things in the world: drones, GPS hosts, modules, storage |
-| `bin/` | Sync helpers |
+| `bin/` | Sync helpers; `fleet-watch.sh` polls `/brief` and prints fault changes |
+| `hq/test/lua/` | The Lua, executed: `cc_stubs.lua` (a stub ComputerCraft world) and `run.lua` (behavioural tests run under Lua 5.4 by `hq/test/lua-behaviour.test.ts`) |
+| `.luacheckrc` | luacheck config for `lua/`; gated by `hq/test/luacheck.test.ts`, baseline in `hq/luacheck-baseline.json` |
+| `hq/scripts/*.mjs` | The ratchets' scanners (`complexity`, `adoption`, `duplication`, `silence`, `luacheck`); each takes `--update` to bank a win |
 
 The world save lives at `~/Projects/minecraft-create121/data/world`. Drone logs are at
 `data/world/computercraft/computer/<id>/drone.log` — that is the primary debugging surface.
@@ -404,6 +407,22 @@ cross its plane. What changed, and the rule each change encodes:
   moved every minute; `/brief` carries income, burn and fuel per block over 20 minutes, and raises
   `NO INCOME` when drones work and nothing arrives. That is the fault the whole evening needed.
 
+**Where things stood at the end of 2026-09-03.** Every mechanism above was verified once in the
+world -- targeted felling (5, 9, 8 logs), wood-fired smelting (5 logs became 5 charcoal), relief
+(three revivals in two minutes), planting (2 saplings on grove-01) -- and the settlement still
+stranded overnight: 6 of 7 drones at zero, 377 fuel in the fleet, 0 burnable on the shelf, 26 logs
+and 11 coal in a cache 45 blocks out that no drone could afford to fetch. Nothing has been built
+since: tower level 0 with 67 blocks placed all day, 546 stone bricks and 121 cobblestone waiting,
+`planks-01` and `charcoal-01` "running" with nothing to consume, 13 storage plots and the docks
+"clearing" since they were planned, `crafting-01/02` and `grove-01` planned. **Base and factories
+are not being built.** The economy is not fuel-positive at 1.2-2.8 fuel per block with trees 40-60
+blocks out, and no amount of scheduler correctness changes that; the grove and the movement cost do.
+
+**A monitor that prints to a file is not a monitor.** `bin/fleet-watch.sh` logged 79 fault changes
+that night -- `FUEL SPIRAL`, `OUT OF FUEL` for six drones -- into a background task file nobody was
+reading, and the sentinel counted 20,059 "self-resolved" incidents. Neither reached a person. A
+fault the operator cannot see from where they are (in the game, at the desk) has not been raised.
+
 Three more, from the hour after (each with a check in `fuel-leaks-closed.test.ts`):
 
 - **One coroutine moves the turtle at a time.** `TravelTo` is owned by the first coroutine to start
@@ -483,8 +502,12 @@ for two logs that did not exist anywhere.
 
 ## When something looks stuck
 
+0. `/brief` → `economy`. Income (networked burnable over 20 min), burn (fleet tanks), fuel per block.
+   If drones are "working" and income is 0, the brief says `NO INCOME` and nothing else matters until
+   that does. `bin/fleet-watch.sh` prints the fault list as it changes.
 1. `hive.plan` — the queue as a dependency tree with the reason each task is blocked. This answers
-   "why is nothing happening" better than anything else.
+   "why is nothing happening" better than anything else. "no miner can afford it: D31 has 415, the
+   job needs ~576" is TaskMan pricing the job; it is not a stuck drone.
 2. `hive.nodes` — module reachability. A busy module gets one retry before being called dead.
 3. `fleet.status` — includes `detail` (what the job is) and `carrying` (what it holds). Stock inside
    a drone is invisible to planning; `storage.recall` and `fleet.handover` move it.
