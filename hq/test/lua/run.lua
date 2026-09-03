@@ -288,7 +288,8 @@ test("DroneLogic.TravelTo: one coroutine owns the turtle; the other is told busy
 end)
 
 test("DroneLogic.FellTrunkAt fells the whole column from the side and climbs it", function()
-    local env = loadModule("DroneLogic.lua", { fuel = 1000, pos = { x = 0, y = 64, z = 0 } })
+    local env, D = loadModule("DroneLogic.lua", { fuel = 1000, pos = { x = 0, y = 64, z = 0 } })
+    D.setExecuting(true)                                  -- felling happens inside a job
     local t = env.__world.turtle
     -- A trunk: one log in front that disappears when dug, then a column of three above the base.
     -- Height matters: the block overhead is the one at y+1 for the drone's CURRENT y, so digging up
@@ -309,7 +310,8 @@ test("DroneLogic.FellTrunkAt fells the whole column from the side and climbs it"
 end)
 
 test("DroneLogic.FellTrunkAt reports a trunk that is gone and observes the air", function()
-    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    local env, D = loadModule("DroneLogic.lua", { fuel = 1000 })
+    D.setExecuting(true)                                  -- felling happens inside a job
     local observed = {}
     env.pgps.noteObservation = function(idx, solid) observed[#observed + 1] = idx .. "=" .. tostring(solid) end
     local logs, why = env.FellTrunkAt({ x = 5, y = 64, z = 5 })
@@ -413,6 +415,39 @@ test("pgps.ensureHeading reads the heading from a clean probe step and refuses o
     eq(ok, false, "disturbed probe refused") eq(why, "moved during the probe", "and it says why")
     local _, _, _, d2 = env.getCachedPosition()
     eq(d2, env.HEADINGS.east, "the heading we had is kept")
+end)
+
+test("DroneLogic.FellTargets stops at an abort and when the tank is the trip home", function()
+    local env, D = loadModule("DroneLogic.lua", { fuel = 500, pos = { x = 10, y = 64, z = 0 } })
+    D.setHome({ x = 0, y = 64, z = 0 })                    -- floor 150 here
+    local calls = 0
+    env.FellTrunkAt = function() calls = calls + 1 return 1 end
+    local targets = { { x = 1, y = 64, z = 1 }, { x = 2, y = 64, z = 2 }, { x = 3, y = 64, z = 3 } }
+    D.setExecuting(false)
+    env.FellTargets(targets)
+    eq(calls, 0, "an aborted job fells nothing more")
+    D.setExecuting(true)
+    env.FellTargets(targets)
+    eq(calls, 3, "a live job with fuel works the list")
+    env.__world.turtle.fuel = 160                          -- floor 150 + 40 for the next approach: short
+    env.FellTargets(targets)
+    eq(calls, 3, "the trip-home tank is not spent on another target")
+end)
+
+test("DroneLogic.ApproachFromSide gives up after the fuel cap instead of trying every side", function()
+    local env, D = loadModule("DroneLogic.lua", { fuel = 500, pos = { x = 0, y = 64, z = 0 } })
+    D.setExecuting(true)
+    local movers = 0
+    local burn = function() movers = movers + 1 env.__world.turtle.fuel = env.__world.turtle.fuel - 30 return false end
+    env.pgps.moveTo, env.pgps.flyTo, env.pgps.digTo = burn, burn, burn
+    local ok, why = env.ApproachFromSide({ x = 5, y = 70, z = 5 })
+    eq(ok, false, "unreachable") eq(why, "too costly", "and it says why")
+    truthy(movers <= 6, "one side's movers, not four sides' (" .. movers .. ")")
+    truthy(500 - env.__world.turtle.fuel <= 200, "bounded burn")
+    D.setExecuting(false)
+    movers = 0
+    local ok2, why2 = env.ApproachFromSide({ x = 5, y = 70, z = 5 })
+    eq(ok2, false, "aborted") eq(why2, "aborted", "an abort ends it before the first mover") eq(movers, 0, "no movers")
 end)
 
 test("DroneLogic.ConfirmHeading does not step the turtle while another coroutine owns travel", function()

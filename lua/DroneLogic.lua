@@ -1375,46 +1375,48 @@ local function reachAdjacent(p_X, p_Y, p_Z, p_Budget)
     end
     local s_Mapped = pgps.moveTo(p_X, p_Y, p_Z)
     if s_Mapped ~= false then return s_Mapped end
+    -- A canopy target sits inside leaves: the mapped route ends against them and the flight below
+    -- bounces on them for its whole budget. A miner digs leaves for free (no fuel, and saplings drop),
+    -- so it tunnels the last stretch; the flight is the tool-less drone's last resort.
+    if CanDig() then
+        local s_Dug = pgps.digTo(p_X, p_Y, p_Z)
+        if s_Dug ~= false then return s_Dug end
+    end
     return pgps.flyTo(p_X, p_Y, p_Z, p_Budget or 64)
 end
 
 function ApproachFromSide(p_Target, p_FlyBudget)
+    -- EVERY SIDE IS FOUR MOVERS, AND NONE OF THEM LOOKED AT THE TANK. D35 died at a canopy site with
+    -- 433 fuel spent on approaches that all failed, in silence, while the watchdog's trip home was
+    -- refused because this loop still held the travel lock. A target is worth at most this much
+    -- fuel; past it the target is "unreachable" and the next one is cheaper. And an abort from the
+    -- watchdog (executing = false) ends the loop at once instead of at the fourth side.
+    local APPROACH_FUEL_CAP = 40
+    local s_Start = turtle.getFuelLevel()
+    local function spent()
+        local f = turtle.getFuelLevel()
+        if type(s_Start) ~= "number" or type(f) ~= "number" then return 0 end
+        return s_Start - f
+    end
     for _, s_Side in ipairs(SIDE_APPROACHES) do
+        if not executing then return false, "aborted" end
+        if spent() > APPROACH_FUEL_CAP then
+            trace(("approach: %d fuel spent on the sides of %d,%d,%d -- giving it up as unreachable")
+                :format(spent(), p_Target.x, p_Target.y, p_Target.z))
+            return false, "too costly"
+        end
         local x, z = p_Target.x + s_Side.dx, p_Target.z + s_Side.dz
-        -- THE BLOCK WE STAND ON HAS TO BE LEGAL TOO, NOT JUST THE ONE WE CUT.
-        --
-        -- The gather reach-filters its seeds and its vein neighbours -- both are about the TARGET.
-        -- This picks where the drone puts itself, one block to the side of it, and checked nothing.
-        -- A target sitting on the boundary therefore parks the drone just outside, where mayStep
-        -- refuses every move and the status goes to "blocked": pickDrone stops offering it work and
-        -- TaskMan queues a dig-out for a drone that is not buried.
-        --
-        -- Measured on D31 at -525,78,30, 64 blocks out against a reach of 56, holding the lumber
-        -- task. Same trap the vein filter above was written for, one step further along: no single
-        -- decision looks wrong, and the drone ends up somewhere it cannot work from.
         if pgps.isWithinReach(x, z) then
-            -- DIRECT FIRST FOR A SHORT HOP. THIS IS THE PER-CANDIDATE PATH.
-            --
-            -- The order here was moveTo (an A* request to MapServer) and only then flyTo. TravelTo
-            -- already carries the comment explaining why that is backwards -- "DO NOT ASK THE
-            -- PATHFINDER TO CROSS THE ROOM", 207,574 cells, 5.8 seconds for a small query -- but
-            -- the fix was never applied to this function, which is the one a gather calls ONCE PER
-            -- CANDIDATE. A sweep of 192 targets a couple of blocks apart therefore issued 192 A*
-            -- searches, and every other drone queued behind them.
-            --
-            -- Measured: "gather: 32/192 checked" and "33/192 checked" two hundred seconds apart --
-            -- one candidate per three minutes, with MapServer dropping out under the load. The
-            -- fleet was not slow at cutting wood; it was slow at asking permission to walk.
-            -- A side approach is a hop to the cell NEXT to the target. reachAdjacent's default
-            -- flight budget was 64 steps, and a failed side spends it all before the next side is
-            -- tried -- up to 256 fuel to decide one trunk is boxed in. Sixteen is four times the
-            -- longest legitimate detour around it.
             local s_Try = reachAdjacent(x, p_Target.y, z, p_FlyBudget or 16)
             if s_Try ~= false then
                 pgps.turnTo(pgps.HEADINGS[s_Side.face])
                 return s_Try
             end
         end
+    end
+    if spent() > 0 then
+        trace(("approach: %d,%d,%d unreachable from any side -- %d fuel spent finding that out")
+            :format(p_Target.x, p_Target.y, p_Target.z, spent()))
     end
     return false
 end
@@ -1440,14 +1442,15 @@ end
 function ReachSite(p_X, p_Y, p_Z)
     local s_Above = p_Y and (p_Y + 1) or nil
     local s_At = pgps.moveTo(p_X, s_Above, p_Z)
-    if s_At == false and p_Y ~= nil then
+    if s_At == false and p_Y ~= nil and executing then
         trace("site unreachable from above -- trying the sides")
         s_At = ApproachFromSide({x = p_X, y = p_Y, z = p_Z})
     end
-    if s_At == false and CanDig() then
+    if s_At == false and executing and CanDig() then
         trace("site unreachable by path -- digging in")
         s_At = pgps.digTo(p_X, s_Above, p_Z)
     end
+    if s_At == false and not executing then return false, "aborted" end
     return s_At
 end
 
@@ -4966,8 +4969,21 @@ end
 
 -- Work a list of recorded trunks. Returns trees, logs, gone, unreachable.
 function FellTargets(p_Targets)
-    local s_Trees, s_Logs, s_Gone, s_Unreached = 0, 0, 0, 0
-    for _, t in ipairs(p_Targets) do
+    local s_Trees, s_Logs, s_Gone, s_Unreached, s_Left = 0, 0, 0, 0, 0
+    for i, t in ipairs(p_Targets) do
+        if not executing then
+            s_Left = #p_Targets - i + 1
+            trace(("lumber: aborted with %d target(s) left"):format(s_Left))
+            break
+        end
+        -- THE NEXT TARGET COSTS UP TO A SIDE-APPROACH CAP ON TOP OF THE TRIP HOME. Below that the
+        -- right move is to carry what we have back to the furnace, not to find out.
+        local f = turtle.getFuelLevel()
+        if type(f) == "number" and f < FuelFloorNow() + 40 then
+            s_Left = #p_Targets - i + 1
+            trace(("lumber: %d fuel is the trip home -- leaving %d target(s) for a fuller drone"):format(f, s_Left))
+            break
+        end
         if not depositIfFull() then break end
         local n, s_Why = FellTrunkAt(t)
         if n > 0 then
@@ -4978,8 +4994,8 @@ function FellTargets(p_Targets)
             s_Gone = s_Gone + 1
         end
     end
-    trace(("lumber: %d target(s): %d gone from the world, %d unreachable"):format(
-        #p_Targets, s_Gone, s_Unreached))
+    trace(("lumber: %d target(s): %d gone from the world, %d unreachable, %d left"):format(
+        #p_Targets, s_Gone, s_Unreached, s_Left))
     return s_Trees, s_Logs
 end
 
@@ -8873,6 +8889,28 @@ end
 --
 -- Deliberately does NOT set m_Refuelling: there is nothing to refuel with, and marking the drone
 -- unavailable would only hide it from the relief that is its actual way out.
+-- THE ABORT IS NOT DONE UNTIL THE JOB HAS LET GO OF THE WHEEL. Setting executing = false and
+-- breaking the current mover is a request; the job coroutine honours it at its next check, and
+-- until then it owns TravelTo -- so the watchdog's own trip home was answered "another routine is
+-- already moving the drone" and D35 burned to zero at the site while the watchdog kept asking.
+-- Repeat the abort until the lock clears, for a bounded time; then move.
+function AbortJobAndWait(p_Tries)
+    for _ = 1, (p_Tries or 10) do
+        executing = false                      -- stop whatever job is running
+        -- And actually STOP MOVING. Clearing `executing` only stops the job loop between steps; a
+        -- drone already inside flyTo keeps flying until that call returns on its own terms, which
+        -- for a climb to cruising height is minutes. This is the fuel watchdog -- minutes is the
+        -- whole tank.
+        pgps.BreakExec()
+        -- Yield long enough for the mover to SEE the flag and unwind. Clearing it in the next
+        -- statement would be a race the flight usually wins: it is in another coroutine, and if it
+        -- has not been scheduled yet it never observes the abort at all.
+        os.sleep(2)
+        pgps.StartExec()                       -- abort landed; our own trip may now move
+        if not TravelIsBusy() then return true end
+    end
+    return false
+end
 local function parkForFuel(p_Fuel, p_Floor)
     local hx, hy, hz = HomeXYZ()
     local cx, _, cz = pgps.getCachedPosition()
@@ -8881,10 +8919,7 @@ local function parkForFuel(p_Fuel, p_Floor)
     if BlocksFlat(cx, cz, hx, hz) <= 4 then return end
     trace(("fuel at %d (floor %d) and storage is dry -- heading home to wait rather than "
            .. "stranding in the field"):format(p_Fuel, p_Floor))
-    executing = false
-    pgps.BreakExec()
-    os.sleep(2)
-    pgps.StartExec()
+    AbortJobAndWait()
     Tried("fly home", TravelTo, hx, hy, hz)
 end
 
@@ -8944,18 +8979,8 @@ local function fuelLoop()
         if s_Fuel ~= "unlimited" and s_Fuel < s_Floor and not StorageKnownDry(s_Fuel) then
             trace(("fuel at %d (floor %d for this position) -- breaking off to refuel")
                 :format(s_Fuel, s_Floor))
-            executing = false                      -- stop whatever job is running
-            m_Refuelling = true                    -- ...and stay unavailable until fuel is aboard
-            -- And actually STOP MOVING. Clearing `executing` only stops the job loop between
-            -- steps; a drone already inside flyTo keeps flying until that call returns on its own
-            -- terms, which for a climb to cruising height is minutes. This is the fuel watchdog --
-            -- minutes is the whole tank.
-            pgps.BreakExec()
-            -- Yield long enough for the mover to SEE the flag and unwind. Clearing it in the next
-            -- statement would be a race the flight usually wins: it is in another coroutine, and if
-            -- it has not been scheduled yet it never observes the abort at all.
-            os.sleep(2)
-            pgps.StartExec()                       -- abort landed; the trip to fuel may now move
+            m_Refuelling = true                    -- stay unavailable until fuel is aboard
+            AbortJobAndWait()
 
             -- STOP AS SOON AS THE TANK IS FULL, AT EVERY STEP.
             --
@@ -9520,6 +9545,7 @@ if HiveMindTest then
     HiveMindTest.DroneLogic = {
         setHome = function(p) m_HomePos = p end,
         setRelieving = function(v) m_Relieving = v end,
+        setExecuting = function(v) executing = v end,
     }
 end
 parallel.waitForAny(table.unpack(s_Fns))
