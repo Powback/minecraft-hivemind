@@ -444,6 +444,30 @@ falls is not idle -- **dump its position every two seconds**; the movement that 
 movement nothing traces. And an ore gather is underground: no GPS, so no clears, so the index only
 grows stale, and no relief can reach it. During a fuel emergency HQ now fells and does not mine.
 
+**POSITION DRIFT WAS A RACE, NOT GPS NOISE (2026-09-04).** Logs were full of `position corrected
+by 1-18` and `heading was W, we actually travelled E`, and a three-fix hysteresis was added to
+"filter GPS jitter". Measured properly -- 12 `gps.locate` calls on each of three stationary drones,
+a census of the hosts answering, and `computercraft dump` for the truth -- every fix was identical
+and equal to the cache and to the server. GPS here is exact: 16 fixed hosts on a 44-block grid at
+their true coordinates. The drift came from **two coroutines driving one turtle**:
+
+- `refixLoop` took a fix while the travel coroutine was mid-leg. The hosts' distances were measured
+  across a step, the cache had moved on, and the difference was adopted as a "correction" that put
+  the bookkeeping behind the drone.
+- A correction of 4+ called `ConfirmHeading`, whose probe is a raw `turtle.forward()`/`back()`. Under
+  a traveller, the GPS delta it read was theirs plus its own, and the heading it "re-established"
+  was whatever that sum pointed at. D54 was re-established to N, E, S and W in turn, 45 s apart,
+  while flying straight; each wrong heading produced the next big drift, which produced the next
+  probe. The `not executing` gate did not help: `executing` means a JOB is running, and docking,
+  refuelling and flying home all move the drone outside one.
+
+The rule, now in pgps: **a fix or a heading probe during which anything else moved the turtle is
+discarded** (`m_MoveSeq`, bumped by every tracked step and `setLocation`; `verifyPosition` returns
+`nil, "moved during the fix"` with no back-off), and `ConfirmHeading`/`HeadingFromPeers` do nothing
+while `TravelIsBusy()`. The hysteresis is gone. The earlier "six fixes read -496 ×4, -497 ×2 on a
+drone that had not moved" was taken on a drone that WAS moving -- for a heading probe. Before
+calling any sensor noisy, measure it on something that is provably still, against the world.
+
 ## Environment invariants
 
 - **Wired modems need BOTH blockstates: `modem=true` AND `peripheral=true`.** For weeks this was
