@@ -287,6 +287,72 @@ test("DroneLogic.TravelTo: one coroutine owns the turtle; the other is told busy
     falsy(env.TravelIsBusy(), "free again")
 end)
 
+test("DroneLogic.FellTrunkAt fells the whole column from the side and climbs it", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000, pos = { x = 0, y = 64, z = 0 } })
+    local t = env.__world.turtle
+    -- A trunk: one log in front that disappears when dug, then a column of three above the base.
+    -- Height matters: the block overhead is the one at y+1 for the drone's CURRENT y, so digging up
+    -- once removes one log and the next is only reachable after moving up -- as in the world.
+    local front, y = true, 64
+    local column = { [65] = true, [66] = true, [67] = true }
+    t.detect = function() return front end
+    t.inspect = function() if front then return true, { name = "minecraft:oak_log" } end return false end
+    t.dig = function() front = false return true end
+    t.detectUp = function() return column[y + 1] == true end
+    t.inspectUp = function() if column[y + 1] then return true, { name = "minecraft:oak_log" } end return false end
+    t.digUp = function() column[y + 1] = nil return true end
+    env.pgps.up = function() y = y + 1 return true end
+    env.pgps.down = function() y = y - 1 return true end
+    local logs, why = env.FellTrunkAt({ x = 5, y = 64, z = 5 })
+    eq(why, nil, "no failure reason")
+    eq(logs, 4, "the base log plus three overhead")
+end)
+
+test("DroneLogic.FellTrunkAt reports a trunk that is gone and observes the air", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    local observed = {}
+    env.pgps.noteObservation = function(idx, solid) observed[#observed + 1] = idx .. "=" .. tostring(solid) end
+    local logs, why = env.FellTrunkAt({ x = 5, y = 64, z = 5 })
+    eq(logs, 0, "nothing felled")
+    eq(why, "gone", "reason")
+    eq(#observed, 3, "the foot and the two cells above it were recorded as air")
+    eq(observed[1], "5:64:5=0", "first observation")
+end)
+
+test("DroneLogic.PlantSaplingAt plants on soil from one above, and not on stone", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    local t = env.__world.turtle
+    t.inv[1] = { name = "minecraft:oak_sapling", count = 4 }
+    t.inspectDown = function() return true, { name = "minecraft:grass_block" } end
+    local placed = 0
+    t.placeDown = function() placed = placed + 1 t.inv[1].count = t.inv[1].count - 1 return true end
+    truthy(env.PlantSaplingAt({ x = 3, y = 64, z = 3 }), "planted on grass")
+    eq(placed, 1, "one sapling placed")
+    t.inspectDown = function() return true, { name = "minecraft:stone" } end
+    falsy(env.PlantSaplingAt({ x = 4, y = 64, z = 3 }), "not on stone")
+    eq(placed, 1, "nothing more placed")
+end)
+
+-- ================================================================================================
+-- pgps
+-- ================================================================================================
+test("pgps loads under the stub world", function()
+    local env = loadModule("pgps.lua")
+    truthy(env.setLocation, "setLocation defined")
+    truthy(env.moveTo, "moveTo defined")
+end)
+
+test("pgps.setLocation with no heading keeps the heading it has", function()
+    local env = loadModule("pgps.lua")
+    env.setLocation(1, 2, 3, "north")
+    local x, y, z, d = env.getCachedPosition()
+    eq(x, 1, "x") eq(d, env.HEADINGS.north, "heading set")
+    local rx, ry, rz, rd = env.setLocation(10, 20, 30, nil)
+    eq(rx, 10, "position moved") eq(rd, env.HEADINGS.north, "heading kept")
+    local _, _, _, d2 = env.getCachedPosition()
+    eq(d2, env.HEADINGS.north, "still north")
+end)
+
 -- ================================================================================================
 local failed = 0
 for _, r in ipairs(results) do if not r.ok then failed = failed + 1 end end
