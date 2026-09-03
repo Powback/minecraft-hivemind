@@ -496,6 +496,20 @@ walk of the bay (`grove-01` sits 45 blocks from the chests because the plot spir
 the tower, not the deposit point), a longer reach toward the forest, or both. Neither is a code
 fix to make quietly.
 
+**Four scheduler rules from the same night, each measured before it was written:**
+- **A docked drone is a free drone.** Idle drones park and report `docking` for up to 90 s at a
+  time; `pickDrone` asked for exactly `idle`, so "every crafter is busy (D4)" was logged every 15 s
+  for an hour while D4 sat docked with 1,600 fuel (`FREE_STATES`).
+- **A fuel emergency holds the miners' non-fuel work, not the crafter's.** Fuel is not transferable
+  between tanks; holding the brick craft saved nothing for the felling and idled the only drone
+  that could build.
+- **Ask before flying.** `CollectFuel` asks StorageMan for burnable over the network before any
+  flight; every earlier attempt flew to the chest that last held fuel and swept the bay, 14-59 fuel
+  a time, at every job end.
+- **In a fuel emergency HQ hauls only caches KNOWN to hold burnable, and the haul reports what it
+  leaves.** A never-reported chest of stone 33 blocks out was hauled 64 at a time, trip after trip,
+  by the scout carrying the fleet's last tank.
+
 ## Environment invariants
 
 - **Wired modems need BOTH blockstates: `modem=true` AND `peripheral=true`.** For weeks this was
