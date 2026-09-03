@@ -8691,6 +8691,16 @@ local function goHomeIfOutside()
     Tried("fly home from outside the region", TravelTo, hx, hy, hz)
 end
 
+-- Idle, under target, fuel available: go and fill up. See the caller for what it cost not to. A
+-- global rather than a `local`: DroneLogic is at Lua's 200-local limit for the main chunk.
+function TopUpWhileIdle()
+    local s_F = turtle.getFuelLevel()
+    if s_F == "unlimited" or s_F >= REFUEL_TARGET or StorageKnownDry(s_F) then return false end
+    Tried("top up while idle", RefuelAtStorage)
+    m_Status = "idle"
+    return true
+end
+
 local function idleDockLoop()
     local s_IdleSince = nil
     while true do
@@ -8750,6 +8760,15 @@ local function idleDockLoop()
             s_IdleSince = nil
         else
             s_IdleSince = s_IdleSince or os.clock()
+            -- AN IDLE DRONE WITH FUEL ON THE SHELF SHOULD BE FULL.
+            --
+            -- Refuelling only happened below the floor, and the floor at base is ~120. Every job is
+            -- priced by TaskMan at more than that. So D37 sat idle at 311 fuel beside 240 coal for
+            -- forty minutes, offered nothing ("no miner can afford it: D37 has 311, the job needs
+            -- ~576"), and never once walked to the chest -- the one thing that would have made it
+            -- affordable. Idle, under target, fuel available: top up. StorageKnownDry keeps this
+            -- from pacing to an empty chest every fifteen seconds when there is nothing to fetch.
+            TopUpWhileIdle()
             if (os.clock() - s_IdleSince) >= IDLE_BEFORE_DOCK then
                 -- NEVER GO IDLE HOLDING CARGO.
                 --
