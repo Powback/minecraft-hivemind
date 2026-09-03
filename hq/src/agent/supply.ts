@@ -1347,7 +1347,7 @@ async function maintenancePhases(
   return (await expandStorageIfFull(live, queued))
     ?? (await bringFactoriesOnline())
     ?? (await runFactories(queued))
-    ?? (await keepTowerOrdered(queued))
+    ?? (await keepTowerOrdered(live, queued))
     ?? (await collectFieldCaches(live, queued));
 }
 
@@ -1741,7 +1741,23 @@ async function clearStaleFloors(p_Stale: string[]): Promise<{ acted: boolean; re
   };
 }
 
-async function keepTowerOrdered(queued: Set<string>): Promise<{ acted: boolean; reason: string } | null> {
+/**
+ * THE TOWER PAUSES TO FREE MINERS FOR FUEL WORK -- AND ONLY FOR THAT. Bricks are on the shelf;
+ * laying them costs a scout or the crafter a few blocks of travel from the bay, and their fuel
+ * cannot become anyone else's. With every miner dry (2026-09-04: four at zero, 818 bricks in
+ * stock, tower at level 0 all day) pausing the tower idled the whole settlement for nothing.
+ * Pause while a miner still has the fuel to fell; otherwise build with whoever has fuel.
+ */
+const MINER_CAN_FELL_FUEL = 400;
+function towerPausedForFuel(emergency: boolean | null, live: any[]): boolean {
+  if (!emergency) return false;
+  const minerCouldFell = live.some((d: any) => d.role === 'miner' && Number(d.fuel) >= MINER_CAN_FELL_FUEL);
+  if (!minerCouldFell) {
+    note('tower: fuel emergency with no miner able to fell -- building continues with the drones that have fuel');
+  }
+  return minerCouldFell;
+}
+async function keepTowerOrdered(live: any[], queued: Set<string>): Promise<{ acted: boolean; reason: string } | null> {
   const level = supply.towerLevel ?? 0;
 
   // THE DESIGN HAS A TOP, AND NOTHING IN THE GEOMETRY SAID SO. bandFor falls back to the topmost
@@ -1774,7 +1790,8 @@ async function keepTowerOrdered(queued: Set<string>): Promise<{ acted: boolean; 
   if (stale.length) return await clearStaleFloors(stale);
 
   const emergency = await fuelEmergency();
-  if (emergency !== null && emergency) {
+  const paused = towerPausedForFuel(emergency, live);
+  if (paused) {
     const cleared = await stopTasksNamed(`tower-L${level}-`);
     // A PAUSE MUST NOT LOOK LIKE A COMPLETION.
     //

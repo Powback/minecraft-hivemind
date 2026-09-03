@@ -24,7 +24,7 @@ describe('the supply loop runs the settlement without a human', () => {
     const body = fn.slice(0, fn.indexOf('\n}\n') + 3);
     expect(body).toMatch(/bringFactoriesOnline\(\)/);
     expect(body).toMatch(/runFactories\(queued\)/);
-    expect(body).toMatch(/keepTowerOrdered\(queued\)/);
+    expect(body).toMatch(/keepTowerOrdered\(live, queued\)/);
   });
 
   /**

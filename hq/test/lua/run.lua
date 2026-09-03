@@ -111,6 +111,15 @@ test("TaskMan.pickDrone treats a docked drone as free", function()
     truthy(drone, "picked") eq(drone and drone.name, "D4", "the docked drone") eq(busy, nil, "not busy")
 end)
 
+test("TaskMan.pickDrone prices work with no site as no trip, so a crafter can afford a craft", function()
+    local _, T = taskManWithFleet({
+        { id = 2, name = "D4", role = "crafter", status = "docking", fuel = 1200, pos = { x = 0, y = 64, z = 0 } },
+    })
+    local drone, _, poor, need = T.pickDrone("crafter", nil, nil, 100)
+    truthy(drone, "picked: " .. tostring(need)) eq(drone and drone.name, "D4", "the crafter")
+    eq(poor, nil, "not reported as poor")
+end)
+
 test("TaskMan.pickDrone offers the job to a drone that can afford it", function()
     local _, T = taskManWithFleet({
         { id = 1, name = "D1", role = "miner", status = "idle", fuel = 1000, pos = { x = 0, y = 64, z = 0 } },
@@ -137,6 +146,7 @@ test("TaskMan: while the fleet is low, a crafter's job is placeable and a miner'
     }, {})
     falsy(T.notPlaceableNow({ id = 4, name = "craft-stone_bricks", work = { craft = {} } }, "crafter", {}), "a craft costs no fuel anyone else could use")
     truthy(T.notPlaceableNow({ id = 5, name = "dig:stone", work = { mine = { pos = {} } } }, "miner", {}), "a miner's dig waits for fuel work")
+    falsy(T.notPlaceableNow({ id = 6, name = "tower-L0-3", work = { build = { origin = {} } } }, "miner", {}), "a build of stocked bricks is placeable; anyoneForBuild hands it on")
 end)
 
 -- ================================================================================================

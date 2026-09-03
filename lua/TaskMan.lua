@@ -326,7 +326,13 @@ local function workPos(p_Task)
 end
 
 local function distTo(p_Drone, p_Pos)
-    if p_Pos == nil or p_Drone == nil or p_Drone.pos == nil or p_Drone.pos.x == nil then
+    -- WORK WITH NO SITE HAPPENS WHERE THE DRONE IS. A craft has no position -- it is done at
+    -- storage -- and this used to answer math.huge for it, so every craft priced as an infinite
+    -- trip and no crafter could ever afford one: "D4 has 1252 fuel, the job needs an unknown
+    -- amount" for every craft in the queue, all night (2026-09-04). No site: no trip. A drone
+    -- with no known position is a different matter -- its trip really cannot be priced.
+    if p_Pos == nil then return 0 end
+    if p_Drone == nil or p_Drone.pos == nil or p_Drone.pos.x == nil then
         return math.huge
     end
     return math.abs(p_Drone.pos.x - p_Pos.x) + math.abs(p_Drone.pos.y - p_Pos.y)
@@ -2460,7 +2466,10 @@ local function notPlaceableNow(p_Task, p_Role, p_NoDrone)
         -- stone waited to become the tower's bricks, for the whole of a fuel emergency, because this
         -- gate held every non-fuel task for every role. Miners are the fuel-makers; their work is
         -- what the emergency is for. Everyone else's work is cheap, or it is what finds the forest.
-        if not s_IsFuelWork and p_Role == "miner" then return true end
+        -- A build lays bricks that are already on the shelf, and anyoneForBuild hands it to a scout
+        -- or the crafter when no miner is free -- which in an emergency with the miners dry is the
+        -- only building that will happen. Fuel work still ranks ahead of it for a miner that is free.
+        if not s_IsFuelWork and p_Role == "miner" and w.build == nil then return true end
     end
     local s_Off = m_PlaceBackoff[tostring(p_Task.id)]
     if s_Off ~= nil and (os.epoch("utc") - s_Off) < PLACE_BACKOFF_MS then return true end
