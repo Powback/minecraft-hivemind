@@ -515,6 +515,7 @@ export type SupplyCtx = {
   crafterFree: boolean;
   idleCrafter: unknown;
   held: (m: string) => number;
+  fuelCritical: boolean;    // the tick's fuel emergency; lumber harvests leftover canopy under it
 };
 
 /**
@@ -666,7 +667,7 @@ async function dispatchLumber(rule: SupplyRule, have: number, ctx: SupplyCtx): P
     return false;
   }
 
-  const sweep = await queueLumberSweep(bridge, rule.match);
+  const sweep = await queueLumberSweep(bridge, rule.match, 1, { leftovers: ctx.fuelCritical });
   if (sweep.reason) {
     note(`${rule.match}: ${have}/${rule.min}, ${sweep.reason} -> survey`);
     return dispatchSurvey(rule, have, ctx);
@@ -678,7 +679,8 @@ async function dispatchLumber(rule: SupplyRule, have: number, ctx: SupplyCtx): P
   const at = sweep.at!;
   supply.lastAction = `lumber at ${at.x},${at.y},${at.z}`;
   note(`${rule.match}: ${have}/${rule.min} -> lumber sweep at ${at.x},${at.y},${at.z} `
-     + `(${sweep.trunks} trunks in range, fells and replants)`);
+     + `(${sweep.trunks} trunks in range, fells and replants`
+     + `${sweep.leftovers ? '; leftover canopy too -- fuel emergency' : ''})`);
   ctx.did.push(`lumber ${rule.match}`);
   return true;
 }
@@ -2314,6 +2316,7 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
     now, queued, did, waiting,
     minerFree, scoutFree, crafterFree,
     idleCrafter, held,
+    fuelCritical,
   };
   const storageFull = await storageHasNoRoom();
 

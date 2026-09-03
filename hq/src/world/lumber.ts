@@ -35,6 +35,7 @@ export interface LumberSweep {
   at?: { x: number; y: number; z: number };
   /** How many known trunks fall inside the sweep from there. */
   trunks?: number;
+  leftovers?: boolean;      // true when the sweep harvests canopy leftovers (fuel emergency)
   /** Why nothing was queued, when nothing was. */
   reason?: string;
 }
@@ -241,41 +242,52 @@ function densestStart(p_All: any[]): { at: any; trunks: number } {
  * Returns a reason rather than throwing when there is nothing to fell, so the caller can decide
  * whether that means "survey for more" or "give up quietly".
  */
+/**
+ * THE CHOICE, WITHOUT THE NETWORK. Which logs count as a tree, where the sweep starts and which
+ * trunk feet the drone is sent to -- pure, so the test can hand it a forest and read the answer.
+ *
+ * `leftovers` is the fuel-emergency switch. The standing-tree filter exists because leftover canopy
+ * poisoned every pick when the fleet was choosing ONE sweep by density; but 88 leftover logs inside
+ * the operating circle are 88 charcoal, and their canopies still hold the saplings the grove needs.
+ * With no standing tree in reach and the shelf at zero (2026-09-04), refusing them is refusing the
+ * only wood there is. Standing trees are still preferred when any exist.
+ */
+export function chooseSweep(p_All: any[], p_Leftovers = false):
+    { at: { x: number; y: number; z: number }; trunks: number;
+      targets: Array<{ x: number; y: number; z: number }>; leftovers: boolean } | { reason: string } {
+  if (!p_All.length) return { reason: 'no trees known inside the operating circle' };
+  let trees = standingTrees(p_All);
+  let leftovers = false;
+  if (!trees.length) {
+    if (!p_Leftovers) {
+      return { reason: `no standing trees known -- ${p_All.length} recorded log(s) are all leftover `
+                     + `canopy, ${MIN_TRUNK} stacked logs needed to be worth felling` };
+    }
+    trees = p_All;
+    leftovers = true;
+  }
+  const { at, trunks } = densestStart(trees);
+  const targets = trunkFeetNear(trees, at);
+  return { at: { x: at.x, y: at.y, z: at.z }, trunks, targets, leftovers };
+}
+
 export async function queueLumberSweep(
   bridge: { call: (mod: string, key: string, data: unknown,
                    opts?: { timeoutMs?: number; idem?: string }) => Promise<any> },
   match: string,
   priority = 1,
+  opts: { leftovers?: boolean } = {},
 ): Promise<LumberSweep> {
   const all = await knownTrunks(bridge, match);
-  if (!all.length) return { reason: 'no trees known inside the operating circle' };
-
-  // STANDING TREES ONLY -- see standingTrees. A sweep sent at leftover canopy logs burns a round
-  // trip and comes back with nothing, and says `felled 0 tree(s)` while doing it.
-  //
-  // SAYING SO IS THE POINT. "No standing trees, only N leftovers" tells the supply loop to survey
-  // for more forest; a doomed sweep tells it nothing and costs fuel the settlement may not have.
-  // That distinction is what separates a fleet that recovers from one that grinds to a halt with
-  // every job completing successfully.
-  const trees = standingTrees(all);
-  if (!trees.length) {
-    return { reason: `no standing trees known -- ${all.length} recorded log(s) are all leftover `
-                   + `canopy, ${MIN_TRUNK} stacked logs needed to be worth felling` };
-  }
-
-  const { at, trunks } = densestStart(trees);
-  const targets = trunkFeetNear(trees, at);
-
-  // Priority 1, the same as the other fuels. Felling and gathering compete for the same miners and
-  // lumber used to queue at 3 against the gather's 2, so with lowest-first the fleet ran the gather
-  // every time and the lumber task sat unassigned for an entire session.
+  const pick = chooseSweep(all, opts.leftovers === true);
+  if ('reason' in pick) return { reason: pick.reason };
+  const { at, trunks, targets, leftovers } = pick;
   const r: any = await bridge.call('TaskMan', 'Add', {
     name: `lumber:${match}`,
     priority,
     work: { lumber: { w: SWEEP, l: SWEEP, start: { x: at.x, y: at.y, z: at.z }, targets } },
   }, { timeoutMs: 8000 });
-
   const id = typeof r?.id === 'number' ? r.id
            : (typeof r?.data?.id === 'number' ? r.data.id : undefined);
-  return { task: id, at: { x: at.x, y: at.y, z: at.z }, trunks };
+  return { task: id, at: { x: at.x, y: at.y, z: at.z }, trunks, leftovers };
 }

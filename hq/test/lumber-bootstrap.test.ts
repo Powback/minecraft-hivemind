@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { standingTrees, chooseSweep } from '../src/world/lumber.js';
 
 const drone = readFileSync(join(__dirname, '../../lua/DroneLogic.lua'), 'utf8');
 
@@ -176,33 +177,41 @@ describe('the lumber sweep starts at the foot of the tree', () => {
 describe('lumber targets standing trees, not leftover canopy', () => {
   const src = readFileSync(join(__dirname, '../src/world/lumber.ts'), 'utf8');
 
+  // A forest the picker can be handed: five columns of one leftover log each (felled trees whose
+  // canopy stayed), and optionally one real trunk of four.
+  const canopy = [-500, -496, -492, -488, -484].map((x) => ({ x, y: 70, z: 60, name: 'minecraft:oak_log' }));
+  const trunk  = [64, 65, 66, 67].map((y) => ({ x: -490, y, z: 64, name: 'minecraft:oak_log' }));
+
   it('keeps only columns tall enough to be a tree', () => {
-    const i = src.indexOf('export function standingTrees');
-    if (i < 0) throw new Error('standingTrees is gone -- move this assertion, do not delete it');
-    const fn = src.slice(i, src.indexOf('\n}\n', i) + 3);
-    expect(fn).toMatch(/logs\.length >= MIN_TRUNK/);
-    expect(src).toMatch(/const MIN_TRUNK = 3/);
+    expect(standingTrees(canopy)).toEqual([]);
+    expect(standingTrees([...canopy, ...trunk])).toHaveLength(4);
   });
 
-  it('the sweep is chosen from those only', () => {
-    const i = src.indexOf('export async function queueLumberSweep');
-    const fn = src.slice(i, src.indexOf('\n}\n', i) + 3);
-    expect(fn).toMatch(/const trees = standingTrees\(all\)/);
-    expect(fn).toMatch(/densestStart\(trees\)/);
+  it('the sweep is chosen from standing trees when any exist', () => {
+    const pick = chooseSweep([...canopy, ...trunk], true);
+    if ('reason' in pick) throw new Error(pick.reason);
+    expect(pick.leftovers).toBe(false);
+    expect(pick.targets).toEqual([{ x: -490, y: 64, z: 64 }]);
+  });
+
+  it('says why rather than dispatching a doomed sweep', () => {
+    const pick = chooseSweep(canopy);
+    expect('reason' in pick && pick.reason).toMatch(/no standing trees known -- 5 recorded log\(s\) are all leftover/);
   });
 
   /**
-   * Reporting "nothing worth felling" is half the fix. A doomed sweep costs a round trip and tells
-   * the supply loop nothing; a reason tells it to go survey for more forest.
+   * The fuel emergency of 2026-09-04: no standing tree inside the circle, 88 leftover logs in it,
+   * shelf at zero. Leftovers are wood. The picker takes them when told the fleet is out of fuel,
+   * and only then.
    */
-  it('says why rather than dispatching a doomed sweep', () => {
-    const i = src.indexOf('export async function queueLumberSweep');
-    const fn = src.slice(i, src.indexOf('\n}\n', i) + 3);
-    expect(fn).toMatch(/no standing trees known/);
-    expect(fn).toMatch(/leftover /);
+  it('harvests leftover canopy when the fleet is out of fuel, and says so', () => {
+    const pick = chooseSweep(canopy, true);
+    if ('reason' in pick) throw new Error(pick.reason);
+    expect(pick.leftovers).toBe(true);
+    expect(pick.targets.length).toBeGreaterThanOrEqual(2);     // several leftovers per trip, not one
+    for (const t of pick.targets) expect(t.y).toBe(70);
   });
 
-  /** The real histogram, so the threshold is judged against data rather than taste. */
   it('the threshold separates the measured populations', () => {
     const measured = { 1: 63, 2: 11, 3: 9, 4: 10, 5: 2, 6: 4, 7: 2 };
     const kept = Object.entries(measured).filter(([h]) => Number(h) >= 3)
