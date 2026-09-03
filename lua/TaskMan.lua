@@ -457,8 +457,12 @@ end
 UNAFFORDABLE = "can afford it"
 local function noDroneReason(p_Role, p_Busy, p_Poor, p_PoorNeed)
     if p_Poor then
+        -- %d REFUSES A FRACTION. The need is a floor plus fuel-per-block times a distance, and the
+        -- per-block rates are not integers; the first fractional need threw "bad argument #5 (not a
+        -- number in proper range)" out of the tick every 15 s and stopped the blocker-placement pass
+        -- for the rest of the night, while the tests fed it whole numbers. Floor it.
         return ("no %s " .. UNAFFORDABLE .. ": %s has %s fuel, the job needs ~%d from there")
-            :format(p_Role, tostring(p_Poor.name), tostring(p_Poor.fuel), p_PoorNeed or 0)
+            :format(p_Role, tostring(p_Poor.name), tostring(p_Poor.fuel), math.floor(p_PoorNeed or 0))
     end
     if p_Busy then return "every " .. p_Role .. " is busy (" .. tostring(p_Busy.name) .. ")" end
     return "no " .. p_Role .. " in the fleet -- one drone needs a "

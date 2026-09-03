@@ -417,6 +417,13 @@ test("pgps.ensureHeading reads the heading from a clean probe step and refuses o
     eq(d2, env.HEADINGS.east, "the heading we had is kept")
 end)
 
+test("TaskMan.noDroneReason survives a fractional fuel need", function()
+    local env, T = loadModule("TaskMan.lua")
+    local why = T.noDroneReason("miner", nil, { name = "D31", fuel = 190 }, 255.5)
+    truthy(why:find("~255"), "the need is reported whole: " .. why)
+    truthy(why:find(env.UNAFFORDABLE, 1, true), "and named as unaffordable")
+end)
+
 test("DroneLogic.FellTargets stops at an abort and when the tank is the trip home", function()
     local env, D = loadModule("DroneLogic.lua", { fuel = 500, pos = { x = 10, y = 64, z = 0 } })
     D.setHome({ x = 0, y = 64, z = 0 })                    -- floor 150 here

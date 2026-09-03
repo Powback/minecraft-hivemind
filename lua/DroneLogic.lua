@@ -8767,7 +8767,12 @@ end
 -- global rather than a `local`: DroneLogic is at Lua's 200-local limit for the main chunk.
 function TopUpWhileIdle()
     local s_F = turtle.getFuelLevel()
-    if s_F == "unlimited" or s_F >= REFUEL_TARGET or StorageKnownDry(s_F) then return false end
+    -- StorageKnownDry(nil), NOT StorageKnownDry(s_F). With the tank passed in, the predicate
+    -- answers false below FUEL_STRANDING_RISK so a LOW drone re-checks the shelf rather than
+    -- strand -- right for a drone in the field, wrong for one parked at the bay: D40 sat idle at
+    -- 482 fuel and flew to the empty shelf every 15 s, 14-34 fuel a time, down to 179 (2026-09-04).
+    -- An idle drone is not stranding; it waits for the shelf to report something.
+    if s_F == "unlimited" or s_F >= REFUEL_TARGET or StorageKnownDry(nil) then return false end
     Tried("top up while idle", RefuelAtStorage)
     m_Status = "idle"
     return true
