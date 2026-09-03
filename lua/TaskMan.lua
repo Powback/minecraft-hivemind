@@ -629,7 +629,11 @@ end
 -- Is there crafting queued that nobody has picked up?
 local function craftIsWaiting()
     for _, t in pairs(DATA["tasks"] or {}) do
-        if type(t) == "table" and t.work and t.work.craft and t.assignedTo == nil and taskLive(t) then
+        -- A craft that has already FAILED is not waiting for the crafter, it is waiting for materials
+        -- -- craft-oak_planks with no log in the settlement held the crafter out of building for a
+        -- whole fuel emergency (2026-09-04) while it was the only drone with fuel to lay bricks.
+        if type(t) == "table" and t.work and t.work.craft and t.assignedTo == nil and taskLive(t)
+           and (tonumber(t.attempts) or 0) == 0 then
             return true
         end
     end
