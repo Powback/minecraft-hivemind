@@ -48,6 +48,24 @@ const BOUNDS = {
 /** The plant. Persisted beside the plots, because a factory without its plot is meaningless. */
 export const factories: Factory[] = [];
 
+/**
+ * Put the previous world's registry somewhere before starting clean, and say whether that worked.
+ *
+ * The forensics really are a bonus -- but the caller's log line CLAIMS the archive exists, by name,
+ * and it is the only record that a whole settlement's plot registry was just discarded. A swallowed
+ * write turned that claim into a false statement pointing at a file that is not there, which is a
+ * worse way to lose the data than admitting it was lost.
+ */
+function archivePriorRegistry(raw: unknown, o: { x: number; y: number; z: number }): string {
+  const archived = `${FILE}.${o.x}_${o.y}_${o.z}.bak`;
+  try {
+    writeFileSync(archived, JSON.stringify(raw));
+    return `archived to ${archived}`;
+  } catch (err) {
+    return `COULD NOT archive it to ${archived} (${(err as Error)?.message ?? err}) -- the old registry is gone`;
+  }
+}
+
 function load(): Registry {
   try {
     const raw = JSON.parse(readFileSync(FILE, 'utf8'));
@@ -66,10 +84,8 @@ function load(): Registry {
     const o = raw?.origin;
     const sameWorld = o && o.x === ORIGIN.x && o.y === ORIGIN.y && o.z === ORIGIN.z;
     if (!sameWorld && o) {
-      const archived = `${FILE}.${o.x}_${o.y}_${o.z}.bak`;
-      try { writeFileSync(archived, JSON.stringify(raw)); } catch { /* forensics are a bonus */ }
       console.log(`[city] persisted registry is for origin ${o.x},${o.y},${o.z} but this settlement `
-                + `is at ${ORIGIN.x},${ORIGIN.y},${ORIGIN.z} -- archived to ${archived}, starting clean`);
+                + `is at ${ORIGIN.x},${ORIGIN.y},${ORIGIN.z} -- ${archivePriorRegistry(raw, o)}, starting clean`);
       return newRegistry(ORIGIN, BOUNDS);
     }
 

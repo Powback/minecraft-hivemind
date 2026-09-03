@@ -1,0 +1,23 @@
+{
+  "unverified": [
+    "dock.add",
+    "dock.remove",
+    "factory.attach",
+    "factory.create",
+    "factory.route",
+    "fleet.goto",
+    "order.abort",
+    "plan.execute",
+    "plot.alloc",
+    "recover.dispatch",
+    "rescue.party",
+    "rescue.relay",
+    "storage.deposit",
+    "storage.pickup",
+    "storage.smelt",
+    "supply.set",
+    "supply.tick",
+    "task.stop",
+    "world.bounds"
+  ]
+}

@@ -58,6 +58,25 @@ local m_HomePos = nil
 -- every rescue in the fleet.
 --
 -- Caught by test/lua-hygiene.test.ts, which exists because this is the eighth time.
+-- HOW MANY BLOCKS AWAY IS THAT.
+--
+-- Manhattan, not Euclid, and that is the whole point: a turtle moves one axis at a time, so the sum
+-- of the axis differences IS the number of steps -- which is the number of FUEL UNITS. Every travel
+-- budget, reserve check and "is this worth the trip" in this file is computed from it.
+--
+-- It was written out inline twenty-three times. Nothing was wrong with any single copy; the problem
+-- is that "how far away" is one question and twenty-three places each answered it in a form nobody
+-- could search for, so no fuel decision could be traced to a definition. BlocksFlat is the
+-- horizontal-only version -- the four callers that deliberately ignore altitude, because climbing
+-- is not what makes a trip expensive when the drone is already in open air.
+function Blocks(p_Ax, p_Ay, p_Az, p_Bx, p_By, p_Bz)
+    return math.abs(p_Ax - p_Bx) + math.abs(p_Ay - p_By) + math.abs(p_Az - p_Bz)
+end
+
+function BlocksFlat(p_Ax, p_Az, p_Bx, p_Bz)
+    return math.abs(p_Ax - p_Bx) + math.abs(p_Az - p_Bz)
+end
+
 local reachableTarget
 local executing = false
 -- REFUELLING MUST LOOK BUSY, BECAUSE IT IS.
@@ -69,6 +88,10 @@ local executing = false
 -- refuelled nothing, and carried on down to 185. The watchdog fired perfectly every time and was
 -- undone by the very line it used to interrupt the job.
 local m_Refuelling = false
+-- Carrying fuel FOR SOMEBODY ELSE. Read by burnFrom, which otherwise eats it -- see there. Declared
+-- here with the rest of the state because a `local` first assigned inside OnRelieve would be a
+-- global there and nil in burnFrom: the guard would compile, pass every test, and never fire.
+local m_Relieving = false
 
 -- Walled in: the way up is solid and this drone has no pickaxe. Set by surfaceIfBuried, cleared the
 -- moment a climb succeeds. Kept as state rather than a one-shot Distress because the fleet's rescue
@@ -133,6 +156,36 @@ local reportTask
 -- file scope: pgps is an os.loadAPI module and may not be loaded when this line runs.
 local function HEADINGS_() return pgps.HEADINGS end
 
+-- DO THE THING, AND SAY SO WHEN IT DID NOT HAPPEN.
+--
+-- A drone is the one computer nobody can watch, so every `pcall(f)` whose result was thrown away
+-- here produced the same observable event whether f worked or threw: nothing. That is the most
+-- expensive pattern in this project and this file held sixty instances of it -- a lost TaskDone
+-- leaves a task assigned for ever to a drone the scheduler then skips; a lost ReportChest leaves
+-- StorageMan certain a full chest is empty, which is worse than an unknown one because the fetch
+-- sweep SKIPS it; a lost setHeading leaves the drone flying the wrong way while the line above it
+-- in the log says the heading was corrected.
+--
+-- The pcall itself is almost always right: a drone must not die because a server was slow. What was
+-- wrong was being unable to tell afterwards.
+--
+-- ONE function, and it takes the label, so the branch lives here instead of at sixty call sites --
+-- both because that is the only way this stays inside the complexity gate, and because a per-site
+-- if/else is what people quietly stop writing after the tenth one.
+--
+-- Genuinely best-effort calls do NOT use this. They keep a bare pcall and carry a
+-- `silent: allow (<why>)` justification, so the difference between "we accept losing this" and
+-- "nobody ever decided" is written down.
+--
+-- GLOBAL, not local, and not by preference: this chunk is at 192 of Lua's 200 locals and adding
+-- one more fails the whole file to load with "too many local variables". Same reason DigUp and
+-- PutDown are globals. Assigned at file scope, so it exists before anything calls it.
+function Tried(p_What, p_Fn, ...)
+    local s_Ok, s_Err = pcall(p_Fn, ...)
+    if not s_Ok then trace("FAILED to " .. tostring(p_What) .. " -- " .. tostring(s_Err)) end
+    return s_Ok
+end
+
 -- A DOCK IS BORROWED, NOT OWNED.
 --
 -- Docking used to be a home berth: DroneMan allocated a slot the first time a drone registered, the
@@ -169,7 +222,7 @@ function Init()
     end
     -- Out of radio range there is nobody to ask -- and that is exactly when knowing the region
     -- matters, because it is the only thing that will send the drone back toward the mast.
-    pcall(pgps.loadRegion)
+    Tried("load the operating region from disk", pgps.loadRegion)
 
     x,y,z = pgps.setLocationFromGPS()
 
@@ -312,10 +365,37 @@ end
 local function reregisterIfDisowned(p_Reply)
     if p_Reply ~= "unregistered" then return false end
     trace("DroneMan does not know me -- dropping my name and rebooting to re-register")
-    pcall(os.setComputerLabel, nil)
+    -- If the label does not actually clear, the reboot below comes back with the SAME name
+    -- DroneMan just disowned, and the drone re-registers, gets disowned and reboots again --
+    -- a loop with nothing in any log to say why.
+    Tried("drop my computer label before re-registering", os.setComputerLabel, nil)
     os.sleep(1)
     os.reboot()
     return true
+end
+
+-- THE FUEL LEVEL BELOW WHICH THIS DRONE, HERE, CANNOT WORK -- reported, rather than guessed at the
+-- other end.
+--
+-- TaskMan had its own constant for the same idea, and its comment says exactly why that is a
+-- mistake: "Two numbers for one idea is how they drift apart. They mean the same thing, so they are
+-- the same number." They drifted anyway, because FUEL_SEARCH_ALLOWANCE was later added to THIS side
+-- only -- so the drone's real floor became ~700 near base while TaskMan went on using 300, opening a
+-- band in which a drone is refused work for being too low AND refused fuel for being too high.
+-- Nothing reports that state; the drone simply stops existing as far as the scheduler is concerned.
+--
+-- Measured: D4 -- the settlement's ONLY crafter -- sat at 507 fuel raising "low fuel" distress every
+-- fifteen seconds while 295 tower patches waited on the stone bricks that only it could craft, and
+-- every fuel relief went to drones under 300 instead.
+--
+-- A constant cannot be kept in step across three files; a reported value cannot drift, because only
+-- one place computes it. FuelFloorNow is a GLOBAL declared further down and resolved at call time,
+-- and it already handles an unknown position. nil rather than a guess if it throws: TaskMan falls
+-- back to its own constant, which is the old behaviour and no worse.
+function ReportedFuelFloor()
+    local s_Ok, s_Floor = pcall(FuelFloorNow)
+    if not s_Ok then return nil end
+    return tonumber(s_Floor)
 end
 
 function SendHeartBeat()
@@ -486,7 +566,9 @@ function SendHeartBeat()
         if fs.exists("/last-run.txt") then
             local h = fs.open("/last-run.txt", "r")
             if h then m_LastCrash = (h.readAll() or ""):gsub("%s+$", "") h.close() end
-            pcall(fs.delete, "/last-run.txt")
+            -- A marker that will not delete is read again on the NEXT boot, so the drone
+            -- reports a crash that did not happen -- for ever.
+            Tried("clear the crash marker", fs.delete, "/last-run.txt")
         end
     end
 
@@ -525,6 +607,7 @@ function SendHeartBeat()
     -- The mesh is worth having; it just has to say who it is speaking for.
     local s_Data = {ccid = os.getComputerID(),
                     pos = s_Pos, status = s_Report, detail = m_Detail, fuel = s_Fuel, role = Role(),
+                    fuelFloor = ReportedFuelFloor(),
                     inv = s_Inv,
                     -- What code this drone is running, so a stale fleet is visible instead of
                     -- silently reintroducing bugs that were already fixed. See fileStamp.
@@ -632,25 +715,36 @@ end
 -- one. Retracing is safe because it is going back, not reasoning about somewhere new.
 local RECOVER_MAX_CRUMBS = 120
 
+-- WALK THE BREADCRUMB TRAIL BACKWARDS UNTIL WE ARE BACK IN TOUCH.
+--
+-- Both recovery paths are this loop -- lost radio link, and lost GPS fix -- and only the test for
+-- "back in touch" differs. It is the one escape that does not require knowing where you are, which
+-- is exactly what is missing when it is needed. Returns crumbs retraced, and whether it worked.
+function RetraceTrail(p_Max, p_Ceiling, p_Regained)
+    local s_Steps = 0
+    while s_Steps < p_Max do
+        local bx, by, bz = pgps.trailBack()
+        if bx == nil then break end
+        s_Steps = s_Steps + 1
+        pgps.flyTo(bx, by, bz, p_Ceiling)
+        if p_Regained() then return s_Steps, true end
+    end
+    return s_Steps, false
+end
+
 function RecoverLink()
     local s_Was = m_Status
     m_Status = "recovering"
     pgps.setRecovering(true)
     Say("link lost -- retracing " .. tostring(pgps.trailLength()) .. " crumbs")
 
-    local s_Steps = 0
-    while s_Steps < RECOVER_MAX_CRUMBS do
-        local bx, by, bz = pgps.trailBack()
-        if bx == nil then break end
-        s_Steps = s_Steps + 1
-        pgps.flyTo(bx, by, bz, 32)
-        if SendHeartBeat() then
-            pgps.setRecovering(false)
-            m_Status = s_Was
-            Say("link regained after " .. s_Steps .. " crumbs")
-            Distress("link lost and regained", "retraced " .. s_Steps .. " crumbs")
-            return true
-        end
+    local s_Steps, s_Back = RetraceTrail(RECOVER_MAX_CRUMBS, 32, SendHeartBeat)
+    if s_Back then
+        pgps.setRecovering(false)
+        m_Status = s_Was
+        Say("link regained after " .. s_Steps .. " crumbs")
+        Distress("link lost and regained", "retraced " .. s_Steps .. " crumbs")
+        return true
     end
 
     -- NO CRUMBS? THEN HEAD FOR HOME ON THE MAP.
@@ -689,7 +783,7 @@ function RecoverLink()
                 trace(("link regained on the way home at %d,%d,%d"):format(cx, cy, cz))
                 return true
             end
-            if math.abs(cx - hx) + math.abs(cz - hz) < 8 then break end
+            if BlocksFlat(cx, cz, hx, hz) < 8 then break end
         end
     end
 
@@ -785,6 +879,7 @@ local function repeatFilter(p_What)
 end
 
 trace = function(p_What)
+    -- silent: allow (the logger itself -- reporting its own failure through itself is circular, and the print path above has already tried)
     pcall(function()
         p_What = repeatFilter(tostring(p_What))
         if p_What == nil then return end
@@ -1201,13 +1296,16 @@ function NoteSeenColumn(p_X, p_Y, p_Z, p_FromBelow)
     local s_Far  = p_FromBelow and (p_Y - 2) or (p_Y + 2)
     local s_Look = p_FromBelow and turtle.inspectDown or turtle.inspectUp
 
+    -- silent: allow (one map cell of telemetry; the next pass over this column re-reads it, and the map is advisory by design)
     pcall(pgps.noteObservation, p_X .. ":" .. s_Own .. ":" .. p_Z, 0)
 
     local s_Ok, s_Blk = s_Look()
     local s_Key = p_X .. ":" .. s_Far .. ":" .. p_Z
     if s_Ok and s_Blk and s_Blk.name then
+        -- silent: allow (one map cell of telemetry; re-observed on the next pass, and a lost cell costs a number rather than a decision)
         pcall(pgps.noteObservation, s_Key, 1, {true, {name = s_Blk.name}})
     else
+        -- silent: allow (one map cell of telemetry; re-observed on the next pass, and a lost cell costs a number rather than a decision)
         pcall(pgps.noteObservation, s_Key, 0)
     end
 end
@@ -1266,7 +1364,7 @@ local SHORT_HOP = 32
 local function reachAdjacent(p_X, p_Y, p_Z, p_Budget)
     local s_Cx, s_Cy, s_Cz = pgps.getCachedPosition()
     local s_Near = s_Cx ~= nil and
-        (math.abs(s_Cx - p_X) + math.abs(s_Cy - p_Y) + math.abs(s_Cz - p_Z)) <= SHORT_HOP
+        (Blocks(s_Cx, s_Cy, s_Cz, p_X, p_Y, p_Z)) <= SHORT_HOP
     if s_Near and CanDig() then
         local s_Dug = pgps.digTo(p_X, p_Y, p_Z)
         if s_Dug ~= false then return s_Dug end
@@ -1451,6 +1549,7 @@ function SaveProgress(p_Progress, p_Force)
     -- at y=12 had to wait for the whole shaft to finish rather than for the dig to pass y=12, which
     -- serialises two jobs that should overlap and leaves a scout idle for the length of a dig.
     if m_Job.data and m_Job.data.taskId then
+        -- silent: allow (progress telemetry sent every few blocks -- the next update carries the same number, so losing one delays a dependent scan by seconds)
         pcall(function()
             PowNet.SendToServer("TaskMan", PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL,
                 "TaskProgress", {id = m_Job.data.taskId, progress = p_Progress}))
@@ -1470,10 +1569,12 @@ end
 
 function OnShutdown(p_Reason)
     -- Observations first: they are the expensive thing to re-gather, and a scout can have
-    -- thousands of blocks pending between 30s upload cycles.
-    pcall(UploadWorld)
+    -- thousands of blocks pending between 30s upload cycles -- so a failure here is thousands of
+    -- blocks lost, and it used to be lost in silence, on a stand-down that logged normally.
+    Tried("upload pending observations before standing down", UploadWorld)
     saveResume()
     m_Status = "updating"
+    -- silent: allow (the final beat on the way down; DroneMan re-learns this drone from the next beat after reboot)
     pcall(SendHeartBeat)
     Say("standing down for " .. tostring(p_Reason) .. (m_Job and (", will resume " .. tostring(m_Job.verb)) or ""))
     -- Close the log handle we now hold open (see trace). Each line is flushed as it is written, so
@@ -1549,7 +1650,9 @@ local function resumeJob()
         -- simply ignore the field and restart as before.
         local s_Data = s_Job.data or {}
         s_Data.resume = s_Job.progress
-        pcall(s_Entry.func, 0, {data = s_Data})
+        -- The else-branch below traces a MISSING handler. A handler that THREW went unmentioned,
+        -- so the job was dropped and the drone went idle looking exactly as if it had finished.
+        Tried(("resume the %s job"):format(tostring(s_Job.verb)), s_Entry.func, 0, {data = s_Data})
     else
         trace(("resume: no handler for verb %s -- dropping the job"):format(tostring(s_Job.verb)))
     end
@@ -1558,7 +1661,7 @@ end
 -- waitForAny ends the moment ANY branch returns, so this branch must never return -- otherwise a
 -- drone with nothing to resume would shut its own module down the instant it booted.
 local function resumeBranch()
-    pcall(resumeJob)
+    Tried("resume the job saved before the last stand-down", resumeJob)
     while true do os.sleep(3600) end
 end
 
@@ -1612,6 +1715,37 @@ function Distress(p_Reason, p_Detail, p_Mobility)
     PowNet.SendToServer("DroneMan", PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Distress", s_Data))
 end
 
+-- Enough in the tank to be worth calling healthy. Below this a drone cannot reach storage, so
+-- whatever it is reporting is still true and its distress must stand.
+local CLEAR_DISTRESS_FUEL = 320
+
+function CanStillMove()
+    local f = turtle.getFuelLevel()
+    if type(f) ~= "number" then return true end      -- unlimited-fuel worlds: never the problem
+    return f >= CLEAR_DISTRESS_FUEL
+end
+
+-- IS WHATEVER WENT WRONG ACTUALLY OVER?
+--
+-- Four things must hold, and the fourth is the one that was missing for a long time: no job, not
+-- busy, knows where it is, AND can still move. None of the first three needs fuel, so a drone that
+-- ran dry cleared its own distress the moment its job ended and told the fleet it was fine on every
+-- heartbeat -- TaskMan queued no relief because nothing was reported wrong, and recover.dispatch
+-- answered "no drone needs rescuing". Caught live on D35, oscillating once a minute:
+--
+--   DISTRESS: low fuel level 201, nothing to refuel with at the dock
+--   clearing stale distress: low fuel
+--
+-- One predicate rather than a four-part condition inside the watchdog, which is the densest branch
+-- cluster in this file and the worst place to hide a rule this load-bearing.
+function distressHasPassed()
+    if m_Stuck == nil then return false end
+    if executing then return false end
+    if m_Status ~= "idle" then return false end
+    if pgps.getCachedPosition() == nil then return false end
+    return CanStillMove()
+end
+
 function ClearDistress()
     m_Stuck = nil
 end
@@ -1652,7 +1786,10 @@ end
 local function undock()
     if not m_Docked then return end
     m_Docked = false
-    pcall(function()
+    -- A release that does not arrive is a LEAKED BERTH, and leaked berths are what filled a
+    -- tower that was standing physically empty: 16 of 16 slots held by ghosts, every dock request
+    -- answered "No registered docking stations", and idle drones hovering over the storage bay.
+    Tried("tell DockingMan I have left the berth", function()
         PowNet.SendToServer("DockingMan", PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "FreeDocking",
             {id = tostring(os.getComputerLabel() or os.getComputerID())}))
     end)
@@ -1692,6 +1829,7 @@ function OnDock(p_ID, p_Message)
     if not ok then return false, res end
     -- Refuel while we are here. Sitting in a berth facing an inventory full of coal and not taking
     -- any is the whole reason the plus pattern exists.
+    -- silent: allow (an opportunistic top-up while parked -- the fuel watchdog covers the drone whether or not this one works)
     pcall(TryRefuel)
     m_Status = "docking"
     SendHeartBeat()
@@ -1721,12 +1859,33 @@ end
 
 reportTask = function(p_Data, p_Ok, p_Reason, p_Result)
     if p_Data == nil or p_Data.taskId == nil then return end
-    pcall(function()
+    -- THE ONE MESSAGE THE WHOLE QUEUE DEPENDS ON.
+    --
+    -- If this never arrives, TaskMan never learns the task ended: it stays assigned to this drone
+    -- for ever, and pickDrone -- which only chooses idle drones -- skips the drone for ever too. One
+    -- lost packet takes a task AND a drone out of the settlement permanently, and swallowed it did
+    -- so with the drone cheerfully logging the job as finished on its own side.
+    Tried(("report task %s to TaskMan"):format(tostring(p_Data.taskId)), function()
         PowNet.SendToServer("TaskMan", PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "TaskDone",
             {id = p_Data.taskId, ok = p_Ok and true or false,
              reason = (not p_Ok) and tostring(p_Reason) or nil,
              result = p_Ok and p_Result or nil}))
     end)
+end
+
+-- THE FIVE THINGS THAT MUST HAPPEN WHEN A SURVEY ENDS WELL.
+--
+-- Written out once per survey mode -- the scanning one and the walking one -- so the pair could
+-- drift, and each line is load-bearing on its own. Dropping the UploadWorld(true) flush leaves the
+-- observations the survey EXISTS to produce sitting in the drone's buffer behind the throttle;
+-- dropping the `m_Job = nil saveResume()` makes a finished survey resume itself after the next
+-- stand-down and re-fly ground it already covered.
+local function surveyFinished(p_Data, p_Stats)
+    TaskEnd()
+    m_Status = "idle"
+    UploadWorld(true)      -- job over: flush, do not hold for the throttle
+    m_Job = nil saveResume()
+    reportTask(p_Data, true, nil, p_Stats)
 end
 
 function OnSurvey(p_ID, p_Message)
@@ -1834,7 +1993,7 @@ function OnSurvey(p_ID, p_Message)
                 -- that scanning here still covers ground the task cares about". A strict one-radius
                 -- test would not have fired for D19, which sat twelve blocks from a target it could
                 -- never occupy -- inside the useful range, outside the pedantic one.
-                local s_Off = math.abs(cx4 - tonumber(d.pos.x)) + math.abs(cz4 - tonumber(d.pos.z))
+                local s_Off = BlocksFlat(cx4, cz4, tonumber(d.pos.x), tonumber(d.pos.z))
                 if s_Off <= s_R4 * 3 then
                     trace(("survey: already within %d blocks of the start -- scanning from here"):format(s_Off))
                     s_At = true
@@ -1892,7 +2051,7 @@ function OnSurvey(p_ID, p_Message)
             -- So if we are close enough for the scan to overlap the region, scan here and report it.
             -- Useless coverage is still better than none, and it ends the retry loop honestly.
             local cx3, cy3, cz3 = pgps.getCachedPosition()
-            local s_Near = cx3 and (math.abs(cx3 - tonumber(d.pos.x)) + math.abs(cz3 - tonumber(d.pos.z)))
+            local s_Near = cx3 and (BlocksFlat(cx3, cz3, tonumber(d.pos.x), tonumber(d.pos.z)))
             if s_Near and s_Near <= (tonumber(d.radius) or 8) * 3 then
                 trace(("survey: cannot stand at the start -- scanning from here (%d blocks off)")
                     :format(s_Near))
@@ -1983,11 +2142,7 @@ function OnSurvey(p_ID, p_Message)
                 os.sleep(SCAN_COOLDOWN)
             end
         end
-        TaskEnd()
-        m_Status = "idle"
-        UploadWorld(true)      -- job over: flush, do not hold for the throttle
-        m_Job = nil saveResume()
-        reportTask(d, true, nil, {scanned = s_Total, sweeps = s_Scans})
+        surveyFinished(d, {scanned = s_Total, sweeps = s_Scans})
         return true, {message = "scanned " .. s_Total .. " blocks in " .. s_Scans .. " sweeps"}
     end
 
@@ -2026,11 +2181,7 @@ function OnSurvey(p_ID, p_Message)
         end
     end
 
-    TaskEnd()
-    m_Status = "idle"
-    UploadWorld(true)      -- job over: flush, do not hold for the throttle
-    m_Job = nil saveResume()
-    reportTask(d, true, nil, {cells = s_Cells, blocked = s_Blocked})
+    surveyFinished(d, {cells = s_Cells, blocked = s_Blocked})
     return true, {message = "surveyed " .. s_Cells .. " cells, " .. s_Blocked .. " blocked"}
 end
 
@@ -2098,6 +2249,7 @@ local function digHard(p_Dig, p_Detect, p_Inspect, p_Which)
                 local s_Now = os.clock()
                 if m_BlockedUploadAt == nil or (s_Now - m_BlockedUploadAt) > 15 then
                     m_BlockedUploadAt = s_Now
+                    -- silent: allow (throttled telemetry, at most once per 15s; the next upload carries the same observations)
                     pcall(UploadWorld)
                 end
                 trace(("refusing to mine %s -- recorded as impassable so nothing routes through it")
@@ -2167,8 +2319,9 @@ function DigDown()    return digHard(turtle.digDown, turtle.detectDown, turtle.i
 function AskToMakeWay(p_X, p_Y, p_Z)
     -- SendToAllDrones, not Broadcast. There is no PowNet.Broadcast; calling it is a nil global,
     -- which inside this pcall would have failed silently for ever -- the exact shape of bug this
-    -- whole mechanism exists to expose.
-    pcall(function()
+    -- whole mechanism exists to expose. The pcall no longer can: it says which call failed, which
+    -- is the only reason a nil global here would ever be found.
+    Tried("ask the other drones to make way", function()
         PowNet.SendToAllDrones(PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "MakeWay",
             {pos = {x = p_X, y = p_Y, z = p_Z}, from = os.getComputerID()}))
     end)
@@ -2267,7 +2420,13 @@ function ReportChest()
     local s_Size = 27
     if c.size then local ok2, sz = pcall(c.size) if ok2 and tonumber(sz) then s_Size = tonumber(sz) end end
 
-    pcall(function()
+    -- STOCK IS OBSERVED, NOT ACCOUNTED, AND THIS IS THE OBSERVATION.
+    --
+    -- A report that never lands leaves StorageMan's idea of this chest at whatever it last heard.
+    -- A chest wrongly recorded as EMPTY is worse than an unknown one, because the fetch sweep skips
+    -- it entirely -- 22 logs sat in a chest reading zero while the crafter was sent elsewhere for
+    -- hours. Swallowed, the drone had no way to know its reading never arrived.
+    Tried("report this chest's contents to StorageMan", function()
         PowNet.sendAndWaitForResponse("StorageMan",
             PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "ChestContents",
                 {at = {x = cx, y = cy - 1, z = cz}, items = s_Items,
@@ -2313,7 +2472,7 @@ function ReportStorage(p_Verb, p_Items)
     local cx, cy, cz = pgps.getCachedPosition()
     local s_At = nil
     if cx ~= nil then s_At = {x = cx, y = cy - 1, z = cz} end   -- the chest is the block below us
-    pcall(function()
+    Tried(("report a %s to StorageMan"):format(tostring(p_Verb)), function()
         PowNet.sendAndWaitForResponse("StorageMan",
             PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, p_Verb, {items = p_Items, at = s_At}),
             PowNet.SERVER_PROTOCOL, 3)
@@ -2376,10 +2535,15 @@ function RequestClearance(p_X, p_Y, p_Z)
     -- the fleet was clearing each other out of the way instead of working.
     --
     -- The right answer for a drone in the way already exists and costs one message: ask it to move.
-    if s_What:find("turtle", 1, true) or s_What:find("drone", 1, true) then
-        trace(("blocked by a DRONE at %d,%d,%d -- asking it to move rather than queuing a dig")
-            :format(p_X, p_Y, p_Z))
+    -- Ask, do not queue a dig. Written out twice below as well; the only difference was the reason.
+    local function askInstead(p_Why)
+        trace(("blocked by %s at %d,%d,%d -- asking it to move, not queuing a dig")
+            :format(p_Why, p_X, p_Y, p_Z))
         if type(AskToMakeWay) == "function" then AskToMakeWay(p_X, p_Y, p_Z) end
+    end
+
+    if s_What:find("turtle", 1, true) or s_What:find("drone", 1, true) then
+        askInstead("a DRONE")
         return
     end
 
@@ -2399,9 +2563,7 @@ function RequestClearance(p_X, p_Y, p_Z)
     -- that costs one message and works -- and let travel retry. A dig is for something we have
     -- looked at and know to be diggable.
     if s_What == "something" then
-        trace(("blocked by something unidentified at %d,%d,%d -- asking it to move, not queuing a dig")
-            :format(p_X, p_Y, p_Z))
-        if type(AskToMakeWay) == "function" then AskToMakeWay(p_X, p_Y, p_Z) end
+        askInstead("something unidentified")
         return
     end
 
@@ -2431,7 +2593,10 @@ function RequestClearance(p_X, p_Y, p_Z)
         :format(s_What, p_X, p_Y, p_Z))
     Distress("blocked, needs a miner", ("%s at %d,%d,%d"):format(s_What, p_X, p_Y, p_Z))
 
-    pcall(function()
+    -- The Distress above says the drone is stuck; THIS is the thing that actually gets a miner
+    -- sent. Lost silently, the drone waits for help nobody was ever asked for, and for a crafter a
+    -- blocked route is permanent.
+    Tried("ask TaskMan for a miner to clear the way", function()
         PowNet.SendToServer("TaskMan", PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Add", {
             name = ("clear-%d:%d:%d"):format(p_X, p_Y, p_Z),
             -- Above every ordinary job: something is STOPPED until this is done, and the whole
@@ -2463,6 +2628,86 @@ local function hardStop(p_What)
     return true
 end
 
+-- A ONE-BLOCK STEP DOES NOT NEED A PATHFINDER.
+--
+-- moveTo and digTo are the SAME A* request to MapServer -- the difference is only whether digging
+-- is permitted -- so every leg of every journey, including a two-block hop, queued behind a search
+-- over 207,574 cells that the file above measures at 5.8 seconds for a small region. A build patch
+-- makes that request once per block, thirty-two times, with the whole fleet queued behind the same
+-- service. When the search is starved the leg fails and OnBuild counts the block as SKIPPED.
+--
+-- Measured with the build instrumentation, and this is the entire reason the floor came out sparse
+-- rather than absent:
+--
+--   build:  8/32 blocks (4 placed,  4 skipped) in  89s
+--   build: 16/32 blocks (5 placed, 11 skipped) in 232s
+--
+-- Two thirds skipped, on squares that were plainly AIR -- verified with rcon against a known-good
+-- control. Nothing was in the way; the drone simply never got a route.
+--
+-- Consecutive blocks in a patch are adjacent, which is the one case where a route is not a
+-- question: turn, step, dig if something is there. This is NOT the old flyTo -- it does not climb
+-- over obstacles or wander; it walks the axes and gives up after a few tries, leaving the real
+-- pathfinder to handle anything that actually needs routing.
+local STRAIGHT_HOP = 3
+
+local function stepVertically(p_Cy, p_Y)
+    if p_Cy < p_Y then
+        DigUp()
+        return pgps.up()
+    end
+    DigDown()
+    return pgps.down()
+end
+
+-- Which way to face to close the gap. Nil when we are already on the square.
+local function headingToward(p_Cx, p_Cz, p_X, p_Z)
+    if p_X > p_Cx then return HEADINGS_().east end
+    if p_X < p_Cx then return HEADINGS_().west end
+    if p_Z > p_Cz then return HEADINGS_().south end
+    if p_Z < p_Cz then return HEADINGS_().north end
+    return nil
+end
+
+local function stepHorizontally(p_Cx, p_Cz, p_X, p_Z)
+    local s_H = headingToward(p_Cx, p_Cz, p_X, p_Z)
+    if s_H == nil then return false end
+    if pgps.turnTo(s_H) == false then return false end
+    DigForward()
+    return pgps.forward()
+end
+
+local function arrivedAt(p_Cx, p_Cy, p_Cz, p_X, p_Y, p_Z)
+    return p_Cx == p_X and p_Cy == p_Y and p_Cz == p_Z
+end
+
+local function stepStraightTo(p_X, p_Y, p_Z)
+    for _ = 1, 12 do
+        local cx, cy, cz = pgps.getCachedPosition()
+        if cx == nil then return false end
+        if arrivedAt(cx, cy, cz, p_X, p_Y, p_Z) then return true end
+        local s_Ok
+        if cy ~= p_Y then
+            s_Ok = stepVertically(cy, p_Y)
+        else
+            s_Ok = stepHorizontally(cx, cz, p_X, p_Z)
+        end
+        if not s_Ok then return false end
+    end
+    return false
+end
+
+-- Climb out of the ground before asking the pathfinder again. Its own function so TravelTo reads as
+-- the ladder of strategies it is, rather than one of the rungs being a loop with its own bookkeeping.
+local function riseToCeiling(p_Ceiling)
+    if not CanDig() or not p_Ceiling then return false end
+    local _, s_Cy = pgps.getCachedPosition()
+    if s_Cy == nil or s_Cy >= p_Ceiling then return false end
+    -- The loop itself is ClimbToOpenAir's; only the guard above and the log line were ever ours.
+    ClimbToOpenAir(p_Ceiling, "travel")
+    return true
+end
+
 function TravelTo(p_X, p_Y, p_Z, p_Ceiling)
     -- DO NOT ASK THE PATHFINDER TO CROSS THE ROOM.
     --
@@ -2479,7 +2724,9 @@ function TravelTo(p_X, p_Y, p_Z, p_Ceiling)
     local cx, cy, cz = pgps.getCachedPosition()
 
     if cx ~= nil then
-        local s_D = math.abs(cx - p_X) + math.abs(cy - p_Y) + math.abs(cz - p_Z)
+        local s_D = Blocks(cx, cy, cz, p_X, p_Y, p_Z)
+        -- Adjacent squares first, with no network call at all. See stepStraightTo.
+        if s_D <= STRAIGHT_HOP and stepStraightTo(p_X, p_Y, p_Z) then return true end
         if s_D <= SHORT_HOP then
             if CanDig() and pgps.digTo(p_X, p_Y, p_Z) ~= false then return true end
             if hardStop("travel") then return false end
@@ -2490,21 +2737,7 @@ function TravelTo(p_X, p_Y, p_Z, p_Ceiling)
     if pgps.moveTo(p_X, p_Y, p_Z) ~= false then return true end
     if hardStop("travel") then return false end
 
-    if CanDig() and p_Ceiling then
-        local _, s_Cy = pgps.getCachedPosition()
-        if s_Cy and s_Cy < p_Ceiling then
-            local s_Rose = 0
-            while s_Rose < 128 do
-                local _, cy = pgps.getCachedPosition()
-                if cy == nil or cy >= p_Ceiling then break end
-                DigUp()
-                if not pgps.up() then break end
-                s_Rose = s_Rose + 1
-            end
-            trace(("travel: rose %d to get out of the ground"):format(s_Rose))
-            if pgps.moveTo(p_X, p_Y, p_Z) ~= false then return true end
-        end
-    end
+    if riseToCeiling(p_Ceiling) and pgps.moveTo(p_X, p_Y, p_Z) ~= false then return true end
 
     if CanDig() and pgps.digTo(p_X, p_Y, p_Z) ~= false then return true end
     if hardStop("travel") then return false end
@@ -2565,6 +2798,18 @@ function FlyHome(p_X, p_Y, p_Z, p_Ceiling)
     return pgps.flyTo(p_X, p_Y, p_Z, 64) ~= false
 end
 
+-- GET OFF THE SQUARE, WHICHEVER WAY IS OPEN.
+--
+-- Written out in both places that honour a make-way request, and they are the two halves of the same
+-- deadlock: the mid-job one in ArriveAt and the idle one in idleDockLoop. Four right turns means the
+-- drone tries every horizontal face and ends on its original heading if none of them opened.
+function stepAside()
+    for _ = 1, 4 do
+        if pgps.forward() then break end
+        pgps.turnRight()
+    end
+end
+
 function ArriveAt(p_X, p_Y, p_Z, p_Ceiling)
     if not TravelTo(p_X, p_Y, p_Z, p_Ceiling) then
         -- ASK BEFORE GIVING UP. THE OBSTRUCTION IS USUALLY A DRONE.
@@ -2593,10 +2838,7 @@ function ArriveAt(p_X, p_Y, p_Z, p_Ceiling)
             local cx2, cy2, cz2 = pgps.getCachedPosition()
             if cx2 ~= nil and cx2 == y.x and cz2 == y.z and math.abs(cy2 - y.y) <= 0 then
                 trace("travel: standing where somebody needs to be -- stepping aside first")
-                for _ = 1, 4 do
-                    if pgps.forward() then break end
-                    pgps.turnRight()
-                end
+                stepAside()
             end
         end
         os.sleep(2)
@@ -2706,12 +2948,86 @@ function CollectNearby()
     return s_After - s_Before
 end
 
+-- THE SIXTEEN-SLOT WALK, ONCE.
+--
+-- Select each occupied slot in turn, hand it to p_Do(slot, count), and put the selection back on 1.
+-- Four hand-written copies -- TakeFromChest, Handover, Relieve and the deposit loop -- and the
+-- select(1) at the end is the part a copy forgets: a drone left holding slot 14 selected crafts
+-- whatever happens to be there. p_Last bounds the walk; 12 stops short of the crafting staging
+-- slots. The detail is NOT read here, because the fuel-relief walk does not need it.
+function eachCarriedSlot(p_Do, p_Last)
+    for i = 1, (p_Last or 16) do
+        local n = turtle.getItemCount(i)
+        if n > 0 then
+            turtle.select(i)
+            p_Do(i, n)
+        end
+    end
+    turtle.select(1)
+end
+
+-- STORAGE ANSWERS A REFUSAL AS A PLAIN STRING ON THE FIELD A SUCCESS USES, so "a table with a pos"
+-- is the only honest test that anything was handed over at all. Craft and Build each wrote it out.
+function HandoverOrThrow(p_Hand, p_What)
+    if type(p_Hand) ~= "table" or p_Hand.pos == nil then
+        error("storage would not hand over " .. p_What, 0)
+    end
+end
+
+-- ASK STORAGE TO SURFACE A STACK THAT IS TOO DEEP TO SUCK, AND SAY WHERE IT ENDED UP.
+--
+-- suckDown only ever hands over the chest's FIRST occupied slot, so reaching slot N costs N-1 stacks
+-- of turtle inventory and there are only 16. StorageMan is on the wired network and can move it.
+--
+-- Returns (rescan, elsewhere): `rescan` is this chest re-read after the move, `elsewhere` is set
+-- when the stack went to a DIFFERENT chest -- which is the normal outcome when this chest has no
+-- free low slot to shuffle into, and which the caller must be able to act on. Reporting that as a
+-- dead end is what left two drones at zero fuel beside charcoal that had just been relocated for
+-- them:
+--
+--   chest: slot 19 is out of a turtle's reach -- asking storage to bring it forward
+--   chest: storage moved it to slot 2          <- succeeded
+--   chest: still out of reach after asking     <- and the answer was thrown away
+--
+-- A GLOBAL, like the other helpers here: this file is at Lua's 200-local ceiling.
+function SurfaceDeepSlot(p_Chest, p_WantName, p_Want, p_Slot)
+    trace(("chest: slot %d is out of a turtle's reach -- asking storage to bring it forward")
+        :format(p_Slot))
+    local s_Moved = PowNet.sendAndWaitForResponse("StorageMan",
+        PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "BringToFront",
+            {match = tostring(p_WantName or "")}), PowNet.SERVER_PROTOCOL, 8)
+    if type(s_Moved) ~= "table" or not s_Moved.slot then
+        trace("chest: storage could not bring it forward -- " .. tostring(s_Moved))
+        return nil, nil
+    end
+    trace(("chest: storage moved it to slot %d"):format(s_Moved.slot))
+
+    local s_Elsewhere = nil
+    if type(s_Moved.pos) == "table" and s_Moved.pos.x ~= nil then s_Elsewhere = s_Moved.pos end
+
+    local s_Ok, s_List = pcall(p_Chest.list)
+    if not s_Ok or type(s_List) ~= "table" then return nil, s_Elsewhere end
+    local s_Ahead, s_Slot = 0, nil
+    for slot = 1, 128 do
+        local it = s_List[slot]
+        if it and it.name then
+            if p_Want(it.name) then s_Slot = slot break end
+            s_Ahead = s_Ahead + 1
+        end
+    end
+    return {list = s_List, ahead = s_Ahead, slot = s_Slot}, s_Elsewhere
+end
+
 function TakeFromChest(p_Want)
     local s_Before = {}
     for i = 1, 16 do
         local d = turtle.getItemDetail(i)
         if d and d.name then s_Before[d.name] = (s_Before[d.name] or 0) + turtle.getItemCount(i) end
     end
+    -- WHERE STORAGE PUT IT, WHEN IT PUT IT SOMEWHERE ELSE. Declared here because a `local` used
+    -- above its declaration is a nil global in Lua, silently -- the most expensive mistake in this
+    -- file. Returned as a third value so every existing caller is unaffected.
+    local s_ElsewhereAt = nil
 
     -- ASK THE CHEST WHAT IS IN IT, INSTEAD OF EMPTYING IT TO FIND OUT.
     --
@@ -2771,29 +3087,18 @@ function TakeFromChest(p_Want)
         -- cobblestone, ran out of room, put them back, and reported the logs missing. StorageMan is
         -- on the wired network and can simply move the stack forward.
         if s_TargetSlot > 16 then
-            trace(("chest: slot %d is out of a turtle's reach -- asking storage to bring it forward")
-                :format(s_TargetSlot))
-            local s_Moved = PowNet.sendAndWaitForResponse("StorageMan",
-                PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "BringToFront",
-                    {match = tostring(s_WantName or "")}), PowNet.SERVER_PROTOCOL, 8)
-            if type(s_Moved) == "table" and s_Moved.slot then
-                trace(("chest: storage moved it to slot %d"):format(s_Moved.slot))
-                local ok3, l3 = pcall(s_Chest.list)
-                if ok3 and type(l3) == "table" then
-                    s_List = l3
-                    s_Ahead, s_TargetSlot = 0, nil
-                    for slot = 1, 128 do
-                        local it = s_List[slot]
-                        if it and it.name then
-                            if p_Want(it.name) then s_TargetSlot = slot break end
-                            s_Ahead = s_Ahead + 1
-                        end
-                    end
-                end
-            else
-                trace("chest: storage could not bring it forward -- " .. tostring(s_Moved))
-            end
+            local s_Re
+            s_Re, s_ElsewhereAt = SurfaceDeepSlot(s_Chest, s_WantName, p_Want, s_TargetSlot)
+            if s_Re then s_List, s_Ahead, s_TargetSlot = s_Re.list, s_Re.ahead, s_Re.slot end
             if s_TargetSlot == nil or s_TargetSlot > 16 then
+                -- Not reachable HERE. Say which of the two that is: "it moved to another chest" is
+                -- a working answer the caller can act on, and reporting it as a dead end is what
+                -- left the fleet dry beside the charcoal it had just successfully relocated.
+                if s_ElsewhereAt then
+                    trace(("chest: it is in another chest now -- %d,%d,%d")
+                        :format(s_ElsewhereAt.x, s_ElsewhereAt.y, s_ElsewhereAt.z))
+                    return {}, {}, s_ElsewhereAt
+                end
                 trace("chest: still out of reach after asking")
                 Doing(("%s is stuck in slot %s -- storage could not surface it")
                     :format(tostring(s_WantName):gsub("^minecraft:", ""), tostring(s_TargetSlot)))
@@ -2820,20 +3125,15 @@ function TakeFromChest(p_Want)
         end
     end
 
-    for i = 1, 16 do
-        local n = turtle.getItemCount(i)
-        if n > 0 then
-            turtle.select(i)
-            local d = turtle.getItemDetail(i)
-            local nm = d and d.name
-            if nm and p_Want(nm, i) then
-                s_Kept[nm] = (s_Kept[nm] or 0) + n
-            else
-                PutDown()
-            end
+    eachCarriedSlot(function(i, n)
+        local d = turtle.getItemDetail(i)
+        local nm = d and d.name
+        if nm and p_Want(nm, i) then
+            s_Kept[nm] = (s_Kept[nm] or 0) + n
+        else
+            PutDown()
         end
-    end
-    turtle.select(1)
+    end)
 
     -- Report only what actually LEFT the chest: what we kept, less what we were already carrying.
     local s_Net = {}
@@ -2940,23 +3240,30 @@ local function sweepPointless(p_HasAny, p_Count)
     return nil
 end
 
+-- HOW MUCH OF EACH WANTED KIND IS ABOARD -- matched by FAMILY, not by name.
+--
+-- The recipe table says oak because something had to be written down; a fleet standing in a birch
+-- forest holds birch. FetchItems and OnCraft each kept their own copy of this count, so "am I
+-- holding enough" had two answers that only happened to agree.
+function CarriedTally(p_Want)
+    local s_Got = {}
+    for i = 1, 16 do
+        local d = turtle.getItemDetail(i)
+        if d and d.name then
+            for w in pairs(p_Want) do
+                if SameItem(w, d.name) then s_Got[w] = (s_Got[w] or 0) + turtle.getItemCount(i) break end
+            end
+        end
+    end
+    return s_Got
+end
+
 function FetchItems(p_Want, p_Min)
     local s_Match = function(nm)
         for w in pairs(p_Want) do if SameItem(w, nm) then return true end end
         return false
     end
-    local function tally()
-        local got = {}
-        for i = 1, 16 do
-            local d = turtle.getItemDetail(i)
-            if d and d.name then
-                for w in pairs(p_Want) do
-                    if SameItem(w, d.name) then got[w] = (got[w] or 0) + turtle.getItemCount(i) break end
-                end
-            end
-        end
-        return got
-    end
+    local function tally() return CarriedTally(p_Want) end
     local function short(got)
         for w, n in pairs(p_Want) do if (got[w] or 0) < n then return w end end
         return nil
@@ -2991,26 +3298,53 @@ function FetchItems(p_Want, p_Min)
     -- six minutes per attempt trying to travel to other chests to look for what was already beneath
     -- it. The bay is the busiest airspace in the settlement precisely because it is where the chests
     -- are, so "do not move" is the cheapest and most reliable option available here, not a shortcut.
+    -- DECLARED ABOVE ITS FIRST USE. tryChest used to sit below the chest-below block, which was
+    -- fine only because nothing there called it; a `local` referenced above its declaration is a
+    -- nil global in Lua, silently, and this file has nine outages to its name from exactly that.
+    local s_Tried = {}
+    local function tryChest(pos)
+        if type(pos) ~= "table" or pos.x == nil then return false end
+        local s_Hops = 0
+        -- FOLLOW THE STACK IF STORAGE MOVES IT.
+        --
+        -- Surfacing an item out of a deep slot needs a free LOW slot, and when the chest has none
+        -- StorageMan pushes the stack into another inventory on the wired network. That is a
+        -- SUCCESS, and it answers with the new chest's position -- but the drone used to re-read the
+        -- chest under it, not find the item, and give up. Measured on D52 while two drones sat at
+        -- zero fuel waiting for the very charcoal it had just relocated.
+        --
+        -- Bounded, because a bay under load can shuffle the same stack more than once and a fetch
+        -- that chases it for ever is a drone that never comes home.
+        while type(pos) == "table" and pos.x ~= nil and s_Hops < 3 do
+            local k = ("%d:%d:%d"):format(pos.x, pos.y, pos.z)
+            if s_Tried[k] then break end
+            s_Tried[k] = true
+            if not ArriveAt(pos.x, pos.y + 1, pos.z, (pos.y or 64) + 4) then return s_Hops > 0 end
+            local _, _, s_MovedTo = TakeFromChest(s_Match)   -- reports its contents, repairing the index
+            s_Hops = s_Hops + 1
+            pos = s_MovedTo
+        end
+        return s_Hops > 0
+    end
+
     if ContainerBelow() then
         Doing(("looking for %s in the chest below"):format(tostring(s_First):gsub("^minecraft:", "")))
-        TakeFromChest(s_Match)
+        local _, _, s_MovedTo = TakeFromChest(s_Match)
         s_Got = tally()
         if short(s_Got) == nil then
             trace("fetch: it was in the chest we were already standing on")
             return s_Got, nil
         end
-    end
-
-    -- The fast path: one lookup, one flight.
-    local s_Tried = {}
-    local function tryChest(pos)
-        if type(pos) ~= "table" or pos.x == nil then return false end
-        local k = ("%d:%d:%d"):format(pos.x, pos.y, pos.z)
-        if s_Tried[k] then return false end
-        s_Tried[k] = true
-        if not ArriveAt(pos.x, pos.y + 1, pos.z, (pos.y or 64) + 4) then return false end
-        TakeFromChest(s_Match)     -- reports its own contents, repairing the index
-        return true
+        -- Storage surfaced it into a different chest while we were asking. Follow it rather than
+        -- flying the whole bay to rediscover where it just told us it put the stack.
+        if s_MovedTo then
+            tryChest(s_MovedTo)
+            s_Got = tally()
+            if short(s_Got) == nil then
+                trace("fetch: followed it to the chest storage moved it to")
+                return s_Got, nil
+            end
+        end
     end
 
     local s_Where = PowNet.sendAndWaitForResponse("StorageMan",
@@ -3085,27 +3419,48 @@ function FetchItems(p_Want, p_Min)
     return s_Got, short(s_Got)
 end
 
--- Put everything down into the container below. Returns what moved, or nil if there is none.
--- Split out because "unload here" is the same six lines in three places and the interesting part --
--- reporting what ACTUALLY moved rather than what we intended to move -- was written differently in
--- each of them.
-local function unloadHere()
-    if not ContainerBelow() then return nil end
+-- WALK THE SIXTEEN SLOTS, PUT THEM DOWN, AND TALLY WHAT ACTUALLY MOVED.
+--
+-- The measurement is the point, not the loop. turtle.dropDown() throws items on the GROUND and
+-- returns true when there is no container below, so neither its return value nor "the slot must be
+-- empty now" is evidence of a deposit -- which is why this goes through PutDown() and reports the
+-- before/after delta. Stock here is OBSERVED, so a deposit that reports more than it moved poisons
+-- every planning decision downstream until the next chest reading corrects it.
+--
+-- p_Wanted(i) decides whether slot i is ours to unload; nil means every occupied slot. The slot is
+-- SELECTED before the predicate is asked, because CollectFuel's predicate (isFuelSelected) tests the
+-- selected slot.
+--
+-- p_Last bounds the walk, and 12 is not an arbitrary number: slots 13-16 are the crafting STAGING
+-- slots, and stageFromChest hands the grid back to the chest without disturbing what it has staged.
+-- Both of its loops, emptyInventory, and OnCraft's selective grid clear were each their own copy of
+-- this walk, so the "which slots are mine" question had four answers in one file.
+-- lua-hygiene: allow (the primitive itself -- it returns the tally so the CALLER reports; every
+-- caller does, and the rule above now counts a call to this as the loop it replaced)
+function putDownSlots(p_Wanted, p_Last)
     local s_Put = {}
-    for i = 1, 16 do
-        if turtle.getItemCount(i) > 0 then
-            turtle.select(i)
+    eachCarriedSlot(function(i, before)
+        if p_Wanted == nil or p_Wanted(i) then
             local det = turtle.getItemDetail(i)
-            local before = turtle.getItemCount(i)
             PutDown()
             local moved = before - turtle.getItemCount(i)
             if det and det.name and moved > 0 then
                 s_Put[det.name] = (s_Put[det.name] or 0) + moved
             end
         end
-    end
-    turtle.select(1)
+    end, p_Last)
     return s_Put
+end
+
+-- Put everything down into the container below. Returns what moved, or nil if there is none.
+-- Split out because "unload here" is the same six lines in three places and the interesting part --
+-- reporting what ACTUALLY moved rather than what we intended to move -- was written differently in
+-- each of them.
+-- lua-hygiene: allow (returns the tally; both callers -- UnloadInto and Deposit's below-us shortcut
+-- -- report it and call ReportChest)
+local function unloadHere()
+    if not ContainerBelow() then return nil end
+    return putDownSlots(nil)
 end
 
 -- MOVE THE LOAD OUT OF THE DRONE, REPORT IT, AND SAY HOW MUCH WENT.
@@ -3194,7 +3549,17 @@ local FUEL_PER_BLOCK_HOME = 3
 --
 -- The floor of 8 stays because FetchItems' minimum is 8: below that it returns nothing at all, and
 -- a drone that walked to storage should not come back empty over a rounding decision.
-local REFUEL_TARGET = 1200
+--
+-- 1,200 -> 1,600, AND IT IS NOW THE ONLY NUMBER FOR "HOW FULL".
+--
+-- The rule above was obeyed by CollectFuel and undone by the watchdog: TryRefuel had its own gate
+-- (FUEL_LOW, 4,000) and burnFrom its own target (FUEL_KEEP, 2,500), so any drone under 4,000 that
+-- stood on a chest sucked ninety-six items out of it every twenty seconds and burned to 2,500.
+-- Seven drones at 2,500 is 17,500 fuel of tank that had to fill before a single lump could STAY in
+-- storage -- which is why 192 coal added by hand was gone in half an hour with five drones dry and
+-- the two fuelled ones holding 2,000 each. 1,600 leaves room for one full job from a ~700 floor at
+-- base and a lumber round trip of ~500; the point is that there is one of it.
+local REFUEL_TARGET = 1600
 local REFUEL_MAX_UNITS = 24
 -- Coal and charcoal both burn for 80 in CC:T, and CollectFuel asks for nothing else.
 local FUEL_PER_UNIT = 80
@@ -3385,7 +3750,11 @@ function SurfaceForFix()
         if tx then
             trace(("no GPS out here -- the fleet places us at %d,%d,%d (anchors agree to %d)")
                 :format(tx, ty, tz, math.floor(terr or 0)))
-            pcall(pgps.setLocation, tx, ty, tz, nil)
+            -- The trace above states the position as though it has been adopted. If the set fails
+            -- the drone keeps the OLD position and the log says otherwise -- and a wrong position is
+            -- how blocks land in the wrong places and drones are written off 50 blocks from where
+            -- they actually are.
+            Tried("adopt the position the peers agree on", pgps.setLocation, tx, ty, tz, nil)
             return true
         end
     end
@@ -3406,7 +3775,9 @@ function SurfaceForFix()
         if s_Dir ~= nil and s_Dir ~= s_Have then
             trace(("HEADING WAS WRONG: thought %s, the neighbours say %s (fit %.2f)")
                 :format(tostring(s_Have), tostring(s_Dir), s_Err or 0))
-            pcall(pgps.setHeading, s_Dir)
+            -- Announcing the correction and then failing to apply it is worse than not noticing:
+            -- a wrong heading strands drones, and the log now reads as though it was fixed.
+            Tried("adopt the heading the neighbours agree on", pgps.setHeading, s_Dir)
         elseif s_Dir ~= nil then
             trace("no fix, but the neighbours confirm which way we face")
         end
@@ -3492,7 +3863,9 @@ end
 -- sideways through stone for its entire 256-step budget and gives up 550 seconds later, having
 -- travelled most of the way to nowhere. Twenty-six digs upward puts the drone in open air, where
 -- moveTo and flyTo both work properly.
-function ClimbToOpenAir(p_Ceiling)
+-- p_Why only names the caller in the log; the climb is the same one either way. TravelTo's
+-- riseToCeiling was a second copy of this loop and drifted only in its trace line.
+function ClimbToOpenAir(p_Ceiling, p_Why)
     local s_Rose = 0
     while true do
         local _, cy = pgps.getCachedPosition()
@@ -3503,7 +3876,7 @@ function ClimbToOpenAir(p_Ceiling)
         if s_Rose > 128 then break end                  -- bounded: never an unbounded climb
     end
     local _, cy = pgps.getCachedPosition()
-    trace(("deposit: rose %d block(s) to y=%s"):format(s_Rose, tostring(cy)))
+    trace(("%s: rose %d block(s) to y=%s"):format(p_Why or "deposit", s_Rose, tostring(cy)))
     return s_Rose
 end
 
@@ -3678,8 +4051,10 @@ function PlaceCacheHere()
     turtle.select(1)
 
     local s_Pos = {x = cx, y = cy - 1, z = cz}
-    -- Register it, or it is a hole with a chest in it that nobody will ever visit again.
-    pcall(function()
+    -- Register it, or it is a hole with a chest in it that nobody will ever visit again -- which
+    -- is exactly what a swallowed failure here produced, silently, with the drone flying off having
+    -- logged a successful cache.
+    Tried("register this cache chest with StorageMan", function()
         PowNet.sendAndWaitForResponse("StorageMan",
             PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "deposit", {pos = s_Pos}),
             PowNet.SERVER_PROTOCOL, 5)
@@ -3688,6 +4063,13 @@ function PlaceCacheHere()
           :format(s_Pos.x, s_Pos.y, s_Pos.z))
     return s_Pos
 end
+-- Try for a cache chest; carry on regardless. Its own function so the "optional" is structural
+-- rather than a comment somebody can delete: there is no path here that returns failure to a caller.
+local function fetchCacheChestOptional()
+    if pcall(FetchItems, {["minecraft:chest"] = 1}, {["minecraft:chest"] = 1}) then return end
+    trace("kit: no spare chest anywhere -- felling without a cache and carrying the load home")
+end
+
 
 -- WILL THERE BE ANYWHERE TO UNLOAD WHERE WE ARE GOING?
 --
@@ -3722,12 +4104,32 @@ function EnsureCacheChest(p_Job)
             {near = {x = p_Pos.x, y = p_Pos.y or 64, z = p_Pos.z}}), PowNet.SERVER_PROTOCOL, 5)
     if type(s_Res) ~= "table" or s_Res.pos == nil then return end
 
-    local d = math.abs(s_Res.pos.x - p_Pos.x) + math.abs(s_Res.pos.y - (p_Pos.y or 64))
-            + math.abs(s_Res.pos.z - p_Pos.z)
+    local d = Blocks(s_Res.pos.x, s_Res.pos.y, s_Res.pos.z, p_Pos.x, (p_Pos.y or 64), p_Pos.z)
     if d < CACHE_WORTH_IT then return end          -- somewhere to unload already; no chest needed
 
     trace(("kit: %d blocks from the nearest deposit point -- taking a chest for a cache"):format(d))
-    FetchItems({["minecraft:chest"] = 1}, {["minecraft:chest"] = 1})
+
+    -- A CACHE IS A CONVENIENCE. IT MUST NEVER BE A PREREQUISITE.
+    --
+    -- This fetched the chest with a minimum of one, so a settlement with no spare chest could not
+    -- run a lumber job at all -- and that is a DEADLOCK, not an inconvenience, because chests are
+    -- made of planks, planks are made of logs, and logs come from the lumber job this was blocking.
+    -- The only renewable resource in the settlement was gated behind a manufactured good that
+    -- requires that resource. Nothing inside the game can break that cycle.
+    --
+    -- Caught in full, and it had already emptied the larder of wood, charcoal and therefore fuel:
+    --
+    --   kit: 85 blocks from the nearest deposit point -- taking a chest for a cache
+    --   chest: nothing matching is in there
+    --   fetch: storage holds none of it -- not flying 8 chest(s) to confirm that
+    --   Aborting (was executing: true)
+    --   JOB Lumber done
+    --
+    -- Without a cache the drone simply carries its load home: sixteen slots is roughly a thousand
+    -- logs, far more than one trip fells. Slower, and slower is not the same as impossible.
+    -- Same rule the rest of this file already follows -- partial progress beats waiting for the
+    -- full order.
+    fetchCacheChestOptional()
 end
 
 -- CARRY A CHEST BACK OUT, OR THE CACHE CAN NEVER EXIST.
@@ -3771,9 +4173,25 @@ local function cacheIfFar(p_Point)
     if p_Point == nil then return nil end
     local cx, cy, cz = pgps.getCachedPosition()
     if cx == nil then return nil end
-    local d = math.abs(p_Point.x - cx) + math.abs(p_Point.y - cy) + math.abs(p_Point.z - cz)
+    local d = Blocks(p_Point.x, p_Point.y, p_Point.z, cx, cy, cz)
     if d < CACHE_WORTH_IT then return nil end
     return PlaceCacheHere()
+end
+
+-- BACK TO THE FACE, SO A DIG RESUMES WHERE IT STOPPED INSTEAD OF STARTING OVER.
+--
+-- Best effort: failing to get back is not a failed deposit, because the load is already in the
+-- chest. moveTo alone routes only through surveyed, passable cells, and a miner's own tunnel is by
+-- definition unsurveyed -- so a drone carrying a pickaxe cuts its way back rather than giving up.
+--
+-- Both of DepositNow's success paths ended in these five lines. Returns true so the call site reads
+-- `return resumeAtFace(...)`.
+local function resumeAtFace(p_X, p_Y, p_Z)
+    if p_X then
+        if pgps.moveTo(p_X, p_Y, p_Z) == false and CanDig() then pgps.digTo(p_X, p_Y, p_Z) end
+    end
+    m_Status = "mining"
+    return true
 end
 
 function DepositNow()
@@ -3830,12 +4248,9 @@ function DepositNow()
     if s_Arrived then
         trace("deposit: arrived, unloading")
         UnloadInto()
+        -- silent: allow (a convenience errand -- the drone works fine without a spare chest, it just caches less efficiently)
         pcall(TakeCacheChest)          -- leave with a chest for the next work site
-        if hx then
-            if pgps.moveTo(hx, hy, hz) == false and CanDig() then pgps.digTo(hx, hy, hz) end
-        end
-        m_Status = "mining"
-        return true
+        return resumeAtFace(hx, hy, hz)
     end
     local ok = ReachByAnyMeans(
         s_Res.pos.x, s_Res.pos.y + 1, s_Res.pos.z, (s_Res.pos.y or 64) + 4, "deposit")
@@ -3857,13 +4272,7 @@ function DepositNow()
     end
     trace("deposit: arrived, unloading")
     UnloadInto()
-    -- Back to where we were, so a dig resumes at the face instead of starting over. Best effort:
-    -- failing to get back is not a failed deposit -- the load is already in the chest.
-    if hx then
-        if pgps.moveTo(hx, hy, hz) == false and CanDig() then pgps.digTo(hx, hy, hz) end
-    end
-    m_Status = "mining"
-    return true
+    return resumeAtFace(hx, hy, hz)
 end
 
 -- REFUEL WHILE WORKING, NOT ONLY WHEN IDLE.
@@ -3886,7 +4295,8 @@ end
 -- So there is a floor. Below it the drone stops working and docks -- while it still has the fuel to
 -- get there -- and the dock is where the coal is. Returning early costs a trip; running dry costs
 -- the drone.
-local FUEL_TOPUP  = 2000
+-- The level a top-up aims for is REFUEL_TARGET, beside CollectFuel. This used to be a second number
+-- (FUEL_TOPUP, 2,000) and the watchdog kept a third (FUEL_LOW, 4,000) -- see there for what it cost.
 
 -- When we last went to storage for fuel and found none, and how long that answer is trusted.
 --
@@ -3963,48 +4373,41 @@ end
 -- A GLOBAL, deliberately. depositIfFull is defined above the fuel watchdog and both need this; a
 -- `local function` here would be invisible to everything declared before it, which is the single
 -- most expensive mistake in this codebase -- six outages and counting.
--- What a drone needs IN HAND once it reaches storage, to actually find the fuel there. Roughly four
--- hops between deposit points with the re-routing a congested bay forces. See FuelFloorNow.
-local FUEL_SEARCH_ALLOWANCE = 400
-
+-- THE FLOOR ANSWERS ONE QUESTION: CAN I STILL GET HOME.
+--
+-- It used to answer three. Trip home, plus a flat 300 "reserve", plus a 400 "search allowance"
+-- for finding fuel in the bay -- 700 before a single block of distance. That number was tuned for a
+-- bay where WhereIs answered from memory, the deposit point was the emptiest chest anywhere, and a
+-- drone that arrived still had a dozen chests to visit. All three of those are gone: WhereIs reads
+-- the network, the deposit point is a networked chest, and arriving is finding.
+--
+-- What the 700 did in the meantime was the settlement's defining deadlock. D38 at 607 fuel, 23
+-- blocks from storage, declared itself stuck. D40 at 821 broke off a job under a floor of 838. A
+-- drone with 600 fuel refused a 150-fuel lumber run and sat in distress, and lumber was the only
+-- thing that could end the shortage it was saving fuel against. Every recovery mechanism in this
+-- file that "collapses the floor when storage is known dry" exists to punch a hole in a number that
+-- should never have been that large. TaskMan now decides whether a drone can AFFORD a job (see
+-- jobMinFuel there); this only decides whether it can come back.
 local FUEL_DRY_MARGIN = 120
 function FuelFloorNow()
     if m_HomePos == nil then return FUEL_RESERVE end
     local cx, cy, cz = pgps.getCachedPosition()
     if cx == nil then return FUEL_RESERVE end
-    local d = math.abs(m_HomePos.x - cx) + math.abs(m_HomePos.y - cy) + math.abs(m_HomePos.z - cz)
-    local s_Trip = d * FUEL_PER_BLOCK_HOME
-    if StorageKnownDry(turtle.getFuelLevel()) then return s_Trip + FUEL_DRY_MARGIN end
-    -- ARRIVING IS NOT FINDING. RESERVE FOR THE SEARCH AT THE OTHER END TOO.
-    --
-    -- s_Trip buys the journey home and FUEL_RESERVE is a flat 300 on top. That is enough to REACH
-    -- the bay and nothing more -- but a drone that gets there still has to find the fuel, and
-    -- finding it means hopping between deposit points, up to twelve of them, through the busiest
-    -- airspace in the settlement where a failed hop is re-routed rather than free.
-    --
-    -- So the drone lands with 300, spends it looking, and strands ON TOP OF the larder. Measured on
-    -- D31 twice over: "fuel at 0 (floor 468 for this position) -- breaking off to refuel", then
-    -- "refuel: heading to storage", then "MOVE REFUSED: Out of fuel [x119 more in the last 60s]".
-    -- It had broken off at exactly the right moment and still ended at zero, because the floor was
-    -- never sized for what happens after arrival. Each of those cost a relief run by another drone,
-    -- which is far more fuel than the allowance being saved.
-    --
-    -- Deliberately a separate constant rather than a bigger FUEL_RESERVE: the reserve is "do not
-    -- strand in the field", this is "do not strand in the bay", and they are sized by different
-    -- things. FUEL_RESERVE was cut from 900 to 300 for good reasons and should stay there.
-    return FUEL_RESERVE + FUEL_SEARCH_ALLOWANCE + s_Trip
+    local d = Blocks(m_HomePos.x, m_HomePos.y, m_HomePos.z, cx, cy, cz)
+    return d * FUEL_PER_BLOCK_HOME + FUEL_DRY_MARGIN
 end
 
 local function depositIfFull()
     local s_Fuel = turtle.getFuelLevel()
     if s_Fuel ~= "unlimited" then
-        if s_Fuel < FUEL_TOPUP then pcall(TryRefuel) end
-        s_Fuel = turtle.getFuelLevel()
+        s_Fuel = TopUpAboard()
         if s_Fuel ~= "unlimited" and s_Fuel < FuelFloorNow() then
             -- Straight to the fuel, for the same reason as the watchdog: deposit-then-dock is two
             -- journeys the drone cannot currently afford, and neither of them puts fuel in it.
             trace(("fuel down to %d -- breaking off to refuel before it runs out"):format(s_Fuel))
-            pcall(RefuelAtStorage)
+            -- The job is ended below regardless, on the assumption the next one starts fuelled. If
+            -- this threw, it does not -- and the next job breaks off for the same reason, forever.
+            Tried("refuel at storage", RefuelAtStorage)
             return false            -- end this job; the next assignment starts fuelled
         end
     end
@@ -4064,6 +4467,13 @@ function DescribeJob(p_Name, d)
     return tostring(p_Name):lower() .. " " .. table.concat(s_Bits, " ")
 end
 
+-- "The body said it failed" in one place: Lua job bodies signal failure either by returning nil or
+-- by returning false, and spelling both out at the call site is a branch in the most complex
+-- function in the file for a question with one answer.
+local function bodyReportedFailure(p_Res)
+    return p_Res == nil or p_Res == false
+end
+
 -- ACCEPT THE JOB HERE, RUN IT SOMEWHERE ELSE.
 --
 -- Jobs used to execute inside the rednet message handler that received them, which meant a working
@@ -4098,6 +4508,7 @@ function RunJob(p_Name, p_Data, p_Opts, p_Body)
         -- Fire-and-forget going back, too: this must never block the message handler. Losing the
         -- refusal costs a timeout-based release later, which is the behaviour we already have.
         if p_Data and p_Data.taskId then
+            -- silent: allow (the note above is the decision: losing the refusal costs a timeout-based release later, which is the behaviour we already have)
             pcall(function()
                 PowNet.SendToServer("TaskMan", PowNet.newMessage(
                     PowNet.MESSAGE_TYPE.CALL, "TaskRefused",
@@ -4188,7 +4599,9 @@ local function RunJobNow(p_Name, p_Data, p_Opts, p_Body)
         -- finished chest order every ninety seconds, correctly reporting it was short of the
         -- planks it had already made into chests.
         if d.taskId ~= nil then
-            pcall(function()
+            -- Same message, same stakes as reportTask: unheard, the task stays assigned to this
+            -- drone and the scheduler stops offering the drone anything, permanently.
+            Tried(("report task %s done"):format(tostring(d.taskId)), function()
                 PowNet.SendToServer("TaskMan", PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL,
                     "TaskDone", {id = d.taskId, ok = p_Ok and true or false,
                                  reason = (not p_Ok) and tostring(p_Res) or nil,
@@ -4207,6 +4620,7 @@ local function RunJobNow(p_Name, p_Data, p_Opts, p_Body)
     --
     -- Cheap here and only here: the drone is at base and idle when a job starts, so the detour is a
     -- few blocks. Once it is at the face, the same errand costs the round trip.
+    -- silent: allow (a convenience errand at base; without a cache chest the job still runs, it just hauls more often)
     pcall(EnsureCacheChest, d)
 
     -- Go to the ordered site, or refuse. Digging "somewhere" is worse than digging nowhere.
@@ -4243,11 +4657,38 @@ local function RunJobNow(p_Name, p_Data, p_Opts, p_Body)
     end
 
     local s_Res, s_Why = s_Ret[2], s_Ret[3]
-    if s_Res == nil or s_Res == false then
+    if bodyReportedFailure(s_Res) then
         local s_Reason = tostring(s_Why or "job returned no result and gave no reason")
         trace(("JOB %s FAILED %s"):format(p_Name, s_Reason))
         Distress(p_Name .. " failed", s_Reason, false)
         return finish(false, s_Reason)
+    end
+    -- INTERRUPTED IS NOT DONE, FOR EVERY VERB AT ONCE.
+    --
+    -- The two cases above cover a body that THREW and a body that returned nil. The one they
+    -- missed is the common one: the body returned its ordinary result table while `executing` had
+    -- gone false underneath it. Every job loop in this file breaks on `not executing` -- that is
+    -- how a stand-down, a reassignment and a task.stop stop work -- so an aborted job falls out of
+    -- its loop, returns whatever it had accumulated, and arrives here looking exactly like success.
+    -- finish(true, ...) then tells TaskMan the task is 100% done and it is never given to anybody
+    -- again.
+    --
+    -- This was found and patched TWICE in one day, once in Build and once in Lumber, before it was
+    -- clear they were the same defect:
+    --
+    --   built 0 of 48 blocks (0 skipped)     <- placed + skipped = 0 against a total of 48
+    --   JOB Lumber done                      <- logged four lines after "Aborting"
+    --
+    -- Both were per-verb patches for a bug that belongs to the job protocol, not to any verb, and
+    -- Craft, Gather, Dig, Haul and Relieve all had it too and were never looked at. One check here
+    -- covers every verb that exists and every verb anyone adds later.
+    --
+    -- Failing a job that was interrupted at the very last moment costs one repeat of idempotent
+    -- work -- placed blocks are memoised, felled trees are gone. Marking it done costs the work
+    -- permanently, and silently.
+    if not executing then
+        trace(("JOB %s INTERRUPTED -- returning it to the queue"):format(p_Name))
+        return finish(false, "interrupted before it finished")
     end
     trace(("JOB %s done"):format(p_Name))
     return finish(true, s_Res)
@@ -4348,17 +4789,25 @@ end
 
 -- Drops land on the ground and in the air around a felled trunk; sweep all three planes.
 local function suckAround()
+    -- silent: allow (sweeping for drops that are usually not there -- an empty sweep is the normal case, not a fault)
     pcall(turtle.suck)
+    -- silent: allow (sweeping for drops that are usually not there -- an empty sweep is the normal case, not a fault)
     pcall(turtle.suckUp)
+    -- silent: allow (sweeping for drops that are usually not there -- an empty sweep is the normal case, not a fault)
     pcall(turtle.suckDown)   -- lua-hygiene: allow (a dropped ITEM, not a chest)
 end
 
--- Fell the tree whose trunk is directly in FRONT. Returns how many log blocks were taken.
-local function fellTree()
-    if not DigForward() then return 0 end
-    if not pgps.forward() then return 0 end
-
-    local s_Logs, s_Climbed = 1, 0
+-- Take every log stacked directly ABOVE the drone, then come back down. Returns how many.
+--
+-- Shared by fellTree (which steps into the trunk's base first) and the sweep itself, which used
+-- to look only FORWARD. Measured on a column verified by rcon as oak_log from y=66 to y=71 with
+-- air beneath -- the base had been cut on an earlier pass: the drone dug the lowest log while
+-- approaching, ended the approach standing in the column with five logs overhead, inspected
+-- forward at every cell of the 8x8, and reported "felled 1 tree(s), 1 log(s)". The trunk it was
+-- sent for was above its head the whole time. A global rather than a `local`: DroneLogic is at
+-- Lua's 200-local limit for the main chunk.
+function ClimbTrunkAbove()
+    local s_Logs, s_Climbed = 0, 0
     while true do
         local ok, blk = turtle.inspectUp()
         if not (ok and isLog(blk.name)) then break end
@@ -4378,16 +4827,75 @@ local function fellTree()
 
     for _ = 1, s_Climbed do pgps.down() end
     suckAround()
+    return s_Logs
+end
+
+-- Fell the tree whose trunk is directly in FRONT. Returns how many log blocks were taken.
+local function fellTree()
+    if not DigForward() then return 0 end
+    if not pgps.forward() then return 0 end
+
+    local s_Logs = 1 + ClimbTrunkAbove()
 
     -- Replant. The turtle is standing IN the old trunk base, so it has to step back before the
     -- sapling has somewhere to go: placeDown would target the dirt block it is standing on.
     if pgps.back() then
         if selectMatching(isSapling) then
+            -- silent: allow (replanting a sapling; a failure costs one tree over time, and lumber sites are re-picked from the live map anyway)
             pcall(turtle.place)
         end
     end
     turtle.select(1)
     return s_Logs
+end
+
+-- Fell the trunk the index records at p_T, approaching from the side. Returns the logs taken, or
+-- 0 and why: "unreachable", or "gone" -- and in that case the cells looked at have been observed
+-- as air, so the index forgets a trunk that is no longer there instead of sending the next drone.
+--
+-- The recorded foot may be a block or two low. An earlier pass cut the base and left the rest of
+-- the trunk hanging, which is exactly the shape three sweeps flew under tonight; so the drone looks
+-- at the foot, then one and two above it, before calling the tree gone. A global rather than a
+-- `local`: DroneLogic is at Lua's 200-local limit for the main chunk.
+function FellTrunkAt(p_T)
+    local s_At = ApproachFromSide({x = p_T.x, y = p_T.y, z = p_T.z})
+    if s_At == false then return 0, "unreachable" end
+    local s_Rose = 0
+    for i = 0, 2 do
+        local ok, blk = turtle.inspect()
+        if ok and isLog(blk.name) then
+            local n = fellTree()
+            for _ = 1, s_Rose do pgps.down() end
+            return n, nil
+        end
+        -- silent: allow (an observation is best-effort; noteObservation's own gate decides whether an unverified fix may record it)
+        pcall(pgps.noteObservation, p_T.x .. ":" .. (p_T.y + i) .. ":" .. p_T.z, 0)
+        if i < 2 then
+            if not pgps.up() then break end
+            s_Rose = s_Rose + 1
+        end
+    end
+    for _ = 1, s_Rose do pgps.down() end
+    return 0, "gone"
+end
+
+-- Work a list of recorded trunks. Returns trees, logs, gone, unreachable.
+local function fellTargets(p_Targets)
+    local s_Trees, s_Logs, s_Gone, s_Unreached = 0, 0, 0, 0
+    for _, t in ipairs(p_Targets) do
+        if not depositIfFull() then break end
+        local n, s_Why = FellTrunkAt(t)
+        if n > 0 then
+            s_Trees, s_Logs = s_Trees + 1, s_Logs + n
+        elseif s_Why == "unreachable" then
+            s_Unreached = s_Unreached + 1
+        else
+            s_Gone = s_Gone + 1
+        end
+    end
+    trace(("lumber: %d target(s): %d gone from the world, %d unreachable"):format(
+        #p_Targets, s_Gone, s_Unreached))
+    return s_Trees, s_Logs
 end
 
 -- Go and get SPECIFIC blocks, and take the WHOLE cluster.
@@ -4477,7 +4985,7 @@ function OnGather(p_ID, p_Message)
                 local s_BestD
                 for i = 1, #s_Queue do
                     local q = s_Queue[i]
-                    local dd = math.abs(q.x - s_Cx) + math.abs(q.y - s_Cy) + math.abs(q.z - s_Cz)
+                    local dd = Blocks(q.x, q.y, q.z, s_Cx, s_Cy, s_Cz)
                     if s_BestD == nil or dd < s_BestD then s_BestD, s_Idx = dd, i end
                 end
             end
@@ -4523,7 +5031,7 @@ function OnGather(p_ID, p_Message)
             end
 
             if s_Got > 0 and s_Cx then
-                local s_Far = math.abs(t.x - s_Cx) + math.abs(t.y - s_Cy) + math.abs(t.z - s_Cz)
+                local s_Far = Blocks(t.x, t.y, t.z, s_Cx, s_Cy, s_Cz)
                 if s_Far > 48 then
                     trace(("gather: nearest remaining target is %d blocks away -- taking the %d "
                         .. "already cut home instead"):format(s_Far, s_Got))
@@ -4575,7 +5083,7 @@ function OnGather(p_ID, p_Message)
                 -- is something substantial to route around.
                 local s_Near = 0
                 if s_Cx then
-                    s_Near = math.abs(t.x - s_Cx) + math.abs(t.y - s_Cy) + math.abs(t.z - s_Cz)
+                    s_Near = Blocks(t.x, t.y, t.z, s_Cx, s_Cy, s_Cz)
                 end
                 local s_At = false
                 -- Which face we ended up on, so the inspect and the dig agree with the approach.
@@ -4596,7 +5104,7 @@ function OnGather(p_ID, p_Message)
                     -- costs one candidate out of hundreds.
                     local s_D = 64
                     if s_Cx then
-                        s_D = math.abs(t.x - s_Cx) + math.abs(t.y - s_Cy) + math.abs(t.z - s_Cz)
+                        s_D = Blocks(t.x, t.y, t.z, s_Cx, s_Cy, s_Cz)
                     end
                     s_At = pgps.digTo(t.x, t.y + 1, t.z, math.min(96, s_D * 2 + 16))
                 end
@@ -4613,8 +5121,7 @@ function OnGather(p_ID, p_Message)
                     -- up on a hard one is nearly free and trying forever is what costs the fleet.
                     local s_FlyBudget = 64
                     if s_Cx then
-                        s_FlyBudget = math.min(128, (math.abs(t.x - s_Cx) + math.abs(t.y - s_Cy)
-                                                   + math.abs(t.z - s_Cz)) * 3 + 16)
+                        s_FlyBudget = math.min(128, (Blocks(t.x, t.y, t.z, s_Cx, s_Cy, s_Cz)) * 3 + 16)
                     end
                     s_At = pgps.flyTo(t.x, t.y + 1, t.z, s_FlyBudget)
                 end
@@ -4698,10 +5205,13 @@ function OnGather(p_ID, p_Message)
                         -- One cheap attempt to re-verify before reporting. Underground it will
                         -- often fail and we skip, which is the old behaviour and no worse; above
                         -- ground it succeeds and the ghost is pruned for the whole fleet.
+                        -- silent: allow (the note above is the decision -- underground this fails routinely and we skip, which is the old behaviour)
                         pcall(pgps.verifyPosition)
                         if s_Ok and s_Blk then
+                            -- silent: allow (one map cell of telemetry; re-observed on the next pass)
                             pcall(pgps.noteObservation, s_Idx, 1, {true, {name = s_Blk.name}})
                         else
+                            -- silent: allow (one map cell of telemetry; re-observed on the next pass)
                             pcall(pgps.noteObservation, s_Idx, 0)   -- air: it is simply gone
                         end
                         -- PRUNE THE WHOLE COLUMN WE CAN SEE, NOT ONE CELL.
@@ -4725,6 +5235,7 @@ function OnGather(p_ID, p_Message)
                         -- cells above and below it are ones this drone never looked at,
                         -- and inventing them is how the map got its ghosts.
                         if not s_FromSide then
+                            -- silent: allow (map telemetry for a column we can see; re-observed whenever a drone passes again)
                             pcall(NoteSeenColumn, t.x, t.y, t.z, s_FromBelow)
                         end
                     end
@@ -4840,12 +5351,7 @@ end
 local STAGE_SLOTS = {13, 14, 15, 16}
 
 local function emptyInventory()
-    for i = 1, 16 do
-        if turtle.getItemCount(i) > 0 then
-            turtle.select(i)
-            PutDown()
-        end
-    end
+    putDownSlots()
     -- A WRITE THAT IS NOT REPORTED IS DRIFT. Every path that puts items into a chest has to say so,
     -- or the index goes stale in exactly the way the observed-contents scheme exists to prevent --
     -- and stale here is worse than absent, because a chest recorded as empty gets SKIPPED by the
@@ -4908,9 +5414,8 @@ local function stageFromChest(p_Wanted)
                     if cd == nil or cd.name == d.name then s_Slot = cand break end
                 end
                 if s_Slot == nil then
-                    for j = 1, 12 do
-                        if turtle.getItemCount(j) > 0 then turtle.select(j) PutDown() end
-                    end
+                    -- 12, not 16: whatever is already staged in 13-16 stays there.
+                    putDownSlots(nil, 12)
                     return nil, "more ingredient kinds than staging slots"
                 end
                 s_Where[d.name] = s_Slot
@@ -4923,12 +5428,7 @@ local function stageFromChest(p_Wanted)
     -- ...and hand everything else straight back. The fleet's whole store passes through this
     -- turtle; none of it may stay there, and anything left in slots 1-11 is IN the crafting grid
     -- and would change what turtle.craft believes it is making.
-    for i = 1, 12 do
-        if turtle.getItemCount(i) > 0 then
-            turtle.select(i)
-            PutDown()
-        end
-    end
+    putDownSlots(nil, 12)
     ReportChest()          -- everything just handed back changed this chest (see emptyInventory)
 
     return s_Where
@@ -5021,6 +5521,34 @@ local function batchAboard(p_Inputs, p_Cap)
     return s_Fit, s_Want
 end
 
+-- KEEP TRYING. THE BAY CLEARS ITSELF.
+--
+-- Both pickups used to make ONE attempt and throw. The access square above a chest is a single
+-- block, every builder in the fleet is sent to the chest holding the bricks, and CLAUDE.md already
+-- records that three drones stacked over one chest is NORMAL here -- so the ordinary state of a
+-- working settlement was being treated as a fatal error. The job died, TaskMan handed out another,
+-- that one raced for the same square, and the fleet spent its fuel thrashing:
+--
+--   JOB Build THREW could not reach the pickup chest
+--   JOB Build start ...
+--   JOB Build THREW could not reach the pickup chest
+--
+-- Not one block was placed while this ran. The blocker is transient by nature -- whoever is in the
+-- way is itself trying to leave, and the idle-vacate rule pushes it off the column -- so waiting is
+-- the correct response and failing is not. Only give up once it is clearly not clearing.
+local PICKUP_TRIES = 6
+local function arrivePickupOrWait(p_Pos)
+    for i = 1, PICKUP_TRIES do
+        if ArriveOrAskToMove(p_Pos.x, p_Pos.y + 1, p_Pos.z, (p_Pos.y or 64) + 4, "pickup") then
+            return true
+        end
+        if not executing then error("interrupted while waiting for the pickup chest", 0) end
+        trace(("pickup: access is occupied (%d/%d) -- waiting for it to clear"):format(i, PICKUP_TRIES))
+        os.sleep(3)
+    end
+    error("could not reach the pickup chest", 0)
+end
+
 -- lua-hygiene: allow (a craft is transactional -- it either produced the item or it did not, and
 -- ingredients are re-collected from the chest on the way in. Resuming half a craft would mean
 -- reasoning about a grid the drone can no longer see, so starting over is the correct behaviour
@@ -5087,17 +5615,7 @@ function OnCraft(p_ID, p_Message)
             -- the difference between "blocked for ever" and "took the delivery and carried on".
             if s_Short and CollectNearby() > 0 then
                 trace("craft: picked up a delivery -- checking it covers the recipe")
-                s_Got, s_Short = {}, nil
-                for i = 1, 16 do
-                    local det = turtle.getItemDetail(i)
-                    if det and det.name then
-                        for w in pairs(s_Want) do
-                            if SameItem(w, det.name) then
-                                s_Got[w] = (s_Got[w] or 0) + turtle.getItemCount(i) break
-                            end
-                        end
-                    end
-                end
+                s_Got, s_Short = CarriedTally(s_Want), nil
                 for w, n in pairs(s_Want) do if (s_Got[w] or 0) < n then s_Short = w break end end
             end
             SetHauling(nil)
@@ -5127,9 +5645,7 @@ function OnCraft(p_ID, p_Message)
             s_Hand = {pos = {x = cx or 0, y = (cy or 64) - 1, z = cz or 0}, self = true}
         end
 
-        if type(s_Hand) ~= "table" or s_Hand.pos == nil then
-            error("storage would not hand over ingredients", 0)
-        end
+        HandoverOrThrow(s_Hand, "ingredients")
         if s_Hand.complete == false then
             -- Stop rather than craft a partial batch. A short craft silently produces fewer items
             -- than the plan counted on, and the shortfall surfaces much later as a mystery.
@@ -5160,10 +5676,7 @@ function OnCraft(p_ID, p_Message)
             -- A parked drone is not a wall: moveTo will not route through it and digTo will not dig
             -- it, so a bare arrival simply fails and the whole craft fails with it. Asking costs
             -- one message. This is the same primitive Deposit uses, for the same reason.
-            if not ArriveOrAskToMove(s_Hand.pos.x, s_Hand.pos.y + 1, s_Hand.pos.z,
-                                     (s_Hand.pos.y or 64) + 4, "pickup") then
-                error("could not reach the pickup chest", 0)
-            end
+            arrivePickupOrWait(s_Hand.pos)
             -- 3. Load the grid. Layout IS the recipe: turtle.craft reads the slots and infers the
             --    result, so a misplaced ingredient yields the wrong item or nothing at all.
             Doing(("craft %s: clearing the grid at the pickup chest"):format(tostring(s_Item):gsub("^minecraft:", "")))
@@ -5171,19 +5684,16 @@ function OnCraft(p_ID, p_Message)
         else
             -- Same requirement -- the grid must hold nothing but the recipe -- met without
             -- discarding what we came here with. Only the slots that are NOT ingredients go down.
-            for i = 1, 16 do
-                if turtle.getItemCount(i) > 0 then
-                    local det = turtle.getItemDetail(i)
-                    local keep = false
-                    if det and det.name then
-                        for w in pairs(s_Wanted) do
-                            if SameItem(w, det.name) then keep = true break end
-                        end
+            putDownSlots(function(i)
+                local det = turtle.getItemDetail(i)
+                local keep = false
+                if det and det.name then
+                    for w in pairs(s_Wanted) do
+                        if SameItem(w, det.name) then keep = true break end
                     end
-                    if not keep then turtle.select(i) PutDown() end
                 end
-            end
-            turtle.select(1)
+                return not keep
+            end)
         end
         -- ALREADY ABOARD? THEN STAGE FROM THE INVENTORY, NOT THE CHEST.
         --
@@ -5366,6 +5876,11 @@ end
 local VEIN_BUDGET = 32   -- blocks per strike
 local VEIN_DEPTH  = 6    -- how far from the tunnel a vein may pull us
 
+-- Forward declaration. takeAheadIfValuable and veinFrom call each other, and a `local` declared
+-- BELOW a function that uses it is a nil global here -- silent, branch simply dead. Declared above
+-- both, assigned below veinFrom.
+local takeAheadIfValuable
+
 --- Dig into an adjacent ore block, recurse from inside it, then step back out.
 local function veinFrom(p_Budget, p_Depth)
     if p_Depth > VEIN_DEPTH or p_Budget[1] <= 0 or not executing then return 0 end
@@ -5397,20 +5912,30 @@ local function veinFrom(p_Budget, p_Depth)
     -- facing the way it started whether or not anything was found.
     for _ = 1, 4 do
         if p_Budget[1] <= 0 or not executing then break end
-        local ok, blk = turtle.inspect()
-        if ok and blk and looksValuable(blk.name) then
-            if DigForward() then
-                p_Budget[1] = p_Budget[1] - 1
-                s_Got = s_Got + 1
-                if pgps.forward() then
-                    s_Got = s_Got + veinFrom(p_Budget, p_Depth + 1)
-                    pgps.back()
-                end
-            end
-        end
+        s_Got = s_Got + takeAheadIfValuable(p_Budget, p_Depth + 1)
         pgps.turnRight()
     end
 
+    return s_Got
+end
+
+--- LOOK AHEAD, TAKE IT IF IT IS ORE, AND FOLLOW WHAT IT WAS HIDING.
+---
+--- Three copies of this existed -- one per horizontal face in veinFrom, and one for each side wall
+--- in harvestAround -- and they are the whole vein-following behaviour, so a fix to one was a fix to
+--- one third of the miner. Stepping IN and back OUT is what makes the block's neighbours visible;
+--- coming back out is what leaves the caller's position unchanged whatever the vein does.
+takeAheadIfValuable = function(p_Budget, p_Depth)
+    local s_Got = 0
+    local ok, blk = turtle.inspect()
+    if ok and blk and looksValuable(blk.name) and DigForward() then
+        p_Budget[1] = p_Budget[1] - 1
+        s_Got = s_Got + 1
+        if pgps.forward() then
+            s_Got = s_Got + veinFrom(p_Budget, p_Depth)
+            pgps.back()
+        end
+    end
     return s_Got
 end
 
@@ -5464,29 +5989,13 @@ local function harvestAround()
 
     if s_Left then
         pgps.turnLeft()
-        local ok, blk = turtle.inspect()
-        if ok and blk and looksValuable(blk.name) and DigForward() then
-            s_Budget[1] = s_Budget[1] - 1
-            s_Got = s_Got + 1
-            if pgps.forward() then
-                s_Got = s_Got + veinFrom(s_Budget, 2)
-                pgps.back()
-            end
-        end
+        s_Got = s_Got + takeAheadIfValuable(s_Budget, 2)
         pgps.turnRight()
     end
 
     if s_Right then
         pgps.turnRight()
-        local ok, blk = turtle.inspect()
-        if ok and blk and looksValuable(blk.name) and DigForward() then
-            s_Budget[1] = s_Budget[1] - 1
-            s_Got = s_Got + 1
-            if pgps.forward() then
-                s_Got = s_Got + veinFrom(s_Budget, 2)
-                pgps.back()
-            end
-        end
+        s_Got = s_Got + takeAheadIfValuable(s_Budget, 2)
         pgps.turnLeft()
     end
 
@@ -5757,6 +6266,112 @@ local function selectItem(p_Name)
     return false
 end
 
+-- Re-fix if the fix is stale, and say so if it cannot be had. Its own function because OnBuild is
+-- the densest job in the file and because "do we actually know where we are" is one question.
+-- "Is the block already the one the blueprint asks for?" -- one question, one function, and it
+-- keeps a two-part nil-guard out of the placement loop.
+-- One progress line per eight blocks. Its own function so the placement loop keeps its shape and
+-- so the "every eighth" arithmetic is in one place rather than inline in the densest loop here.
+-- WHERE DID THAT BLOCK ACTUALLY GO?
+--
+-- placeDown() returning true says a block was placed; it says nothing about WHERE. The drone writes
+-- to the square beneath wherever it physically is, while the job -- and noteObservation, and the
+-- resume memo -- record the coordinate it MEANT. When those differ, every report says the floor is
+-- being built and the floor is empty, which is exactly the state this settlement spent a night in:
+-- patches completing, bricks draining from storage, and a centre cut through the floor reading
+-- 3 of 33 for hours.
+--
+-- So take one honest reading per patch: the target, and the position GPS says we are at, captured
+-- at the moment the placement succeeded. If they disagree the answer is immediate and unarguable.
+-- First two placements only -- enough to prove it, not enough to drown the log or cost a fix per
+-- block.
+function provePlacement(p_Nth, p_X, p_Y, p_Z)
+    if p_Nth > 2 then return end
+    local gx, gy, gz = gps.locate(2, false)
+    trace(("place: target %d,%d,%d gps %s,%s,%s")
+          :format(p_X, p_Y, p_Z, tostring(gx), tostring(gy), tostring(gz)))
+end
+
+function notePace(p_Idx, p_Total, p_Placed, p_Skipped, p_Began)
+    if p_Idx <= 1 then return end
+    if (p_Idx % 8) ~= 1 then return end
+    trace(("build: %d/%d blocks (%d placed, %d skipped) in %ds")
+          :format(p_Idx - 1, p_Total, p_Placed, p_Skipped, math.floor(os.clock() - p_Began)))
+end
+
+-- Tally a skip by reason. One line, so the placement loop stays readable and the counting cannot
+-- drift out of step with the branches it describes.
+-- Say why the skipped blocks were skipped, once, at the end. Its own function so the tally and the
+-- reporting sit together and OnBuild keeps its shape.
+function reportSkips(p_Tally)
+    local s_Reasons = {}
+    for k, v in pairs(p_Tally) do s_Reasons[#s_Reasons + 1] = ("%s x%d"):format(k, v) end
+    if #s_Reasons == 0 then return end
+    trace("build: skipped because -- " .. table.concat(s_Reasons, ", "))
+end
+
+function noteSkip(p_Tally, p_Reason)
+    p_Tally[p_Reason] = (p_Tally[p_Reason] or 0) + 1
+end
+
+function alreadyThatBlock(p_What, p_Item)
+    if p_What == nil then return false end
+    return p_What.name == p_Item
+end
+
+function sureWhereWeAre(p_X, p_Y, p_Z)
+    -- A FRESH FIX, NOT A RECENT ONE.
+    --
+    -- positionVerified() answers "how old is the last fix", and nothing else. A drone that fixed
+    -- twenty seconds ago and has since flown ten blocks on a heading that turned out to be wrong
+    -- still answers true -- so the first version of this guard, which only re-fixed when
+    -- positionVerified() was false, never re-fixed at all. It logged ZERO refusals while blocks
+    -- went on landing in the wrong places, which is the most convincing possible way for a guard
+    -- to be useless.
+    --
+    -- The proof was the drone's own memo, which is written only after a placement succeeds:
+    -- four consecutive coordinates recorded as built, and not one of them had a block on it.
+    --
+    -- Placement is the one operation where being wrong is unrecoverable -- the material is spent
+    -- and the block has to be found and dug out by hand -- so it pays for a fix every time. A
+    -- gps.locate costs a second or two; a misplaced brick costs an hour of somebody's evening.
+    if pgps.verifyPosition(true) ~= nil and pgps.positionVerified() then return true end
+    trace(("build: refusing to place at %d,%d,%d -- no fresh gps fix"):format(p_X, p_Y, p_Z))
+    return false
+end
+
+local function stageBuildMaterials(s_Hand, s_Need)
+    -- ONE CONTESTED SQUARE MUST NOT BE THE ONLY WAY TO GET BRICKS.
+    --
+    -- StorageMan hands every builder the same chest, and the access square above it is a single
+    -- block. When it is occupied by a drone that is busy-but-stationary -- crafting, depositing,
+    -- waiting -- that drone never steps aside: the mid-job yield lives inside ArriveAt, so only
+    -- a drone that is TRAVELLING honours a make-way request, and OnMakeWay refuses outright if
+    -- its position is unverified, which most of the bay is after a reboot.
+    --
+    -- So the whole fleet queued for one square and every build died there, with a full larder:
+    --
+    --   JOB Build THREW could not reach the pickup chest
+    --   JOB Build THREW interrupted while waiting for the pickup chest
+    --
+    -- Eleven dispatches in thirteen minutes, not one block placed. FetchItems already knows how
+    -- to find a material anywhere -- it reads the container directly below first and sweeps the
+    -- bay after -- so falling back to it turns a hard dependency on one square into a
+    -- preference for it. Slower when the bay is busy; never deadlocked.
+    local s_Got = pcall(arrivePickupOrWait, s_Hand.pos)
+    if s_Got then
+        emptyInventory()
+    else
+        trace("pickup: that chest is unreachable -- collecting the materials the ordinary way")
+    end
+    local s_Stage, s_StageErr = stageFromChest(s_Need)
+    if s_Stage == nil and s_Got then error(s_StageErr, 0) end
+    if s_Stage == nil then
+        FetchItems(s_Need, s_Need)
+        s_Stage = true
+    end
+end
+
 function OnBuild(p_ID, p_Message)
     return RunJob("Build", p_Message.data, {status = "building", travel = false}, function(d)
         local s_Origin = d.origin
@@ -5780,9 +6395,7 @@ function OnBuild(p_ID, p_Message)
         local s_Hand = PowNet.sendAndWaitForResponse("StorageMan",
             PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Provide", {items = s_Req}),
             PowNet.SERVER_PROTOCOL, 8)
-        if type(s_Hand) ~= "table" or s_Hand.pos == nil then
-            error("storage would not hand over materials", 0)
-        end
+        HandoverOrThrow(s_Hand, "materials")
         -- PLACE WHAT WE HAVE. A PARTLY BUILT WALL IS PROGRESS; A REFUSAL IS NOT.
         --
         -- This threw the moment storage could not fill the whole order, which is the same mistake
@@ -5814,13 +6427,8 @@ function OnBuild(p_ID, p_Message)
         -- block, so "a drone is standing there" is the ORDINARY reason a pickup fails, not an
         -- exceptional one. build-chest-row failed on exactly this while the settlement sat at zero
         -- free slots waiting for the chests it was trying to collect.
-        if not ArriveOrAskToMove(s_Hand.pos.x, s_Hand.pos.y + 1, s_Hand.pos.z,
-                                 (s_Hand.pos.y or 64) + 4, "pickup") then
-            error("could not reach the pickup chest", 0)
-        end
-        emptyInventory()
-        local s_Stage, s_StageErr = stageFromChest(s_Need)
-        if s_Stage == nil then error(s_StageErr, 0) end
+        stageBuildMaterials(s_Hand, s_Need)
+
 
         -- Materials live in the staging slots; spread them into the main inventory so placeDown
         -- has something in the selected slot regardless of which kind is wanted next.
@@ -5850,8 +6458,24 @@ function OnBuild(p_ID, p_Message)
         -- the drone can actually guarantee in the blueprint, and leaves the per-block convention with
         -- the blueprint, which is where it can be written down and checked.
         local s_Placed, s_Skipped = 0, 0
-        for _, b in ipairs(s_Blocks) do
+        -- WHY a block was skipped, counted by reason. Two thirds of every patch was being skipped
+        -- and the log said only how MANY -- so every theory about the cause (occupied ground, bad
+        -- position, no route) stayed a theory, and several were chased at length and were wrong.
+        local s_Why = {}
+        -- SAY HOW IT IS GOING WHILE IT IS GOING.
+        --
+        -- A build logged "start" and then nothing until it finished, so a patch that was merely
+        -- slow was indistinguishable from one that had wedged -- and with 33 starts and zero
+        -- completions on the board, that distinction was the whole question. Every attempt to
+        -- answer it from outside (scanning the world, counting bricks in storage) measured the
+        -- wrong thing and sent the diagnosis somewhere else.
+        --
+        -- One line per eight blocks: enough to see the rate and where it stops, not enough to
+        -- drown the log.
+        local s_Began = os.clock()
+        for s_Idx, b in ipairs(s_Blocks) do
             if not executing then break end
+            notePace(s_Idx, #s_Blocks, s_Placed, s_Skipped, s_Began)
             local bx = s_Origin.x + (tonumber(b.dx) or 0)
             local by = s_Origin.y + (tonumber(b.dy) or 0)
             local bz = s_Origin.z + (tonumber(b.dz) or 0)
@@ -5865,32 +6489,95 @@ function OnBuild(p_ID, p_Message)
                 -- already placed before the last stand-down
             elseif not TravelTo(bx, by + 1, bz, (by or 64) + 4) then
                 s_Skipped = s_Skipped + 1
+                noteSkip(s_Why, "no route to the square")
             else
-                s_BuildDone.mark(s_BK)
+                -- MARK ONLY WHAT WAS ACTUALLY PLACED. This used to mark here, on arrival, which
+                -- recorded "the drone reached this coordinate" and not "a block stands there". Every
+                -- abort mid-build -- and builds abort routinely, on reassignment and on stand-down --
+                -- therefore retired its remaining coordinates permanently. The memo filled up with
+                -- blocks nobody ever placed, and because a memo hit increments NEITHER counter, the
+                -- job then reported the tell-tale:
+                --
+                --   built 0 of 48 blocks (0 skipped)
+                --
+                -- placed + skipped = 0 against a total of 48: the loop ran the full length and did
+                -- nothing on every pass. That read as "the builder is broken" or "materials never
+                -- arrived" for a long time; the builder was fine and the larder was full. The floor
+                -- sat at zero blocks while every re-issued patch completed instantly and successfully.
                 -- Something already here. Leave it: overwriting is how a build eats whatever was
                 -- standing on the site, and the plot check cannot see blocks that arrived after it
                 -- ran. Refusing costs one block; the alternative destroyed a drone once already.
+                -- NEVER PLACE A BLOCK ON A POSITION WE HAVE NOT VERIFIED.
+                --
+                -- A build writes the world at a COORDINATE, and the only thing turning "forward"
+                -- into a coordinate is the drone's belief about where it is. When that belief is
+                -- wrong the placement still succeeds -- turtle.placeDown() returns true wherever it
+                -- happens to be -- so the brick lands somewhere arbitrary and noteObservation
+                -- records it at the coordinate we MEANT. The fleet's map then fills with structure
+                -- that does not exist.
+                --
+                -- Measured, and this is the whole bug in two numbers: of seven coordinates the
+                -- fleet had recorded as built, ZERO had a block on them; meanwhile a blind grid
+                -- scan found bricks at four points nobody had ever recorded. Hundreds of bricks
+                -- left storage, every build reported success, and no floor ever appeared. Every
+                -- other fault chased today -- unreachable pickups, phantom obstructions at squares
+                -- that were plainly air -- is the same wrong position seen from a different angle.
+                --
+                -- So: verify, or do not place. A skipped block is re-issued by order.tower and
+                -- costs one pass; a misplaced one costs the material, corrupts the map, and has to
+                -- be found and dug out by hand.
+                if not sureWhereWeAre(bx, by, bz) then
+                    s_Skipped = s_Skipped + 1
+                    noteSkip(s_Why, "position unverified")
+                    goto continueBlock
+                end
                 local s_Occupied, s_What = turtle.inspectDown()
                 if s_Occupied then
-                    if s_What and s_What.name == b.item then
+                    if alreadyThatBlock(s_What, b.item) then
+                        s_BuildDone.mark(s_BK)
                         s_Placed = s_Placed + 1        -- already correct; count it as done
                     else
                         s_Skipped = s_Skipped + 1
+                        noteSkip(s_Why, "occupied by something else")
                     end
                 elseif not selectItem(b.item) then
                     error("ran out of " .. tostring(b.item) .. " partway through", 0)
                 elseif (b.heading == nil or pgps.turnTo(HEADINGS_()[b.heading]) ~= false)
                         and turtle.placeDown() then
+                    s_BuildDone.mark(s_BK)
                     s_Placed = s_Placed + 1
+                    provePlacement(s_Placed, bx, by, bz)
                     pgps.noteObservation(bx .. ":" .. by .. ":" .. bz, 1, {true, {name = b.item}})
                 else
                     s_Skipped = s_Skipped + 1
+                    noteSkip(s_Why, "placeDown refused")
                 end
             end
+            ::continueBlock::
         end
 
         Deposit()          -- leftovers go back rather than riding around in a turtle
         UploadWorld()
+
+        -- AN INTERRUPTED BUILD IS NOT A FINISHED BUILD.
+        --
+        -- The loop above breaks the moment `executing` goes false, which is what an Abort sets --
+        -- and a stand-down, a reassignment and a task.stop all abort. It then fell straight through
+        -- to this return, TaskMan took a returned table as success, marked the patch 100% done, and
+        -- the blocks were never placed by anybody. The tell was in the numbers and went unread for
+        -- hours:
+        --
+        --   built 0 of 48 blocks (0 skipped)
+        --
+        -- placed + skipped = 0 against a total of 48 -- arithmetic that only an early break can
+        -- produce, because every ordinary pass increments one counter or the other. The floor stayed
+        -- empty while patch after patch completed successfully, so every external view agreed the
+        -- tower was being built and the world disagreed. Aborts are ROUTINE here, so this quietly
+        -- retired most of the floor.
+        --
+        -- Throw instead. The patch goes back on the queue and the coordinates already placed are
+        -- memoised, so the retry finishes the remainder rather than starting over.
+        reportSkips(s_Why)
         return {message = ("built %d of %d blocks (%d skipped)")
                     :format(s_Placed, #s_Blocks, s_Skipped),
                 placed = s_Placed, skipped = s_Skipped, total = #s_Blocks}
@@ -5903,8 +6590,21 @@ function OnLumber(p_ID, p_Message)
         local s_L = tonumber(d.l) or 8
         local s_Logs, s_Trees = 0, 0
 
+        -- THE JOB IS THE TRUNKS, NOT THE SQUARE. HQ sends the feet of the standing trunks it knows
+        -- about (see lumber.ts); each is approached from the side and climbed. The sweep below is
+        -- the fallback for a task that carries none.
+        if type(d.targets) == "table" and #d.targets > 0 then
+            s_Trees, s_Logs = fellTargets(d.targets)
+        else
         Serpentine(s_W, s_L, function()
             if not depositIfFull() then return false end
+            -- Overhead first: a trunk whose base is one above the sweep plane, or one the drone is
+            -- standing in after digging its way to the site, is directly above and never in front.
+            local okUp, above = turtle.inspectUp()
+            if okUp and isLog(above.name) then
+                local n = ClimbTrunkAbove()
+                if n > 0 then s_Trees = s_Trees + 1 s_Logs = s_Logs + n end
+            end
             local ok, blk = turtle.inspect()
             if ok and isLog(blk.name) then
                 local n = fellTree()
@@ -5916,7 +6616,22 @@ function OnLumber(p_ID, p_Message)
                 return false
             end
         end, function() return stepForward(2) end)
+        end
 
+        -- Same rule as a build: a job that was interrupted before it achieved anything must not
+        -- report success, or TaskMan retires it and nobody ever fells those trees. Observed as
+        -- "JOB Lumber done" logged four lines after "Aborting (was executing: true)", with the
+        -- settlement's wood stock at zero the entire time.
+        -- SAY IT OUT LOUD, NOT JUST IN THE RETURN VALUE.
+        --
+        -- The count of what a sweep actually felled goes back to TaskMan and is never written to
+        -- the drone log, so from outside "JOB Lumber done" is indistinguishable between sixteen
+        -- logs and none at all. That gap cost an entire session: sweeps ran, reported done, and
+        -- storage stayed at oak_log 0 for hours while the plank and chest chains starved behind
+        -- them -- and every theory about why was guesswork, because the one number that would have
+        -- settled it was thrown away. Same trap as `built %d of %d blocks`, which reported zero
+        -- completions while eighteen patches had completed.
+        trace(("lumber: felled %d tree(s), %d log(s)"):format(s_Trees, s_Logs))
         return {message = ("felled %d trees, %d logs"):format(s_Trees, s_Logs),
                 trees = s_Trees, logs = s_Logs}
     end)
@@ -5981,22 +6696,8 @@ local function CollectFuel()
     -- holding three stacks. Cargo goes in the chest, fuel stays aboard.
     local s_Below = ContainerBelow()
     if s_Below then
-        local s_Put = {}
-        for i = 1, 16 do
-            if turtle.getItemCount(i) > 0 then
-                turtle.select(i)
-                if not isFuelSelected(i) then                     -- cargo belongs in the chest
-                    local det = turtle.getItemDetail(i)
-                    local before = turtle.getItemCount(i)
-                    PutDown()
-                    local moved = before - turtle.getItemCount(i)
-                    if det and det.name and moved > 0 then
-                        s_Put[det.name] = (s_Put[det.name] or 0) + moved
-                    end
-                end
-            end
-        end
-        turtle.select(1)
+        -- cargo belongs in the chest; the fuel we came for stays aboard
+        local s_Put = putDownSlots(function(i) return not isFuelSelected(i) end)
         ReportStorage("Deposited", s_Put)
         ReportChest()
     end
@@ -6004,18 +6705,40 @@ local function CollectFuel()
     -- Coal first, charcoal second -- as separate asks, not one. FetchItems requires EVERY item in
     -- the request, so asking for both at once fails whenever the settlement has only one of them,
     -- which is the normal case.
+    --
+    -- WOOD IS ON THE LIST BECAUSE THE ACCOUNTANT ALREADY COUNTS IT.
+    --
+    -- TaskMan's storageFuelCount asks taskProducesFuel, which matches "log" and "wood", so a store
+    -- holding nothing but logs reads as "there is fuel to deliver" and fuel reliefs are queued. This
+    -- list held only coal and charcoal, so the drone that answered the call could not pick up the
+    -- very thing the gate had counted -- and came back with "storage had nothing burnable".
+    --
+    -- That is not a wasted trip, it is the fuel deadlock: each failed relief occupies one of the few
+    -- drones that can still move, and the job it displaces is the lumber sweep that would have ended
+    -- the shortage. Measured with three drones at zero, one lumber task waiting, and
+    -- `task 14723 failed (no fuel to deliver: storage had nothing burnable)` while storage held logs.
+    --
+    -- A turtle burns logs and planks directly, so there was never a reason to refuse them. Ordered
+    -- by energy per slot: coal and charcoal are worth eight items of wood each, so they go first and
+    -- wood is what the fleet falls back on -- which is exactly when it is needed.
     local s_Fuel = 0
-    for _, s_Name in ipairs({"minecraft:coal", "minecraft:charcoal"}) do
+    for _, s_Name in ipairs({"minecraft:coal", "minecraft:charcoal",
+                             "minecraft:oak_log", "minecraft:oak_planks"}) do
         -- p_Min is a TABLE of per-item minimums, not a scalar. Passing the number 8 here made
         -- FetchItems do `pairs(8)` and throw "bad argument (table expected, got number)" -- which
         -- failed fuel-D3 outright, in the very function that was rewritten to stop fuel failing.
-        local s_Got = FetchItems({[s_Name] = FuelUnitsWanted()}, {[s_Name] = 8})
+        -- ANY FUEL IS WORTH TAKING. The minimum was 8 "so a drone that walked to storage does not
+        -- come back empty over a rounding decision" -- and it did exactly that: D31 ran to zero two
+        -- blocks from a chest holding 7 coal and 5 charcoal, 960 fuel it was not allowed to touch.
+        -- TaskMan's FUEL_FETCH_MIN is the same number and fuel-fetchable.test.ts holds them equal.
+        local s_Got = FetchItems({[s_Name] = FuelUnitsWanted()}, {[s_Name] = 1})
         for _, n in pairs(s_Got or {}) do s_Fuel = s_Fuel + n end
         if s_Fuel > 0 then break end
     end
     if s_Fuel == 0 then return 0, "storage had nothing burnable" end
 
     -- Top the DELIVERER up too, or it strands next to the drone it came to save.
+    -- silent: allow (topping the deliverer up is opportunistic -- its own fuel watchdog is what actually keeps it alive)
     pcall(TryRefuel)
     return s_Fuel
 end
@@ -6128,17 +6851,12 @@ function OnHandover(p_ID, p_Message)
         end
 
         local s_Given = 0
-        for i = 1, 16 do
-            local n = turtle.getItemCount(i)
-            if n > 0 then
-                turtle.select(i)
-                local det = turtle.getItemDetail(i)
-                if det and det.name and det.name:find(s_Match, 1, true) and HandTo() then
-                    s_Given = s_Given + n
-                end
+        eachCarriedSlot(function(i, n)
+            local det = turtle.getItemDetail(i)
+            if det and det.name and det.name:find(s_Match, 1, true) and HandTo() then
+                s_Given = s_Given + n
             end
-        end
-        turtle.select(1)
+        end)
         if s_Given == 0 then return nil, "arrived but could not hand anything over" end
 
         -- Step aside so the recipient is not boxed in by the drone that just helped it.
@@ -6243,7 +6961,7 @@ function ReachCasualty(p_Name, p_X, p_Y, p_Z)
     -- One distance rather than three comparisons: same test, and this function sits right on the
     -- complexity gate.
     if s_Now == nil then return nil end
-    if math.abs(s_Now.x - p_X) + math.abs(s_Now.y - p_Y) + math.abs(s_Now.z - p_Z) == 0 then
+    if Blocks(s_Now.x, s_Now.y, s_Now.z, p_X, p_Y, p_Z) == 0 then
         return nil
     end
 
@@ -6254,64 +6972,69 @@ function ReachCasualty(p_Name, p_X, p_Y, p_Z)
     return s_Now.x, s_Now.y, s_Now.z
 end
 
+local function relieveBody(d)
+    if not (d.pos and d.pos.x) then return nil, "no casualty position" end
+
+    local s_Got, s_Why = CollectFuel()
+    if s_Got == 0 then return nil, "no fuel to deliver: " .. tostring(s_Why or "storage empty") end
+    trace(("relieve: carrying %d fuel to %s,%s,%s"):format(
+        s_Got, tostring(d.pos.x), tostring(d.pos.y), tostring(d.pos.z)))
+
+    -- Directly ABOVE the casualty. Its own block is occupied -- by the casualty.
+    local s_X, s_Y, s_Z = tonumber(d.pos.x), tonumber(d.pos.y), tonumber(d.pos.z)
+    if not TravelTo(s_X, s_Y + 1, s_Z, (s_Y or 64) + 4) then
+        return nil, "could not reach the stranded drone"
+    end
+
+    -- SAY THE CASUALTY IS MISSING, DO NOT SAY THE DROP FAILED.
+    --
+    -- "arrived but dropped nothing" described the symptom and hid the cause, so four identical
+    -- round trips read as a broken PutDown rather than a drone that was not there. Look around
+    -- before giving up, and if it really is absent, name that -- the fix for a missing casualty
+    -- is a fresh position, which is a different repair entirely.
+    -- No "is it already below?" test here on purpose: RELIEF_SEARCH starts at {0,0,0}, so the
+    -- search answers that on its first step. The extra branch bought nothing and this is one of
+    -- the largest functions in the file -- see the complexity gate.
+    local s_Fx, s_Fy, s_Fz = ReachCasualty(d.drone, s_X, s_Y, s_Z)
+    if s_Fx == nil then
+        return nil, ("no drone at or around %d,%d,%d -- %s is not where it was last seen")
+            :format(s_X, s_Y, s_Z, tostring(d.drone or "the casualty"))
+    end
+    s_X, s_Y, s_Z = s_Fx, s_Fy, s_Fz
+
+    local s_Dropped = 0
+    eachCarriedSlot(function(i, s_N)
+        -- HandTo, NOT PutDown. PutDown refuses to drop unless ContainerBelow() says there
+        -- is a chest or barrel underneath -- and what is underneath a rescue is a DRONE, so
+        -- it returned false every single time. Fuel relief has therefore never delivered
+        -- anything in the history of this fleet: the rescuer flew out with 64 coal, hovered
+        -- over the casualty, refused its own handover, and flew home still carrying it,
+        -- reporting "arrived but dropped nothing" -- which read as a navigation fault and
+        -- sent us looking at positions for hours.
+        --
+        -- HandTo exists for exactly this case and its own comment claims "the fuel relief
+        -- already solved this shape". It did not; HandTo was generalised from a manoeuvre
+        -- that was broken. This is the call site that was supposed to be using it.
+        if isFuelSelected(i) and HandTo() then s_Dropped = s_Dropped + s_N end
+    end)
+    if s_Dropped == 0 then return nil, "arrived but dropped nothing" end
+
+    trace(("relieve: dropped %d fuel onto %s"):format(s_Dropped, tostring(d.drone or "?")))
+    -- Step aside so the casualty is not boxed in by its rescuer once it can move again.
+    pgps.up()
+    return {message = ("delivered %d fuel"):format(s_Dropped), dropped = s_Dropped}
+end
+
 function OnRelieve(p_ID, p_Message)
     return RunJob("Relieve", p_Message.data,
         {status = "hauling", travel = false, settle = false, deposit = false}, function(d)
-        if not (d.pos and d.pos.x) then return nil, "no casualty position" end
-
-        local s_Got, s_Why = CollectFuel()
-        if s_Got == 0 then return nil, "no fuel to deliver: " .. tostring(s_Why or "storage empty") end
-        trace(("relieve: carrying %d fuel to %s,%s,%s"):format(
-            s_Got, tostring(d.pos.x), tostring(d.pos.y), tostring(d.pos.z)))
-
-        -- Directly ABOVE the casualty. Its own block is occupied -- by the casualty.
-        local s_X, s_Y, s_Z = tonumber(d.pos.x), tonumber(d.pos.y), tonumber(d.pos.z)
-        if not TravelTo(s_X, s_Y + 1, s_Z, (s_Y or 64) + 4) then
-            return nil, "could not reach the stranded drone"
-        end
-
-        -- SAY THE CASUALTY IS MISSING, DO NOT SAY THE DROP FAILED.
-        --
-        -- "arrived but dropped nothing" described the symptom and hid the cause, so four identical
-        -- round trips read as a broken PutDown rather than a drone that was not there. Look around
-        -- before giving up, and if it really is absent, name that -- the fix for a missing casualty
-        -- is a fresh position, which is a different repair entirely.
-        -- No "is it already below?" test here on purpose: RELIEF_SEARCH starts at {0,0,0}, so the
-        -- search answers that on its first step. The extra branch bought nothing and this is one of
-        -- the largest functions in the file -- see the complexity gate.
-        local s_Fx, s_Fy, s_Fz = ReachCasualty(d.drone, s_X, s_Y, s_Z)
-        if s_Fx == nil then
-            return nil, ("no drone at or around %d,%d,%d -- %s is not where it was last seen")
-                :format(s_X, s_Y, s_Z, tostring(d.drone or "the casualty"))
-        end
-        s_X, s_Y, s_Z = s_Fx, s_Fy, s_Fz
-
-        local s_Dropped = 0
-        for i = 1, 16 do
-            local s_N = turtle.getItemCount(i)
-            if s_N > 0 then
-                turtle.select(i)
-                -- HandTo, NOT PutDown. PutDown refuses to drop unless ContainerBelow() says there
-                -- is a chest or barrel underneath -- and what is underneath a rescue is a DRONE, so
-                -- it returned false every single time. Fuel relief has therefore never delivered
-                -- anything in the history of this fleet: the rescuer flew out with 64 coal, hovered
-                -- over the casualty, refused its own handover, and flew home still carrying it,
-                -- reporting "arrived but dropped nothing" -- which read as a navigation fault and
-                -- sent us looking at positions for hours.
-                --
-                -- HandTo exists for exactly this case and its own comment claims "the fuel relief
-                -- already solved this shape". It did not; HandTo was generalised from a manoeuvre
-                -- that was broken. This is the call site that was supposed to be using it.
-                if isFuelSelected(i) and HandTo() then s_Dropped = s_Dropped + s_N end
-            end
-        end
-        turtle.select(1)
-        if s_Dropped == 0 then return nil, "arrived but dropped nothing" end
-
-        trace(("relieve: dropped %d fuel onto %s"):format(s_Dropped, tostring(d.drone or "?")))
-        -- Step aside so the casualty is not boxed in by its rescuer once it can move again.
-        pgps.up()
-        return {message = ("delivered %d fuel"):format(s_Dropped), dropped = s_Dropped}
+        -- Flagged for the whole run and cleared however it ends: an error escaping with the flag
+        -- set would leave the next job's watchdog refusing to refuel. See burnFrom.
+        m_Relieving = true
+        local ok, r1, r2 = pcall(relieveBody, d)
+        m_Relieving = false
+        if not ok then error(r1, 0) end
+        return r1, r2
     end)
 end
 
@@ -6336,7 +7059,23 @@ function OnHaul(p_ID, p_Message)
     return s_Ok, {message = s_Ok and "hauled" or "haul failed"}
 end
 
-function OnAbort()
+-- SAY WHO SENT IT.
+--
+-- An abort cancels whatever the drone is doing, and five separate things can send one: TaskMan
+-- reclaiming a stalled assignment, TaskMan freeing an orphaned drone, DroneMan's Stop, DroneMan's
+-- chunk-coverage sweep, and the abort that precedes every ordinary re-dispatch. The log recorded
+-- only that one arrived.
+--
+-- That cost an evening. A lumber run -- the settlement's only renewable fuel, with the fleet down to
+-- 7 burnable in storage -- crawled one block per 96 seconds for half an hour, aborted over and over,
+-- and the sender could not be identified from any log. Each candidate was checked and eliminated by
+-- hand against a different log file; the coverage sweep had never run, the reclaim path does not
+-- match "logging", the fuel test passed with 2,049 in the tank. The one fact that would have settled
+-- it in a second was thrown away at the door.
+--
+-- p_ID is the sending computer. It costs nothing to keep and it is the difference between a
+-- diagnosis and an evening of elimination.
+function OnAbort(p_ID)
     -- ALWAYS CLEAR, even when nothing is running.
     --
     -- This used to refuse whenever `executing` was false -- which is precisely the state abort is
@@ -6348,7 +7087,8 @@ function OnAbort()
     -- Two drones sat like that and the whole fleet looked like it had stopped working, while every
     -- component was behaving exactly as designed.
     local s_Was = executing
-    Say("Aborting (was executing: " .. tostring(s_Was) .. ")")
+    Say(("Aborting (was executing: %s) -- sent by #%s, job was %s")
+        :format(tostring(s_Was), tostring(p_ID), tostring(m_Job and m_Job.verb or "none")))
     -- Clear the flag as well as breaking pgps. BreakExec stops a pgps path mid-flight, but the
     -- survey loop is our own and only watches `executing` -- without this an abort would stop the
     -- current move and the lawnmower would calmly carry on to the next cell. This runs on the
@@ -6357,9 +7097,12 @@ function OnAbort()
     pgps.BreakExec()
     m_Status = "idle"
     m_Job = nil
-    pcall(saveResume)
+    -- m_Job is already nil, so this WRITES THE CLEARED STATE. If it fails, the old resume file
+    -- survives and the next boot picks the cancelled job straight back up.
+    Tried("clear the saved resume state", saveResume)
     -- Say so immediately rather than waiting up to 30s for the next beat: the whole point is to
     -- get this drone back into the pool.
+    -- silent: allow (an early beat to shorten a 30s wait; the scheduled beat delivers the same thing shortly after)
     pcall(SendHeartBeat)
     return true, s_Was and "Aborted" or "was already idle; stale status cleared"
 end
@@ -6546,11 +7289,8 @@ end
 -- It pulls from whatever container is adjacent rather than a configured position, so a fuel chest
 -- can be moved or added without touching drone code. Charcoal works as well as coal, which is why
 -- the tree farm doubles as the power plant.
-local FUEL_LOW = 4000
--- What a drone tops itself up TO before it starts banking the surplus for everyone else. Well above
--- FUEL_RESERVE (600), so it never refuels itself into another emergency, and well below FUEL_LOW,
--- so there is something left over to carry to storage.
-local FUEL_KEEP = 2500
+-- ONE NUMBER FOR "FULL ENOUGH": REFUEL_TARGET, beside CollectFuel, where the larder rule lives and
+-- where the cost of having three of them is written down.
 
 -- Burn from the inventory, optionally restricted to the dense fuels. Its own function so TryRefuel
 -- can make two passes without carrying the loop twice, and so the complexity gate stays quiet.
@@ -6559,16 +7299,36 @@ local FUEL_KEEP = 2500
 -- stop the moment it has enough and carry the remainder home. A fuel economy needs a surplus, and
 -- a surplus needs somebody to stop eating.
 local function burnFrom(p_DenseOnly)
+    -- THE RELIEF PAYLOAD IS NOT THE RELIEVER'S LUNCH.
+    --
+    -- A reliever collects coal for a drone that cannot move, and this watchdog -- every twenty
+    -- seconds and on every bore step -- saw coal aboard and a tank under target, and ate it. D40's
+    -- log for one delivery: "carrying 28 fuel", then "refuelled +559" five times on the way, then
+    -- "arrived but dropped nothing". Every fuel relief after the HandTo fix let it reach the
+    -- casualty at all failed exactly this way. While carrying relief the reliever burns only what
+    -- it needs not to strand itself; FuelFloorNow is that line.
+    if m_Relieving and turtle.getFuelLevel() >= FuelFloorNow() then return end
     for i = 1, 16 do
-        if turtle.getFuelLevel() >= FUEL_KEEP then return end
+        if turtle.getFuelLevel() >= REFUEL_TARGET then return end
         local s_Det = turtle.getItemDetail(i)
         if s_Det ~= nil and ((not p_DenseOnly) or FUEL_NAMES[s_Det.name]) then
             turtle.select(i)
-            while turtle.getItemCount(i) > 0 and turtle.getFuelLevel() < FUEL_KEEP do
+            while turtle.getItemCount(i) > 0 and turtle.getFuelLevel() < REFUEL_TARGET do
                 if not turtle.refuel(1) then break end
             end
         end
     end
+end
+
+-- Burn what is aboard: dense fuel up to the target, wood only below the floor. Returns the fuel
+-- gained. One function because TryRefuel and BurnAboardLoop both need exactly this, and the wood
+-- rule is the kind of thing that drifts when it lives in two places.
+function BurnAboard()
+    local s_Before = turtle.getFuelLevel()
+    burnFrom(true)
+    if turtle.getFuelLevel() < FuelFloorNow() then burnFrom(false) end
+    turtle.select(1)
+    return turtle.getFuelLevel() - s_Before
 end
 
 -- A DRONE AT ZERO CAN STILL TURN, AND THE FUEL IS RARELY IN FRONT OF IT.
@@ -6602,11 +7362,32 @@ end
 function TryRefuel()
     local s_Level = turtle.getFuelLevel()
     if s_Level == "unlimited" then return false end
-    if s_Level >= FUEL_LOW then return false end
+    if s_Level >= REFUEL_TARGET then return false end
 
+    -- What a burnable item aboard is worth, for deciding whether to keep collecting: logs and
+    -- planks burn for 15, the dense fuels for FUEL_PER_UNIT. Nested, not file-level: DroneLogic
+    -- sits at Lua's limit of 200 locals in the main chunk, and the compile check fails at 201.
+    local FUEL_PER_WOOD = 15
+    local function carriedBurnable()
+        local s_Total = 0
+        eachCarriedSlot(function(i, n)   -- dup: allow (this IS the helper the idiom counter wants adopted; a call is not a copy)
+            local d = turtle.getItemDetail(i)
+            if d and FUEL_NAMES[d.name] then s_Total = s_Total + n * FUEL_PER_UNIT
+            elseif d and WoodFamily(d.name) then s_Total = s_Total + n * FUEL_PER_WOOD end
+        end)
+        return s_Total
+    end
+
+    -- COLLECT WHAT IS NEEDED, NOT WHAT IS THERE.
+    --
+    -- Twelve blind sucks of eight took ninety-six items from whatever was adjacent, and what is
+    -- adjacent to a drone at the dock is a STORAGE CHEST. This is how a top-up emptied the fleet's
+    -- coal into one inventory, and how drones came to carry stacks of cobblestone nobody asked
+    -- for. Stop once what is aboard would reach the target; the rest stays where the fleet can see it.
     -- lua-hygiene: allow (collects delivered fuel lying in the world, not a chest)
     for _, suck in ipairs({turtle.suckDown, turtle.suckUp, turtle.suck}) do
         for _ = 1, 4 do
+            if s_Level + carriedBurnable() >= REFUEL_TARGET then break end
             if not suck(8) then break end
         end
     end
@@ -6637,10 +7418,15 @@ function TryRefuel()
     --
     -- Two passes. Coal and charcoal first, then anything -- so a drone with no dense fuel still
     -- burns wood rather than stranding. Survival is unchanged; only the ORDER is.
-    burnFrom(true)
-    burnFrom(false)
-    turtle.select(1)
-    local s_Gained = turtle.getFuelLevel() - s_Before
+    --
+    -- AND THE WOOD PASS IS FOR SURVIVAL ONLY. Ordering was not enough: the second pass ran whenever
+    -- the tank was under target, so a lumber drone at 1,100 ate every log it cut -- "refuelled +15"
+    -- straight after "JOB Lumber start", on the first sweep after the fleet was revived -- and the
+    -- charcoal chain, the settlement's only fuel source that comes out ahead, never saw a log. A log
+    -- is 15 fuel raw and 80 smelted; burning it to top up a tank that can reach storage destroys
+    -- four fifths of the fleet's income. Below the floor the drone cannot be sure of reaching
+    -- storage, and then the log is worth more as motion than as charcoal nobody will make.
+    local s_Gained = BurnAboard()
     if s_Gained > 0 then
         Say("refuelled +" .. s_Gained)
         return true
@@ -6667,6 +7453,14 @@ function TryRefuel()
         Distress("low fuel", "level " .. s_Before .. ", nothing to refuel with at the dock")
     end
     return false
+end
+
+-- Burn what is aboard, then say what is in the tank. depositIfFull and fuelLoop each wrote this
+-- pair out; TryRefuel gates itself on REFUEL_TARGET, so there is nothing for a caller to decide.
+function TopUpAboard()
+    -- silent: allow (TryRefuel logs what it burned or why it could not; the caller acts on the tank it re-reads)
+    pcall(TryRefuel)
+    return turtle.getFuelLevel()
 end
 
 -- GPS RELAY
@@ -6698,6 +7492,7 @@ function OnRelay(p_ID, p_Message)
     if s_Modem == nil then return false, "no modem" end
 
     if d.on == false then
+        -- silent: allow (closing a channel we have stopped answering on; a handle left open costs nothing here because m_Hosting already gates every reply)
         pcall(s_Modem.close, gps.CHANNEL_GPS)
         m_Hosting, m_HostPos = false, nil
         return true, {hosting = false}
@@ -6821,8 +7616,8 @@ local function peersByHomeward()
     end
     local hx, hy, hz = HomeXYZ()
     table.sort(s_Out, function(a, b)
-        local da = math.abs(a.p.x - hx) + math.abs(a.p.y - hy) + math.abs(a.p.z - hz)
-        local db = math.abs(b.p.x - hx) + math.abs(b.p.y - hy) + math.abs(b.p.z - hz)
+        local da = Blocks(a.p.x, a.p.y, a.p.z, hx, hy, hz)
+        local db = Blocks(b.p.x, b.p.y, b.p.z, hx, hy, hz)
         return da < db
     end)
     return s_Out
@@ -6936,7 +7731,9 @@ end
 local function pingPeers(p_Nonce, p_WaitS)
     local s_Modem = peripheral.find("modem")
     if not s_Modem then return {} end
+    -- silent: allow (one ping in a mesh that re-pings every cycle -- a lost packet is the normal case for this transport)
     pcall(s_Modem.open, PEER_CHANNEL)
+    -- silent: allow (one ping in a mesh that re-pings every cycle -- a lost packet is the normal case for this transport)
     pcall(s_Modem.transmit, PEER_CHANNEL, PEER_CHANNEL,
           {ping = os.getComputerID(), nonce = p_Nonce})
 
@@ -7064,10 +7861,20 @@ function HeadingFromPeers()
 end
 
 -- Announce ourselves, and adopt a peer-derived position when GPS has nothing to offer.
-local function peerBeacon()
+-- Open the mesh channel. Three peer coroutines did this by hand, and a copy that forgets the
+-- open() listens for ever on a channel nothing is delivered on -- silently.
+local function peerModem()
     local s_Modem = peripheral.find("modem")
+    if not s_Modem then return nil end
+    -- The note above is about listening on a channel nothing is delivered on, SILENTLY. A failed
+    -- open is the other half of that: no listener at all, and the mesh simply never answers.
+    Tried("open the peer channel", s_Modem.open, PEER_CHANNEL)
+    return s_Modem
+end
+
+local function peerBeacon()
+    local s_Modem = peerModem()
     if not s_Modem then return end
-    pcall(s_Modem.open, PEER_CHANNEL)
 
     while true do
         os.sleep(PEER_BEACON_S)
@@ -7076,6 +7883,7 @@ local function peerBeacon()
         -- decide whether we are safe to trilaterate against.
         local s_Fix = pgps.positionVerified and pgps.positionVerified() or false
         if x ~= nil then
+            -- silent: allow (one position broadcast in a mesh that re-broadcasts every cycle)
             pcall(s_Modem.transmit, PEER_CHANNEL, PEER_CHANNEL, {
                 peer = os.getComputerID(), x = x, y = y, z = z, fix = s_Fix and true or false,
             })
@@ -7110,7 +7918,9 @@ local function peerBeacon()
                 m_PeerFixAt = s_Now
                 trace(("mesh: no GPS fix -- the fleet places us at %d,%d,%d (anchors agree to %d)")
                     :format(tx, ty, tz, math.floor(terr or 0)))
-                pcall(pgps.setLocation, tx, ty, tz, nil)
+                -- As above: the trace states the fix as adopted, so a failed set makes the log lie
+                -- about the one number every later decision is built on.
+                Tried("adopt the meshed position", pgps.setLocation, tx, ty, tz, nil)
             end
         end
     end
@@ -7127,6 +7937,7 @@ local function answerPing(p_Modem, p_Msg)
     local px, py, pz = pgps.getCachedPosition()
     if px == nil then return end
     local s_Fix = pgps.positionVerified and pgps.positionVerified() or false
+    -- silent: allow (one reply to a peer ping; the peer re-pings on its next cycle)
     pcall(p_Modem.transmit, PEER_CHANNEL, PEER_CHANNEL, {
         peer = os.getComputerID(), x = px, y = py, z = pz,
         fix = s_Fix and true or false, echo = p_Msg.nonce,
@@ -7136,9 +7947,8 @@ end
 -- Receive beacons and keep the neighbour table. Separate from the repeater so a burst of relay
 -- traffic cannot starve our picture of who is nearby.
 local function peerListen()
-    local s_Modem = peripheral.find("modem")
+    local s_Modem = peerModem()
     if not s_Modem then return end
-    pcall(s_Modem.open, PEER_CHANNEL)
 
     while true do
         local _, _, s_Ch, _, s_Msg, s_Dist = os.pullEvent("modem_message")
@@ -7199,16 +8009,17 @@ function meshForward(p_Envelope, p_FromId)
 
     local hx, hy, hz = HomeXYZ()
     local cx, cy, cz = pgps.getCachedPosition()
-    local s_Mine = cx and (math.abs(cx - hx) + math.abs(cy - hy) + math.abs(cz - hz)) or math.huge
+    local s_Mine = cx and (Blocks(cx, cy, cz, hx, hy, hz)) or math.huge
 
     local s_Modem = peripheral.find("modem")
     if not s_Modem then return false end
 
     for _, e in ipairs(peersByHomeward()) do
-        local d = math.abs(e.p.x - hx) + math.abs(e.p.y - hy) + math.abs(e.p.z - hz)
+        local d = Blocks(e.p.x, e.p.y, e.p.z, hx, hy, hz)
         -- Strictly closer to base than us, and not the peer that just handed it to us. Both
         -- conditions are what stop two drones passing the same message back and forth for ever.
         if d < s_Mine and tostring(e.id) ~= tostring(p_FromId) then
+            -- silent: allow (one relay hop; the sender retries and other peers relay the same envelope)
             pcall(s_Modem.transmit, PEER_CHANNEL, PEER_CHANNEL,
                   {relay = true, dest = e.id, from = os.getComputerID(), env = p_Envelope})
             trace(("mesh: forwarded via peer %s (%d blocks from base, we are %d)")
@@ -7221,9 +8032,8 @@ end
 
 -- Accept a forwarded envelope addressed to us and carry it one hop further.
 local function meshRelayListen()
-    local s_Modem = peripheral.find("modem")
+    local s_Modem = peerModem()
     if not s_Modem then return end
-    pcall(s_Modem.open, PEER_CHANNEL)
 
     while true do
         local _, _, s_Ch, _, s_Msg = os.pullEvent("modem_message")
@@ -7246,7 +8056,10 @@ local function meshRepeat()
     -- an event that could not arrive -- the relay was dead twice over, once by the m_Hosting gate
     -- and once by a channel nobody opened. Opening it here ties the channel to the thing that
     -- actually uses it.
-    pcall(s_Modem.open, rednet.CHANNEL_REPEAT)
+    --
+    -- And say when the open fails, or the relay is dead a THIRD way -- for the same reason as the
+    -- other two: nothing anywhere reports that the channel is not being listened to.
+    Tried("open the relay channel", s_Modem.open, rednet.CHANNEL_REPEAT)
 
     local s_Seen = {}
     local s_Window, s_Count = 0, 0
@@ -7281,7 +8094,9 @@ local function meshRepeat()
                 -- that skips the mapping transmits where nobody is listening.
                 local s_Ch = s_Message.nRecipient
                 if s_Ch ~= rednet.CHANNEL_BROADCAST then s_Ch = s_Ch % rednet.MAX_ID_CHANNELS end
+                -- silent: allow (one repeat of a rednet frame; rednet is lossy by design and the sender retries)
                 pcall(s_Modem.transmit, s_Ch, s_Reply, s_Message)
+                -- silent: allow (one repeat of a rednet frame; rednet is lossy by design and the sender retries)
                 pcall(s_Modem.transmit, rednet.CHANNEL_REPEAT, s_Reply, s_Message)
             end
         end
@@ -7312,12 +8127,12 @@ local function scanOnTheMove()
                 if s_LastX == nil then
                     s_LastX, s_LastY, s_LastZ = cx, cy, cz
                 else
-                    local s_Moved = math.abs(cx - s_LastX) + math.abs(cy - s_LastY)
-                                  + math.abs(cz - s_LastZ)
+                    local s_Moved = Blocks(cx, cy, cz, s_LastX, s_LastY, s_LastZ)
                     if s_Moved >= SCAN_EVERY then
                         s_LastX, s_LastY, s_LastZ = cx, cy, cz
                         -- pcall: the scanner shares a cooldown with the survey job and a refusal
                         -- here is routine. It must never take the drone down.
+                        -- silent: allow (the note above is the decision -- the scanner shares a cooldown with the survey job and a refusal here is routine)
                         pcall(absorbScan, s_Sc, 8)
                     end
                 end
@@ -7574,6 +8389,7 @@ function RefuelAtStorage()
 
     local s_Before = turtle.getFuelLevel()
     local s_Got, s_Why = CollectFuel()
+    -- silent: allow (an opportunistic burn of coal already aboard; the fuel watchdog is the thing that keeps the drone alive)
     pcall(TryRefuel)
 
     local s_Gained = turtle.getFuelLevel() - s_Before
@@ -7678,6 +8494,30 @@ local UNDERGROUND_BELOW_HOME = 8
 -- already at the surface never enters the loop.
 local CLIMB_MAX = 96
 
+-- One step up, cutting through if the way is solid. Its own function because the climb loop that
+-- uses it is inside the idle watchdog, which is already the densest branch cluster in this file.
+--
+-- The loop it replaces only ever called pgps.up(), so "climbing out" meant floating up through air
+-- that happened to be there. Under the floor there is no such air: the first move failed, the loop
+-- broke on its first pass, and the drone declared itself walled in -- WITH A PICKAXE ON IT. The
+-- long note at the call site concluded from D35 that "having a pickaxe is not the same as getting
+-- out", which was the right observation and the wrong cause: nothing had ever tried to use it.
+--
+-- Measured directly on D57, entombed at y=50 and logging "climbed 0" every minute:
+--   probe turtle.digUp() -> dig=true
+-- It could cut its own way out at any point during the hour it spent asking for a rescue.
+--
+-- IsProtected is the fleet's one list of things no drone may ever dig, so ask it rather than
+-- keeping a second copy -- burying a drone under a chest must not turn into mining the chest.
+local function riseOneDigging()
+    if pgps.up() then return true end
+    if not CanDig() then return false end
+    local s_Seen, s_What = turtle.inspectUp()
+    if s_Seen and IsProtected(s_What and s_What.name) then return false end
+    if not turtle.digUp() then return false end
+    return pgps.up()
+end
+
 local function surfaceIfBuried()
     if executing or m_Refuelling then return end
     local px, py, pz = pgps.getCachedPosition()
@@ -7693,7 +8533,7 @@ local function surfaceIfBuried()
     while s_Rose < CLIMB_MAX do
         local _, cy = pgps.getCachedPosition()
         if cy == nil or cy >= (hy or 63) then break end
-        if not pgps.up() then break end
+        if not riseOneDigging() then break end
         s_Rose = s_Rose + 1
     end
     trace(("climbed %d block(s) toward the surface"):format(s_Rose))
@@ -7742,7 +8582,11 @@ local function goHomeIfOutside()
     local hx, hy, hz = HomeXYZ()
     trace(("outside the region at %d,%d,%d -- heading home rather than waiting for a rescue")
           :format(px, py, pz))
-    pcall(TravelTo, hx, hy, hz)
+    -- THIS IS THE DRONE-LOSS PATH. Two drones have already been lost past the edge of the region,
+    -- and the box corners sit ~82 blocks out against a 64-block modem range -- so a drone that
+    -- fails to get home from here may never be heard from again. Swallowed, the log's last word on
+    -- the subject was "heading home", which is not what happened.
+    Tried("fly home from outside the region", TravelTo, hx, hy, hz)
 end
 
 local function idleDockLoop()
@@ -7770,10 +8614,7 @@ local function idleDockLoop()
             if cx ~= nil and math.abs(cx - y.x) <= 1 and math.abs(cy - y.y) <= 1
                and math.abs(cz - y.z) <= 1 then
                 trace(("making way from %d,%d,%d"):format(cx, cy, cz))
-                for _ = 1, 4 do
-                    if pgps.forward() then break end
-                    pgps.turnRight()
-                end
+                stepAside()
             end
         end
 
@@ -7819,7 +8660,9 @@ local function idleDockLoop()
                 for i = 1, 16 do s_Cargo = s_Cargo + turtle.getItemCount(i) end
                 if s_Cargo > 0 then
                     trace(("idle while holding %d item(s) -- depositing before parking"):format(s_Cargo))
-                    pcall(Deposit)
+                    -- Stock inside a drone is invisible to planning, so a failed deposit hides the
+                    -- cargo from every supply decision while the log says it was put away.
+                    Tried("deposit the load before parking", Deposit)
                     s_IdleSince = nil
                 end
 
@@ -7859,24 +8702,45 @@ local function parkForFuel(p_Fuel, p_Floor)
     local cx, _, cz = pgps.getCachedPosition()
     if cx == nil then return end
     -- Already home: nothing to spend the tank on. Sit still and wait for the furnaces.
-    if math.abs(cx - hx) + math.abs(cz - hz) <= 4 then return end
+    if BlocksFlat(cx, cz, hx, hz) <= 4 then return end
     trace(("fuel at %d (floor %d) and storage is dry -- heading home to wait rather than "
            .. "stranding in the field"):format(p_Fuel, p_Floor))
     executing = false
     pgps.BreakExec()
     os.sleep(2)
     pgps.StartExec()
-    pcall(TravelTo, hx, hy, hz)
+    Tried("fly home", TravelTo, hx, hy, hz)
+end
+
+-- THE WATCHDOG MUST NOT BE THE THING THAT TRAVELS.
+--
+-- fuelLoop both checks the tank AND goes to fix it: RefuelAtStorage and parkForFuel are TravelTo
+-- calls made from inside the loop. So while it was flying to a chest that turned out to hold
+-- nothing -- fifteen minutes of "moveTo: no progress" toward a dead cache 45 blocks out -- it
+-- never came round to look in its own inventory, and D40 went 300 -> 59 fuel with eight coal in
+-- slot 16 the entire time. An abort from DroneMan broke the flight, the loop came round, and it
+-- burned them at once: "refuelled +639". The watchdog had been blocked by its own remedy.
+--
+-- This coroutine only ever burns what is aboard, below the floor, and touches nothing else -- no
+-- travel, no network -- so nothing can keep it from running. Selecting slots is the one thing it
+-- shares with a running job; it does so only below the floor, when stranding is the alternative.
+-- A global rather than a `local`: DroneLogic is at Lua's 200-local limit for the main chunk.
+function BurnAboardLoop()
+    while true do
+        os.sleep(10)
+        local f = turtle.getFuelLevel()
+        if f ~= "unlimited" and f < FuelFloorNow() then
+            local g = BurnAboard()
+            if g > 0 then Say("refuelled +" .. g .. " from what was aboard (watchdog)") end
+        end
+    end
 end
 
 local function fuelLoop()
     while true do
         os.sleep(FUEL_WATCH_EVERY)
         local s_Fuel = turtle.getFuelLevel()
-        if s_Fuel ~= "unlimited" and s_Fuel < FUEL_TOPUP then
-            pcall(TryRefuel)                       -- free if it is carrying coal
-            s_Fuel = turtle.getFuelLevel()
-        end
+        if s_Fuel ~= "unlimited" then s_Fuel = TopUpAboard() end   -- free if it is carrying coal
         local s_Floor = FuelFloorNow()
 
         -- AN EMPTY LARDER IS A REASON TO COME HOME, NOT A REASON TO KEEP WORKING UNTIL ZERO.
@@ -7943,6 +8807,7 @@ local function fuelLoop()
             -- Only one of those three trips keeps the drone alive. The cargo can wait -- and
             -- RefuelAtStorage puts non-fuel back in the chest anyway, so the load usually gets
             -- delivered as a side effect. Docking a drone that has no fuel just parks the problem.
+            -- silent: allow (the comment says it -- free burn of what is aboard, and fuelled() is checked on the very next line)
             pcall(TryRefuel)                       -- free: burn what is already aboard
             if not fuelled() then
                 local s_Try, s_Why = pcall(RefuelAtStorage)
@@ -8096,15 +8961,16 @@ local function gpsRelay()
             if fx == nil then
                 trace("relay: no fix of my own (status=" .. tostring(m_Status) .. ")")
                 if m_Hosting then
+                    -- silent: allow (closing a channel we have stopped hosting on; m_Hosting already gates every reply)
                     pcall(s_Modem.close, gps.CHANNEL_GPS)
+                    -- silent: allow (closing a channel we have stopped hosting on; m_Hosting already gates every reply)
                     pcall(s_Modem.close, rednet.CHANNEL_REPEAT)
                     m_Hosting, m_HostPos = false, nil
                     print("GPS relay stopped (lost my own fix)")
                 end
             elseif m_Hosting and m_HostPos then
                 -- Still here? A host that has drifted is worse than no host at all.
-                local s_Drift = math.abs(fx - m_HostPos.x) + math.abs(fy - m_HostPos.y)
-                             + math.abs(fz - m_HostPos.z)
+                local s_Drift = Blocks(fx, fy, fz, m_HostPos.x, m_HostPos.y, m_HostPos.z)
                 if s_Drift > RELAY_DRIFT_LIMIT then
                     m_HostPos = {x = fx, y = fy, z = fz}
                     Say("GPS relay re-anchored (moved " .. s_Drift .. ")")
@@ -8127,13 +8993,14 @@ local function gpsRelay()
                 local cx, cy, cz = pgps.getCachedPosition()
                 if cx == nil then
                     trace("relay: refusing to host -- no position of my own to check the fix against")
-                elseif (math.abs(fx - cx) + math.abs(fy - cy) + math.abs(fz - cz)) > 8 then
+                elseif (Blocks(fx, fy, fz, cx, cy, cz)) > 8 then
                     trace(("relay: refusing to host -- fix %d,%d,%d disagrees with my position %d,%d,%d")
                         :format(fx, fy, fz, cx, cy, cz))
                 else
                 s_Modem.open(gps.CHANNEL_GPS)
                 -- Listen for traffic to pass along only while parked as a relay. See meshRepeat.
-                pcall(s_Modem.open, rednet.CHANNEL_REPEAT)
+                -- A failed open here means m_Hosting is set on a relay that relays nothing.
+                Tried("open the relay channel", s_Modem.open, rednet.CHANNEL_REPEAT)
                 m_Hosting = true
                 m_HostPos = {x = fx, y = fy, z = fz}
                 trace(("relay: hosting at %d,%d,%d"):format(fx, fy, fz))
@@ -8200,7 +9067,7 @@ function NearMast()
     if m_HomePos == nil then return false end
     local cx, cy, cz = pgps.getCachedPosition()
     if cx == nil then return false end
-    local d = math.abs(m_HomePos.x - cx) + math.abs(m_HomePos.y - cy) + math.abs(m_HomePos.z - cz)
+    local d = Blocks(m_HomePos.x, m_HomePos.y, m_HomePos.z, cx, cy, cz)
     return d <= LINK_IN_RANGE_RADIUS
 end
 -- Consecutive link-loss episodes where the lookup still answered. Reset on recovery and on any
@@ -8246,7 +9113,21 @@ local function heartbeat()
         -- to accept any work at all. D3 sat like that with all four GPS hosts up and in range.
         -- A stale distress reason keeps a healthy drone looking troubled. If it is idle, not
         -- executing, and knows where it is, whatever went wrong is over.
-        if m_Stuck ~= nil and not executing and m_Status == "idle" and pgps.getCachedPosition() ~= nil then
+        -- AND IT MUST STILL BE ABLE TO MOVE.
+        --
+        -- The three tests above are "no job, not busy, knows where it is" -- none of which a drone
+        -- needs FUEL to satisfy. So a drone that ran dry cleared its own distress the moment its
+        -- job ended, told the fleet it was fine on every heartbeat, and was never rescued: TaskMan
+        -- queued no relief because nothing was reported wrong, and recover.dispatch answered "no
+        -- drone needs rescuing". Caught live on D35, oscillating once a minute and going nowhere:
+        --
+        --   DISTRESS: low fuel level 201, nothing to refuel with at the dock
+        --   clearing stale distress: low fuel
+        --
+        -- This file already states the principle for the buried case -- "A DRONE THAT CANNOT MOVE
+        -- IS NOT IDLE, WHATEVER IT HAS IN THE TANK" -- and the fuel case is the same fact from the
+        -- other end: idle means "no job", never "able to work".
+        if distressHasPassed() then
             Say("clearing stale distress: " .. tostring(m_Stuck))
             ClearDistress()
             SendHeartBeat()
@@ -8281,17 +9162,9 @@ local function heartbeat()
                 Say("no position -- retracing " .. pgps.trailLength() .. " crumbs to find coverage")
                 m_Status = "recovering"
                 pgps.setRecovering(true)
-                local s_Steps = 0
-                while s_Steps < 80 do
-                    local bx, by, bz = pgps.trailBack()
-                    if bx == nil then break end
-                    s_Steps = s_Steps + 1
-                    pgps.flyTo(bx, by, bz, 24)
-                    if pgps.verifyPosition(true) then
-                        Say("coverage regained after " .. s_Steps .. " crumbs")
-                        break
-                    end
-                end
+                local s_Steps, s_Back = RetraceTrail(80, 24,
+                    function() return pgps.verifyPosition(true) end)
+                if s_Back then Say("coverage regained after " .. s_Steps .. " crumbs") end
                 pgps.setRecovering(false)
                 m_Status = "idle"
                 SendHeartBeat()
@@ -8450,7 +9323,7 @@ end
 local s_Loops = {
     {"PowNet.main", PowNet.main}, {"PowNet.droneMain", PowNet.droneMain},
     {"PowNet.control", PowNet.control}, {"heartbeat", heartbeat},
-    {"fuelLoop", fuelLoop}, {"idleDockLoop", idleDockLoop}, {"jobLoop", jobLoop},
+    {"fuelLoop", fuelLoop}, {"burnAboard", BurnAboardLoop}, {"idleDockLoop", idleDockLoop}, {"jobLoop", jobLoop},
     {"resumeBranch", resumeBranch}, {"gpsRelay", gpsRelay}, {"gpsServe", gpsServe},
     {"meshRepeat", meshRepeat}, {"scanOnTheMove", scanOnTheMove}, {"refixLoop", refixLoop},
     -- The mesh: announce ourselves, learn the neighbours, and carry other drones' traffic one

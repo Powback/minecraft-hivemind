@@ -60,6 +60,31 @@ local function fetch(url)
   return body
 end
 
+-- Tell the modules something moved, and say whether they were actually told.
+--
+-- Its own function so `pull` does not carry the branch, and because the branch is the whole point:
+-- the log line used to go out BEFORE the broadcast and regardless of it, so a failed notify read
+-- exactly like a successful one -- files updated on MainFrame's disk, "notifying modules to
+-- re-fetch" in the log, and every module still running the old code because nothing ever told them
+-- to pull. That is how 17 of 20 computers ran stale code for hours while the deploy reported
+-- success, and stale code is the hardest fault to diagnose: the source in front of you is not the
+-- source that is running.
+local function broadcastReinit()
+  os.loadAPI("disk/PowNet")
+  rednet.broadcast({ type = PowNet.MESSAGE_TYPE.INIT, ID = 0, dataKey = "MAINFRAME" },
+                   PowNet.SERVER_PROTOCOL)
+end
+
+local function notifyModules()
+  local s_Told, s_Err = pcall(broadcastReinit)
+  if s_Told then
+    log("notified modules to re-fetch")
+  else
+    log(("COULD NOT notify modules to re-fetch: %s -- they are still running the OLD code; "
+         .. "reboot them or re-run the sync"):format(tostring(s_Err)))
+  end
+end
+
 local function pull()
   local raw, err = fetch(HQ .. "/lua/manifest")
   if not raw then
@@ -115,12 +140,8 @@ local function pull()
       -- Drones pull their own modules from MainFrame on next boot, so we only
       -- have to tell them something moved. MainFrame's INIT broadcast already
       -- means "re-initialise"; reuse it rather than inventing a second signal.
-      log("notifying modules to re-fetch")
-      pcall(function()
-        os.loadAPI("disk/PowNet")
-        rednet.broadcast({ type = PowNet.MESSAGE_TYPE.INIT, ID = 0, dataKey = "MAINFRAME" },
-                         PowNet.SERVER_PROTOCOL)
-      end)
+      -- It logs whether they were actually told -- see notifyModules.
+      notifyModules()
     end
   end
   return true

@@ -10,7 +10,22 @@ if not rednet.isOpen() then
     printError("Could not open rednet")
     return
 end
-turtle.refuel(64)
+-- BOOT BURNS ONLY WHAT A STRANDED DRONE NEEDS.
+--
+-- turtle.refuel(64) burned the whole selected stack on every boot, so a redeploy that caught a
+-- reliever carrying 64 coal burned all of it: D35 rebooted at 770 and came up at 5,833 with its
+-- casualty still dry, and every redeploy of the evening did the same to whatever was in transit.
+-- DroneLogic's own watchdog tops the tank up properly once it runs; this is only the net for a
+-- drone that cannot get that far, so it burns one item at a time and stops the moment it can move.
+local BOOT_FUEL_MIN = 200
+if turtle.getFuelLevel() ~= "unlimited" then
+    for i = 1, 16 do
+        if turtle.getFuelLevel() >= BOOT_FUEL_MIN then break end
+        turtle.select(i)
+        while turtle.getFuelLevel() < BOOT_FUEL_MIN and turtle.refuel(1) do end
+    end
+    turtle.select(1)
+end
 -- Wait for MainFrame rather than spinning on Connect. The blind retry loop hammered rednet with
 -- lookups during every fleet reload -- visible on the wire as a flood of dns traffic -- and gave
 -- no indication whether it was making progress or would never succeed.

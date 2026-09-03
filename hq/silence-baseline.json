@@ -1,0 +1,4 @@
+{
+  "sites": {},
+  "note": "Silent-failure sites: a caught error that is neither logged, counted, nor returned as a reason. This file may only ever SHRINK -- see test/silence.test.ts. It is now EMPTY, so any new site fails the build outright; the exemption is `silent: allow (<why>)` on the line or the line above, with a justification, not a blanket entry here."
+}

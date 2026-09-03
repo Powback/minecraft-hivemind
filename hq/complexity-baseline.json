@@ -1,29 +1,26 @@
 {
   "note": "Cyclomatic-complexity debt. This file may only ever SHRINK -- see test/complexity.test.ts.",
   "max": 15,
-  "total": 76,
+  "total": 65,
   "files": {
     "lua/DroneLogic.lua": {
       "cc": [
-        83,
+        66,
         58,
         51,
         45,
         45,
-        44,
-        36,
         31,
-        23,
+        31,
+        29,
+        25,
         22,
-        22,
-        21,
-        21,
-        20,
-        20,
         20,
         19,
-        18,
         17,
+        17,
+        16,
+        16,
         16
       ],
       "names": [
@@ -37,29 +34,26 @@
         "idleDockLoop",
         "FetchItems",
         "Init",
-        "(anonymous)",
-        "TravelTo",
-        "stageFromChest",
-        "veinFrom",
         "gpsRelay",
-        "heartbeat",
         "refixLoop",
-        "harvestAround",
         "DescribeJob",
+        "stageFromChest",
+        "TravelTo",
+        "(anonymous)",
         "meshForward"
       ]
     },
     "lua/TaskMan.lua": {
       "cc": [
-        69,
-        51,
-        32,
-        31,
-        30,
-        19,
+        53,
+        43,
+        33,
+        28,
+        25,
+        22,
         18,
         18,
-        17,
+        18,
         17,
         16
       ],
@@ -67,24 +61,22 @@
         "rescueNeeded",
         "(anonymous)",
         "OnTaskDone",
-        "OnStartTask",
         "placeRescues",
-        "freeOrphanedDrones",
+        "OnStartTask",
         "workPos",
-        "verbFor",
         "pickDrone",
+        "verbFor",
+        "freeOrphanedDrones",
         "placeBlockers",
-        "blockers"
+        "releaseStalledAssignments"
       ]
     },
     "hq/src/agent/sentinel.ts": {
       "cc": [
-        47,
-        25
+        47
       ],
       "names": [
-        "detect",
-        "observe"
+        "detect"
       ]
     },
     "lua/MapRender.lua": {
@@ -99,14 +91,6 @@
         "columnColour",
         "rebuild",
         "activeBox"
-      ]
-    },
-    "lua/PowNetRemote.lua": {
-      "cc": [
-        40
-      ],
-      "names": [
-        "RunInstallerOld"
       ]
     },
     "lua/PowGPSServer.lua": {
@@ -139,39 +123,21 @@
         "ensureHeading"
       ]
     },
-    "hq/src/agent/supply.ts": {
-      "cc": [
-        34,
-        22,
-        21,
-        21
-      ],
-      "names": [
-        "runSupplyTick",
-        "buildQueuedSet",
-        "replanShortfalls",
-        "topUpQueue"
-      ]
-    },
     "hq/src/tools/core.ts": {
       "cc": [
         33,
-        29,
-        26,
-        25,
+        27,
+        22,
         21,
-        21,
-        21,
-        21,
-        18,
-        17
+        17,
+        17,
+        17,
+        16
       ],
       "names": [
         "describeTask",
         "handler",
         "doRefreshFleet",
-        "handler",
-        "(anonymous)",
         "(anonymous)",
         "(anonymous)",
         "handler",
@@ -209,22 +175,28 @@
         "(anonymous)"
       ]
     },
+    "hq/src/agent/supply.ts": {
+      "cc": [
+        26
+      ],
+      "names": [
+        "runSupplyTick"
+      ]
+    },
     "lua/StorageMan.lua": {
       "cc": [
-        27,
         26,
         25,
         23,
-        19,
-        16
+        22,
+        18
       ],
       "names": [
-        "OnBringToFront",
         "OnProvide",
         "ServiceRoutes",
+        "OnBringToFront",
         "OnChestContents",
-        "ServiceFurnaces",
-        "OnWhereIs"
+        "ServiceFurnaces"
       ]
     },
     "lua/DroneMan.lua": {

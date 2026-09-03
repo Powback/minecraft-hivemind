@@ -19,7 +19,7 @@ cd /Users/macback/Projects/minecraft-create121
 REPO=/Users/macback/Projects/HiveMind
 WORLD=data/world
 IDS=/private/tmp/claude-501/-Users-macback/52e2a9bb-ae40-4df1-bce7-106c98b31824/scratchpad
-ALL=(MainFrame DroneMan TaskMan MapServer StorageMan DockingMan Bridge)
+ALL=(MainFrame DroneMan TaskMan MapServer StorageMan DockingMan Bridge Drones)
 TARGETS=(${@:-$ALL})
 FAILED=0
 
@@ -81,6 +81,7 @@ if [ -n "$MF" ]; then
 fi
 
 for name in $TARGETS; do
+  [ "$name" = "Drones" ] && continue        # handled by deploy_drones below, not a module computer
   id=$(lookup $name)
   remember $name "$id"
   # LOUD, NOT SKIPPED. A missing id means this module did not get the code, and a redeploy that
@@ -103,6 +104,64 @@ for name in $TARGETS; do
   cycle $id
   echo "  $name #$id on=$(state $id)"
 done
+
+# THE DRONES ARE THE FLEET. DEPLOYING TO THE MODULES IS NOT DEPLOYING.
+#
+# This script shipped seven module computers and NOT ONE DRONE, and had done since it was written.
+# DroneLogic.lua is the file that changes most in this repo -- every job verb, all of movement,
+# fuel, deposit and rescue live in it -- and the only way it reached a drone was if something
+# happened to reboot that drone afterwards. Nothing in the deploy path does.
+#
+# Measured immediately after a "successful" redeploy, on a seven-drone fleet:
+#
+#   drones WITHOUT the fix: cc#20 21 22 47 48 49 50 51 52 53 54 55 56 59 60 61 62
+#   drones WITH it:         cc#57 58 63
+#
+# Seventeen of twenty on stale code. Hours went into "the fix does not work" for fixes that were
+# never running, and each one had to be rediscovered from a log written by yesterday's binary. It
+# is the most expensive class of failure there is, because every measurement taken to diagnose it
+# is describing different code from the code in front of you.
+#
+# A drone is any computer holding DroneLogic.lua -- ask the world, same as lookup() does for
+# modules, so this keeps working across scratchpad wipes and restored saves.
+deploy_drones() {
+  local d id n=0 cycled=0 stale=0
+  for d in "$WORLD"/computercraft/computer/*/; do
+    [ -f "$d/DroneLogic.lua" ] || continue
+    id=$(basename "$d")
+    cp "$REPO/lua/DroneLogic.lua" "$d/DroneLogic.lua"
+    cp "$REPO/lua/pgps.lua"       "$d/pgps"    2>/dev/null || true
+    cp "$REPO/lua/PowNet"         "$d/PowNet"  2>/dev/null || true
+    # DroneBoot.lua, NOT lua/startup. A drone's bootloader is a DIFFERENT PROGRAM from a module's,
+    # and copying the module one over it bricked the entire fleet the first time this function ran:
+    # the module bootloader derives what to launch from the computer label, so every drone came up
+    # trying to loadfile("D40.lua"), failed, rebooted, and did it again -- seven drones powered ON,
+    # executing nothing, logs frozen mid-sentence.
+    #
+    #   boot-stage.txt: stage=entered-startup label=D40
+    #   last-run.txt:   module=D40 ok=false err=loadfile: File not found
+    #
+    # bootstrap/drone.sh has always been the authority on this ("the drone's bootloader IS
+    # DroneBoot") and this function was written without reading it.
+    cp "$REPO/lua/DroneBoot.lua"  "$d/startup" 2>/dev/null || true
+    chmod -R a+rwX "$d"
+    n=$((n+1))
+    # Only cycle what is actually running. A drone that is off picks the new code up when it boots,
+    # and turn-on here would strand it wherever it happens to be sitting.
+    if [ "$(state $id)" = "Y" ]; then cycle $id; cycled=$((cycled+1)); fi
+  done
+  # VERIFY AT THE EFFECT, NOT AT THE COPY. A drone that was mid-write, read-only or simply missed
+  # must be named -- a redeploy that silently skips one is how this whole class of bug survives.
+  for d in "$WORLD"/computercraft/computer/*/; do
+    [ -f "$d/DroneLogic.lua" ] || continue
+    if ! cmp -s "$REPO/lua/DroneLogic.lua" "$d/DroneLogic.lua"; then
+      echo "  drone #$(basename "$d"): STILL STALE after deploy"; stale=$((stale+1)); FAILED=1
+    fi
+  done
+  echo "  Drones: $n written, $cycled cycled, $stale stale"
+}
+
+if [[ " ${TARGETS[@]} " == *" Drones "* ]]; then deploy_drones; fi
 
 if [ -n "$MF" ]; then :; else echo "  MainFrame: NO ID -- disk/ not synced, modules will update from stale code"; FAILED=1; fi
 [ "$FAILED" = "1" ] && { echo "REDEPLOY INCOMPLETE -- see NOT DEPLOYED above"; exit 1; }

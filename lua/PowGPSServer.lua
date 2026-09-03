@@ -33,6 +33,19 @@ local deltas = {[North] = {0, 0, -1}, [West] = {-1, 0, 0}, [South] = {0, 0, 1},
 -- return: nil if there is no information on the block
 --
 
+-- YIELD, OR CC KILLS THE COROUTINE MID-WALK.
+--
+-- CC:T terminates anything that runs ~10s without yielding, uncatchably, and the computer is left
+-- POWERED OFF with a clean-looking last-run. queueEvent/pullEvent satisfies the watchdog and
+-- resumes in the SAME tick, so a full walk still costs no wall clock -- os.sleep(0) costs a tick
+-- per iteration and is refused by lua-hygiene for that reason. 7 hand-written copies before this.
+local function breathe(p_Tag)
+    -- dup: allow (three modules need this and CC has no shared library here -- giving them one
+    -- means a new os.loadAPI file deployed to every computer, which is a deployment change,
+    -- not a refactor. Two lines each is the cheaper of the two honest options.)
+    os.queueEvent(p_Tag) os.pullEvent(p_Tag)
+end
+
 function getBlock(bX, bY, bZ)
     local idx_block = bX..":"..bY..":"..bZ
     if cachedWorld[idx_block] == nil then
@@ -415,7 +428,7 @@ local function writeLines(p_Name, p_Header, p_Rows)
             -- Same reason as the read side: a large write must let the module breathe, or CC
             -- terminates it mid-save and leaves a staging file behind. queueEvent rather than
             -- os.sleep(0), which costs a full game tick per 512 lines and does no work in it.
-            os.queueEvent("save") os.pullEvent("save")
+            breathe("save")
         end
     end
 
@@ -507,7 +520,7 @@ function load()
                     local s_Row = 0
                     for k, occ, nid in s_Rows:gmatch("([^\n=]+)=([^,\n]+),(%d+)") do
                         s_Row = s_Row + 1
-                        if s_Row % 500 == 0 then os.queueEvent("walk") os.pullEvent("walk") end
+                        if s_Row % 500 == 0 then breathe("walk") end
                         cachedWorld[k] = tonumber(occ)
                         local id = tonumber(nid)
                         if id and id > 0 and m_Names[id] then
@@ -520,7 +533,7 @@ function load()
             -- One yield per file rather than per row: 70 yields instead of 455, and the work
             -- between them is now bounded by one file rather than unbounded. queueEvent rather
             -- than os.sleep(0) -- 70 ticks of waiting was three and a half seconds of the boot.
-            os.queueEvent("load") os.pullEvent("load")
+            breathe("load")
           end
         end
         say("load: parsed " .. s_Cells .. " cells")
@@ -575,7 +588,7 @@ function save()
     local s_Seen2 = 0
     for k in pairs(cachedWorld) do
         s_Seen2 = s_Seen2 + 1
-        if s_Seen2 % 5000 == 0 then os.queueEvent("walk") os.pullEvent("walk") end
+        if s_Seen2 % 5000 == 0 then breathe("walk") end
         local c = chunkOfKey(k)
         if c and m_Dirty[c] then
             local b = s_Buckets[c]
@@ -633,7 +646,7 @@ function save()
         -- queueEvent/pullEvent, not os.sleep(0): it satisfies the watchdog and resumes in the SAME
         -- tick, so a save of hundreds of chunks costs no wall clock. The same pair is used for this
         -- reason everywhere this codebase walks a large structure.
-        os.queueEvent("mapsave") os.pullEvent("mapsave")
+        breathe("mapsave")
         -- Header carries WHEN this ground was last observed, so staleness is readable straight off
         -- the file without decoding a single cell.
         local s_Header = {"seen=" .. tostring(m_Seen[c] or 0)}
@@ -886,9 +899,14 @@ end
 -- returns: boolean "success"
 --
 
-function SetDronePos(idx, y, z)
+-- ACCEPT EITHER "x:y:z" OR x, y, z, AND HAND BACK BOTH.
+--
+-- Every cell accessor here takes both shapes, and each one carried its own copy of this -- four of
+-- them, each having to get the same three patterns right. They address the SHARED world cache, so a
+-- key rebuilt from the wrong pieces does not error, it silently reads or writes a different cell.
+-- Returns the canonical key first, because that is what the callers index with.
+local function coordsOrKey(idx, y, z)
     local x
-
     if y == nil and z == nil then
         x = tonumber(string.match(idx, "(.*):"))
         y = tonumber(string.match(idx, ":(.*):"))
@@ -897,6 +915,11 @@ function SetDronePos(idx, y, z)
         x = idx
         idx = x..":"..y..":"..z
     end
+    return idx, x, y, z
+end
+
+function SetDronePos(idx, y, z)
+    idx = coordsOrKey(idx, y, z)
     d = d or 0
     if cachedWorld[idx] == nil then noteWorldKey(idx) end
     cachedWorld[idx] = 2
@@ -913,15 +936,7 @@ end
 
 function setExclusion(idx, y, z)
     local x
-
-    if y == nil and z == nil then
-        x = tonumber(string.match(idx, "(.*):"))
-        y = tonumber(string.match(idx, ":(.*):"))
-        z = tonumber(string.match(idx, ":(.*)"))
-    else
-        x = idx
-        idx = x..":"..y..":"..z
-    end
+    idx, x, y, z = coordsOrKey(idx, y, z)
     d = d or 0
     exclusions[idx] = {x, y, z}
     if exclusions[idx] ~= nil then
@@ -974,14 +989,7 @@ end
 
 function getExclusion(idx, y, z)
     local x
-    if y == nil and z == nil then
-        x = tonumber(string.match(idx, "(.*):"))
-        y = tonumber(string.match(idx, ":(.*):"))
-        z = tonumber(string.match(idx, ":(.*)"))
-    else
-        x = idx
-        idx = x..":"..y..":"..z
-    end
+    idx, x, y, z = coordsOrKey(idx, y, z)
     if exclusions[idx] ~= nil then
         x = exclusions[idx][1]
         y = exclusions[idx][2]
@@ -1002,15 +1010,7 @@ end
 --
 
 function delExclusion(idx, y, z)
-    local x
-    if y == nil and z == nil then
-        x = tonumber(string.match(idx, "(.*):"))
-        y = tonumber(string.match(idx, ":(.*):"))
-        z = tonumber(string.match(idx, ":(.*)"))
-    else
-        x = idx
-        idx = x..":"..y..":"..z
-    end
+    idx = coordsOrKey(idx, y, z)
     exclusions[idx] = nil
     print("exclusion deleted")
     return true
@@ -1118,8 +1118,35 @@ local function mergeCachedWorldDetail(newData, p_ID)
         cachedWorldDetail[k].lastUpdated = {day = os.day(), time = os.time()}
         cachedWorldDetail[k].data = v
 
-        if(type(v[2]) == table) then
-            if(v[2].name == "ComputerCraft:CC-TurtleAdvanced" or "ComputerCraft:CC-Turtle") then
+        -- TWO BUGS ON TWO LINES, AND BETWEEN THEM THE MAP COULD NEVER FORGET ANYTHING.
+        --
+        --     if(type(v[2]) == table) then                                   -- always FALSE
+        --         if(v[2].name == "...Advanced" or "...Turtle") then         -- always TRUE
+        --
+        -- `table` unquoted is the standard library, so `type(x) == table` compares a string to a
+        -- table and is false for every value -- the branch never ran. And `a == "x" or "y"` is
+        -- Lua's classic truthy-or: it parses as `(a == "x") or "y"`, so it would have matched
+        -- everything if it had ever been reached.
+        --
+        -- This insert is the ONLY thing that feeds `aged`, and `ClearAged` -- the only code in the
+        -- system that removes a map record -- iterates `aged`. So `aged` was permanently empty,
+        -- ClearAged permanently cleared nothing, and the world map became append-only: a cell that
+        -- once held a block keeps that block for ever, because the scanner reports only NON-AIR
+        -- blocks and this merge only ever adds keys.
+        --
+        -- That is the cause of the settlement's death by fuel. Every tree the fleet fells stays in
+        -- the index at full height, so the share of the index that is fiction rises with every
+        -- harvest. The lumber picker chooses the densest cluster, which is therefore a grove that
+        -- was cut down hours ago -- verified: the chosen site -530,69,55 has three logs recorded
+        -- and NONE in the world. Every sweep flew to a ghost, felled nothing, and reported success;
+        -- wood income reached zero, the charcoal line starved behind it, and the fleet burned its
+        -- reserve to nothing with every job completing normally.
+        --
+        -- Fixing these two lines restores aging for the case it was written for. It does NOT make
+        -- the map forget felled trees -- nothing tracks those -- and that remains the open hole.
+        if(type(v[2]) == "table") then
+            local n = tostring(v[2].name or "")
+            if(n == "ComputerCraft:CC-TurtleAdvanced" or n == "ComputerCraft:CC-Turtle") then
                 table.insert(aged, {coords = k, lastUpdated = cachedWorldDetail[k].lastUpdated})
             end
         end
@@ -1181,7 +1208,7 @@ function worldKeyList()
             s_Since = s_Since + 1
             if s_Since >= 2000 then
                 s_Since = 0
-                os.queueEvent("worldKeys") os.pullEvent("worldKeys")
+                breathe("worldKeys")
             end
         end
     end
@@ -1390,7 +1417,7 @@ function a_star(x1, y1, z1, x2, y2, z2, discover, priority, asker, dig)
         -- yield, not a delay -- and the search runs at the speed of the search. The same pair is
         -- used for exactly this reason wherever this codebase walks a large structure.
         if s_Nodes % 200 == 0 then
-            os.queueEvent("astar") os.pullEvent("astar")
+            breathe("astar")
         end
         if s_Nodes > ASTAR_MAX_NODES then
             return false, ("gave up after %d nodes"):format(s_Nodes)

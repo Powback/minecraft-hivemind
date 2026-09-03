@@ -23,6 +23,7 @@
  * it gets exactly one answer.
  */
 import { withinReach } from './settlement.js';
+import { field } from '../lua-table.js';
 
 /** How far a single sweep reaches from its start, in blocks. */
 export const SWEEP = 8;
@@ -46,9 +47,49 @@ async function knownTrunks(
 ): Promise<any[]> {
   const found: any = await bridge.call('MapServer', 'FindBlocks',
     { match, limit: 400 }, { timeoutMs: 15000 });
-  const hits = found?.hits ?? found?.data?.hits ?? [];
+  const hits = field(found, 'hits') ?? [];
   const list = Array.isArray(hits) ? hits : Object.values(hits ?? {});
   return (list as any[]).filter((h: any) => h && typeof h.x === 'number' && withinReach(h));
+}
+
+/**
+ * A LOG IS NOT A TREE, AND THE INDEX FILLS UP WITH THE DIFFERENCE.
+ *
+ * Felling leaves the canopy behind, and the map keeps every log it has ever seen -- so each harvest
+ * ADDS single floating logs six or seven blocks up with nothing beneath them. Nothing removes them,
+ * so the proportion of un-fellable targets rises with every tree cut. This is a self-poisoning
+ * index: the better the fleet works, the worse its next target gets.
+ *
+ * Measured on the settlement that died of it -- 200 recorded oak logs, 101 distinct columns:
+ *
+ *   height 1: 63 columns   <- remnants. 62% of everything the picker could choose.
+ *   height 2: 11
+ *   height 3+: 27 columns  <- actual standing trees
+ *
+ * And the last sweep before the fuel ran out was sent to `-505,71,30`: a single log at y=71 with
+ * air for six blocks under it, verified against the world. The drone arrives at `pos.y + 1`, so it
+ * serpentined through open sky and honestly reported `felled 0 tree(s), 0 log(s)`.
+ *
+ * That is the whole fuel death: wood income went to zero while every sweep completed successfully,
+ * the charcoal line starved behind it, and the fleet burned its reserve down to nothing.
+ *
+ * An oak is four to six logs tall, so three is comfortably below a real tree and comfortably above
+ * a leftover. NOT a spot-check against the world: those blocks ARE there -- being present and being
+ * a tree are different questions, and checking presence is what made this look fine earlier.
+ */
+const MIN_TRUNK = 3;
+
+/** Group logs into columns, keeping only those tall enough to be a standing tree. */
+export function standingTrees(p_All: any[]): any[] {
+  const col = new Map<string, any[]>();
+  for (const h of p_All) {
+    const k = `${h.x},${h.z}`;
+    const at = col.get(k);
+    if (at) at.push(h); else col.set(k, [h]);
+  }
+  const out: any[] = [];
+  for (const logs of col.values()) if (logs.length >= MIN_TRUNK) out.push(...logs);
+  return out;
 }
 
 /**
@@ -58,15 +99,140 @@ async function knownTrunks(
  * sweep meeting six trunks pays for its travel several times over and one meeting a lonely tree
  * does not. The drone is going out either way.
  */
+/**
+ * COUNT THE TREES THE DRONE WILL ACTUALLY WALK PAST.
+ *
+ * This counted anything within +/-SWEEP of the candidate -- a 17x17 box, 289 cells. The drone walks
+ * `Serpentine(SWEEP, SWEEP)`: an 8x8 block, 64 cells, anchored at the point it arrives on and
+ * oriented by whatever heading it happens to have. So the number scored the site over four and a
+ * half times the ground the sweep covers, and only one quadrant of it could ever be visited.
+ *
+ * Measured: `oak_log: 8/128 -> lumber sweep at -495,65,19 (32 trunks in range)`, and the sweep
+ * returned `felled 1 tree(s), 9 log(s)`. Nothing failed -- the drone walked its 64 cells and met one
+ * tree, exactly as instructed. The site picker had scored a neighbourhood and sent the drone to a
+ * corner of it.
+ *
+ * Half a sweep either way is the largest window that fits inside the walked block whichever way the
+ * drone ends up facing, so every trunk counted is one it can actually reach. That makes the reported
+ * figure honest AND picks a better start: the best 9x9 window rather than the best 17x17
+ * neighbourhood.
+ */
+const HALF_SWEEP = Math.floor(SWEEP / 2);
+
+/**
+ * TREES, NOT LOG BLOCKS. A trunk is a COLUMN, and the map records every block in it.
+ *
+ * The score counted map hits, so one oak eight blocks tall scored eight. Spot-checking the index
+ * against the world found `-477,67,11` and `-477,70,11` -- the same tree, two records, and the
+ * sweep can fell it once. That is how a site advertised as "32 trunks in range" returns
+ * `felled 1 tree(s), 9 log(s)` with nothing having gone wrong: nine logs IS that tree, and the
+ * other records were the rest of it and its neighbours' upper halves.
+ *
+ * An inflated count is not just a wrong number in a log line -- it picks the site. A single tall
+ * tree outscored a stand of short ones, so the drone was repeatedly sent to the least productive
+ * ground available, burning a round trip for one tree while wood is the settlement's only renewable
+ * fuel.
+ */
+function columnsNear(p_All: any[], p_At: any): number {
+  const seen = new Set<string>();
+  for (const o of p_All) {
+    if (Math.abs(o.x - p_At.x) <= HALF_SWEEP && Math.abs(o.z - p_At.z) <= HALF_SWEEP) {
+      seen.add(`${o.x},${o.z}`);
+    }
+  }
+  return seen.size;
+}
+
+/**
+ * START AT THE FOOT OF THE TREE, NOT WHEREVER THE BEST-SCORING BLOCK HAPPENED TO SIT.
+ *
+ * The map records every log in a column, so the chosen record is as likely to be a canopy log as a
+ * trunk one -- and the sweep walks at the altitude it is given. RunJobNow arrives at `pos.y + 1`, so
+ * a start taken from a log at y=71 puts the drone at y=72, ABOVE the canopy, where `turtle.inspect()`
+ * looks forward into open air for all sixty-four cells of the sweep.
+ *
+ * That is the shape CLAUDE.md already records for gathers: "approaching vertically wrote off the
+ * entire forest". A trunk log has more trunk above it and dirt below; only the SIDES are open, so
+ * the drone has to be at trunk height to see anything at all. It explains a sweep that walks its
+ * whole grid over a verified stand of trees and reports `felled 0 tree(s), 0 log(s)` with nothing
+ * having failed.
+ *
+ * The lowest recorded log in the column is the trunk base, which is the one height where forward
+ * inspection meets wood.
+ */
+/**
+ * The lowest trunk foot of ANY standing column inside the sweep window, not just the densest one.
+ *
+ * The sweep flies one plane and looks forward and up, so a trunk whose base sits BELOW that plane
+ * is never seen at all -- the drone passes through its canopy. Starting at the lowest foot in the
+ * window puts every trunk at or above the plane, where the forward and overhead inspections find it.
+ * The densest column's own foot was used before; on uneven ground it read as "felled 0" while
+ * rcon showed oak_log two blocks lower in the next column over.
+ */
+/** Every log column inside the sweep window around p_At, with its lowest and highest recorded log. */
+function columnsInWindow(p_All: any[], p_At: any): Map<string, { x: number; z: number; lo: number; hi: number }> {
+  const cols = new Map<string, { x: number; z: number; lo: number; hi: number }>();
+  for (const o of p_All) {
+    if (Math.abs(o.x - p_At.x) > HALF_SWEEP || Math.abs(o.z - p_At.z) > HALF_SWEEP) continue;
+    if (typeof o.y !== 'number') continue;
+    const k = `${o.x},${o.z}`;
+    const c = cols.get(k);
+    if (c) { c.lo = Math.min(c.lo, o.y); c.hi = Math.max(c.hi, o.y); }
+    else cols.set(k, { x: o.x, z: o.z, lo: o.y, hi: o.y });
+  }
+  return cols;
+}
+
+function lowestFootNear(p_All: any[], p_At: any): number {
+  // THE PLANE THAT CUTS THE MOST TRUNKS, NOT THE LOWEST FOOT.
+  //
+  // The sweep sees the cell in front and the cell overhead, so a plane at y finds every trunk
+  // whose logs include y or y+1. The lowest foot in the window put the plane at 64 under a trunk
+  // whose remaining logs sat at 67-70 -- its base had been cut on an earlier pass and it hung in
+  // the air -- and three sweeps in a row walked beneath it: "felled 0 tree(s), 0 log(s)", ~900
+  // fuel. Score every candidate height by the columns it would intersect and take the best;
+  // ties go to the lowest, which is where uncut trees begin.
+  const cols = columnsInWindow(p_All, p_At);
+  if (!cols.size) return p_At.y;
+  let best = p_At.y;
+  let bestN = -1;
+  const lo = Math.min(...[...cols.values()].map((c) => c.lo));
+  const hi = Math.max(...[...cols.values()].map((c) => c.hi));
+  for (let y = lo; y <= hi; y++) {
+    let n = 0;
+    for (const c of cols.values()) if (c.lo <= y + 1 && c.hi >= y) n++;
+    if (n > bestN) { best = y; bestN = n; }
+  }
+  return best;
+}
+
+/**
+ * THE JOB IS THE TRUNKS, NOT THE SQUARE.
+ *
+ * A sweep walks one plane and hopes the trunks cross it. Three sweeps in one evening walked under a
+ * trunk whose remaining logs hung two blocks above the plane, each reporting "felled 0" with the
+ * tree verified standing by rcon. The index already knows where every standing trunk begins, so the
+ * drone is handed that list: it goes to each foot, approaches from the side, fells the column and
+ * climbs it, and records the ones that are gone so the index forgets them. The sweep stays as the
+ * fallback for a task that carries no targets.
+ */
+const LUMBER_TARGETS_MAX = 12;
+function trunkFeetNear(p_Trees: any[], p_At: any): Array<{ x: number; y: number; z: number }> {
+  const near = (p: { x: number; z: number }) => Math.abs(p.x - p_At.x) + Math.abs(p.z - p_At.z);
+  return [...columnsInWindow(p_Trees, p_At).values()]
+    .map((c) => ({ x: c.x, y: c.lo, z: c.z }))
+    .sort((a, b) => near(a) - near(b))
+    .slice(0, LUMBER_TARGETS_MAX);
+}
+
 function densestStart(p_All: any[]): { at: any; trunks: number } {
   let best = p_All[0];
   let bestN = -1;
   for (const h of p_All) {
-    const n = p_All.filter((o) =>
-      Math.abs(o.x - h.x) <= SWEEP && Math.abs(o.z - h.z) <= SWEEP).length;
+    const n = columnsNear(p_All, h);
     if (n > bestN) { best = h; bestN = n; }
   }
-  return { at: best, trunks: bestN };
+  return { at: { ...best, y: lowestFootNear(p_All, best) }, trunks: bestN };
 }
 
 /**
@@ -84,7 +250,21 @@ export async function queueLumberSweep(
   const all = await knownTrunks(bridge, match);
   if (!all.length) return { reason: 'no trees known inside the operating circle' };
 
-  const { at, trunks } = densestStart(all);
+  // STANDING TREES ONLY -- see standingTrees. A sweep sent at leftover canopy logs burns a round
+  // trip and comes back with nothing, and says `felled 0 tree(s)` while doing it.
+  //
+  // SAYING SO IS THE POINT. "No standing trees, only N leftovers" tells the supply loop to survey
+  // for more forest; a doomed sweep tells it nothing and costs fuel the settlement may not have.
+  // That distinction is what separates a fleet that recovers from one that grinds to a halt with
+  // every job completing successfully.
+  const trees = standingTrees(all);
+  if (!trees.length) {
+    return { reason: `no standing trees known -- ${all.length} recorded log(s) are all leftover `
+                   + `canopy, ${MIN_TRUNK} stacked logs needed to be worth felling` };
+  }
+
+  const { at, trunks } = densestStart(trees);
+  const targets = trunkFeetNear(trees, at);
 
   // Priority 1, the same as the other fuels. Felling and gathering compete for the same miners and
   // lumber used to queue at 3 against the gather's 2, so with lowest-first the fleet ran the gather
@@ -92,7 +272,7 @@ export async function queueLumberSweep(
   const r: any = await bridge.call('TaskMan', 'Add', {
     name: `lumber:${match}`,
     priority,
-    work: { lumber: { w: SWEEP, l: SWEEP, start: { x: at.x, y: at.y, z: at.z } } },
+    work: { lumber: { w: SWEEP, l: SWEEP, start: { x: at.x, y: at.y, z: at.z }, targets } },
   }, { timeoutMs: 8000 });
 
   const id = typeof r?.id === 'number' ? r.id

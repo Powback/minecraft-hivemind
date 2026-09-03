@@ -62,6 +62,9 @@ local LOG_LIMIT = 64 * 1024     -- bytes; diagnostics, not an audit trail
 -- throws, and an unguarded log call inside the reconnect path would make recovery impossible.
 local function log(msg)
   print(("[bridge] %s"):format(msg))
+  -- The note above is the reason this must not throw: an unguarded log call in the reconnect path
+  -- makes recovery impossible once the disk is full.
+  -- silent: allow (this IS the logger -- reporting its own failure through itself is circular, and the print above already delivered the message)
   pcall(function()
     if fs.exists(LOG_FILE) and fs.getSize(LOG_FILE) > LOG_LIMIT then fs.delete(LOG_FILE) end
     local h = fs.open(LOG_FILE, "a")
@@ -82,10 +85,36 @@ end
 -- never reconnect. That is what took the fleet off HQ.
 local m_Dialing = false
 
+-- CC:T COUNTS HANDLES, NOT VARIABLES -- so a close that did not happen is a leak, and a leak is
+-- what took the fleet off HQ ("Too many websockets already open", after which it can never
+-- reconnect). The pcall stays, because closing an already-dead socket throws and that case is
+-- routine; discarding its result did not, because the one outcome worth knowing about is the
+-- handle that is still open after this returns.
 local function closeSocket()
   if m_Socket then
-    pcall(function() m_Socket.close() end)   -- dropping the reference does NOT free the socket
+    local s_Ok, s_Err = pcall(function() m_Socket.close() end)   -- dropping the reference does NOT free the socket
     m_Socket = nil
+    if not s_Ok then
+      -- log(), not print(): print goes to the in-game terminal only, and a leaked handle is
+      -- diagnosed from outside the game or not at all.
+      log(("socket close FAILED: %s -- the handle may still be open"):format(tostring(s_Err)))
+    end
+    return s_Ok
+  end
+  return true
+end
+
+-- Close the handle we are about to drop, and say whether it actually closed.
+--
+-- Its own function so socketLoop does not carry the branch: CC:T counts handles, not variables, so
+-- the reporting is not optional -- the old line announced "closed a leaked socket on reconnect"
+-- unconditionally, which is the one sentence that would stop anyone looking for the leak that took
+-- the fleet off HQ.
+local function closeLeaked()
+  if closeSocket() then
+    log("closed a leaked socket on reconnect")
+  else
+    log("a leaked socket could NOT be closed on reconnect -- the handle count is still up")
   end
 end
 
@@ -285,10 +314,11 @@ local function socketLoop()
       -- without closing it. CC:T counts handles, not variables. Every HQ restart leaked one, and
       -- HQ was restarting repeatedly while the map work was being rebuilt -- so the bridge died
       -- and took the fleet's whole view of itself with it.
-      if m_Socket and m_Socket ~= param then
-        pcall(function() m_Socket.close() end)
-        log("closed a leaked socket on reconnect")
-      end
+      -- closeSocket(), not a fourth hand-rolled copy of it: it is the one place that knows a
+      -- dropped reference does not free the handle, and it now reports a close that failed. The
+      -- old line here logged "closed a leaked socket" unconditionally, so the exact failure this
+      -- branch exists to prevent -- a handle left open on reconnect -- was announced as fixed.
+      if m_Socket and m_Socket ~= param then closeLeaked() end
       m_Socket = param
       m_Dialing = false
       m_Backoff = RECONNECT_MIN                 -- reset only on real success

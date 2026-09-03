@@ -100,8 +100,9 @@ export function bounds() {
  */
 export async function pushSettlement(
   call: (module: string, method: string, args: unknown, opts?: unknown) => Promise<unknown>,
-): Promise<{ bounds: boolean; hosts: number; expected: number; failed: string[] }> {
+): Promise<{ bounds: boolean; boundsError: string | null; hosts: number; expected: number; failed: string[] }> {
   let ok = false;
+  let boundsError: string | null = null;
   try {
     // Send the RADIUS as well as the box. The box bounds the force-loaded chunks; the radius bounds
     // what a drone can still call home from. A square region of reach 56 has edges ~60 blocks from
@@ -112,7 +113,14 @@ export async function pushSettlement(
         cx: settlement.base.x, cy: settlement.base.y, cz: settlement.base.z },
       { timeoutMs: 8000 });
     ok = true;
-  } catch { /* reported by the caller; a failed push must not take HQ down */ }
+  } catch (err) {
+    // A failed push must not take HQ down -- but `bounds: false` on its own is not a report, it is
+    // a flag, and the host loop below already sets the standard for this file by NAMING what is
+    // still missing rather than shrinking a count. A bounds push that never landed means MapServer
+    // is holding a stale region while drones ask it whether they may step, so the reason it failed
+    // is the difference between "retry in a moment" and "the module is wedged".
+    boundsError = (err as Error)?.message ?? String(err);
+  }
 
   // ONE HOST FAILING IS NOT A REASON TO SKIP THE REST -- BUT IT IS NOT A REASON TO FORGET IT EITHER.
   //
@@ -138,5 +146,5 @@ export async function pushSettlement(
       hosts++;
     } catch { failed.push(`${h.x},${h.y},${h.z}`); }
   }
-  return { bounds: ok, hosts, expected: settlement.gpsHosts.length, failed };
+  return { bounds: ok, boundsError, hosts, expected: settlement.gpsHosts.length, failed };
 }

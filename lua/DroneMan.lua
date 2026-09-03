@@ -279,6 +279,23 @@ end
 
 
 
+-- WHICH DRONES DOES THIS MESSAGE ADDRESS?
+--
+-- Every dispatching endpoint asks the same two questions in the same order -- was a target named at
+-- all, and does it resolve to real drones -- and each carried its own copy of the pair. They had
+-- already drifted in spelling (`s_Mesage` in OnGoTo) and in whether the ParseMessage failure was
+-- returned at all, which matters: PowNet hands a plain-string refusal back on the same field a
+-- success uses, so a handler that ignores it dispatches to an empty list and reports success.
+--
+-- Returns exactly what ParseMessage does -- true, message or false, reason -- so the caller keeps
+-- its own `if(s_Status == false) then return s_Status, s_Parsed end`.
+local function addressedDrones(p_Message)
+    if(p_Message.data.id == nil and p_Message.data.range == nil) then
+        return false, "Missing id/range"
+    end
+    return ParseMessage(p_Message)
+end
+
 function OnRegisterDrone(p_ID, p_Message)
     print("New Drone")
     local s_Result, s_Data = RegisterDrone(p_ID, p_Message.data.pos, p_Message, p_Message.data.role)
@@ -298,22 +315,42 @@ function OnRestartDrones(p_ID, p_Message)
     return true, "Dispatched restart"
 end
 
+-- SEND EACH ADDRESSED DRONE TO A BERTH OF ITS OWN.
+--
+-- This handler could never have worked. It did `local p_Message = ParseMessage(p_Message)`, which
+-- captures only the FIRST return value -- a boolean -- and then indexed it; and it read `v.pos`
+-- and `v.heading` where `v` was an undeclared global, because the loop that was meant to bind it
+-- was never written. Either fault alone throws on the first call. It also asked DockingMan for
+-- GetDroneInfo once, for the whole fleet, and then tried to use that single answer as one drone's
+-- berth -- berths are allocated per drone, one at a time.
+--
+-- Docking matters more than it looks: a drone with nowhere to park hovers over the storage bay,
+-- and that airspace is the one every pickup and deposit has to come down through. A fleet that
+-- cannot dock is a fleet that jams its own warehouse.
 function OnDockDrones(p_ID, p_Message)
-    print("Docking drones")
-    if(p_Message.data.id == nil and p_Message.data.range == nil) then
-        return false, "Missing id/range"
+    local s_Status, s_Parsed = addressedDrones(p_Message)
+    if(s_Status == false) then return s_Status, s_Parsed end
+
+    local s_Sent, s_NoBerth = 0, 0
+    for _, l_Id in pairs(s_Parsed.data.drones or {}) do
+        local s_Ask = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "AllocateDocking", {id = l_Id})
+        local s_Berth = PowNet.sendAndWaitForResponse("DockingMan", s_Ask)
+        -- A refusal comes back as a plain string on the same field a success uses, so the type
+        -- check is the whole guard -- see the note on addressedDrones.
+        if(type(s_Berth) == "table" and s_Berth.pos ~= nil) then
+            local s_Go = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "GoTo",
+                {pos = s_Berth.pos, heading = s_Berth.heading})
+            PowNet.SendToDrone(l_Id, s_Go)
+            s_Sent = s_Sent + 1
+        else
+            s_NoBerth = s_NoBerth + 1
+        end
     end
 
-    local p_Message = ParseMessage(p_Message)
-
-    local s_Message = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "GetDroneInfo", {})
-    local s_Response = PowNet.sendAndWaitForResponse("DockingMan", s_Message)
-    if(type(s_Response) == "table") then
-        local s_Message = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "GoTo", {pos = v.pos, heading = v.heading})
-        local s_Response = PowNet.SendToDrone(k, s_Message)
-    end
-
-    return true
+    -- SAY HOW MANY GOT NOWHERE. "Dispatched" with no count reads as success when every berth was
+    -- refused, which is exactly what a full tower looks like from outside.
+    return true, {message = ("sent %d drone(s) to a berth, %d had none free"):format(s_Sent, s_NoBerth),
+                  docked = s_Sent, noBerth = s_NoBerth}
 end
 
 -- Report the fleet, for anything that needs to draw or reason about it.
@@ -375,10 +412,7 @@ end
 
 -- Tell a stuck drone to climb out. Straight up is almost always free.
 function OnRescueDrones(p_ID, p_Message)
-    if(p_Message.data.id == nil and p_Message.data.range == nil) then
-        return false, "Missing id/range"
-    end
-    local s_Status, s_Parsed = ParseMessage(p_Message)
+    local s_Status, s_Parsed = addressedDrones(p_Message)
     if(s_Status == false) then return s_Status, s_Parsed end
     local s_N = 0
     for k,v in pairs(s_Parsed.data.drones) do
@@ -437,19 +471,19 @@ function OnGetDrones(p_ID, p_Message)
             -- machines that had not received it, and it was only found by md5-ing files on the
             -- host by hand.
             build = v.build,
+            -- WHAT THIS DRONE SAYS IT NEEDS TO WORK. TaskMan used a constant of its own for the
+            -- same idea and the two drifted -- see the note beside fuelFloor in DroneLogic. It is
+            -- only useful if it survives THIS list, which has already silently swallowed `build`
+            -- once for exactly the reason written above.
+            fuelFloor = v.fuelFloor,
         }
     end
     return true, {drones = s_List, count = #s_List}
 end
 
 function OnSurveyDrones(p_ID, p_Message)
-    if(p_Message.data.id == nil and p_Message.data.range == nil) then
-        return false, "Missing id/range"
-    end
-    local s_Status, s_Parsed = ParseMessage(p_Message)
-    if(s_Status == false) then
-        return s_Status, s_Parsed
-    end
+    local s_Status, s_Parsed = addressedDrones(p_Message)
+    if(s_Status == false) then return s_Status, s_Parsed end
     local s_Sent = 0
     for k,v in pairs(s_Parsed.data.drones) do
         local s_Message = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Survey", {
@@ -512,10 +546,7 @@ function OnRetireDrone(p_ID, p_Message)
 end
 
 function OnStopDrone(p_ID, p_Message)
-    if(p_Message.data.id == nil and p_Message.data.range == nil) then
-        return false, "Missing id/range"
-    end
-    local s_Status, s_Parsed = ParseMessage(p_Message)
+    local s_Status, s_Parsed = addressedDrones(p_Message)
     if(s_Status == false) then return s_Status, s_Parsed end
 
     local s_Done = {}
@@ -531,10 +562,7 @@ function OnStopDrone(p_ID, p_Message)
 end
 
 function OnRelayCmd(p_ID, p_Message)
-    if(p_Message.data.id == nil and p_Message.data.range == nil) then
-        return false, "Missing id/range"
-    end
-    local s_Status, s_Parsed = ParseMessage(p_Message)
+    local s_Status, s_Parsed = addressedDrones(p_Message)
     if(s_Status == false) then return s_Status, s_Parsed end
 
     local s_On = p_Message.data.on
@@ -564,16 +592,10 @@ function OnGoTo(p_ID, p_Message)
     if(p_Message.data.pos == nil and p_Message.data.gps == nil) then
         return false, "Missing pos"
     end
-    if(p_Message.data.id == nil and p_Message.data.range == nil) then
-        return false, "Missing id/range"
-    end
-
-    local s_Status, s_Mesage = ParseMessage(p_Message)
-    if(s_Status == false) then
-        return s_Status, s_Mesage
-    end
+    local s_Status, s_Parsed = addressedDrones(p_Message)
+    if(s_Status == false) then return s_Status, s_Parsed end
     local s_Sent = {}
-    for k,v in pairs(s_Mesage.data.drones) do
+    for k,v in pairs(s_Parsed.data.drones) do
 
         -- Fire the abort, do not WAIT for it.
         --
@@ -654,7 +676,14 @@ local m_ServerEvents = {
     },
     escort = {
         func = OnEscort, callable = true,
-        params = { pos = { length = 3 } }
+        params = {
+             pos = { length = 3 },
+            -- DECLARED, OR IT NEVER ARRIVES. PowNet filters the payload to the fields named
+            -- here the moment a params block exists, silently, and the call still returns
+            -- success -- which is how order.build's dependsOn was dropped for months while
+            -- every call reported fine. See hq/test/wiring.test.ts.
+            gps = { optional = true },
+        },
     },
     stuck = {
         func = OnListStuck,
@@ -727,8 +756,13 @@ local m_ServerEvents = {
             drone   = { optional = true },
             match   = { optional = true },
             deposit = { optional = true },
-            code    = { optional = true }
-        }
+            code    = { optional = true },
+            -- DECLARED, OR IT NEVER ARRIVES. PowNet filters the payload to the fields named
+            -- here the moment a params block exists, silently, and the call still returns
+            -- success -- which is how order.build's dependsOn was dropped for months while
+            -- every call reported fine. See hq/test/wiring.test.ts.
+            gps     = { optional = true },
+        },
     }
 }
 

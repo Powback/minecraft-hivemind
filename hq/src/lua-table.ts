@@ -34,3 +34,38 @@ export function luaList<T = unknown>(v: unknown): T[] | null {
 export function isLuaList(v: unknown): boolean {
   return luaList(v) !== null;
 }
+
+/**
+ * READ A FIELD OFF A POWNET REPLY, WRAPPED OR NOT.
+ *
+ * The Bridge unwraps replies, but SaveWorld-era callers saw a nested `data`, so every consumer
+ * hedges: `res?.tasks ?? res?.data?.tasks`. That was written out TWENTY-EIGHT times across HQ.
+ *
+ * It is not just noise. It is a real question -- "where does the payload live" -- and answering it
+ * inline everywhere means a reply shape that changes has to be chased through 28 sites, of which
+ * some will be missed; that is exactly how readStock's three unadopted copies came to disagree.
+ * It also costs about four branches every time, which is why it shows up in the complexity budget
+ * of functions that are otherwise perfectly simple.
+ */
+// Returns `any` by default: these are untyped wire replies, and every call site this
+// replaced was already `any`. Callers that know the shape can supply T.
+export function field<T = any>(reply: any, name: string): T {
+  return reply?.[name] ?? reply?.data?.[name];
+}
+
+/**
+ * A NUMERIC field from a Lua reply, or `null` when it is absent or unreadable.
+ *
+ * `Number(field(r, 'live'))` was written out in three places within a week, and the coercion is the
+ * whole point of it: `Number(undefined)` is NaN, which is not a number you can compare but IS a
+ * value that flows onward silently. Every one of those sites then wrote its own
+ * `Number.isFinite(...) ? ... : null` guard, and a site that forgets it reads a missing field as a
+ * live figure -- the shape that had a floor counter advancing on a count that was never taken.
+ *
+ * Null, never 0: "the module did not say" and "the module said none" are different facts, and this
+ * repo's most expensive bugs are the ones that treated them as the same.
+ */
+export function numField(reply: any, name: string): number | null {
+  const n = Number(field(reply, name));
+  return Number.isFinite(n) ? n : null;
+}

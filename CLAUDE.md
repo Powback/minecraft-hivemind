@@ -93,12 +93,123 @@ fleet.probe { id: 47, code: 'peripheral.wrap("bottom").list()' }
 Three wrong implementations of chest withdrawal were written because nobody checked whether a
 turtle can read the inventory beneath it. It can.
 
+### This is the #1 recurring defect here, and it is now COUNTED
+
+Saying it was not enough -- it came back ten times in a single evening, always the same shape: a
+success value produced by something other than the effect.
+
+| what said "fine" | what was true |
+|---|---|
+| `redeploy.sh` printed `redeploy ok` | shipped to no drone; 17 of 20 ran stale code for hours |
+| `OnBuild` / `OnLumber` returned a result table | the job had been aborted; TaskMan marked it 100% done |
+| the build memo was marked | written on ARRIVAL, so aborts retired blocks nobody placed |
+| `noteObservation` recorded a block | filed at a coordinate that had none -- the map filled with phantom structure |
+| `task.stop` returned `ok: true` | 25 tasks kept being dispatched for another two hours |
+| `positionVerified()` | answers "is the fix RECENT", not "is the position RIGHT" -- it logged zero refusals while blocks landed in the wrong places |
+| `tooManyMissedStarts` | declared below its use: a nil global, so the filter was silently dead |
+| `stopTasksNamed` reported `stopped 32 of 32` | it could only SEE 40 of the 131 tasks -- see the caps below |
+| `saveSupply` persisted `towerLevel` correctly | `loadSupply` read a five-field whitelist and dropped it on every restart |
+
+The individual bugs were cheap. What is expensive is that **a false success corrupts the
+diagnosis** -- you measure the proxy, believe it, and spend hours fixing something that was never
+broken. Three separate wrong causes were chased that night for exactly this reason.
+
+**`hq/test/verify-at-effect.test.ts` now counts it.** Every tool marked `danger: 'mutate'` must
+carry a `// verify-at-effect: <what it re-reads>` note, or sit in `hq/verify-baseline.json`. The
+baseline may fall and may not rise, and a NEW mutating tool cannot ship without one. The note is
+the mechanism: it forces whoever writes the tool to answer "how do I know it worked?"
+
+`task.stop` is the worked example -- it re-reads the queue and reports `stopped` from whether the
+task is actually gone, plus a `stillQueued` list naming the ones that are not.
+
+**A CAP THE CALLER CANNOT SEE TURNS EVERY ANSWER INTO A SAMPLE.** Three separate size limits sit
+between HQ and the queue, each of them correct on its own and none of them visible to the code
+asking the question:
+
+| where | limit | why it exists |
+|---|---|---|
+| `TaskMan.GetTasks` | 40 tasks | the reply must fit a 61,440-byte websocket frame |
+| `fleet.tasks` | 60 live | same reason, one layer up |
+| `task.stop` | 32 ids | schema `.max(32)` |
+
+So a loop that read the queue, filtered by name and sent the ids back to be stopped saw 37 of 131
+`tower-L0` patches, stopped what it could see, and reported complete success. Clearing a finished
+floor's leftovers is the ONLY thing that lets the next floor be ordered, so the tower sat at level 0
+behind a backlog that could not shrink while every log line said the clear had worked. The same cap
+silently broke `task.stop`'s holder lookup, which searches `GetTasks` for the drone to release: for
+any task outside the window it found nobody, released nothing, and still answered `stopped: true` --
+leaving a drone executing a cancelled task for ever, which from outside looks like a dead fleet.
+
+**The fix is never a bigger window.** "Which tasks are named like this" is a question about the
+queue, and the queue lives in TaskMan -- `StopNamed` answers it there, where there is no gap between
+deciding and acting, and reports what it actually marked. When a decision needs to see ALL of
+something, do not ship the something to the decision; send the decision to it.
+
+**A ROUND TRIP HAS TWO HALVES, AND FIXING ONE OF THEM FIXES NOTHING.** `saveSupply` wrote a
+hand-picked subset, so fields added later were never persisted. That was found, fixed and given a
+test -- and the tower still reset to the ground floor on every redeploy, because `loadSupply` read
+five fields by name. `towerLevel` was written to disk perfectly and thrown away on the way back in:
+`supply.json` holding `towerLevel: 2` with the running loop reporting 0. The test passed throughout,
+because it only ever looked at the save. Persist everything and name the exclusions -- in BOTH
+directions -- and when you check one direction, check the other in the same commit.
+
+**A REMEMBERED BLOCK IS NOT A BLOCK.** The world map records what a drone once saw, and nothing
+removes a record when the thing is gone -- so it drifts from the world in one direction only, and
+every consumer of it inherits that drift as confident wrong answers.
+
+Measured: `world.find oak_log` reported 767 trunks; spot-checking four found TWO already felled. The
+lumber site picker does the right thing with that data -- it goes to the densest cluster -- and the
+densest cluster was a grove cut down hours earlier. So every sweep flew to `-521,66,40`, where a
+direct rcon query found ZERO logs, felled nothing, and honestly logged `JOB Lumber done`. Wood sat
+at 0 for an entire session with 767 trees "known", the plank and chest chains starved behind it, and
+nothing in any log said anything was wrong.
+
+The same shape applies to ore: `gather: 1/768 checked, 0 taken` is the ore version of this, and it
+was read as a pathing problem for a long time.
+
+`world.forget <match>` clears the records so the fleet re-observes. Treat a persistent "job completes
+but produces nothing" as a stale-map symptom before assuming the job is broken -- and prefer a
+direct query of the world over the map when the two could disagree.
+
+**The same rule applies to MEASUREMENT, not just code.** Three of that evening's wrong turns were
+instrument error, not system faults:
+- rapid-fire `rcon-cli` silently drops commands -- a known-present block read as absent. Space the
+  calls and interleave a control that must return a HIT, or the scan is fiction.
+- `built %d of %d blocks` is the value RETURNED to TaskMan; it is never written to the drone log.
+  Grepping for it reported "0 completions" while 18 patches had completed. Grep `JOB Build done`.
+- `fleet.tasks` returns a SUBSET of the queue. Purges built from it miss most of their targets;
+  read TaskMan's own store when completeness matters. `task.countNamed` answers "how many of these
+  are outstanding" in TaskMan itself, which is the only count worth acting on.
+- **`drone.log` ROTATES.** Counting occurrences at two points in time and subtracting reported
+  "5 aborts, then 0" -- a negative delta, from a drone that had not rebooted and whose clock had not
+  reset. Any measurement that spans a rotation is fiction; anchor on timestamps in the file you are
+  holding, not on counts taken minutes apart.
+- **A handler that discards `p_ID` makes "who did this" unanswerable.** `OnAbort` logged that an
+  abort had arrived and not who sent it, with five possible senders. Identifying one took an evening
+  of eliminating candidates against four different log files, and the answer was in the message.
+
 ## Traps that have bitten repeatedly
 
 **A `local` declared below a function that uses it is a nil global.** No error, no warning — the
 branch is simply dead. This has caused nine separate outages, including one where `OnGoTo` called
 `reachableTarget` 465 lines before its declaration, so *every* `GoTo` — and therefore every rescue —
 threw on its first line for days while TaskMan logged successful dispatches.
+
+**`x and nil or y` CANNOT PRODUCE nil — it is always `y`.** Lua's and/or is not a ternary: `x and nil`
+is nil for every x, so the `or` branch always wins. Three modules independently wrote
+`local s_Now = s_Ok and nil or tostring(s_Err)` after a `pcall`, and pcall's second return on
+SUCCESS is the function's return value — so every healthy maintenance pass reported itself failed
+with its return value as the reason (`FAILED -- 0`, `FAILED -- 1`, `FAILED -- nil`), once per change
+of that value, for ever. The mechanism whose only job is to announce "a pass has silently died and a
+whole class of recovery has stopped happening" had never worked in any of the three, and a real
+failure was indistinguishable from routine operation. `lua-hygiene` now bans the shape outright —
+there is no correct use of it — and the wrapper lives once, in `PowNet.WatchPass`.
+
+**`DroneLogic.lua` sits at Lua's hard limit of 200 `local`s in the main chunk.** The 201st makes the
+whole file refuse to compile -- and a drone that cannot compile its logic reboots into nothing, with
+no log line. `hq/test/pownet-reply.test.ts` runs `luac -p` on every Lua file for exactly this. When
+adding state or a helper at file level, nest it inside the one function that uses it, or spend a
+global (the codebase's `function Name()` style); do not add a top-level `local` without removing one.
 
 **CC APIs degrade silently rather than failing.** `turtle.dropDown()` throws items on the ground and
 returns `true` when there is no container below (use `PutDown()`). `setblock` drops a turtle upgrade
@@ -124,6 +235,48 @@ and `preemptable()` kept a third local `producesFuel()` that also only knew coal
 preempted mid-run for rescue duty. Three separate bugs, one duplicated concept. When a predicate
 answers a question the whole file cares about, there is exactly one of it.
 
+### EXTRACTING A HELPER IS NOT ADOPTING IT. THIS IS THE OTHER RECURRING DEFECT, AND IT IS NOW COUNTED.
+
+The same shape, over and over, for ten days:
+
+1. The same logic gets written in four places.
+2. Somebody notices, extracts a helper, and writes a good comment explaining why.
+3. **One** call site is converted. The others are left exactly as they were.
+4. The comment now reads as if the problem is solved, so nobody looks again.
+5. A bug is found and fixed — in whichever copy the reporter happened to be standing in.
+6. The other copies keep the bug, and now they disagree with the helper too.
+
+The comments in this repo are confessions of steps 1–4, written by people who had just done step 2
+and believed they had finished:
+
+| the comment said | what was actually true |
+|---|---|
+| `pgps`: "Exported name -> number, so callers stop writing their own copy" | three `if/elseif` ladders still answered it, in the module where a wrong heading strands drones |
+| `core.ts`: "the same eight lines were written out three times" | `readStock` was written and **one of four** call sites adopted it — and the three survivors never got `luaList()`, so an object-shaped stock list threw inside their own `catch` and the planner concluded the settlement owned nothing |
+| `DroneLogic`: "'unload here' is the same six lines in three places" | a fourth copy sat in `CollectFuel`, without the `ContainerBelow()` guard |
+| `TaskMan`: "One function because this exact pcall was written out SEVEN times" | four call sites went on doing it by hand |
+
+Step 5 is the expensive one and it is **invisible**: the fix looks complete, the tests pass, and the
+copies fail later somewhere else looking like a brand-new bug. No amount of care prevents it —
+the person fixing the bug has no way to know the other copies exist.
+
+**`hq/test/adoption.test.ts` now asks the one question that has no judgement in it: does a named
+function's body also appear somewhere else?** If it does, the extraction was never finished, and the
+fix is never ambiguous — call the thing that already exists. `hq/adoption-baseline.json` may fall and
+may not rise. `hq/test/duplication.test.ts` is the wider net (copy-paste that never had a helper),
+and it counts **one-line** idioms too, because a block scanner structurally cannot see the shape that
+turned out to be the worst offender: `math.abs(a-x) + math.abs(b-y) + math.abs(c-z)`, written out
+**twenty-three times**, and it *is* the fuel budget.
+
+**A CHECK THAT CANNOT FAIL IS NOT A CHECK, AND REFACTORING IS WHAT SILENTLY DISARMS THEM.** Folding
+duplicated loops into helpers made `lua-hygiene`'s "bulk chest write must call `ReportChest`" rule
+and `lua-traps`' peripheral-yield rule stop matching anything — both scanned for a literal call
+(`PutDown(`, `peripheral.wrap`) that had just moved behind a new name. Neither failed. They went
+**quiet**, which is worse: the wrap rule is what stops StorageMan being killed mid-scan, and it would
+have been switched off by a commit that made the code better. So: when you extract something a guard
+watches, teach the guard the new name in the same commit, and give the check a canary that proves it
+still fires. `adoption.test.ts` runs its detector against a planted duplicate for exactly this reason.
+
 **For a field that grants permission to SKIP, a stale answer is worse than no answer.**
 `OnDepositPoints` ships each chest's contents and the drone skips every chest "known not to hold it".
 `nil` means unknown, so the drone looks — one hop across the bay. A stale `{}` means *definite*, so it
@@ -138,6 +291,99 @@ ever. A canopy log has leaves above; a trunk log has more trunk above and dirt b
 are open. 52% of indexed wood sits at trunk height, 45% canopy — approaching vertically wrote off the
 entire forest, which is why coal at y=40 worked and wood never once did. The inspect and the dig must
 follow the face actually taken, or the drone reads one block and breaks another.
+
+## THE FUEL TRAP: the one state the settlement cannot leave
+
+Every other failure here is recoverable. This one is not, and it is worth recognising early:
+
+```
+FUEL TRAP: all 4 miners dry, 0 burnable -- nothing can make fuel
+```
+
+Mining coal needs a fuelled drone. Felling wood needs a fuelled drone. Smelting charcoal needs fuel.
+So once storage reaches zero burnable AND every drone is at zero, there is no sequence of actions the
+settlement can take -- the graph of "what produces fuel" has no node that does not consume it first.
+Reached on 2026-09-03 with six of seven drones at zero and the seventh at 350 and falling.
+
+**It is approached gradually and looks fine the whole way down.** The fleet keeps working, jobs keep
+completing, nothing errors. The signal is not a failure, it is a TREND: burnable in storage falling
+while `felled 0 tree(s), 0 log(s)` and `gather: N/768 checked, 0 taken` repeat. Both of those read as
+healthy completions.
+
+What was fixed after the fact, and would have prevented it:
+- lumber sweeps started at whatever log the map scored highest -- usually a CANOPY log -- so the
+  drone walked above the trees inspecting air, and every sweep honestly reported felling nothing;
+- fuel reliefs were queued on `storageFuelCount() ~= 0`, so one stray log kept the last mobile drones
+  running deliveries that could collect nothing (`CollectFuel` needs 8 of an item to fetch it);
+- `CollectFuel` fetched only coal and charcoal while the gate counted logs and wood as fuel;
+- tower work was outranked by fuel work but still QUEUED, so a freed drone took a build and spent
+  its last fuel laying blocks. Ranking is not enough -- the work has to be unavailable.
+
+**Recovery requires putting burnable material in a chest by hand.** There is no in-system path, and
+that is worth saying plainly rather than discovering it again: `FUEL_STRANDING_RISK` and
+`FuelFloorNow`'s dry-storage collapse are both designed to keep drones WORKING through a shortage,
+which is right until the shortage is total and then keeps them working to zero.
+
+### Where the fuel actually went (measured against the world, 2026-09-03)
+
+Three hand-fed loads of 192 coal each vanished within the hour, and every log line said the fleet was
+working. Read from the world -- `data get block` on the drones and chests, positions dumped every two
+seconds -- the coal took four exits. Each is now a check in `hq/test/fuel-leaks-closed.test.ts`:
+
+| exit | what it looked like | what it was |
+|---|---|---|
+| **three numbers for "full"** | coal reached a chest and was gone within minutes | `CollectFuel` topped up to 1,200 and left the rest; `TryRefuel` ran every 20 s with its own gate (4,000) and target (2,500) and sucked 96 items out of the chest below. Seven tanks × 2,500 had to fill before one lump could stay in storage |
+| **the reliever ate the payload** | `JOB Relieve FAILED arrived but dropped nothing` | `carrying 28 fuel` … `refuelled +559` ×5 on the way. Every relief that reached its casualty had already burned what it brought |
+| **pacing** | `DISTRESS: low fuel` every 30 s, fuel −20 each, nothing else logged | `moveLeg` compared each replan with the LAST one, so a two-cell bounce never tripped the stall counter and ran all 40 replans, one GetPath and one move each. Only a position trace showed it -- the log was silent |
+| **the mesh fix threw** | `FAILED to adopt the meshed position -- pgps:2403` | `setLocation(x, y, z, nil)` did `string.lower(nil)`. Every underground recovery kept the position it had just been told was wrong |
+
+And a fifth, in StorageMan: `WhereIs` answered from a drone's *remembered* observation before the
+peripheral index it rescans for every other question, and sent D38 45 blocks to a chest that once held
+coal while 64 coal sat two hops away. It died in the sweep. **A chest on the network is read, not
+remembered.**
+
+**The "ghost grove" was partly instrument error.** The paragraph above about `-521,66,40` holding
+zero logs was written from rapid-fire `rcon-cli` reads with no control. Re-checked with
+`execute if block` and a chest as the control, nine of nine "phantom" trunk positions were oak_log.
+What had happened was smaller and worse: earlier passes cut the bottom logs and left the trunks
+FLOATING (air at y64-66, logs at y67-70), and the sweep inspected only FORWARD along one plane -- so
+the drone dug its way into a trunk column on approach, stood with five logs over its head for all
+sixty-four cells, and reported `felled 1 tree(s), 1 log(s)`. The sweep now checks overhead at every
+cell and starts at the lowest foot in the window. Verify a "stale index" claim against the world
+with a control before forgetting anything.
+
+**Known hole: the tower judges a floor finished by "fewer than 8 bricks consumed since the last
+batch".** A fleet that placed nothing because it was dry reads the same as a floor with nothing left
+to place, and the level advanced to 1 with 67 blocks on floor 0. Stale floors are now cleared before
+the emergency gate and the level was reset by hand; the heuristic itself still cannot tell starved
+from finished.
+
+### The structural fix (2026-09-03, late)
+
+After eight real leaks were closed one at a time and the loop still had not closed, the shape of the
+problem was named: **nothing was verified against the world, and the fuel economy was assumed rather
+than designed.** Four programs each kept their own fuel policy (about ten thresholds, none derived
+from another), every layer reported success from its own intent, and the sweep hoped trunks would
+cross its plane. What changed, and the rule each change encodes:
+
+- **One floor, one authority.** `FuelFloorNow` is trip home plus a margin -- nothing else. Whether a
+  drone can AFFORD a job is TaskMan's decision (`jobMinFuel`: work estimate plus margin, and
+  `pickDrone` charges the round trip per block from where the candidate actually is). An idle drone
+  that cannot afford a job is reported as exactly that, never as "busy".
+- **The job is the trunks, not the square.** HQ sends the feet of the standing trunks it knows
+  (`targets`); the drone approaches each from the side, climbs it, and records the ones that are
+  gone so the index forgets them. The sweep is the fallback for a task with no targets.
+- **Wood is furnace fuel of last resort.** Zero coal with logs on the shelf was a dead end: the
+  furnaces would not start. Two logs smelt three into charcoal, and the loop bootstraps from wood.
+  The crafting reserve on wood yields while fuel is short -- fuel before furniture.
+- **The brief reports the economy.** `economy.ts` samples networked burnable, fleet fuel and blocks
+  moved every minute; `/brief` carries income, burn and fuel per block over 20 minutes, and raises
+  `NO INCOME` when drones work and nothing arrives. That is the fault the whole evening needed.
+
+Two measurement lessons from the same night. A drone log that shows only distress lines while fuel
+falls is not idle -- **dump its position every two seconds**; the movement that costs fuel is the
+movement nothing traces. And an ore gather is underground: no GPS, so no clears, so the index only
+grows stale, and no relief can reach it. During a fuel emergency HQ now fells and does not mine.
 
 ## Environment invariants
 

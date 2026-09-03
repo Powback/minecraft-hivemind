@@ -277,6 +277,12 @@ describe('lua hygiene: a chest write that is not reported is drift', () => {
    *
    * So: a function that calls PutDown in a loop is writing to a chest, and must call ReportChest
    * before it returns. Handovers are the exception -- they drop onto a drone, not a container.
+   *
+   * A CALL TO THE BULK-PUT HELPER IS A LOOP OF PutDowns. The six copies of that sixteen-slot walk
+   * were folded into putDownSlots/unloadHere, and counting only the literal `PutDown(` would have
+   * quietly emptied this check of everything it covered -- the callers now contain no PutDown at
+   * all, and the helper contains exactly one, below the >= 2 threshold. Deduplicating code must not
+   * deduplicate the guard with it, so a call to either helper counts as the loop it replaced.
    */
   it('every function that bulk-writes to a chest calls ReportChest', () => {
     const offenders: string[] = [];
@@ -296,6 +302,7 @@ describe('lua hygiene: a chest write that is not reported is drift', () => {
         if (/\bfunction\b/.test(l)) depth++;
         if (/^\s*end\b/.test(l) && depth > 0) depth--;
         if (/\bPutDown\s*\(/.test(l)) puts++;
+        if (/\b(?:putDownSlots|unloadHere)\s*\(/.test(l)) puts += 2;   // the loop, by another name
         if (/\bReportChest\s*\(/.test(l)) reports++;
       });
       flush(lines.length);
@@ -841,5 +848,50 @@ describe('lua hygiene: raw turtle moves must be reported to pgps', () => {
       });
     }
     expect(offenders).toEqual([]);
+  });
+});
+
+/**
+ * `x and nil or y` CANNOT EVER PRODUCE nil.
+ *
+ * Lua's and/or is not a conditional expression. `x and nil` is nil for every x, truthy or not, so
+ * the `or` branch always wins and the whole expression is always `y`. Written as the ternary the
+ * author intended it silently inverts into "always take the else".
+ *
+ * It cost the fleet its only watchdog on the maintenance passes:
+ *
+ *     local s_Ok, s_Err = pcall(p_Fn)
+ *     local s_Now = s_Ok and nil or tostring(s_Err)
+ *
+ * pcall's second return on SUCCESS is the function's return value, so every healthy pass was
+ * reported as failed with its return value as the reason -- "FAILED -- 0", "FAILED -- 1",
+ * "FAILED -- nil" -- and because it logs on change, a pass whose return value alternated logged for
+ * ever. The mechanism whose entire purpose is to announce "a maintenance pass has silently died and
+ * a whole class of recovery has stopped happening" has never once worked, and a genuine failure was
+ * indistinguishable from routine operation. THREE modules had copied the line.
+ *
+ * There is no correct use of this shape, so there is no exemption worth taking: write the `if`.
+ */
+describe('lua hygiene: and-nil-or is always the else branch', () => {
+  for (const f of files) {
+    it(`${f} has no \`and nil or\` expression`, () => {
+      const raw = read(f).split('\n');
+      const bad = code(read(f))
+        .map((l, i) => ({ l, i }))
+        .filter(({ l }) => /\band\s+(nil|false)\s+or\b/.test(l))
+        .filter(({ i }) => !exempt(raw, i))
+        .map(({ i }) => `${f}:${i + 1}  ${raw[i]!.trim()}`);
+      expect(bad).toEqual([]);
+    });
+  }
+
+  /**
+   * THE CANARY. Every assertion above is a search that finds nothing on a clean tree, which is
+   * exactly how a rule goes quiet after a refactor renames what it looks for. This proves the
+   * detector still fires.
+   */
+  it('still detects the shape it was written for', () => {
+    const planted = code('    local s_Now = s_Ok and nil or tostring(s_Err)');
+    expect(planted.some((l) => /\band\s+(nil|false)\s+or\b/.test(l))).toBe(true);
   });
 });

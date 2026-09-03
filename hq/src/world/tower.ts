@@ -298,6 +298,17 @@ export function bandFor(level: number): TowerBand {
   return BANDS.find((b) => level >= b.from && level <= b.to) ?? BANDS[BANDS.length - 1]!;
 }
 
+/**
+ * The last level the design describes.
+ *
+ * bandFor falls back to the topmost band for anything above it, so towerFloor(99) cheerfully
+ * returns a cap floor's worth of blocks and NOTHING in the geometry says "that is the top". The
+ * supply loop advances a level whenever the current one stops producing, so without this it would
+ * keep ordering cap floors into the sky for as long as the settlement had bricks -- an autonomous
+ * loop needs a finish line as much as it needs a start.
+ */
+export const TOWER_TOP = Math.max(...BANDS.map((b) => b.to));
+
 /** The spec to build a given level with: the shared shape, resized to that level's band. */
 export function specForLevel(level: number, base: TowerSpec = TOWER): TowerSpec {
   const b = bandFor(level);

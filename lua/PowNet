@@ -816,3 +816,35 @@ function InitServer()
     return true
 end
 
+
+-- RUN A REPEATING JOB AND REPORT ITS HEALTH, ONCE PER CHANGE OF STATE.
+--
+-- Every module has a loop of passes that must keep running -- TaskMan's seven maintenance passes,
+-- StorageMan's Rescan, MainFrame's dashboard. Each is wrapped in a pcall so one fault cannot end the
+-- loop, which is right, and each therefore needs to SAY when a pass has quietly stopped working:
+-- a Rescan that has been throwing for hours leaves the stock index frozen at whatever it last saw,
+-- and nothing downstream can tell that from "nothing has changed".
+--
+-- All three modules wrote this themselves, and all three wrote the same bug:
+--
+--     local s_Now = s_Ok and nil or tostring(s_Err)
+--
+-- `x and nil` is nil for EVERY x, so the `or` branch always wins -- and pcall's second return on
+-- SUCCESS is the function's return value. Every healthy pass was reported as failed, with its
+-- return value as the reason ("FAILED -- 0", "FAILED -- 1", "FAILED -- nil"), and because the
+-- report fires on change, a pass whose return value alternated logged for ever. The one mechanism
+-- that exists to announce a silently dead pass has never once worked, in any of the three.
+--
+-- So it lives here, once, where every module already looks. Callers keep their own wording via
+-- p_Report -- the message is theirs, the logic is not. p_Report(name, reason) is called only when
+-- the state CHANGES; a nil reason means the pass has started working again.
+function WatchPass(p_State, p_Name, p_Fn, p_Report)
+    local s_Ok, s_Err = pcall(p_Fn)
+    local s_Now = nil
+    if not s_Ok then s_Now = tostring(s_Err) end
+    if p_State[p_Name] ~= s_Now then
+        p_State[p_Name] = s_Now
+        p_Report(p_Name, s_Now)
+    end
+    return s_Ok
+end

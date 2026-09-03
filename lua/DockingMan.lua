@@ -227,13 +227,36 @@ function OnDelDockingTower(p_Id, p_Message)
         return false, "Tower " .. s_ID .. " does not exist."
     end
     local s_Tower = DATA["towers"][s_ID]
-    for _,l_DroneID in pairs(s_Tower.occupants) do
-        local s_Message = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "DroneHomeless", {id = l_DroneID})
-        PowNet.send("DroneMan", s_Message)
-    end
     local name = tostring(s_Tower.name)
+
+    -- REMOVE FIRST, TELL AFTERWARDS -- AND YIELD WHILE TELLING.
+    --
+    -- This notified every occupant before deleting anything, in a tight loop with no yield. CC kills
+    -- a coroutine that runs more than ten seconds without yielding, uncatchably, so on a tower whose
+    -- sixteen berths were held by drones that no longer exist the handler died partway through the
+    -- notifications -- the caller saw "no response from DockingMan.rm", and because the delete came
+    -- AFTER the loop the tower was never removed. Retrying could not help: every attempt died in the
+    -- same place, so a full tower became permanently unremovable.
+    --
+    -- That mattered because a full tower is precisely the one you need to remove: freeSlot had
+    -- walked past the end (16 of 16 slots, all ghosts), every dock request answered "No registered
+    -- docking stations", and idle drones hovered over the storage bay instead of parking -- which is
+    -- the congestion that was failing pickups and stalling builds.
+    --
+    -- The state change is what matters and it is now durable before anything can kill us. The
+    -- notifications are a courtesy to drones that may not even exist.
     DATA["towers"][s_ID] = nil
     PowNet.MarkDirty()
+
+    for _, l_DroneID in pairs(s_Tower.occupants or {}) do
+        local s_Message = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "DroneHomeless", {id = l_DroneID})
+        -- silent: allow (the tower is already deleted and durable; a drone that misses this re-docks on its next request, which reads the live tower list)
+        pcall(PowNet.send, "DroneMan", s_Message)
+        -- queueEvent + pullEvent, NOT os.sleep(0). A zero-delay timer does not fire in the same
+        -- tick, so sleep(0) is a stall rather than a yield; this satisfies the watchdog and resumes
+        -- immediately, because the event is already queued when we ask for it. See lua-hygiene.
+        os.queueEvent("dockRm") os.pullEvent("dockRm")
+    end
     return true, {message = "Destroyed tower. ID: " .. s_ID .. ", name: " .. name, id = s_ID}
 end
 
@@ -312,7 +335,23 @@ local m_ServerEvents = {
             pos = {
                 length = 3
             },
-        },
+                    -- DECLARED, OR IT NEVER ARRIVES. PowNet filters the payload to the fields named
+            -- here the moment a params block exists, silently, and the call still returns
+            -- success -- which is how order.build's dependsOn was dropped for months while
+            -- every call reported fine. See hq/test/wiring.test.ts.
+            gps = {
+                optional = true
+            },
+            x = {
+                optional = true
+            },
+            y = {
+                optional = true
+            },
+            z = {
+                optional = true
+            },
+},
         func = OnAddDockingTower
     },
 
@@ -372,7 +411,12 @@ local m_ServerEvents = {
             id = {
             },
             Tower = {
-            }
+            },
+            -- DECLARED, OR IT NEVER ARRIVES. PowNet filters the payload to the fields named
+            -- here the moment a params block exists, silently, and the call still returns
+            -- success -- which is how order.build's dependsOn was dropped for months while
+            -- every call reported fine. See hq/test/wiring.test.ts.
+            pos = { optional = true },
         },
         func = OnAllocateDocking
     },

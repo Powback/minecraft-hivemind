@@ -66,6 +66,20 @@ export interface Observation {
   reads: Array<{ name: string; count: number }>;
   liveTasks?: number;
   assignedTasks?: number;
+  /**
+   * Which inputs this observation could NOT read, and why.
+   *
+   * "IT COULD NOT SEE, AND IT SAID NOTHING ABOUT NOT BEING ABLE TO SEE" -- the note above toArray
+   * says exactly that about the sentinel's worst failure, and four swallowed rejections in observe()
+   * then reproduced it. DroneMan times out, `drones` becomes [], every detector iterates an empty
+   * list, nothing matches, the tick opens ZERO incidents, and the watchdog reports the fleet
+   * healthy at the moment it has stopped being able to look at it. A monitor's silence is read as
+   * good news, so a blind monitor is worse than an absent one.
+   *
+   * Blindness is therefore an OBSERVATION, and detectBlindness turns it into an incident like any
+   * other fault.
+   */
+  blind: Array<{ source: string; error: string }>;
 }
 
 export interface Detection {
@@ -105,13 +119,38 @@ const near = (
  */
 export interface Anchor { x: number; y: number; z: number; ticks: number }
 
+/**
+ * THE WATCHDOG CANNOT SEE. THAT IS A FAULT, AND IT IS THE ONLY ONE IT IS QUALIFIED TO REPORT.
+ *
+ * Every other detector in this file works by finding something wrong in the observation. None of
+ * them can find anything in an observation that is empty because the read failed -- so a blind tick
+ * opened zero incidents, and zero incidents is how this system says "all clear". The fleet could be
+ * entirely wedged and the sentinel would confirm it was fine, confidently, for as long as DroneMan
+ * stayed unreachable.
+ *
+ * Severity 'lie' rather than 'wedge': the module may be perfectly healthy. What is broken is the
+ * monitoring's claim to know, which is the same category as `probe-lies` above.
+ *
+ * Its own function so `detect` does not grow another branch -- and so it can be tested against a
+ * blind observation directly.
+ */
+export function detectBlindness(o: Observation): Detection[] {
+  return (o.blind ?? []).map((b) => ({
+    key: `blind:${b.source}`,
+    kind: 'sentinel-blind',
+    severity: 'lie' as Severity,
+    detail: `could not read ${b.source} (${b.error}) -- every check that depends on it reported ` +
+            'NOTHING WRONG this tick because it saw nothing at all',
+  }));
+}
+
 export function detect(
   o: Observation,
   best: Map<string, number>,
   anchors: Map<string, Anchor> = new Map(),
   idle: Map<string, number> = new Map(),
 ): Detection[] {
-  const out: Detection[] = [];
+  const out: Detection[] = detectBlindness(o);
 
   for (const m of o.modules) {
     // MapServer, for hours: resolvable, addressable, and answering nothing. The probe and the work
@@ -388,7 +427,7 @@ function humanise(ms: number): string {
  * ------------------------------------------------------------------------- */
 
 import { bridge } from '../bridge/ws.js';
-import { luaList } from '../lua-table.js';
+import { luaList, field } from '../lua-table.js';
 
 /**
  * Probe every module TWICE, in two different ways, and keep both answers.
@@ -436,14 +475,22 @@ export async function observe(): Promise<Observation | null> {
     directCallWorked: await ok(p.work()),
   })));
 
-  const fleet: any = await bridge.call('DroneMan', 'GetDrones', {}, { timeoutMs: 6000 }).catch(() => null);
-  const drones = toArray<any>(fleet?.drones ?? fleet?.data?.drones).map((d: any) => ({
+  // Every read below is allowed to fail -- one unreachable module must not cost the other five
+  // observations -- but NOT allowed to fail quietly. See Observation.blind.
+  const blind: Array<{ source: string; error: string }> = [];
+  const seeing = <T,>(source: string) => (err: unknown): T | null => {
+    blind.push({ source, error: (err as Error)?.message ?? String(err) });
+    return null;
+  };
+
+  const fleet: any = await bridge.call('DroneMan', 'GetDrones', {}, { timeoutMs: 6000 }).catch(seeing('DroneMan.GetDrones'));
+  const drones = toArray<any>(field(fleet, 'drones')).map((d: any) => ({
     name: String(d.name ?? d.droneID ?? d.id),
     role: d.role, status: d.status, pos: d.pos,
   }));
 
-  const tk: any = await bridge.call('TaskMan', 'GetTasks', {}, { timeoutMs: 8000 }).catch(() => null);
-  const rawTasks = toArray<any>(tk?.tasks ?? tk?.data?.tasks);
+  const tk: any = await bridge.call('TaskMan', 'GetTasks', {}, { timeoutMs: 8000 }).catch(seeing('TaskMan.GetTasks'));
+  const rawTasks = toArray<any>(field(tk, 'tasks'));
   const tasks = rawTasks.map((t: any) => ({
     id: t.id,
     assigned: t.assigned ?? null,
@@ -457,11 +504,16 @@ export async function observe(): Promise<Observation | null> {
   // Only counts. The point is whether a paged read SHRANK, and pulling the whole map every minute to
   // find that out would itself be the load that wedges MapServer.
   const reads: Array<{ name: string; count: number }> = [];
-  const blocks: any = await bridge.call('MapServer', 'BlockAt', { offset: 0, limit: 1 }, { timeoutMs: 8000 }).catch(() => null);
-  const blockCount = blocks?.count ?? blocks?.data?.count;
+  //
+  // A MISSING SAMPLE IS NOT A STEADY ONE. The shrink detector compares each read against the best
+  // count ever seen, so a failed read that pushes nothing looks identical to a tick where the read
+  // was simply not due -- and MapServer under load is exactly when both a truncated read and a
+  // timeout are likely. Record the blindness so the gap in the series has a reason attached.
+  const blocks: any = await bridge.call('MapServer', 'BlockAt', { offset: 0, limit: 1 }, { timeoutMs: 8000 }).catch(seeing('MapServer.BlockAt'));
+  const blockCount = field(blocks, 'count');
   if (typeof blockCount === 'number') reads.push({ name: 'blocks', count: blockCount });
-  const world: any = await bridge.call('MapServer', 'LoadWorld', { offset: 0, limit: 1 }, { timeoutMs: 8000 }).catch(() => null);
-  const worldCount = world?.count ?? world?.data?.count;
+  const world: any = await bridge.call('MapServer', 'LoadWorld', { offset: 0, limit: 1 }, { timeoutMs: 8000 }).catch(seeing('MapServer.LoadWorld'));
+  const worldCount = field(world, 'count');
   if (typeof worldCount === 'number') reads.push({ name: 'voxels', count: worldCount });
 
   return {
@@ -470,7 +522,8 @@ export async function observe(): Promise<Observation | null> {
     drones,
     tasks,
     reads,
-    liveTasks: tk?.live ?? tk?.data?.live ?? rawTasks.filter((t: any) => (t.progress ?? 0) < 100).length,
+    blind,
+    liveTasks: field(tk, 'live') ?? rawTasks.filter((t: any) => (t.progress ?? 0) < 100).length,
     assignedTasks: rawTasks.filter((t: any) => t.assigned && (t.progress ?? 0) < 100).length,
   };
 }

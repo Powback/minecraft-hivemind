@@ -20,12 +20,15 @@
  */
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { factories, saveCity } from '../world/city.js';
 import { join, dirname } from 'node:path';
 import { bridge } from '../bridge/ws.js';
 import { registry } from '../tools/registry.js';
-import { luaList } from '../lua-table.js';
+import { luaList, field, numField } from '../lua-table.js';
 import { settlement, withinReach } from '../world/settlement.js';
 import { queueLumberSweep } from '../world/lumber.js';
+import { TOWER_TOP } from '../world/tower.js';
+import { readStockDetail, readStockWhere } from '../world/stock.js';
 
 export interface SupplyRule {
   /** The BLOCK to go and mine, e.g. "coal_ore". */
@@ -199,6 +202,14 @@ export interface SupplyState {
   log: string[];
   /** How far along the exploration spiral the fleet has got. Persisted -- see frontier(). */
   frontier?: number;
+  /** Which tower floor the settlement is currently laying. Persisted, so a restart does not
+   *  re-lay a finished floor -- see keepTowerOrdered(). */
+  towerLevel?: number;
+  /** The last batch of patches queued for a floor, and the floor material held when it went out.
+   *  A batch that drains none of it placed nothing, which is how a floor is known to be done. */
+  /** `at` is when the batch was queued: "consumed nothing" and "has not started yet" are the same
+   *  reading from the material count alone, so completion is only judged after a grace period. */
+  towerBatch?: { level: number; held: number | null; at: number };
 }
 
 /**
@@ -243,8 +254,22 @@ function loadSupply(): SupplyState {
   };
   try {
     const raw = JSON.parse(readFileSync(SUPPLY_FILE, 'utf8'));
+    // READING A WHITELIST IS THE SAME BUG AS WRITING ONE, AND FIXING ONLY THE WRITE FIXED NOTHING.
+    //
+    // saveSupply was changed to persist the whole state precisely so a newly added field could not
+    // be silently dropped -- and this function went on reading five fields by name, so the drop
+    // simply moved one step later. `towerLevel` and `towerBatch` were written to disk correctly and
+    // discarded on the way back in: measured directly, supply.json holding `towerLevel: 2` while the
+    // running loop reported level 0, so every HQ redeploy quietly restarted the tower at the ground
+    // floor. The save-side test passed throughout, because it only ever looked at the save.
+    //
+    // Same rule, both directions: take everything, and name what is deliberately dropped. `log` and
+    // `cooldowns` are rebuilt at boot; the fields below are re-derived because they need validating
+    // or merging, and a corrupt file must not be able to inject a wrong shape through the spread.
+    const { log: _log, cooldowns: _cooldowns, enabled: _e, rules: _r, ...carried } = raw;
     return {
       ...base,
+      ...carried,
       enabled: raw.enabled === true,
       // MERGE, do not replace.
       //
@@ -260,7 +285,17 @@ function loadSupply(): SupplyState {
       dispatched: typeof raw.dispatched === 'number' ? raw.dispatched : 0,
       frontier: typeof raw.frontier === 'number' ? raw.frontier : 0,
     };
-  } catch {
+  } catch (err) {
+    // A MISSING FILE IS A FIRST RUN. ANYTHING ELSE IS LOST STATE, AND MUST SAY SO.
+    //
+    // This swallowed both into the same silent default, so a truncated or half-written supply.json
+    // read exactly like a fresh install: policy back to the defaults, the loop switched off, and the
+    // tower back to the ground floor, with nothing anywhere reporting that a file had failed to
+    // parse. Resetting the settlement is not a thing that should ever happen quietly.
+    if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+      console.warn(`[supply] ${SUPPLY_FILE} could not be read -- STARTING FROM DEFAULTS, previous ` +
+        `policy and tower progress are lost: ${(err as Error)?.message ?? err}`);
+    }
     return base;
   }
 }
@@ -333,8 +368,20 @@ function frontier(): { min: Pt; max: Pt } | null {
 export function saveSupply(): void {
   try {
     mkdirSync(dirname(SUPPLY_FILE), { recursive: true });
-    writeFileSync(SUPPLY_FILE, JSON.stringify(
-      { enabled: supply.enabled, rules: supply.rules, dispatched: supply.dispatched }, null, 2));
+    // EVERY FIELD THE STATE CLAIMS TO KEEP, NOT A HAND-PICKED THREE.
+    //
+    // This wrote { enabled, rules, dispatched } and silently dropped the rest, so anything added to
+    // SupplyState afterwards was persisted in the type and nowhere else. `frontier` says
+    // "Persisted -- see frontier()" in its own doc comment and never was; `towerLevel` and
+    // `towerBatch` meant every HQ restart reset the tower to the ground floor and forgot which
+    // floor it was measuring -- which is why the level could never advance across a redeploy, while
+    // the code that advances it was working perfectly.
+    //
+    // A whitelist that must be edited whenever state is added is a silent-drop waiting to happen.
+    // Name what is deliberately EXCLUDED instead: `log` is a rolling display buffer, and cooldowns
+    // are wall-clock timers that mean nothing after a restart.
+    const { log: _log, cooldowns: _cooldowns, ...persisted } = supply;
+    writeFileSync(SUPPLY_FILE, JSON.stringify(persisted, null, 2));
   } catch (err) {
     console.error(`[supply] could not persist ${SUPPLY_FILE}: ${(err as Error).message}`);
   }
@@ -343,6 +390,32 @@ export function saveSupply(): void {
 function note(msg: string) {
   supply.log.unshift(`${new Date().toISOString().slice(11, 19)} ${msg}`);
   supply.log.length = Math.min(supply.log.length, 40);
+}
+
+/** What each recurring condition last said, so an unchanged one is not re-reported. */
+const s_LastNoted: Record<string, string> = {};
+
+/**
+ * REPORT A STANDING CONDITION ONCE, NOT ONCE A TICK.
+ *
+ * The supply log is forty lines deep and this loop runs every sixty seconds, so a condition that
+ * persists -- "oak_planks is not craftable from what we have" -- would fill the entire log with
+ * forty copies of itself inside an hour and evict every other thing that happened. That is how a
+ * report becomes as useless as the swallow it replaced: not by being missing, but by being noise
+ * nobody can read past.
+ *
+ * So: write it when it CHANGES. A condition that clears and returns is worth a second line; the
+ * same condition ticking over is not.
+ */
+function noteOnce(key: string, msg: string) {
+  if (s_LastNoted[key] === msg) return;
+  s_LastNoted[key] = msg;
+  note(msg);
+}
+
+/** The condition has cleared -- let the next occurrence report itself. */
+function clearNote(key: string) {
+  delete s_LastNoted[key];
 }
 
 async function callTool(name: string, args: unknown) {
@@ -632,6 +705,35 @@ async function dispatchGather(rule: SupplyRule, have: number, ctx: SupplyCtx): P
 }
 
 /** Last rung: nothing known and nothing to prospect for -- send a scout to look. */
+/**
+ * QUEUE A SURVEY AND MARK THE SCOUT SPENT.
+ *
+ * Three dispatch paths -- the exploration spiral, cave scouting and miner support -- each wrote
+ * this bookkeeping out, and every line of it is load-bearing:
+ *
+ *   ctx.scoutFree = false   forgetting it dispatches the SAME scout to several tiles in one tick
+ *   supply.dispatched++     and lastAction are the only evidence the loop is alive; without them
+ *                           a working loop reads as idle, which is exactly what "autonomy has
+ *                           died" looked like from outside while it was running fine
+ *
+ * radius 8 is the geo scanner's reach and is the same for all three: a survey box is scaffolding
+ * for one scan sphere, not a resolution setting.
+ */
+async function queueSurvey(ctx: SupplyCtx, o: {
+  name: string; priority: number; kind: string; box: { min: any; max: any };
+  action: string; say: string;
+}): Promise<void> {
+  await bridge.call('TaskMan', 'Add', {
+    name: o.name,
+    priority: o.priority,
+    work: { survey: { kind: o.kind, radius: 8, min: o.box.min, max: o.box.max } },
+  }, { timeoutMs: 8000 });
+  ctx.scoutFree = false;
+  supply.dispatched++;
+  supply.lastAction = o.action;
+  note(o.say);
+}
+
 async function dispatchSurvey(rule: SupplyRule, have: number, ctx: SupplyCtx): Promise<boolean> {
   // Say so rather than skipping in silence: "no scout free" and "nothing to do" are different
   // states and looked identical in the log.
@@ -653,16 +755,12 @@ async function dispatchSurvey(rule: SupplyRule, have: number, ctx: SupplyCtx): P
     note('exploration frontier wrapped -- starting another pass from the base outward');
   }
   supply.frontier = (supply.frontier ?? 0) + 1;
-  await bridge.call('TaskMan', 'Add', {
-    name: `find-${rule.match}`,
-    priority: 3,
-    work: { survey: { kind: 'explore', radius: 8, min: area.min, max: area.max } },
-  }, { timeoutMs: 8000 });
-  ctx.scoutFree = false;
-  supply.dispatched++;
-  supply.lastAction = `survey for ${rule.match}`;
-  note(`${rule.match}: ${have}/${rule.min}, none known → survey tile ${supply.frontier} `
-     + `at ${area.min.x},${area.min.z}..${area.max.x},${area.max.z}`);
+  await queueSurvey(ctx, {
+    name: `find-${rule.match}`, priority: 3, kind: 'explore', box: area,
+    action: `survey for ${rule.match}`,
+    say: `${rule.match}: ${have}/${rule.min}, none known → survey tile ${supply.frontier} `
+       + `at ${area.min.x},${area.min.z}..${area.max.x},${area.max.z}`,
+  });
   ctx.did.push(`survey for ${rule.match}`);
   return true;
 }
@@ -677,7 +775,57 @@ async function dispatchRule(rule: SupplyRule, have: number, ctx: SupplyCtx): Pro
     note(`${rule.match}: ${have}/${rule.min} → ${rule.action} not yet automatable`);
     return false;
   }
+  // AN ORE GATHER IS UNDERGROUND, AND UNDERGROUND IS WHERE A DRONE CANNOT BE RESCUED.
+  //
+  // Below the surface there is no GPS, so the map cannot record what a miner clears and the ore
+  // index only ever grows stale ("1/768 checked, 0 taken"); a drone that runs dry down there is
+  // beyond every relief. During a fuel emergency the miner sent for coal is the LAST fuelled drone,
+  // and this is how D40 was nearly lost twice in one evening: four minutes digging toward a
+  // recorded coal_ore that was not there, then breaking off at 821 fuel under a floor of 838 with
+  // no fix. Wood is on the surface, in GPS range, and verified standing before a sweep is ordered.
+  // So while fuel is short the fleet fells, and ore waits.
+  if (/_ore$/.test(rule.match) && (await fuelEmergency()) === true) {
+    supply.cooldowns[rule.match] = ctx.now + COOLDOWN_MS;
+    note(`${rule.match}: ${have}/${rule.min} -- not sending a miner underground during a fuel emergency; lumber first`);
+    return false;
+  }
   return dispatchGather(rule, have, ctx);
+}
+
+/**
+ * What the failing tasks say they are short OF.
+ *
+ * Its own function because it is the one part of the re-plan with no I/O in it: a pure string ->
+ * set, so the regex that has to match TaskMan's two phrasings can be exercised directly instead of
+ * only through a live bridge.
+ */
+export function shortfallItems(tasks: unknown[]): Set<string> {
+  const shortOf = new Set<string>();
+  for (const t of tasks) {
+    const why = String((t as any)?.failure ?? '');
+    // "nothing available for: minecraft:oak_planks" / "short of minecraft:oak_log x8"
+    const m = why.match(/(?:nothing available for|short of)\s*:?\s*([a-z0-9_]+:[a-z0-9_]+)/i);
+    if (m) shortOf.add(m[1]);
+  }
+  return shortOf;
+}
+
+/**
+ * Try to re-plan one shortfall. Returns how many steps were queued, or WHY none were.
+ *
+ * `number | string` rather than `number` and a swallowed catch: "not craftable from what we have"
+ * and "plan.execute is throwing on everything" are different facts, and collapsing them into 0 is
+ * what left a stuck queue looking like an idle one.
+ */
+async function attemptReplan(item: string): Promise<number | string> {
+  try {
+    const r: any = await callTool('plan.execute', { item, quantity: 16 });
+    const rd = r?.data ?? r;
+    const queued = (rd?.queued ?? []).length;
+    return queued > 0 ? queued : `${item}: nothing queueable`;
+  } catch (err) {
+    return `${item}: ${(err as Error)?.message ?? err}`;
+  }
 }
 
 /**
@@ -700,26 +848,28 @@ async function replanShortfalls(): Promise<{ acted: boolean; reason: string } | 
 // re-running it costs nothing when the answer has not changed.
 try {
   const tl: any = await bridge.call('TaskMan', 'GetTasks', {}, { timeoutMs: 5000 });
-  const tasks = luaList(tl?.tasks ?? tl?.data?.tasks ?? []) ?? [];
-  const shortOf = new Set<string>();
-  for (const t of tasks) {
-    const why = String((t as any)?.failure ?? '');
-    // "nothing available for: minecraft:oak_planks" / "short of minecraft:oak_log x8"
-    const m = why.match(/(?:nothing available for|short of)\s*:?\s*([a-z0-9_]+:[a-z0-9_]+)/i);
-    if (m) shortOf.add(m[1]);
+  const tasks = luaList(field(tl, 'tasks') ?? []) ?? [];
+  // WHY THE RE-PLAN DID NOT HAPPEN IS THE ONLY INTERESTING PART OF THIS LOOP.
+  //
+  // The old comment here claimed "the failure stands and is reported as such" -- it did not.
+  // Nothing recorded which item could not be re-planned or why, so a task stuck on
+  // "nothing available for oak_planks" and a re-planner that threw on every attempt looked
+  // identical from outside: a queue that never moves and a supply log that never mentions it.
+  //
+  // Per-item failures are expected (a material genuinely not craftable from current stock), so they
+  // are collected rather than logged one by one, and reported ONCE when the whole pass came up
+  // empty -- which is the case that means somebody has to intervene.
+  const stuck: string[] = [];
+  for (const item of shortfallItems(tasks)) {
+    const r = await attemptReplan(item);
+    if (typeof r === 'string') { stuck.push(r); continue; }
+    supply.dispatched += r;
+    clearNote('replan-stuck');
+    note(`a task was short of ${item} -- re-planned it, ${r} step(s) queued`);
+    return { acted: true, reason: `re-planned ${item} for a failing task` };
   }
-  for (const item of shortOf) {
-    try {
-      const r: any = await callTool('plan.execute', { item, quantity: 16 });
-      const rd = r?.data ?? r;
-      const queued = (rd?.queued ?? []).length;
-      if (queued > 0) {
-        supply.dispatched += queued;
-        note(`a task was short of ${item} -- re-planned it, ${queued} step(s) queued`);
-        return { acted: true, reason: `re-planned ${item} for a failing task` };
-      }
-    } catch { /* not craftable from what we have; the failure stands and is reported as such */ }
-  }
+  if (stuck.length) noteOnce('replan-stuck', `tasks short of material nobody can re-plan -- ${stuck.join('; ')}`);
+  else clearNote('replan-stuck');
 } catch (err) {
   note(`shortfall re-plan: ${(err as Error)?.message ?? err}`);
 }
@@ -747,6 +897,44 @@ function materialsBeingGathered(tasks: unknown[]): Set<string> {
 }
 
 /**
+ * Queue up to `wanted` gathers, and say what stopped the ones that did not happen.
+ *
+ * "NOTHING SURVEYED FOR IT" AND "THE TOP-UP IS BROKEN" LOOKED THE SAME FROM OUTSIDE.
+ *
+ * order.gather throws for an unsurveyed material, which is the expected answer for most of this
+ * list most of the time -- so the catch was written empty and the loop moved on. But it caught
+ * every other reason too, and the failure mode that matters is the one where drones sit idle, the
+ * queue stays empty, and EVERY material threw: from outside that is indistinguishable from a
+ * healthy fleet with nothing to do, which is exactly the diagnosis it got.
+ *
+ * The refusals are RETURNED rather than logged here, so the caller reports them once (noteOnce)
+ * instead of writing eight routine lines into a forty-line log every sixty seconds.
+ */
+async function queueGathers(
+  materials: string[], liveFor: Set<string>, wanted: number, idleCount: number, open: number,
+): Promise<{ queued: number; refusals: string[] }> {
+  let queued = 0;
+  const refusals: string[] = [];
+  for (const m of materials) {
+    if (queued >= wanted) break;
+    if (liveFor.has(m)) continue;          // already being worked; queuing another wastes a drone
+    try {
+      const g: any = await callTool('order.gather', { match: m, limit: 64 });
+      if ((g?.data ?? g)?.dispatched) {
+        queued++;
+        supply.dispatched++;
+        note(`${idleCount} drone(s) idle with ${open} unassigned task(s) -- queued gather:${m}`);
+      } else {
+        refusals.push(`${m}: not dispatched`);
+      }
+    } catch (err) {
+      refusals.push(`${m}: ${(err as Error)?.message ?? err}`);
+    }
+  }
+  return { queued, refusals };
+}
+
+/**
  * Top the queue up to the idle-drone count, so no drone is idle purely for want of a task.
  *
  * Returns a tick result when it queued something -- topping up IS the action for this tick -- or
@@ -767,7 +955,7 @@ try {
   const idleCount = live.filter((d: any) => d.status === 'idle').length;
   if (idleCount > 0) {
     const tl: any = await bridge.call('TaskMan', 'GetTasks', {}, { timeoutMs: 5000 });
-    const tasks = luaList(tl?.tasks ?? tl?.data?.tasks ?? []) ?? [];
+    const tasks = luaList(field(tl, 'tasks') ?? []) ?? [];
     const open = tasks.filter((t: any) =>
       t && t.state !== 'done' && t.state !== 'failed' && !t.assigned).length;
     const wanted = idleCount - open;
@@ -804,21 +992,12 @@ try {
       // several drones re-walk ground another drone already cleared.
       const liveFor = materialsBeingGathered(tasks);
 
-      let queued = 0;
-      for (const m of MATERIALS) {
-        if (queued >= wanted) break;
-        if (liveFor.has(m)) continue;          // already being worked; queuing another wastes a drone
-        try {
-          const g: any = await callTool('order.gather', { match: m, limit: 64 });
-          const gd = g?.data ?? g;
-          if (gd?.dispatched) {
-            queued++;
-            supply.dispatched++;
-            note(`${idleCount} drone(s) idle with ${open} unassigned task(s) -- queued gather:${m}`);
-          }
-        } catch { /* nothing surveyed for it; try the next material */ }
+      const { queued, refusals } = await queueGathers(MATERIALS, liveFor, wanted, idleCount, open);
+      if (queued > 0) { clearNote('topup-refused'); return { acted: true, reason: `topped up the queue with ${queued} gather(s)` }; }
+      if (refusals.length) {
+        noteOnce('topup-refused',
+          `${idleCount} drone(s) idle and nothing queueable -- ${refusals.join('; ')}`);
       }
-      if (queued > 0) return { acted: true, reason: `topped up the queue with ${queued} gather(s)` };
     }
   }
 } catch (err) {
@@ -869,15 +1048,11 @@ export function caveCandidates(list: any[]): Array<{ cave: any; box: ReturnType<
 }
 
 async function dispatchCaveSurvey(ctx: SupplyCtx, c: any, box: any, pct: number): Promise<void> {
-  await bridge.call('TaskMan', 'Add', {
-    name: `cave-${c.min.x},${c.min.y},${c.min.z}`,
-    priority: 2,
-    work: { survey: { kind: 'scout', radius: 8, min: box.min, max: box.max } },
-  }, { timeoutMs: 8000 });
-  ctx.scoutFree = false;
-  supply.dispatched++;
-  supply.lastAction = `cave survey at ${c.min.x},${c.min.y},${c.min.z}`;
-  note(`cave of ${c.size ?? '?'} cells at ${c.min.x},${c.min.y},${c.min.z} is ${pct}% mapped -> scout dispatched`);
+  await queueSurvey(ctx, {
+    name: `cave-${c.min.x},${c.min.y},${c.min.z}`, priority: 2, kind: 'scout', box,
+    action: `cave survey at ${c.min.x},${c.min.y},${c.min.z}`,
+    say: `cave of ${c.size ?? '?'} cells at ${c.min.x},${c.min.y},${c.min.z} is ${pct}% mapped -> scout dispatched`,
+  });
   ctx.did.push('cave survey');
 }
 
@@ -969,7 +1144,15 @@ async function retireStaleSupport(live: any[], did: string[]): Promise<void> {
     });
     note(`retired ${stale.length} stale support task(s)`);
     did.push(`retired ${stale.length} stale support`);
-  } catch { /* best effort */ }
+    clearNote('retire-support');
+  } catch (err) {
+    // NOT "best effort". This is task.stop, and task.stop is the tool that returned ok:true while
+    // 25 tasks went on being dispatched for two hours -- the failure this whole file is written
+    // against. Swallowed here, a stale priority-1 support task keeps outranking every useful scout
+    // job for ever and the only symptom is "the scouts aren't helping", which is what it was
+    // diagnosed as. Cleanup may still fail without ending the tick; it may not fail quietly.
+    noteOnce('retire-support', `could not retire stale support work -- ${(err as Error)?.message ?? err}`);
+  }
 }
 
 async function scoutForMiners(ctx: SupplyCtx): Promise<void> {
@@ -1002,16 +1185,14 @@ if (ctx.scoutFree) {
       const cov = q?.data?.percent ?? 0;   // percent: see the cave guard above
       if (cov >= 25) continue;          // already mapped well enough to be useful
 
-      await bridge.call('TaskMan', 'Add', {
+      await queueSurvey(ctx, {
         name: `support-${m.name}`,
         priority: 1,                    // ahead of speculative exploration: this has a customer
-        work: { survey: { kind: 'assist', radius: 8, min: box.min, max: box.max } },
-      }, { timeoutMs: 8000 });
-      ctx.scoutFree = false;
-      supply.dispatched++;
-      supply.lastAction = `scout support for ${m.name}`;
-      note(`${m.name} is mining at ${m.pos.x},${m.pos.y},${m.pos.z} with ${cov}% of the `
-         + `surrounding rock mapped → scout dispatched to support it`);
+        kind: 'assist', box,
+        action: `scout support for ${m.name}`,
+        say: `${m.name} is mining at ${m.pos.x},${m.pos.y},${m.pos.z} with ${cov}% of the `
+           + `surrounding rock mapped → scout dispatched to support it`,
+      });
       ctx.did.push(`scout support for ${m.name}`);
       break;                            // one per tick; the next tick takes the next miner
     }
@@ -1045,7 +1226,7 @@ try {
   // luaList, not Array.isArray. An EMPTY task queue serialises to {} rather than [], so the
   // array check classed it unreadable -- and the loop then refused to dispatch, which kept the
   // queue empty, which kept it refusing. On a fresh world nothing could ever start.
-  const list = luaList<any>(res?.tasks ?? res?.data?.tasks);
+  const list = luaList<any>(field(res, 'tasks'));
   // A REFUSAL COMES BACK AS A VALUE, NOT AN EXCEPTION.
   //
   // PowNet puts an error in the same field a success uses, so a failed GetTasks arrives as a
@@ -1060,7 +1241,7 @@ try {
   // stay inside the websocket frame, so counting names from that page under-reports duplicates and
   // the loop cheerfully adds another copy of work already outstanding -- nine find-iron_ore among
   // 159 live tasks with two assigned. The cap was mine and so was the regression.
-  const names = luaList<string>(res?.liveNames ?? res?.data?.liveNames);
+  const names = luaList<string>(field(res, 'liveNames'));
   if (names && names.length) {
     for (const n of names) if (typeof n === 'string') queued.add(n);
   } else {
@@ -1107,7 +1288,7 @@ const FREE_SLOTS_FLOOR = 6;
  */
 async function observedFreeSlots(): Promise<number | null> {
   const stock: any = await bridge.call('StorageMan', 'stock', {}, { timeoutMs: 8000 });
-  const chests = luaList<any>(stock?.chests ?? stock?.data?.chests) ?? [];
+  const chests = luaList<any>(field(stock, 'chests')) ?? [];
   if (!chests.length) return null;
   return chests.reduce((n: number, c: any) => n + (Number(c.free) || 0), 0);
 }
@@ -1149,7 +1330,638 @@ function offlineish(d: any): boolean {
 async function maintenancePhases(
   live: any[], queued: Set<string>,
 ): Promise<{ acted: boolean; reason: string } | null> {
-  return (await expandStorageIfFull(live, queued)) ?? (await collectFieldCaches(live, queued));
+  return (await expandStorageIfFull(live, queued))
+    ?? (await bringFactoriesOnline())
+    ?? (await runFactories(queued))
+    ?? (await keepTowerOrdered(queued))
+    ?? (await collectFieldCaches(live, queued));
+}
+
+/**
+ * Should this line be asked to make more right now? Its own predicate so runFactories reads as the
+ * loop it is. An outstanding craft is the real answer to "did I already ask for this" -- a fact
+ * about the queue rather than a guess from a timer, which is the reasoning mayQueue exists for.
+ */
+function factoryNeedsRun(p_F: any, p_Short: string, p_Have: number, p_Queued: Set<string>): boolean {
+  if (p_Have >= FACTORY_TARGET) return false;
+  if ([...p_Queued].some((n) => n.startsWith(`craft-${p_Short}`))) return false;
+  return mayQueue(p_Queued, `craft-${p_Short}`, `__factory_${p_F.name}`);
+}
+
+/** What a line keeps on the shelf before it stops making more. */
+const FACTORY_TARGET = 64;
+
+/**
+ * MAKE A RUNNING FACTORY ACTUALLY PRODUCE SOMETHING.
+ *
+ * `running` was a label on a data model and nothing else. Every place factory state was read did
+ * one of two things -- wire up a planned line, or sort the dependency order -- and NOTHING walked a
+ * running line to move material through it. factory.route returned {}, links were empty, and the
+ * Lua side mentions factories only in comments. So planks-01 and charcoal-01 sat `running` and
+ * produced nothing; what actually made planks and charcoal was ordinary craft tasks and
+ * StorageMan's furnaces, entirely outside the subsystem meant to own them.
+ *
+ * That is the same defect this project keeps hitting from the other side: a status that reports
+ * success without the effect existing. Reporting them "live" on the strength of the field was
+ * wrong, and this is the fix -- the line now drives the work.
+ *
+ * plan.execute rather than a bespoke queue: it already walks the recipe graph, subtracts what
+ * storage holds and queues the steps in dependency order. A factory says WHAT to keep in stock;
+ * the existing machinery decides how. That also means a factory added later needs no new supply
+ * rule -- which is the point of having factories at all.
+ */
+async function runFactories(queued: Set<string>): Promise<{ acted: boolean; reason: string } | null> {
+  const live = factories.filter((f: any) => f.status === 'running' && f.produces);
+  if (!live.length) return null;
+
+  // AN UNREADABLE STOCK IS NOT AN EMPTY ONE.
+  //
+  // This swallowed its rejection into a null with `?? []` behind it -- the readStock('empty') defect
+  // exactly: StorageMan times out, `have()` answers 0 for every item, every running line looks
+  // starved, and the loop queues a craft for material already sitting on the shelf. The false
+  // premise then propagates -- plan.execute subtracts a stock of zero and queues the whole
+  // dependency chain underneath it too.
+  //
+  // A line that cannot be measured must not be dispatched for. Say so and do nothing this tick.
+  // null, not a tick result: the later phases (tower, field caches) do not depend on this read and
+  // should still get their turn. What must not happen is dispatching ON a stock of zero.
+  const detail = await readStockDetail((why) => note(`factories: storage unreadable -- ${why}`));
+  if (!detail) return null;
+  const have = (item: string) =>
+    detail.filter((d: any) => d?.name === item).reduce((n: number, d: any) => n + (d.count ?? 0), 0);
+
+  for (const f of live as any[]) {
+    const short = f.produces.replace(/^.*:/, '');
+    if (!factoryNeedsRun(f, short, have(f.produces), queued)) continue;
+
+    const r: any = await callTool('plan.execute', { item: f.produces, quantity: FACTORY_TARGET });
+    const steps = r?.data?.queued ?? r?.queued ?? [];
+    supply.cooldowns[`__factory_${f.name}`] = Date.now() + COOLDOWN_MS;
+    if (!steps.length) continue;      // nothing craftable right now; try the next line
+    supply.dispatched++;
+    supply.lastAction = `factory ${f.name}`;
+    saveSupply();
+    return { acted: true, reason: `${f.name} making ${short} (${steps.length} step(s))` };
+  }
+  return null;
+}
+
+/** Blocks a batch must actually PLACE to count as progress. Below this, the floor is done. */
+const FLOOR_PROGRESS_MIN = 8;
+
+/**
+ * Floor material on the shelves, or null when storage cannot be read -- never a guess.
+ *
+ * The null is load-bearing and the caller respects it, but the REASON for it used to be swallowed
+ * by the read, so "storage timed out" and "storage holds no bricks" arrived at keepTowerOrdered as
+ * the same value with nothing anywhere to tell them apart. The `note` callback is that reason.
+ */
+/**
+ * BLOCKS ACTUALLY PLACED, NOT MATERIAL THAT LEFT THE SHELVES.
+ *
+ * This asked storage how much floor material it held and treated a drop as "blocks were placed".
+ * It is not the same thing and the difference stalled the tower: measured 79 units gone from
+ * storage with 66 of them sitting in drone inventories -- carried out to squares that turned out to
+ * be already occupied, and carried back. Material moves for crafting, hauling and carrying; only
+ * placing puts it in the world.
+ *
+ * TaskMan now keeps the true count, fed by the `placed` figure OnBuild has always returned and
+ * always thrown away. Null when it cannot be read -- an unknown, never a zero, because "nothing was
+ * placed" is exactly the answer that advances a floor and skips it for good.
+ */
+async function blocksPlacedTotal(): Promise<number | null> {
+  const r: any = await bridge.call('TaskMan', 'GetTasks', { limit: 1 }, { timeoutMs: 8000 })
+    .catch((err) => {
+      note(`tower: cannot read placed count -- ${(err as Error)?.message ?? err}`);
+      return null;
+    });
+  if (r === null) return null;
+  const n = Number(field(r, 'placedTotal'));
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * KEEP A FLOOR IN FRONT OF THE FLEET, AND MOVE UP WHEN ONE IS DONE.
+ *
+ * Nothing queued tower work by itself. A human ran order.tower, the patches drained, and the fleet
+ * went idle in front of an empty queue until somebody noticed -- which is not a settlement that
+ * builds itself, it is one that waits to be told. Worse, the obvious fix of re-issuing on a timer
+ * is what a monitor was doing earlier: it re-queued the whole floor every three minutes, which
+ * churned the queue and cancelled work already in flight.
+ *
+ * So: order only when there is nothing left of this floor to do. `queued` is the live task list,
+ * which is a FACT about the queue rather than a guess from a timer -- the same reasoning mayQueue
+ * uses. When a level stops yielding patches it is finished (or unaffordable), and the next one
+ * becomes the target.
+ */
+/**
+ * Did the last batch of patches for this floor consume any floor material?
+ *
+ * An unreadable stock is an UNKNOWN, not a zero: both readings must exist before their difference
+ * means anything. Coercing a missing number to 0 here would read as "consumed nothing" and advance
+ * the floor on a storage hiccup -- the same shape as every other silent fallback that has cost this
+ * project a night.
+ */
+function batchPlacedNothing(p_Level: number, p_Held: number | null): boolean {
+  const last = supply.towerBatch;
+  if (!last || last.level !== p_Level) return false;
+  if (p_Held === null || last.held === null) return false;
+  // PLACED COUNTS ONLY RISE, so the sign flips: progress is now-minus-then, not then-minus-now.
+  return p_Held - last.held < FLOOR_PROGRESS_MIN;
+}
+
+/**
+ * Has the current batch had a fair chance to consume anything?
+ *
+ * Without this the level would advance the instant a batch was queued, because nothing has been
+ * placed yet at that moment -- "consumed nothing" and "has not started" look identical from the
+ * material count alone. A patch takes minutes: travel, pickup, then a placement per block.
+ */
+function batchHasHadLongEnough(): boolean {
+  const at = supply.towerBatch?.at;
+  if (at === undefined) return false;      // no timestamp: cannot judge, so do not
+  return Date.now() - at > BATCH_GRACE_MS;
+}
+
+/** Long enough for a batch of patches to travel, collect and place. Shorter and a fresh batch
+ *  reads as a finished floor; much longer and a genuinely finished floor sits blocked for no gain. */
+const BATCH_GRACE_MS = 8 * 60 * 1000;
+
+
+/**
+ * Has this floor stopped changing the world? Both halves of the question in one place: the batch
+ * consumed no floor material, AND it has had long enough to have consumed some.
+ */
+function floorIsFinished(p_Level: number, p_Held: number | null): boolean {
+  return batchPlacedNothing(p_Level, p_Held) && batchHasHadLongEnough();
+}
+
+/**
+ * Begin measuring a floor that already has work outstanding, if nobody is measuring it.
+ *
+ * A batch used to be recorded only at the moment of ORDERING, and ordering waits for an empty
+ * queue -- so a queue full of no-op patches produced no batch, nothing to judge, and therefore
+ * nothing that could ever empty it. Returns null when there is nothing to start.
+ */
+function startWatchingFloor(
+  p_Level: number, p_Held: number | null, p_StillQueued: boolean,
+): { acted: boolean; reason: string } | null {
+  if (!p_StillQueued) return null;
+  if (supply.towerBatch?.level === p_Level) return null;
+  supply.towerBatch = { level: p_Level, held: p_Held, at: Date.now() };
+  saveSupply();
+  return { acted: true, reason: `watching level ${p_Level}: ${p_Held ?? '?'} floor material held` };
+}
+
+/** Move to the next floor and forget the batch. One place, so the two exits cannot drift apart. */
+async function advanceFloor(p_Level: number, p_Why: string): Promise<{ acted: boolean; reason: string }> {
+  supply.towerLevel = p_Level + 1;
+  supply.towerBatch = undefined;
+  saveSupply();
+
+  // A FINISHED FLOOR'S LEFTOVERS MUST GO WITH IT.
+  //
+  // Ordering the next floor waits for an empty tower queue, and a floor is declared finished
+  // precisely BECAUSE its remaining patches place nothing -- so those patches would sit there for
+  // ever, refusing every block as already-occupied, and level 1 could never be ordered. Measured
+  // straight after the first successful advance: towerLevel 1 with 39 tower-L0 patches still
+  // queued, and nothing able to progress.
+  //
+  // Best effort by design: failing to clear them costs a delay, not correctness, and the next pass
+  // tries again. But it is REPORTED, because "the tower silently stopped climbing" is the exact
+  // symptom this whole chain exists to prevent.
+  const cleared = await stopTasksNamed(`tower-L${p_Level}-`);
+  if (cleared > 0) note(`level ${p_Level} finished -- cleared ${cleared} leftover patch(es)`);
+
+  return { acted: true, reason: `${p_Why} -- moving to ${p_Level + 1}` };
+}
+
+/**
+ * Stop every queued task whose name starts with the prefix. Returns how many actually stopped.
+ *
+ * ONE CALL, BECAUSE ENUMERATING THE QUEUE FROM OUT HERE CANNOT BE MADE TO WORK.
+ *
+ * This used to read fleet.tasks, filter by name, and send the ids back to task.stop. Every layer of
+ * that has a window in it: TaskMan caps GetTasks at 40 tasks to fit the websocket frame, fleet.tasks
+ * caps the live list at 60, and task.stop's id array is capped at 32. With 131 tower-L0 patches
+ * queued the loop saw 37, stopped some of them, and reported success -- so a finished floor's
+ * leftovers could never be cleared, and clearing them is the only thing that lets the next floor be
+ * ordered. The tower sat at level 0 behind 131 dead patches while every log line said the clear had
+ * worked. Three separate caps, none of them wrong on its own, and a caller that could not see any
+ * of them.
+ *
+ * task.stopNamed asks TaskMan to do it in its own store, where there is no window between deciding
+ * and acting. The count comes back from what it actually marked.
+ */
+async function stopTasksNamed(p_Prefix: string): Promise<number> {
+  const ctx = { agent: 'supply', callId: `supply-clear-${Date.now()}`, log: (m: string) => note(`clear: ${m}`) };
+  try {
+    const res: any = await registry.invoke('task.stopNamed',
+      { prefix: p_Prefix, reason: 'floor finished -- these patches place nothing' }, ctx);
+    // SAY WHY NOTHING WAS CLEARED. A bare 0 conflates "the call failed" with "there was nothing to
+    // clear", and the first is a bug while the second is routine. This function committed exactly
+    // that fault on its first outing: it cleared nothing, said nothing, and the leftovers sat there
+    // blocking the tower with no trace of why.
+    if (res?.ok === false) {
+      note(`could not clear ${p_Prefix} patches -- ${res?.error ?? 'refused'}`);
+      return 0;
+    }
+    const data = res?.data ?? res;
+    const stopped = Number(field(data, 'stopped') ?? 0);
+    if (!stopped) note(`clearing ${p_Prefix}: nothing matched among ${field(data, 'scanned') ?? '?'} task(s)`);
+    return stopped;
+  } catch (err) {
+    note(`could not clear ${p_Prefix} patches -- ${(err as Error)?.message ?? err}`);
+    return 0;
+  }
+}
+
+/**
+ * Ask order.tower for this floor, and say WHICH answer came back.
+ *
+ * A rejection and an empty result are different facts and must not arrive as the same value: the
+ * caller treats "no tasks" as "floor finished, move up", and a floor advanced past is never
+ * revisited. Returning `{ failed }` rather than a null keeps that distinction at the type level, so
+ * the caller cannot accidentally read a failure as a completion.
+ */
+/**
+ * The palette stays `brick`, and a note about why it is not chosen dynamically.
+ *
+ * A tier-fallback was written here on the theory that the tower was stalled for want of stone bricks
+ * -- drones were logging `ran out of minecraft:stone_bricks` and `fetch: storage holds none of it`.
+ * Storage in fact held 575 stone bricks and 77 cobblestone, so `cobble` was the tier that could not
+ * be supplied and the fallback would have made things worse on any transient dip. The failing
+ * fetches were for GLASS PANES, of which the settlement has none and a floor needs twelve.
+ *
+ * The lesson is the repo's own: measure the thing, not something adjacent to it. "A build ran out of
+ * bricks" is not "storage has no bricks", and one storage read would have said so.
+ */
+async function orderFloor(p_Level: number): Promise<{ res: unknown } | { failed: string }> {
+  const ctx = {
+    agent: 'supply',
+    callId: `supply-tower-${Date.now()}`,
+    log: (m: string) => note(`tower: ${m}`),
+  };
+  try {
+    return { res: await registry.invoke('order.tower',
+      { level: p_Level, palette: 'brick', blocksPerTask: 8 }, ctx) };
+  } catch (err) {
+    return { failed: (err as Error)?.message ?? String(err) };
+  }
+}
+
+/**
+ * What the fleet can actually burn. MUST TRACK CollectFuel's LIST IN DroneLogic.
+ *
+ * "What counts as fuel" now has to be answered on both sides of the bridge, and this repo has been
+ * bitten five times by two answers that disagreed. There is no way to share the predicate across
+ * Lua and TypeScript, so it is asserted equal instead -- see fuel-fetchable.test.ts.
+ */
+const BURNABLE = /coal|_log|planks/;
+
+/** Enough burnable material that stopping to refuel is not the fleet's most urgent problem. Sized
+ *  against TaskMan's FUEL_COMFORTABLE, which means the same thing on the other side.
+ *
+ *  64 -> 160. Sixty-four is one stack: a single drone's top-up to REFUEL_TARGET takes twenty of it,
+ *  and a relief takes a whole stack. So at 64 the tower was "not in an emergency", batched a floor,
+ *  and the first drone to refuel put the settlement straight back under the line -- every bootstrap
+ *  of 192 coal went into tanks and travel with the tower running the whole way down. Seven tanks at
+ *  1,600 are 140 coal; the line has to sit above what the fleet itself absorbs before building is
+ *  affordable, or "not an emergency" is a statement about the next sixty seconds. */
+const FUEL_EMERGENCY_BELOW = 160;
+
+/**
+ * Is the settlement out of fuel? `null` when storage could not be read -- which must NOT read as an
+ * emergency, or one unreadable poll stops the tower for a cooldown.
+ */
+async function fuelEmergency(): Promise<boolean | null> {
+  const burnable = await readStockWhere((n) => BURNABLE.test(n),
+    (why) => note(`tower: cannot read fuel stock (${why}) -- not treating it as an emergency`));
+  if (burnable === null) return null;
+  if (burnable < FUEL_EMERGENCY_BELOW) {
+    note(`fuel emergency: ${burnable} burnable in storage (below ${FUEL_EMERGENCY_BELOW})`);
+    return true;
+  }
+  return false;
+}
+
+/** The floor a queued tower task belongs to, or null if the name does not carry one. */
+function taskLevel(p_Name: string): number | null {
+  const m = /^tower-L(\d+)-/.exec(p_Name);
+  return m ? Number(m[1]) : null;
+}
+
+/**
+ * Split the queued tower work into "this floor's" and "a floor we already moved past".
+ *
+ * An unparseable name counts as the current floor: a tower task nobody can place is work in
+ * progress, not scrap, and guessing "stale" would have it stopped.
+ */
+function towerWorkFor(p_Queued: Set<string>, p_Level: number): { stillQueued: boolean; stale: string[] } {
+  const tower = [...p_Queued].filter((n) => n.startsWith('tower-'));
+  // An unparseable name counts as the CURRENT floor: a tower task nobody can attribute is work in
+  // progress, not scrap, and guessing "stale" would have it stopped.
+  const at = (n: string) => taskLevel(n) ?? p_Level;
+  // ANY floor that is not the one being built is a leftover -- ABOVE as well as below.
+  //
+  // This tested `< p_Level`, on the assumption the counter only ever goes up. It does not: the
+  // counter can be corrected downwards, which is the whole point of supply.set towerLevel, and the
+  // moment it was -- from 3 back to 0, to rebuild floors that had been skipped -- level 3's 236
+  // patches became work for a floor nobody was building. Ordering waits for an empty tower queue,
+  // so they blocked level 0 exactly as thoroughly as the below-level leftovers had, and the filter
+  // written for that bug could not see them because they were on the wrong side of it.
+  return { stillQueued: tower.some((n) => at(n) === p_Level), stale: tower.filter((n) => at(n) !== p_Level) };
+}
+
+/**
+ * How many of this floor's patches are still outstanding -- COUNTED IN TASKMAN, not inferred from
+ * the queue snapshot. `null` if it could not be counted, which must not be read as zero.
+ *
+ * The snapshot comes from GetTasks, which returns at most 40 tasks. Two decisions hang on this
+ * number and both fail badly on an undercount: ordering the next floor requires the current one's
+ * queue to be EMPTY, so a false zero queues a second copy of a 295-patch floor; and a floor is
+ * judged finished partly on it, so a false zero skips a floor that nothing ever revisits.
+ */
+/**
+ * `live` is work still in the queue; `failed` is work that finished by GIVING UP.
+ *
+ * TWO NUMBERS BECAUSE THEY ANSWER TWO QUESTIONS, and folding them into one gets a deadlock either
+ * way round. Ordering more work must wait only on `live` -- a patch that has finished, however
+ * badly, is not going to place anything more, and blocking on it means never re-ordering the floor
+ * that needs re-ordering. Declaring the floor FINISHED must consider both, because a task that
+ * exhausts its attempts is marked done with a failure recorded on it: counting only `live` makes
+ * "the fleet visited every square and found nothing to do" and "the fleet abandoned every square
+ * for want of bricks" the same answer, and a level advanced on that is never revisited.
+ */
+async function outstandingFor(p_Level: number): Promise<{ live: number; failed: number } | null> {
+  const ctx = { agent: 'supply', callId: `supply-count-${Date.now()}`, log: () => {} };
+  try {
+    const res: any = await registry.invoke('task.countNamed', { prefix: `tower-L${p_Level}-` }, ctx);
+    if (res?.ok === false) {
+      note(`tower: could not count level ${p_Level}'s patches -- ${res?.error ?? 'refused'}`);
+      return null;
+    }
+    const data = res?.data ?? res;
+    const live = numField(data, 'live');
+    if (live === null) return null;
+    // A missing `failed` is a drone-side answer we did not get, not a floor with nothing abandoned
+    // on it -- but treating it as zero only ever advances the floor SOONER, so it is the reading
+    // that must be justified rather than assumed. TaskMan always sends it; older TaskMan does not,
+    // and for that case the old behaviour is right.
+    return { live, failed: numField(data, 'failed') ?? 0 };
+  } catch (err) {
+    note(`tower: could not count level ${p_Level}'s patches -- ${(err as Error)?.message ?? err}`);
+    return null;
+  }
+}
+
+/** Clear patches belonging to floors already advanced past. Reports the shortfall rather than
+ *  returning a bare count, because a partial clear leaves the tower just as blocked as no clear. */
+async function clearStaleFloors(p_Stale: string[]): Promise<{ acted: boolean; reason: string }> {
+  const levels = [...new Set(p_Stale.map(taskLevel))].sort((a, b) => (a ?? 0) - (b ?? 0));
+  let cleared = 0;
+  for (const l of levels) cleared += await stopTasksNamed(`tower-L${l}-`);
+  return {
+    acted: cleared > 0,
+    reason: `cleared ${cleared} of ${p_Stale.length} patch(es) left over from level(s) ${levels.join(', ')}`,
+  };
+}
+
+async function keepTowerOrdered(queued: Set<string>): Promise<{ acted: boolean; reason: string } | null> {
+  const level = supply.towerLevel ?? 0;
+
+  // THE DESIGN HAS A TOP, AND NOTHING IN THE GEOMETRY SAID SO. bandFor falls back to the topmost
+  // band, so every level above the cap yields a perfectly valid cap floor -- the loop would have
+  // gone on ordering floors into the sky for as long as bricks lasted, each one advancing the
+  // counter, with nothing ever reporting that the building was finished.
+  if (level > TOWER_TOP) {
+    return { acted: false, reason: `tower complete -- level ${level} is above the design top (${TOWER_TOP})` };
+  }
+
+  // A SETTLEMENT THAT CANNOT MOVE CANNOT BUILD. STOP THE TOWER, DO NOT MERELY OUTRANK IT.
+  //
+  // Tower patches are priority 2 and fuel work is priority 1, which was believed to be enough. It is
+  // not: the patches are already IN the queue, so whenever a drone comes free and no fuel task can
+  // be placed for it, it takes one -- and a build is the most fuel-hungry job the fleet has.
+  //
+  // Measured at the bottom of a fuel spiral: five of seven drones at zero, storage holding one
+  // acacia log, and D60 -- one of the two machines still able to move -- spending its last 593 fuel
+  // laying blocks. Ranking cannot help there; the only thing that helps is the work not being
+  // available to take.
+  //
+  // Reversible by construction: the floor re-orders itself from scratch, so stopping its patches
+  // costs a lap and buys the fleet the drones it needs to end the shortage.
+  // STALE FLOORS ARE CLEARED BEFORE THE EMERGENCY GATE.
+  //
+  // Clearing places nothing, and a floor the level has moved away from is work a freed drone can
+  // still take. 295 tower-L1 patches sat queued through an entire fuel emergency because this ran
+  // below the return just under here, and the emergency branch only stops the CURRENT level's.
+  const { stale } = towerWorkFor(queued, level);
+  if (stale.length) return await clearStaleFloors(stale);
+
+  const emergency = await fuelEmergency();
+  if (emergency !== null && emergency) {
+    const cleared = await stopTasksNamed(`tower-L${level}-`);
+    // A PAUSE MUST NOT LOOK LIKE A COMPLETION.
+    //
+    // Stopping the floor's patches empties its queue, and an empty queue is exactly what the
+    // completion test reads as "the fleet went to every square and did what it could". So the floor
+    // was judged finished on work that had been CANCELLED, and the counter advanced once per
+    // emergency: measured walking 0 -> 3 across three pauses with nothing built on any of them.
+    //
+    // Two of my own changes interacting -- each right alone. Dropping the batch removes the thing
+    // being judged, so nothing can be concluded from a floor whose work was taken away;
+    // startWatchingFloor opens a fresh one when the fleet is fuelled and working again.
+    supply.towerBatch = undefined;
+    saveSupply();
+    // A PAUSE THAT DID NOTHING IS NOT A TICK RESULT. Returning one here ended the tick, so the
+    // phases after the tower -- the field-cache haul above all -- never ran while fuel was short.
+    // The cache at -520,63,34 held 64 coal through an entire emergency because of this line: the
+    // one action that would have ended the emergency sat behind the emergency.
+    if (cleared === 0) return null;
+    return { acted: true,
+      reason: `fuel emergency -- tower paused, ${cleared} patch(es) stopped so the fleet can refuel` };
+  }
+
+  const bricks = await blocksPlacedTotal();
+
+  // WHICH FLOOR IS QUEUED MATTERS. ASKING ONLY "IS ANY TOWER WORK QUEUED" WAS ONE BUG WITH THREE FACES.
+  //
+  // This read `n.startsWith('tower-')`, so patches left over from a floor already advanced past
+  // counted as work on the CURRENT floor. Measured: 39 `tower-L0` patches outstanding with the level
+  // at 2, and every consequence of that one substring:
+  //
+  //   - ordering waits for an empty queue, and the leftovers never left it, so levels 1 and 2 were
+  //     never ordered at all -- the fleet had nothing to build;
+  //   - startWatchingFloor opened a batch for level 2 on the strength of level 0's leftovers, so a
+  //     floor nobody had ordered was being timed for completion;
+  //   - and it duly completed, because a floor that was never ordered places nothing. The counter
+  //     climbed 0 -> 1 -> 2 through floors that do not exist, and NOTHING REVISITS A LEVEL.
+  //
+  // The queue is the authority on what the fleet is actually working on; the counter is only a
+  // pointer into it. When they disagree the counter is wrong, and the disagreement is repairable --
+  // so name the two cases separately instead of folding them into one boolean.
+  //
+  // The SNAPSHOT is used only to spot leftovers, where a miss costs a delay: the next tick sees
+  // them. The current floor's count is asked of TaskMan directly, because a miss there orders the
+  // floor twice or skips it for ever. Stale floors were already cleared above the emergency gate.
+
+
+  // A FLOOR IS FINISHED WHEN ITS OWN WORK IS DONE -- NOT WHEN THE FLEET STOPS BEING ABLE TO WORK.
+  //
+  // "The batch placed nothing" was the whole test, on the reasoning that no-op patches make an empty
+  // queue unreachable so completion has to be judged without one. The first half of that is true and
+  // the conclusion was wrong: no-op patches DO drain -- a drone refuses the block and the task
+  // completes -- and the queue that "never emptied" was being blocked by the level-blindness bug
+  // above, not by no-ops. Measured at level 0: 131 patches, 67 already completed.
+  //
+  // What "placed nothing" cannot distinguish is the case that actually happened. Measured tonight,
+  // twice: the counter walked 0 -> 1 -> 2 with `placedTotal` stuck at 1 -- three drones at zero
+  // fuel, the only crafter dry, not one block laid anywhere -- and each step was recorded as a
+  // finished floor. A fleet that cannot work places nothing, exactly like a floor that is complete,
+  // and NOTHING EVER REVISITS A LEVEL. So the failure mode is holes in the building, permanently,
+  // caused by a fuel shortage that will clear on its own in twenty minutes.
+  //
+  // The floor's own patches are the discriminator. Draining them means the fleet went to every
+  // square and did what it could; if that placed nothing, the floor really is done. Outstanding
+  // patches mean the question has not been answered yet -- so wait, and say why. A stalled tower is
+  // visible and recoverable; a skipped floor is neither.
+  //
+  // Counted in TaskMan rather than read off the 40-task snapshot: an undercount here skips a floor.
+  const counted = await outstandingFor(level);
+  if (counted === null) {
+    return { acted: false, reason: `tower level ${level}: cannot count outstanding patches -- not judging the floor` };
+  }
+  const stillQueued = counted.live > 0;
+  const unfinished = counted.live + counted.failed;
+  if (floorIsFinished(level, bricks) && unfinished === 0) {
+    return await advanceFloor(level, `level ${level} placed nothing and its patches have all drained`);
+  }
+  if (floorIsFinished(level, bricks)) {
+    note(`tower level ${level}: nothing placed, but ${counted.live} patch(es) queued and `
+       + `${counted.failed} abandoned -- waiting rather than advancing past a floor the fleet has `
+       + `not finished`);
+  }
+
+  // START MEASURING FROM WHEREVER WE FIND OURSELVES.
+  //
+  // A batch was only ever recorded at the moment of ORDERING, and ordering waits for an empty queue
+  // -- so a queue full of no-op patches produced no batch, nothing to judge, and therefore nothing
+  // that could ever empty it. A deadlock I built by fixing the judgement without fixing where its
+  // input comes from: `towerBatch: none` with hundreds of patches outstanding and the level pinned.
+  //
+  // If work for this floor is outstanding and nobody is measuring it, measure it from now. The
+  // grace period below still applies, so this cannot declare a floor finished on the spot.
+  const watching = startWatchingFloor(level, bricks, stillQueued);
+  if (watching) return watching;
+
+  // Only ORDERING needs an empty queue -- judging does not.
+  if (stillQueued) return null;
+  if (!mayQueue(queued, 'tower-', '__tower')) return null;
+
+  // DID THE LAST PASS ACTUALLY BUILD ANYTHING?
+  //
+  // A floor is finished when working it stops changing the world -- not when a map says so. The
+  // map cannot be trusted for this and never could: it remembers blocks that were mined, it does
+  // not know the atrium is meant to be open, and it has no idea the settlement's own module row
+  // sits inside the tower footprint at z=76 where no floor block can ever go. Deciding "finished"
+  // from it meant either re-queueing a built floor for ever, or bolting on one exception after
+  // another for every square that is legitimately unbuildable.
+  //
+  // The drones already answer this honestly by consuming material. A whole batch of patches that
+  // drains no floor material placed nothing, whatever the reason -- built already, atrium, a
+  // computer in the way, or unreachable. That is the effect, and it is the only thing worth
+  // reading.
+  if (batchPlacedNothing(level, bricks)) {
+    return await advanceFloor(level, `level ${level} placed nothing more`);
+  }
+
+  return await orderAndRecord(level, bricks);
+}
+
+/**
+ * Queue a floor and record the batch -- or say exactly why neither happened.
+ *
+ * A FLOOR THAT FAILED TO BE ORDERED IS NOT A FLOOR THAT IS FINISHED.
+ *
+ * The order.tower call used to swallow its rejection into a null, and the very next lines treat
+ * "no tasks" as "level complete, move up". So one failure -- MapServer slow, storage unreadable,
+ * anything -- was silently promoted into `supply.towerLevel++`, and the floor was skipped
+ * PERMANENTLY: nothing ever revisits a level once the counter has passed it. That is the
+ * order.tower swallow again, one layer up, and its cost is a hole in the building rather than a
+ * wrong task count.
+ *
+ * The swallowed shape is deliberately not quoted anywhere in this function: autonomy.test.ts
+ * greps the body for it, and a comment holding it as an example fails the check exactly as
+ * loudly as the code would.
+ *
+ * A failure and an empty result are different answers. Say which one happened, and only the
+ * empty result may advance the level.
+ */
+async function orderAndRecord(
+  level: number, bricks: number | null,
+): Promise<{ acted: boolean; reason: string }> {
+  const ordered = await orderFloor(level);
+  supply.cooldowns['__tower'] = Date.now() + 120_000;
+  if ('failed' in ordered) {
+    note(`tower level ${level}: order failed -- ${ordered.failed} (level NOT advanced)`);
+    return { acted: false, reason: `tower level ${level} could not be ordered -- ${ordered.failed}` };
+  }
+  const res: any = ordered.res;
+  const queuedCount = (res?.data?.tasks ?? []).length;
+
+  // A REFUSED QUEUE IS NOT A FINISHED FLOOR EITHER. order.tower now carries TaskMan's refusal out
+  // instead of swallowing it in a bare `break`; "the queue would not take it" is a transient
+  // condition, and advancing past the level on it loses the floor for good.
+  const refused = res?.data?.refused ?? res?.refused;
+  if (refused) {
+    note(`tower level ${level}: TaskMan refused -- ${refused} (level NOT advanced)`);
+    return { acted: false, reason: `tower level ${level} refused by TaskMan -- ${refused}` };
+  }
+
+  // Nothing even queueable -- unaffordable, or off the end of the design. Move on.
+  if (queuedCount === 0) return await advanceFloor(level, `level ${level} queued nothing`);
+
+  supply.towerBatch = { level, held: bricks, at: Date.now() };
+  saveSupply();
+  return { acted: true, reason: `tower level ${level}: queued ${queuedCount} patches` };
+}
+
+/**
+ * A PLANNED FACTORY IS INTENT. GIVE IT CHESTS AND IT IS PLANT.
+ *
+ * factory.create files a line against a plot and leaves it `planned`; factory.attach gives it an
+ * input and an output and only then does it become `running`. Nothing ever did the second step
+ * without a human, so both of this settlement's factories -- planks-01 and charcoal-01, the two
+ * that make the planks and the charcoal everything else is built and fuelled with -- sat at
+ * `planned` indefinitely, with no links and no routes, while the fleet hand-crafted every plank it
+ * needed and ran out of fuel doing it.
+ *
+ * The settlement is supposed to run without anybody watching it, so the loop that keeps supply
+ * moving is the right place to finish the wiring. Chests are chosen by free space, which is the
+ * same rule DepositTarget uses -- the emptiest is the one that can actually accept a delivery.
+ */
+async function bringFactoriesOnline(): Promise<{ acted: boolean; reason: string } | null> {
+  const planned = factories.filter((f: any) => !f.input || !f.output);
+  if (!planned.length) return null;
+
+  // Unreadable storage used to arrive here as "the settlement has fewer than two chests", which is
+  // indistinguishable from a genuinely bare base -- so both factories stayed `planned` indefinitely
+  // and the only trace was that nothing ever happened.
+  const stock: any = await bridge.call('StorageMan', 'Stock', {}, { timeoutMs: 8000 })
+    .catch((err) => { note(`factory wiring: storage unreadable -- ${(err as Error)?.message ?? err}`); return null; });
+  const chests = (luaList<any>(field(stock, 'chests')) ?? [])
+    .filter((c: any) => typeof c?.name === 'string' && c.name.includes('chest'))
+    .sort((a: any, b: any) => (b.free ?? 0) - (a.free ?? 0));
+  // Two distinct chests, or the line would draw from the box it fills.
+  if (chests.length < 2) return null;
+
+  const f: any = planned[0];
+  f.input = f.input ?? chests[0].name;
+  f.output = f.output ?? chests[1].name;
+  f.status = f.input && f.output ? 'running' : 'planned';
+  saveCity();
+  return { acted: true, reason: `${f.name} online: in ${f.input}, out ${f.output}` };
 }
 
 /**
@@ -1192,19 +2004,47 @@ async function collectFieldCaches(
 
   // luaList, not Array.isArray -- an empty deposit list serialises to {} rather than [], the same
   // trap that once made a fresh world refuse to dispatch anything at all.
+  //
+  // And a FAILED read is not an empty one: swallowed, it means "there are no field caches", which is
+  // the same wrong premise as an empty stock -- the wood stays in a box 81 blocks out and the build
+  // chain starves behind it with nothing anywhere saying why.
   const r: any = await bridge.call('StorageMan', 'DepositPoints', {}, { timeoutMs: 8000 })
-    .catch(() => null);
-  const points = luaList<any>(r?.points ?? r?.data?.points) ?? [];
+    .catch((err) => { note(`field caches: deposit points unreadable -- ${(err as Error)?.message ?? err}`); return null; });
+  const points = luaList<any>(field(r, 'points')) ?? [];
 
   // No peripheral == off the wired network == a field cache rather than a bay chest.
-  const caches = points.filter((q: any) => q?.pos && !q.peripheral && withinReach(q.pos));
+  // A cache a drone has already read as EMPTY is not worth a trip; one nobody has read yet is.
+  const holdsSomething = (q: any) =>
+    q.items == null || Object.values(q.items as Record<string, unknown>).some((n) => Number(n) > 0);
+  const caches = points.filter((q: any) => q?.pos && !q.peripheral && withinReach(q.pos) && holdsSomething(q));
   if (!caches.length) return null;
 
   // Furthest first: those are the ones a drone would otherwise refuse to haul from, and the ones
   // holding the most by the time anyone gets there.
+  //
+  // EXCEPT WHILE FUEL IS SHORT: NEAREST SURFACE CACHE FIRST. Farthest-first chose a mining cache at
+  // y=8 -- fifty blocks underground, out of GPS and beyond any relief -- over the surface cache 45
+  // blocks away holding 64 coal, i.e. the emergency's own exit. The cheapest haul that can end the
+  // shortage goes first, and nothing goes underground until it has.
   const b = settlement.base;
   const far = (q: any) => Math.abs(q.x - b.x) + Math.abs(q.y - b.y) + Math.abs(q.z - b.z);
-  const at = caches.sort((x: any, y: any) => far(y.pos) - far(x.pos))[0].pos;
+  const emergency = (await fuelEmergency()) === true;
+  const usable = emergency ? caches.filter((q: any) => q.pos.y >= b.y - 4) : caches;
+  if (!usable.length) return null;
+  // And a cache a drone has SEEN burnable in outranks distance while fuel is short: the one at
+  // -520,63,34 was observed holding 64 coal, and it was fourth in line behind three near-base
+  // caches full of cobblestone and copper.
+  const burnableIn = (q: any) =>
+    q.items ? Object.entries(q.items as Record<string, unknown>)
+      .some(([n, c]) => BURNABLE.test(n) && Number(c) > 0) : false;
+  const at = usable.sort((x: any, y: any) => {
+    if (emergency) {
+      const bx = burnableIn(x) ? 0 : 1, by = burnableIn(y) ? 0 : 1;
+      if (bx !== by) return bx - by;
+      return far(x.pos) - far(y.pos);
+    }
+    return far(y.pos) - far(x.pos);
+  })[0].pos;
 
   const where = `${at.x},${at.y},${at.z}`;
   note(`field cache at ${where} has never been collected -- sending a drone`);
@@ -1213,8 +2053,14 @@ async function collectFieldCaches(
     name: `haul:${where}`,
     priority: 1,
     work: { haul: { pos: { x: at.x, y: at.y, z: at.z } } },
-  }, { timeoutMs: 8000 }).catch(() => null);
-  if (!added || typeof added === 'string') return null;
+  }, { timeoutMs: 8000 })
+    .catch((err) => `queue unreachable -- ${(err as Error)?.message ?? err}`);
+  // Both shapes of failure say WHY now. The note above already promised a drone was being sent; a
+  // silent return here left that promise standing in the log as if it had happened.
+  if (!added || typeof added === 'string') {
+    note(`field cache at ${where}: haul NOT queued -- ${added || 'no answer from TaskMan'}`);
+    return null;
+  }
 
   supply.cooldowns['__haul'] = Date.now() + 3 * 60_000;
   saveSupply();
@@ -1267,7 +2113,7 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
 
   // Never stack speculative work: if anything is already mining, this loop waits.
   const fleet: any = await bridge.call('DroneMan', 'GetDrones', {}, { timeoutMs: 5000 });
-  const drones = fleet?.drones ?? fleet?.data?.drones ?? [];
+  const drones = field(fleet, 'drones') ?? [];
   const live = drones.filter((d: any) => !offlineish(d));
   // Gate per ROLE, not across the fleet.
   //
@@ -1310,7 +2156,7 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
   // function on it, so the very first supply pass in a new world threw before it could decide
   // anything. Empty stock is the NORMAL state of a settlement that has not mined yet -- it is the
   // condition the loop exists to resolve, so it must be the one case it handles cleanly.
-  const detail = luaList<any>(stock?.detail ?? stock?.data?.detail) ?? [];
+  const detail = luaList<any>(field(stock, 'detail')) ?? [];
   // STOCK INSIDE A DRONE IS STILL STOCK THE FLEET HAS.
   //
   // `held` counted chests only, so everything in transit was invisible to every decision this loop

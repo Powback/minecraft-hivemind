@@ -15,6 +15,6 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     include: ['src/world/**/*.test.ts', 'test/**/*.test.ts'],
-    exclude: ['dist/**', 'node_modules/**', 'src/tools/core.test.ts'],
+    exclude: ['dist/**', 'node_modules/**'],
   },
 });

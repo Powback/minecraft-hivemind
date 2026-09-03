@@ -69,6 +69,8 @@ export const PROFILES: Record<string, AgentProfile> = {
       'order.issue',
       'order.abort',
       'task.stop',
+      'task.stopNamed',
+      'task.countNamed',
       // Writing off an unrecoverable drone is a fleet-management decision, and withholding it means
       // one lost drone can occupy every working drone indefinitely via rescues it can never fulfil.
       'fleet.retire',
@@ -104,6 +106,7 @@ export const PROFILES: Record<string, AgentProfile> = {
       'supply.tick',
       'world.bounds',
       'storage.deposit',
+      'storage.forgetDeposit',
       'rescue.party',
       'rescue.relay',
       'storage.pickup',

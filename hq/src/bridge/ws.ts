@@ -107,8 +107,26 @@ export class Bridge {
         // Fire the reconnect hooks. Without this they were registered and never called -- the
         // settlement push looked wired, logged nothing at all, and MapServer went on serving an
         // old constellation and old bounds while every drone stranded on them.
+        // A HOOK MUST NEVER BREAK THE HANDSHAKE -- AND MUST NEVER FAIL SILENTLY EITHER.
+        //
+        // The note above is the record of these hooks being registered and never CALLED: the
+        // settlement push looked wired, logged nothing, and MapServer served an old constellation
+        // and old bounds while drones stranded on them. A hook that is called and throws produces
+        // that outcome exactly, and the empty catch made the two indistinguishable.
+        //
+        // The `catch` also could not see the failure it was written for. `onConnect` accepts
+        // `() => void | Promise<void>` and the settlement push IS async, so `void fn()` discards
+        // the promise: a rejected hook never reaches this synchronous catch at all. It became an
+        // unhandled rejection somewhere else entirely, with nothing tying it back to the handshake.
         for (const fn of this.connectHooks) {
-          try { void fn(); } catch { /* a hook must never break the handshake */ }
+          const failed = (err: unknown) =>
+            this.log(`connect hook (${fn.name || 'anonymous'}) FAILED: ${(err as Error)?.message ?? err}`
+                     + ' -- whatever it pushes to the world was not pushed');
+          try {
+            void Promise.resolve(fn()).catch(failed);
+          } catch (err) {
+            failed(err);
+          }
         }
         break;
       case 'PING':

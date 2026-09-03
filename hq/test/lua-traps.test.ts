@@ -60,7 +60,7 @@ const exemptNear = (raw: string[], line: number, tag: string, span = 5) =>
 const BASELINE: Record<string, number> = {
   'Bridge.lua': 1, 'Debugger.lua': 7, 'DockingMan.lua': 7, 'DroneBoot.lua': 3,
   'DroneLogic.lua': 13, 'DroneMan.lua': 16, 'DroneTankingBoot.lua': 2, 'MainFrame.lua': 7,
-  'MapServer.lua': 10, 'ModuleTemplate.lua': 1, 'PowGPSServer.lua': 25, 'PowNetRemote.lua': 39,
+  'MapServer.lua': 10, 'ModuleTemplate.lua': 1, 'PowGPSServer.lua': 25, 'PowNetRemote.lua': 28,
   'StorageMan.lua': 2, 'Sync.lua': 1, 'TankStation.lua': 7, 'TaskMan.lua': 7,
   'Template.lua': 3, 'pgps.lua': 3, 'turtleLogic.lua': 14,
 };
@@ -161,8 +161,15 @@ describe('hot loops over peripherals must yield', () => {
    * Any loop that crosses into Java per iteration -- peripheral.wrap, .list, .size, pushItems,
    * pullItems -- needs a yield in it. queueEvent/pullEvent, which resumes in the same tick.
    */
-  const YIELDS = /os\.queueEvent|os\.pullEvent|os\.sleep/;
-  const CROSSES = /peripheral\.wrap|\.pushItems|\.pullItems|peripheral\.call/;
+  // THE HELPER COUNTS AS THE THING IT REPLACED, IN BOTH DIRECTIONS.
+  //
+  // StorageMan's thirteen hand-written yields became breathe() and its seven guarded wraps became
+  // wrapped(). Matching only the literal calls would have broken this check twice over: every
+  // deduplicated loop would read as "never yields" (noisy, and it did), and -- far worse -- as
+  // "never crosses into Java", which is a SILENT false negative in the check whose whole job is to
+  // stop the storage server being killed mid-scan. An extraction must not take the guard with it.
+  const YIELDS = /os\.queueEvent|os\.pullEvent|os\.sleep|\bbreathe\s*\(/;
+  const CROSSES = /peripheral\.wrap|\bwrapped\s*\(|\.pushItems|\.pullItems|peripheral\.call/;
   // ONLY LOOPS THAT GROW WITH THE NETWORK.
   //
   // A loop over one inventory's slots, or `for i = 1, 16`, is bounded and small however big the

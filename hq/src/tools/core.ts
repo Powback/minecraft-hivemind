@@ -21,10 +21,12 @@ import { allocate, checkOrder, SPEC, type Purpose } from '../world/plots.js';
 import { city, saveCity, factories } from '../world/city.js';
 import { chain, unmetInputs, buildOrder, inputsOf, type Factory } from '../world/factories.js';
 import { BLUEPRINTS, blueprint, materials, placementOrder, footprint } from '../world/blueprints.js';
-import { PALETTES, towerFloor, floorCost, specForLevel, LEVELS } from '../world/tower.js';
+import { PALETTES, towerFloor, floorCost, specForLevel, LEVELS, TOWER_TOP } from '../world/tower.js';
 import { supply, runSupplyTick, saveSupply, stockKey, type SupplyRule } from '../agent/supply.js';
-import { luaList } from '../lua-table.js';
+import { luaList, field, numField } from '../lua-table.js';
+import { readStockMap } from '../world/stock.js';
 import { settlement, withinReach } from '../world/settlement.js';
+import { economySummary, economyFault } from '../agent/economy.js';
 
 /**
  * Pull the fleet from DroneMan, which owns the registry.
@@ -72,6 +74,36 @@ const REPORTED_STATUS: Record<string, DroneStatus> = {
   offline: 'lost',
 };
 
+/**
+ * EVERY TOOL THAT TALKS TO THE FLEET REFUSES THE SAME WAY WHEN THE BRIDGE IS DOWN.
+ *
+ * Twenty-three copies of this line, one per handler, and each one is a branch the complexity
+ * budget was paying for. Worth a name for a second reason: "bridge offline" and "the fleet said
+ * no" are different answers, and a handler that forgets this guard reports the first as the second
+ * -- which is the false-success shape this repo keeps being bitten by.
+ */
+/** The fleet record for an id, or undefined. Looked up three separate ways before this. */
+function droneById(id: unknown) {
+  return state.listDrones().find((d) => d.id === id);
+}
+
+/**
+ * TASKMAN REFUSES BY RETURNING A STRING ON THE FIELD A SUCCESS USES.
+ *
+ * So `typeof result === 'string'` is the whole test, and a caller that skips it reports a refusal
+ * as a queued task -- the false-success shape this repo counts. Written out once per order verb;
+ * one of them getting a better message and the others not is how the refusals stopped matching.
+ */
+function refuseIfString(result: unknown, what: string): void {
+  if (typeof result === 'string') {
+    throw new ToolError(`TaskMan refused the ${what}: ${result}`, 'Check fleet.tasks.');
+  }
+}
+
+function requireBridge(): void {
+  if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+}
+
 function normaliseStatus(reported: unknown, offline: unknown): DroneStatus {
   if (offline) return 'lost';
   if (typeof reported !== 'string') return 'idle';
@@ -102,7 +134,16 @@ let fleetInflight: Promise<void> | null = null;
 const asRecord = (v: unknown): Record<string, number> | undefined =>
   v && typeof v === 'object' ? (v as Record<string, number>) : undefined;
 
-async function refreshFleet(): Promise<void> {
+/**
+ * Re-read the fleet into HiveState.
+ *
+ * EXPORTED so the /brief route can call it. buildBrief reports on whatever was last refreshed, and
+ * on a cold start that is NOTHING -- an empty fleet has no unhealthy drones, so the surface a human
+ * reads to ask "what is wrong" answered `problems: ["none"]` before anything had been looked at.
+ * Confirmed live: /brief said "none" while every drone in the settlement sat at zero fuel, and the
+ * same call a moment later -- after a tool had refreshed the state -- led with FUEL TRAP.
+ */
+export async function refreshFleet(): Promise<void> {
   if (!bridge.connected) return;        // offline: serve last-known state rather than erroring
   if (Date.now() - fleetAt < FLEET_CACHE_MS) return;
   // One request shared by every concurrent caller: the map's pollers arrive together, and without
@@ -115,7 +156,7 @@ async function refreshFleet(): Promise<void> {
 async function doRefreshFleet(): Promise<void> {
   try {
     const res: any = await bridge.call('DroneMan', 'GetDrones', {}, { timeoutMs: 5000 });
-    const list = res?.drones ?? res?.data?.drones;
+    const list = field(res, 'drones');
     if (!Array.isArray(list)) return;
     for (const d of list) {
       const id = typeof d?.droneID === 'number' ? d.droneID : d?.id;
@@ -219,26 +260,125 @@ registry.register({
   handler: async () => { await refreshFleet(); return buildBrief(); },
 });
 
+/**
+ * FLEET-LEVEL FAULTS: the conditions that are invisible one drone at a time.
+ *
+ * Every one of these was live during the night the settlement died, and every one of them was
+ * reported only as a handful of ordinary per-drone lines that read like a busy afternoon. A brief
+ * that lists symptoms and never names the condition is why it ran for hours unnoticed.
+ *
+ * Ordered worst-first, because the order of a problems list is its only emphasis.
+ */
+/**
+ * The ONE fault worth reporting for a drone, chosen so it does not flip while nothing changes.
+ *
+ * This branched on `status` first, so a dry drone alternated between "is STUCK -- low fuel" and
+ * "is low on fuel (0)" depending on what DroneMan happened to call it that second. Both lines are
+ * true and they are the same fault, but a watcher diffing the list sees one clear and another
+ * appear, and reports a change that did not happen. The first thing the new fleet monitor did was
+ * emit eight lines of that churn.
+ *
+ * A monitor that cries wolf is the failure this whole surface exists to avoid, so the fault is
+ * chosen by what is WRONG rather than by what the drone is currently labelled:
+ *
+ *   out of fuel   beats everything -- it explains any status the drone reports, and it is stable
+ *   lost          nobody has heard from it
+ *   stuck         a real obstruction, not a fuel symptom
+ *   low fuel      still moving, but not for long
+ *   unhealthy     looks busy, achieves nothing -- the state that hid every expensive failure here
+ */
+export function droneFault(d: {
+  name: string; id: number; fuel: number; status: string;
+  stuck?: string | null; silentMs: number | null; healthy: boolean; unhealthyWhy?: string | null;
+}): string | null {
+  const who = `${d.name} (#${d.id})`;
+  // Zero fuel explains "stranded", "idle" and "working" alike -- report the cause, not the label.
+  if (d.fuel === 0) return `${who} is OUT OF FUEL and cannot move.`;
+  if (d.status === 'lost') return `${who} is LOST — ${describeSilence(d.silentMs)}.`;
+  if (d.status === 'stranded') {
+    return d.stuck ? `${who} is STUCK — ${d.stuck}`
+                   : `${who} has gone quiet (${describeSilence(d.silentMs)}).`;
+  }
+  if (d.fuel < 200) return `${who} is low on fuel (${d.fuel}).`;
+  if (!d.healthy) return `${who} ${d.unhealthyWhy}.`;
+  return null;
+}
+
+export function fleetFaults(
+  p_Drones: Array<{ fuel: number; status: string; order: unknown; reported?: string | null }>,
+  p_PendingOrders: number,
+): string[] {
+  const out: string[] = [];
+  const n = p_Drones.length;
+  if (!n) return out;
+
+  const dry = p_Drones.filter((d) => d.fuel === 0).length;
+
+  // THE ONE STATE THERE IS NO WAY OUT OF. Mining, felling and smelting all need a fuelled drone,
+  // so a fleet entirely at zero cannot take any action that would produce fuel.
+  if (dry === n) {
+    out.push(`FUEL TRAP: all ${n} drones are at zero fuel. Nothing can mine, fell or smelt, and `
+           + `every source of fuel requires a fuelled drone -- the settlement cannot recover on its `
+           + `own. Put burnable material (coal, charcoal or logs) in a storage chest to restart it.`);
+  } else if (dry * 3 >= n) {
+    // THE APPROACH, WHICH IS THE PART WORTH CATCHING. The trap is reached gradually and every step
+    // looks like an ordinary bad day; a third of the fleet down is the last point where a top-up is
+    // cheap. Measured: three dry, then five, then seven inside about an hour.
+    out.push(`FUEL SPIRAL: ${dry} of ${n} drones are dry. Each one lost costs the rest a rescue, `
+           + `so this accelerates -- top up storage before it reaches all ${n}.`);
+  }
+
+  // RESCUING COSTS FUEL AND RETURNS NONE. Measured at the bottom: nine Relieve jobs to one Gather,
+  // the whole fleet ferrying fuel to itself while nothing mined or felled, and 192 hand-fed coal
+  // converted into rescue miles in fifteen minutes.
+  const relieving = p_Drones.filter((d) => /relieve|rescue/i.test(String(d.reported ?? ''))).length;
+  const busy = p_Drones.filter((d) => d.fuel > 0).length;
+  if (relieving && busy && relieving * 2 >= busy) {
+    out.push(`RESCUE TREADMILL: ${relieving} of ${busy} working drones are on relief runs. The fleet `
+           + `is spending its fuel rescuing itself instead of earning any -- no income can outrun this.`);
+  }
+
+  // A SCHEDULER WEDGE LOOKS EXACTLY LIKE A QUIET AFTERNOON. Drones sitting idle while work waits is
+  // never normal, and it is how a status mismatch or an exhausted role budget presents.
+  const idle = p_Drones.filter((d) => d.status === 'idle' && d.fuel > 0 && !d.order).length;
+  if (idle >= 2 && p_PendingOrders > 0) {
+    out.push(`IDLE WITH WORK QUEUED: ${idle} fuelled drones are idle while ${p_PendingOrders} order(s) `
+           + `wait. Nothing is refusing the work out loud -- check role budgets and drone status.`);
+  }
+
+  return out;
+}
+
 export function buildBrief() {
   const drones = state.listDrones();
   const orders = state.activeOrders();
   const problems: string[] = [];
 
   for (const d of drones) {
-    if (d.status === 'lost') problems.push(`${d.name} (#${d.id}) is LOST — ${describeSilence(d.silentMs)}.`);
-    else if (d.status === 'stranded') problems.push(
-      d.stuck
-        ? `${d.name} (#${d.id}) is STUCK — ${d.stuck}`
-        : `${d.name} (#${d.id}) has gone quiet (${describeSilence(d.silentMs)}).`);
-    else if (d.fuel < 200) problems.push(`${d.name} (#${d.id}) is low on fuel (${d.fuel}).`);
-    // LOOKS BUSY, ACHIEVES NOTHING -- the state that hid every expensive failure tonight. It is
-    // reported LAST of the drone problems on purpose: a lost or stuck drone is a louder fact about
-    // the same drone, and saying both would just be noise.
-    else if (!d.healthy) problems.push(`${d.name} (#${d.id}) ${d.unhealthyWhy}.`);
+    const f = droneFault(d);
+    if (f) problems.push(f);
   }
   for (const o of orders) if (o.failure) problems.push(`Order ${o.id} (${o.kind}) failed: ${o.failure}`);
 
+  // A WHOLE-FLEET CONDITION IS NOT THE SUM OF ITS DRONE PROBLEMS.
+  //
+  // Every drone at zero was reported as seven separate "low on fuel" lines, which read exactly like
+  // seven ordinary problems on a fleet having a bad day. It is not: mining coal needs a fuelled
+  // drone, felling wood needs a fuelled drone, and smelting charcoal needs fuel -- so once the whole
+  // fleet is dry there is no sequence of actions the settlement can take. It is the one state it
+  // cannot leave, and the brief said nothing that distinguished it from a busy afternoon.
+  //
+  // Reached on 2026-09-03 and confirmed by hand: seven drones at zero, none carrying anything
+  // burnable, storage empty. Hours of "low on fuel" lines led up to it, every one of them true and
+  // none of them saying THIS.
+  //
+  // Unshifted to the front because the order of a problems list is the only emphasis it has.
+  problems.unshift(...fleetFaults(drones as any, orders.length));
+  const noIncome = economyFault();
+  if (noIncome) problems.unshift(noIncome);
+
   return {
+    economy: economySummary(),
     fleet: {
       total: drones.length,
       byStatus: tally(drones.map((d) => d.status)),
@@ -362,7 +502,7 @@ registry.register({
     //
     // MapServer.RegionKnown is the real answer, and its `percent` is the units the callers were
     // always written against.
-    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    requireBridge();
     const r: any = await bridge.call('MapServer', 'RegionKnown',
       { min: a.min, max: a.max }, { timeoutMs: 20_000 });
 
@@ -375,8 +515,15 @@ registry.register({
     // the occupancy map -- it only holds positions whose block NAME was reported. Saying so is the
     // point: `blocks` is a partial answer and a plan that treats it as a census will be wrong.
     const counts: Record<string, number> = {};
+    // A COMPOSITION THAT FAILED TO LOAD IS NOT A REGION WITH NOTHING IN IT.
+    //
+    // Coverage really is the answer that matters here, so the load staying non-fatal is right --
+    // but the empty catch made `blocks: {}` mean two different things, and one of them is "the
+    // fleet has never named a block in this box". That is the answer a caller acts on by sending a
+    // scout, or by writing the region off. Say which `{}` this is.
+    let blocksError: string | null = null;
     try {
-      const map = await loadBlocks();
+      const map = await blocks.load();
       for (const k in map) {
         const [x, y, z] = k.split(':').map(Number);
         if (x < a.min.x || x > a.max.x) continue;
@@ -385,7 +532,9 @@ registry.register({
         const n = map[k].replace(/^minecraft:/, '');
         counts[n] = (counts[n] ?? 0) + 1;
       }
-    } catch { /* composition is a bonus; coverage is the answer that matters */ }
+    } catch (err) {
+      blocksError = (err as Error)?.message ?? String(err);
+    }
 
     return {
       volume,
@@ -396,7 +545,9 @@ registry.register({
       coverage: volume ? +(known / volume).toFixed(3) : 0,
       percent,
       blocks: Object.fromEntries(Object.entries(counts).sort((x, y) => y[1] - x[1]).slice(0, 12)),
-      blocksNote: 'from the named-block index: identified positions only, not a full census',
+      blocksNote: blocksError
+        ? `the named-block index could not be read (${blocksError}) -- \`blocks\` is EMPTY BECAUSE IT FAILED, not because the region is bare`
+        : 'from the named-block index: identified positions only, not a full census',
       oldestObservationAgeMs: r?.oldestMs ?? null,
       newestObservationAgeMs: r?.newestMs ?? null,
       neverSeen: !!r?.neverSeen,
@@ -519,7 +670,7 @@ registry.register({
   returns: 'Per-module fault lists: where it happened and the error text.',
   danger: 'read',
   handler: async (a) => {
-    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    requireBridge();
     const mods = a.module ? [a.module]
       : ['DroneMan', 'TaskMan', 'DockingMan', 'MapServer', 'StorageMan'];
     const out: Record<string, unknown> = {};
@@ -527,7 +678,7 @@ registry.register({
     for (const m of mods) {
       try {
         const r: any = await bridge.call(m, 'Faults', {}, { timeoutMs: 5000 });
-        const list = r?.faults ?? r?.data?.faults ?? [];
+        const list = field(r, 'faults') ?? [];
         out[m] = list;
         total += Array.isArray(list) ? list.length : 0;
       } catch (err) {
@@ -551,24 +702,53 @@ registry.register({
   returns: 'enabled flag, rules with current stock, recent decisions.',
   danger: 'read',
   handler: async () => {
-    let held: Record<string, number> = {};
+    const held: Record<string, number> = {};
+    // "REPORTED AS UNKNOWN BELOW" WAS ONLY HALF TRUE, AND THE OTHER HALF SAID EVERYTHING IS SHORT.
+    //
+    // The catch here was empty, on the grounds that `have` comes out null and null reads as
+    // unknown. `have` did -- `short` did not: it was `(held[r.match] ?? 0) < r.min`, so an
+    // unreadable storage made the zero fallback answer the question, and EVERY rule came back
+    // `short: true`. That is readStock('empty') wearing a different hat, in the one tool a human
+    // reads to decide whether the settlement is actually short of anything.
+    //
+    // Unknown is not zero. `short` is now null when the count is, and the reason for the null is
+    // returned rather than dropped.
+    let stockError: string | null = bridge.connected ? null : 'bridge offline';
     if (bridge.connected) {
       try {
         const stock: any = await bridge.call('StorageMan', 'stock', {}, { timeoutMs: 8000 });
-        const detail = stock?.detail ?? stock?.data?.detail ?? [];
+        const detail = luaList<any>(field(stock, 'detail')) ?? [];
         for (const r of supply.rules) {
           held[r.match] = detail
-            .filter((d: any) => typeof d.name === 'string' && d.name.includes(stockKey(r)))
+            .filter((d: any) => typeof d?.name === 'string' && d.name.includes(stockKey(r)))
             .reduce((n: number, d: any) => n + (d.count ?? 0), 0);
         }
-      } catch { /* reported as unknown below */ }
+      } catch (err) {
+        stockError = (err as Error)?.message ?? String(err);
+      }
     }
     return {
       enabled: supply.enabled,
       dispatched: supply.dispatched,
       lastAction: supply.lastAction ?? null,
-      rules: supply.rules.map((r) => ({ ...r, have: held[r.match] ?? null,
-                                        short: (held[r.match] ?? 0) < r.min })),
+      stockError,
+      rules: supply.rules.map((r) => ({
+        ...r,
+        have: held[r.match] ?? null,
+        short: held[r.match] === undefined ? null : held[r.match] < r.min,
+      })),
+      // THE TOWER WAS INVISIBLE FROM THE ONE TOOL A HUMAN READS TO SEE WHAT THE LOOP IS DOING.
+      //
+      // Autonomous building is the whole point of the loop, and none of its state was reported
+      // anywhere: no level, no batch, no top. So the counter ran away through floors that had never
+      // been ordered -- 0 to 2 with 39 patches of level 0 still queued and not one block placed --
+      // and the only symptom available to anybody was that the building was not getting taller.
+      // A subsystem nobody can see the state of is a subsystem whose failures are all silent.
+      tower: {
+        level: supply.towerLevel ?? 0,
+        top: TOWER_TOP,
+        batch: supply.towerBatch ?? null,
+      },
       recent: supply.log.slice(0, 10),
     };
   },
@@ -591,7 +771,7 @@ registry.register({
   danger: 'mutate',
   bounds: 'Setting these wider than the force-loaded region will strand drones outside it.',
   handler: async (a) => {
-    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    requireBridge();
     if (a.minx === undefined) {
       return await bridge.call('MapServer', 'GetBounds', {}, { timeoutMs: 8000 });
     }
@@ -617,12 +797,38 @@ registry.register({
   danger: 'mutate',
   bounds: 'Registers a position. It does not place a chest -- one has to be there already.',
   handler: async (a) => {
-    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    requireBridge();
     return await bridge.call(
       'StorageMan', 'deposit',
       { pos: { x: a.x, y: a.y, z: a.z }, peripheral: a.peripheral },
       { timeoutMs: 8000 },
     );
+  },
+});
+
+registry.register({
+  name: 'storage.forgetDeposit',
+  summary: 'Drop a registered deposit point whose chest is gone or never existed.',
+  description:
+    'A deposit point is a REGISTRY entry, and nothing checks that a chest is still under it. ' +
+    '-474,64,78 was registered with no block entity behind it, and because the field-cache haul ' +
+    'always targets the farthest unwired point, one task at a time, the fleet hauled from that empty ' +
+    'square for ever while a real cache holding 64 coal went uncollected. Use this when rcon says ' +
+    '"not a block entity" where a deposit point claims a chest.',
+  params: z.object({ x: z.number(), y: z.number(), z: z.number() }).strict(),
+  returns: 'How many entries were dropped, and whether the position is still listed afterwards.',
+  danger: 'mutate',
+  bounds: 'Registry only. Nothing in the world is changed.',
+  handler: async (a) => {
+    requireBridge();
+    const r: any = await bridge.call('StorageMan', 'forgetDeposit',
+      { pos: { x: a.x, y: a.y, z: a.z } }, { timeoutMs: 8000 });
+    // verify-at-effect: re-reads DepositPoints and reports whether the position is still listed
+    const after: any = await bridge.call('StorageMan', 'DepositPoints', {}, { timeoutMs: 8000 });
+    const points = luaList<any>(field(after, 'points')) ?? [];
+    const stillListed = points.some((q: any) =>
+      q?.pos && q.pos.x === a.x && q.pos.y === a.y && q.pos.z === a.z);
+    return { ...(typeof r === 'object' && r ? r : { reply: r }), stillListed, verified: !stillListed };
   },
 });
 
@@ -661,11 +867,27 @@ registry.register({
       .describe('For ores: what depth to prospect at when none has ever been surveyed.'),
     limit: z.number().int().min(1).max(512).optional(),
     runNow: z.boolean().optional().describe('Run one tick immediately rather than waiting.'),
+    // ADVANCING A FLOOR IS IRREVERSIBLE BY DESIGN, SO THERE MUST BE A WAY BACK.
+    //
+    // Nothing revisits a level once the counter has passed it -- which is the right behaviour and
+    // exactly why a counter that has gone wrong is unrecoverable without this. It went wrong: three
+    // floors were recorded as finished while the fleet was out of fuel and `placedTotal` never left
+    // 1, leaving permanent holes with no way to ask for them to be rebuilt. Re-ordering a floor is
+    // safe -- drones skip squares that are already occupied -- so the repair is cheap and the lack
+    // of it was not.
+    towerLevel: z.number().int().min(0).max(64).optional()
+      .describe('Set the floor being built. Use to rebuild floors that were advanced past in error.'),
   }).strict(),
   returns: 'The updated policy, and the result of the immediate tick if requested.',
   danger: 'mutate',
   handler: async (a, ctx) => {
     if (typeof a.enabled === 'boolean') supply.enabled = a.enabled;
+    if (a.towerLevel !== undefined) {
+      // Clear the batch with it: a batch belongs to the floor it was opened for, and leaving one
+      // behind would have the new floor judged against measurements taken on the old one.
+      supply.towerLevel = a.towerLevel;
+      supply.towerBatch = undefined;
+    }
     if (a.match) {
       const existing = supply.rules.find((r) => r.match === a.match);
       if (existing) {
@@ -683,8 +905,10 @@ registry.register({
     saveSupply();
     let tick;
     if (a.runNow) tick = await runSupplyTick();
-    ctx.log('supply.set', { enabled: supply.enabled, rules: supply.rules.length });
-    return { enabled: supply.enabled, rules: supply.rules, tick: tick ?? null };
+    ctx.log('supply.set', { enabled: supply.enabled, rules: supply.rules.length,
+                            towerLevel: supply.towerLevel ?? 0 });
+    return { enabled: supply.enabled, rules: supply.rules,
+             tower: { level: supply.towerLevel ?? 0, top: TOWER_TOP }, tick: tick ?? null };
   },
 });
 
@@ -721,7 +945,7 @@ registry.register({
   returns: 'Whether it dispatched, how many seed positions were found, and the material.',
   danger: 'destructive',
   handler: async (a, ctx) => {
-    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    requireBridge();
 
     // NEAREST FIRST, OR THE FLEET WALKS PAST THE THING IT IS LOOKING FOR.
     //
@@ -734,7 +958,7 @@ registry.register({
     // Ask for a wide sample and pick the closest, so "go and get some wood" means the wood here.
     const found: any = await bridge.call('MapServer', 'FindBlocks',
       { match: a.match, limit: 400 }, { timeoutMs: 15000 });
-    const hits = found?.hits ?? found?.data?.hits ?? [];
+    const hits = field(found, 'hits') ?? [];
     const all = Array.isArray(hits) ? hits : Object.values(hits ?? {});
     const base = settlement.base;
     const seeds = (all as any[])
@@ -787,7 +1011,7 @@ registry.register({
 
     ctx.log(`gather ${a.match}`, { seeds: seeds.length, limit: a.limit });
     return { dispatched: true, material: a.match, seeds: seeds.length,
-             limit: a.limit, task: res?.id ?? res?.data?.id };
+             limit: a.limit, task: field(res, 'id') };
   },
 });
 
@@ -808,7 +1032,7 @@ registry.register({
   returns: 'Total found, counts per block name, and up to `limit` coordinates.',
   danger: 'read',
   handler: async (a) => {
-    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    requireBridge();
     return await bridge.call('MapServer', 'FindBlocks', a, { timeoutMs: 10000 });
   },
 });
@@ -839,76 +1063,6 @@ registry.register({
 // fraction had arrived, so /map drew a world with most of the blocks missing and redrew a DIFFERENT
 // fraction on the next poll. A five-minute cache is both far cheaper and far more stable to look at.
 const VOXEL_CACHE_MS = 300_000;
-let voxelCache: { at: number; grid: Record<string, number> } | null = null;
-/**
- * A single in-flight fetch shared by every concurrent caller. The cache alone is not enough: the
- * map page polls, and rednet round-trips take seconds, so two pollers arriving inside one fetch
- * would each start their own. The grid is ~100KB over a link that also carries drone orders --
- * exactly the traffic the Bridge's backpressure exists to avoid generating in the first place.
- */
-let voxelInflight: Promise<Record<string, number>> | null = null;
-
-async function loadVoxels(): Promise<Record<string, number>> {
-  if (voxelCache && Date.now() - voxelCache.at < VOXEL_CACHE_MS) return voxelCache.grid;
-  if (voxelInflight) return voxelInflight;
-  voxelInflight = (async () => {
-    // PAGE IT. The survey is ~490KB of JSON and a websocket frame caps far below that, so asking
-    // for the whole thing did not return a trimmed world -- it returned NOTHING, and the map
-    // rendered no terrain at all. There is no reason the viewer cannot have all of it; it just has
-    // to arrive in pieces.
-    //
-    // PowNet replies are unwrapped by the Bridge, but SaveWorld-era callers saw a nested `data`,
-    // so accept both shapes rather than returning an empty world on a wrapper change.
-    const grid: Record<string, number> = {};
-    let offset: number | undefined = 0;
-    let truncated = false;
-    for (let page = 0; page < 200 && offset !== undefined; page++) {
-      let res: any;
-      try {
-        res = await bridge.call('MapServer', 'LoadWorld', { offset }, { timeoutMs: 20_000 });
-      } catch {
-        res = null;
-      }
-      const chunk = res?.cachedWorld ?? res?.data?.cachedWorld;
-      // A FAILED PAGE IS NOT THE END OF THE MAP.
-      //
-      // Missing cachedWorld left `next` undefined, which the loop read as "that was the last page"
-      // -- so one timeout mid-walk silently returned a fraction of the world as if it were all of
-      // it. The map went from 111,684 cells to 9,216 and reported success. Partial data presented
-      // as complete is worse than an error: everything downstream trusts it.
-      if (!chunk || typeof chunk !== 'object') {
-        truncated = true;
-        break;
-      }
-      Object.assign(grid, chunk);
-      const nxt = res?.next ?? res?.data?.next;
-      offset = typeof nxt === 'number' ? nxt : undefined;
-    }
-
-    // Keep the better answer. A truncated read must not replace a complete one in the cache,
-    // because the next caller cannot tell the difference.
-    if (truncated && voxelCache && Object.keys(voxelCache.grid).length > Object.keys(grid).length) {
-      console.log(`[voxels] partial read (${Object.keys(grid).length} cells); keeping the previous ${Object.keys(voxelCache.grid).length}`);
-      return voxelCache.grid;
-    }
-    // NEVER CACHE A TRUNCATED READ AT FULL TTL, AND NEVER CACHE AN EMPTY ONE AT ALL.
-    //
-    // A failed page-0 -- MapServer restarting, or busy -- produced an empty grid with no previous
-    // cache to fall back on, and that emptiness was then stored for the full five minutes. The map
-    // page showed no terrain and kept showing none long after MapServer was healthy again, which
-    // read as lost survey data: /map/voxels returned known:0 with cachedAgeMs:103819 while MapServer
-    // held 274,750 cells. Backdating the timestamp makes a partial answer expire in 30s instead of
-    // 300, so the map heals itself on the next poll rather than at the next restart.
-    if (truncated && Object.keys(grid).length === 0) {
-      console.log('[voxels] read returned nothing; not caching, will retry');
-      return grid;
-    }
-    voxelCache = { at: truncated ? Date.now() - (VOXEL_CACHE_MS - 30_000) : Date.now(), grid };
-    return grid;
-  })().finally(() => { voxelInflight = null; });
-  return voxelInflight;
-}
-
 /** Bounds and composition, derived once so neither the agent nor the page has to scan twice. */
 function voxelStats(grid: Record<string, number>) {
   let solid = 0, air = 0, other = 0;
@@ -932,7 +1086,7 @@ function voxelStats(grid: Record<string, number>) {
     bounds: known
       ? { min: { x: minx, y: miny, z: minz }, max: { x: maxx, y: maxy, z: maxz } }
       : null,
-    cachedAgeMs: voxelCache ? Date.now() - voxelCache.at : 0,
+    cachedAgeMs: voxels.cachedAt() ? Date.now() - (voxels.cachedAt() as number) : 0,
   };
 }
 
@@ -950,8 +1104,8 @@ registry.register({
   danger: 'read',
   bounds: `Served from a ${VOXEL_CACHE_MS / 1000}s cache, so polling it is cheap but it can be that stale.`,
   handler: async (a) => {
-    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
-    const grid = await loadVoxels();
+    requireBridge();
+    const grid = await voxels.load();
     const stats = voxelStats(grid);
     return a.raw ? { ...stats, cells: grid } : stats;
   },
@@ -967,55 +1121,93 @@ registry.register({
 
 // Same reasoning as the voxel cache: block identity changes only when a drone reports a new name.
 const BLOCKS_CACHE_MS = 300_000;
-let blocksCache: { at: number; map: Record<string, string> } | null = null;
-let blocksInflight: Promise<Record<string, string>> | null = null;
 
-async function loadBlocks(): Promise<Record<string, string>> {
-  if (blocksCache && Date.now() - blocksCache.at < BLOCKS_CACHE_MS) return blocksCache.map;
-  if (blocksInflight) return blocksInflight;
-  blocksInflight = (async () => {
-    // Shorter than the voxel fetch it rides alongside. Identity is an enrichment: if MapServer
-    // does not have this endpoint yet, the map must fall back to unidentified terrain quickly
-    // rather than hold the whole terrain refresh open waiting for a call that will never answer.
-    // Page through it. MapServer caps each reply so it fits in a websocket frame -- asking for
-    // the whole map in one go produced 427KB, which CC:T refuses to send, and the failed send
-    // closed the socket and dropped the WHOLE FLEET off HQ every time this ran.
-    // 40 pages of 2000 was a 80,000-entry ceiling on an index that now holds 172,296 named blocks,
-    // so even a healthy read stopped less than halfway and reported no error. The limit exists only
-    // to bound a runaway paginator, so it is set above the largest plausible index rather than at
-    // yesterday's map size.
-    const map: Record<string, string> = {};
-    let offset: number | undefined = 0;
-    let truncated = false;
-    for (let page = 0; page < 300 && offset !== undefined; page++) {
-      let res: any;
-      try {
-        // A slow page is not a missing one. Eight seconds was tight enough that a busy MapServer
-        // threw here, which -- with no catch -- rejected the whole read and left the map with no
-        // block identities at all.
-        res = await bridge.call('MapServer', 'BlockAt', { offset }, { timeoutMs: 20_000 });
-      } catch {
-        res = null;
-      }
-      const chunk = res?.blockAt ?? res?.data?.blockAt;
-      if (!chunk || typeof chunk !== 'object') { truncated = true; break; }
-      Object.assign(map, chunk);
-      const nxt = res?.next ?? res?.data?.next;
-      offset = typeof nxt === 'number' ? nxt : undefined;
-    }
-    if (truncated && blocksCache && Object.keys(blocksCache.map).length > Object.keys(map).length) {
-      console.log(`[blocks] partial read (${Object.keys(map).length}); keeping the previous ${Object.keys(blocksCache.map).length}`);
-      return blocksCache.map;
-    }
-    if (truncated && Object.keys(map).length === 0) {
-      console.log('[blocks] read returned nothing; not caching, will retry');
-      return map;
-    }
-    blocksCache = { at: truncated ? Date.now() - (BLOCKS_CACHE_MS - 30_000) : Date.now(), map };
-    return map;
-  })().finally(() => { blocksInflight = null; });
-  return blocksInflight;
+/**
+ * PAGE A BIG MAP OUT OF MapServer, CACHE IT, AND NEVER LET A PARTIAL READ LOOK COMPLETE.
+ *
+ * loadVoxels and loadBlocks were the same forty lines twice, and every lesson in them had to be
+ * learned and then applied TWICE -- which is the failure mode, not the line count:
+ *
+ *   PAGE IT. The survey is ~490KB of JSON and a websocket frame caps far below that, so asking for
+ *   the whole thing did not return a trimmed world, it returned NOTHING and the map drew no
+ *   terrain. The blocks side was worse: 427KB that CC:T refuses to send, and the failed send closed
+ *   the socket and dropped the WHOLE FLEET off HQ every time it ran.
+ *
+ *   A FAILED PAGE IS NOT THE END OF THE MAP. A missing chunk left `next` undefined, which the loop
+ *   read as "that was the last page" -- so one timeout mid-walk silently returned a fraction of the
+ *   world as if it were all of it: 111,684 cells down to 9,216, reported as success. Partial data
+ *   presented as complete is worse than an error, because everything downstream trusts it.
+ *
+ *   NEVER CACHE A TRUNCATED READ AT FULL TTL, AND NEVER CACHE AN EMPTY ONE AT ALL. A failed page-0
+ *   stored emptiness for five minutes: /map/voxels returned known:0 with cachedAgeMs:103819 while
+ *   MapServer held 274,750 cells. Backdating a partial answer expires it in 30s, so the map heals
+ *   on the next poll instead of at the next restart.
+ *
+ *   maxPages bounds a runaway paginator ONLY. It is set above the largest plausible index, never at
+ *   yesterday's map size -- 40 pages of 2000 was an 80,000-entry ceiling on an index holding
+ *   172,296 named blocks, so even a healthy read stopped halfway and reported no error.
+ *
+ * The inflight promise is shared deliberately: /map polls and the agent both ask, rednet round
+ * trips take seconds, and two callers arriving inside one fetch would each start their own ~100KB
+ * read over the link that also carries drone orders.
+ */
+function pagedLoader<V>(o: {
+  label: string; endpoint: string; field: string; maxPages: number; ttlMs: number;
+}) {
+  let cache: { at: number; data: Record<string, V> } | null = null;
+  let inflight: Promise<Record<string, V>> | null = null;
+
+  return {
+    cachedAt: () => cache?.at ?? null,
+    load(): Promise<Record<string, V>> {
+      if (cache && Date.now() - cache.at < o.ttlMs) return Promise.resolve(cache.data);
+      if (inflight) return inflight;
+      inflight = (async () => {
+        const data: Record<string, V> = {};
+        let offset: number | undefined = 0;
+        let truncated = false;
+        for (let page = 0; page < o.maxPages && offset !== undefined; page++) {
+          let res: any;
+          try {
+            // A slow page is not a missing one: eight seconds was tight enough that a busy
+            // MapServer threw, and with no catch that rejected the whole read.
+            res = await bridge.call('MapServer', o.endpoint, { offset }, { timeoutMs: 20_000 });
+          } catch {
+            res = null;
+          }
+          // PowNet replies are unwrapped by the Bridge, but SaveWorld-era callers saw a nested
+          // `data`, so accept both rather than returning an empty world on a wrapper change.
+          const chunk = res?.[o.field] ?? res?.data?.[o.field];
+          if (!chunk || typeof chunk !== 'object') { truncated = true; break; }
+          Object.assign(data, chunk);
+          const nxt = field(res, 'next');
+          offset = typeof nxt === 'number' ? nxt : undefined;
+        }
+        // Keep the better answer: a truncated read must not replace a complete one, because the
+        // next caller cannot tell the difference.
+        if (truncated && cache && Object.keys(cache.data).length > Object.keys(data).length) {
+          console.log(`[${o.label}] partial read (${Object.keys(data).length}); keeping the previous ${Object.keys(cache.data).length}`);
+          return cache.data;
+        }
+        if (truncated && Object.keys(data).length === 0) {
+          console.log(`[${o.label}] read returned nothing; not caching, will retry`);
+          return data;
+        }
+        cache = { at: truncated ? Date.now() - (o.ttlMs - 30_000) : Date.now(), data };
+        return data;
+      })().finally(() => { inflight = null; });
+      return inflight;
+    },
+  };
 }
+
+const voxels = pagedLoader<number>({
+  label: 'voxels', endpoint: 'LoadWorld', field: 'cachedWorld', maxPages: 200, ttlMs: VOXEL_CACHE_MS,
+});
+
+const blocks = pagedLoader<string>({
+  label: 'blocks', endpoint: 'BlockAt', field: 'blockAt', maxPages: 300, ttlMs: BLOCKS_CACHE_MS,
+});
 
 registry.register({
   name: 'world.blocks',
@@ -1032,15 +1224,15 @@ registry.register({
   danger: 'read',
   bounds: `Served from a ${BLOCKS_CACHE_MS / 1000}s cache. Covers only observed positions, not the whole world.`,
   handler: async (a) => {
-    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
-    const map = await loadBlocks();
+    requireBridge();
+    const map = await blocks.load();
     const counts: Record<string, number> = {};
     let n = 0;
     for (const k in map) { counts[map[k]] = (counts[map[k]] ?? 0) + 1; n++; }
     const stats = {
       identified: n,
       counts: Object.fromEntries(Object.entries(counts).sort((x, y) => y[1] - x[1])),
-      cachedAgeMs: blocksCache ? Date.now() - blocksCache.at : 0,
+      cachedAgeMs: blocks.cachedAt() ? Date.now() - (blocks.cachedAt() as number) : 0,
     };
     return a.raw ? { ...stats, blockAt: map } : stats;
   },
@@ -1063,7 +1255,7 @@ registry.register({
   returns: 'Tasks with id, name, verb, region, assigned drone id and name, role, progress, paused/enabled flags.',
   danger: 'read',
   handler: async () => {
-    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    requireBridge();
     const res: any = await bridge.call('TaskMan', 'GetTasks', {}, { timeoutMs: 8000 });
     // AN EMPTY LUA TABLE IS `{}`, WHICH IS AN OBJECT HERE, NOT AN ARRAY.
     //
@@ -1071,7 +1263,7 @@ registry.register({
     // queued came back as `{}` and `.map` threw "raw.map is not a function" -- the queue read as
     // BROKEN precisely when it was simply empty. The same happens for a sparse task table, which
     // TaskMan's is: keys are task ids, so any gap makes it serialise as an object.
-    const rawAny = res?.tasks ?? res?.data?.tasks ?? [];
+    const rawAny = field(res, 'tasks') ?? [];
     const raw: any[] = Array.isArray(rawAny)
       ? rawAny
       : (rawAny && typeof rawAny === 'object' ? Object.values(rawAny) : []);
@@ -1231,6 +1423,16 @@ const NODES_CACHE_MS = 20_000;
 const NODES_BACKOFF_MS = 90_000;
 let nodesCache: { at: number; value: any; anyUp: boolean } | null = null;
 let nodesInflight: Promise<any> | null = null;
+/**
+ * Why the last background refresh produced nothing.
+ *
+ * The refresh is fire-and-forget, so its rejection had to be caught -- but discarding it into undefined
+ * left the tool with no way to say what happened. If probeNodes throws every time, the cache is
+ * never written and hive.nodes answers `probing: true, results appear on the next poll` FOR EVER.
+ * That is the tool the whole debugging playbook points at when the fleet is idle for no reason,
+ * telling you to wait, indefinitely, for a poll that has already failed.
+ */
+let nodesProbeError: string | null = null;
 
 registry.register({
   name: 'hive.nodes',
@@ -1244,7 +1446,7 @@ registry.register({
   returns: 'Per-module: reachable flag, computer id, position, uptime, fault count, last fault, last monitor line, recent log lines.',
   danger: 'read',
   handler: async () => {
-    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    requireBridge();
     const ttl = nodesCache?.anyUp === false ? NODES_BACKOFF_MS : NODES_CACHE_MS;
     const stale = !nodesCache || Date.now() - nodesCache.at >= ttl;
 
@@ -1253,16 +1455,24 @@ registry.register({
     // update rate hostage to its slowest, least urgent panel, and starve the terrain fetch behind
     // it. Whoever asks next gets the fresh answer.
     if (stale && !nodesInflight) {
+      // A failed probe must not become an unhandled rejection -- and must not vanish either.
       nodesInflight = probeNodes()
-        .catch(() => undefined)     // a failed probe must not become an unhandled rejection
+        .then((v) => { nodesProbeError = null; return v; })
+        .catch((err) => { nodesProbeError = (err as Error)?.message ?? String(err); })
         .finally(() => { nodesInflight = null; });
     }
     if (!nodesCache) {
       // First call ever: there is nothing to serve yet, and saying so beats blocking.
-      return { count: NODE_MODULES.length + 1, up: 0, nodes: [], probing: true,
-               note: 'Probing the in-world computers; results appear on the next poll.' };
+      return {
+        count: NODE_MODULES.length + 1, up: 0, nodes: [], probing: true,
+        probeError: nodesProbeError,
+        note: nodesProbeError
+          ? `The probe itself is failing (${nodesProbeError}) -- this is not "still loading". ` +
+            'Nothing here will ever populate until that is fixed.'
+          : 'Probing the in-world computers; results appear on the next poll.',
+      };
     }
-    return { ...nodesCache.value, cachedAgeMs: Date.now() - nodesCache.at };
+    return { ...nodesCache.value, cachedAgeMs: Date.now() - nodesCache.at, probeError: nodesProbeError };
   },
 });
 
@@ -1332,7 +1542,12 @@ async function probeNodes() {
       bridgeNode = { module: 'Bridge', reachable: true, id: b?.id ?? null, pos: null,
                      upSec: typeof b?.up === 'number' ? Math.round(b.up) : null,
                      faults: 0, lastFault: null, monitor: null, log: [] };
-    } catch { /* left unreachable */ }
+    } catch (err) {
+      // Left unreachable -- WITH the reason, the same way an unreachable module above carries one.
+      // The Bridge answers on its own path, so its silence means something different from a
+      // module's, and "reachable: false" alone cannot tell you which of the two you are looking at.
+      bridgeNode.error = (err as Error)?.message ?? String(err);
+    }
 
   const all = [...nodes, bridgeNode];
   // "Any PowNet module answered" — the Bridge is excluded deliberately, because it answers on its
@@ -1362,7 +1577,7 @@ registry.register({
   returns: 'Cave pockets, largest first, with size, bounds and an entry coordinate.',
   danger: 'read',
   handler: async (a) => {
-    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    requireBridge();
     // SIXTY SECONDS. Cave detection walks the entire map twice plus a flood fill, and now that
     // those loops yield (they must -- unyielded they aborted MapServer outright) each yield costs a
     // tick. At 237,000 cells that is legitimately half a minute of wall clock, not a hang. A 15s
@@ -1383,7 +1598,7 @@ registry.register({
   returns: 'Summary line plus per-item totals from StorageMan.',
   danger: 'read',
   handler: async () => {
-    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    requireBridge();
     return await bridge.call('StorageMan', 'stock', {}, { timeoutMs: 8000 });
   },
 });
@@ -1400,7 +1615,7 @@ registry.register({
   returns: 'Towers with position, slot count, and current occupants.',
   danger: 'read',
   handler: async () => {
-    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    requireBridge();
     return await bridge.call('DockingMan', 'ls', {}, { timeoutMs: 8000 });
   },
 });
@@ -1423,7 +1638,7 @@ registry.register({
   danger: 'mutate',
   bounds: 'Registers the tower in DockingMan. It does not build anything -- the blocks must already be there.',
   handler: async (a) => {
-    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    requireBridge();
     return await bridge.call(
       'DockingMan', 'add',
       { name: a.name, pos: [a.x, a.y, a.z], height: a.height },
@@ -1443,7 +1658,7 @@ registry.register({
   danger: 'mutate',
   bounds: 'Drones berthed in it lose their slot record; they re-allocate on the next dock.',
   handler: async (a) => {
-    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    requireBridge();
     return await bridge.call('DockingMan', 'rm', { id: a.id }, { timeoutMs: 8000 });
   },
 });
@@ -1460,7 +1675,7 @@ registry.register({
   returns: 'Whether smelting is now on, and how many furnaces are on the network.',
   danger: 'mutate',
   handler: async (a) => {
-    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    requireBridge();
     return await bridge.call('StorageMan', 'smelt', a.off ? { off: true } : {}, { timeoutMs: 8000 });
   },
 });
@@ -1519,7 +1734,7 @@ registry.register({
     takeaway: 'Recovery is a destination, not a job. The drone aborts and travels.',
   }],
   handler: async (a, ctx) => {
-    const drone = state.listDrones().find((d) => d.id === a.id);
+    const drone = droneById(a.id);
     if (!drone) throw new ToolError(`No drone #${a.id}.`, 'Check fleet.status for drone ids.');
     // A drone that is not reporting cannot be steered -- it will not hear this. Say so plainly
     // rather than returning a hopeful success; recover.dispatch is the tool for that case.
@@ -1580,17 +1795,20 @@ registry.register({
     takeaway: 'The 8 planks already held are subtracted once, not once per chest.',
   }],
   handler: async (a) => {
-    let stock: Record<string, number> = {};
-    try {
-      const res: any = await bridge.call('StorageMan', 'stock', {}, { timeoutMs: 8000 });
-      for (const d of res?.detail ?? res?.data?.detail ?? []) {
-        if (typeof d?.name === 'string') stock[d.name] = (stock[d.name] ?? 0) + (d.count ?? 0);
-      }
-    } catch {
-      // Plan against nothing rather than refusing. A plan that over-orders is recoverable; no
-      // plan at all when the bridge blips is not. The response says which happened.
-      stock = {};
-    }
+    // Plan against nothing rather than refusing. A plan that over-orders is recoverable; no
+    // plan at all when the bridge blips is not. The response says which happened.
+    // THROW, DO NOT PLAN ON A GUESS.
+    //
+    // 'empty' means "if storage cannot be read, assume it holds nothing" -- which for a PLANNER is
+    // the worst possible default: it queues gathering and crafting for materials already on the
+    // shelf, and every downstream decision inherits the false premise. readStock's own comment
+    // records how this bit before: a hole-y stock list arrives from Lua as an object, iterating it
+    // throws, the throw lands in the caller's catch, and the planner silently concluded the
+    // settlement owned nothing. order.tower already asks for 'throw'; these three are the survivors.
+    //
+    // Refusing to plan is recoverable -- the supply loop retries on the next tick. A confidently
+    // wrong plan sends the whole fleet to mine what is already in the chest.
+    const stock = await readStock('throw');
     const plan = expand(a.item, a.quantity, (i) => stock[i] ?? 0);
     return { ...plan, stockKnown: Object.keys(stock).length > 0, craftable: craftable().length };
   },
@@ -1684,13 +1902,18 @@ registry.register({
     takeaway: 'Both craft steps queued in order; nothing needed a dig site because the logs were held.',
   }],
   handler: async (a, ctx) => {
-    let stock: Record<string, number> = {};
-    try {
-      const res: any = await bridge.call('StorageMan', 'stock', {}, { timeoutMs: 8000 });
-      for (const d of res?.detail ?? res?.data?.detail ?? []) {
-        if (typeof d?.name === 'string') stock[d.name] = (stock[d.name] ?? 0) + (d.count ?? 0);
-      }
-    } catch { stock = {}; }
+    // THROW, DO NOT PLAN ON A GUESS.
+    //
+    // 'empty' means "if storage cannot be read, assume it holds nothing" -- which for a PLANNER is
+    // the worst possible default: it queues gathering and crafting for materials already on the
+    // shelf, and every downstream decision inherits the false premise. readStock's own comment
+    // records how this bit before: a hole-y stock list arrives from Lua as an object, iterating it
+    // throws, the throw lands in the caller's catch, and the planner silently concluded the
+    // settlement owned nothing. order.tower already asks for 'throw'; these three are the survivors.
+    //
+    // Refusing to plan is recoverable -- the supply loop retries on the next tick. A confidently
+    // wrong plan sends the whole fleet to mine what is already in the chest.
+    const stock = await readStock('throw');
 
     const plan = expand(a.item, a.quantity, (i) => stock[i] ?? 0);
     if (plan.missing.length)
@@ -1752,11 +1975,23 @@ registry.register({
         // It deliberately does NOT fall back to a gather: that is the job measured at
         // "1/192 checked, 0 taken", and answering "there are no trees in reach" honestly is worth
         // more than dispatching a drone to prove it.
+        // WHY IT COULD NOT BE SOURCED IS THE ACTIONABLE HALF OF `unsourced`.
+        //
+        // The catch below was empty, so every failure arrived at the caller as a bare
+        // `{item, action, runs}` -- identical whether the map has never seen the material (send a
+        // scout), the material is outside the operating circle (nothing will ever fix it), or
+        // MapServer was simply slow (try again in a minute). Three different responses, one
+        // indistinguishable answer, and this is the tool a human uses to find out why a build will
+        // not start.
+        let why = step.action === 'lumber'
+          ? 'no lumber site in reach -- deliberately NOT downgraded to a gather'
+          : `no source for a '${step.action}' step`;
         if (step.action === 'gather') {
           try {
             const g: any = await registry.invoke('order.gather',
               { match: step.item.replace(/^[a-z0-9_]+:/, ''), limit: 64 }, ctx);
             const gd = g?.data ?? g;
+            why = 'order.gather dispatched nothing';
             if (gd?.dispatched) {
               queued.push({ item: step.item, runs: step.runs, action: 'gather', task: gd.task, after: previous });
               // THE GATHER IS THE FIRST LINK, NOT A SIDE ERRAND.
@@ -1768,9 +2003,11 @@ registry.register({
               if (typeof gd.task === 'number') previous = gd.task;
               continue;
             }
-          } catch { /* nothing surveyed for it; fall through and report honestly */ }
+          } catch (err) {
+            why = (err as Error)?.message ?? String(err);
+          }
         }
-        unsourced.push({ item: step.item, action: step.action, runs: step.runs });
+        unsourced.push({ item: step.item, action: step.action, runs: step.runs, why });
         continue;
       }
       const res: any = await bridge.call('TaskMan', 'Add', {
@@ -1780,7 +2017,7 @@ registry.register({
         work: { craft: { item: step.item, runs: step.runs, grid: step.grid, inputs: recipeInputs(step.item) } },
       }, { timeoutMs: 8000 });
       if (typeof res === 'string') throw new ToolError(`TaskMan refused ${step.item}: ${res}`, 'Check fleet.tasks.');
-      const id = res?.id ?? res?.data?.id;
+      const id = field(res, 'id');
       queued.push({ item: step.item, runs: step.runs, task: id, after: previous });
       previous = typeof id === 'number' ? id : previous;
     }
@@ -1965,7 +2202,7 @@ registry.register({
       priority: 2,
       work: { mine: { pos: head, depth: a.depth, length: a.length, branches: a.branches, spacing: a.spacing } },
     }, { timeoutMs: 8000 });
-    if (typeof shaft === 'string') throw new ToolError(`TaskMan refused the shaft: ${shaft}`, 'Check fleet.tasks.');
+    refuseIfString(shaft, 'shaft');
 
     // The scout waits for the shaft to REACH ITS DEPTH, not to finish.
     //
@@ -1983,7 +2220,7 @@ registry.register({
       after: 95,
       work: { survey: { w: 4, h: 4, radius: 8, pos: { x: head.x, y: a.depth, z: head.z } } },
     }, { timeoutMs: 8000 });
-    if (typeof scan === 'string') throw new ToolError(`TaskMan refused the scan: ${scan}`, 'Check fleet.tasks.');
+    refuseIfString(scan, 'scan');
 
     ctx.log('order.prospect', { plot: plot.name, depth: a.depth });
     return {
@@ -2039,7 +2276,7 @@ registry.register({
     takeaway: 'Coverage goes TO the casualty, because the casualty cannot come to it.',
   }],
   handler: async (a, ctx) => {
-    const target = state.listDrones().find((d) => d.id === a.id);
+    const target = droneById(a.id);
     const at = a.at ?? target?.pos;
     if (!at) throw new ToolError(
       `No position known for #${a.id}.`,
@@ -2126,20 +2363,22 @@ registry.register({
  * map, which is right for a planner -- over-ordering is recoverable. The third dispatches a drone to
  * place two thousand blocks, where believing in cobblestone you do not have strands it mid-floor.
  * So the caller decides, and has to say so.
+ *
+ * WRITING THIS WAS NOT THE SAME AS ADOPTING IT. It was extracted and then only order.tower was
+ * switched over, so plan.make, plan.execute and order.build went on running their own copies for
+ * months -- and the copies never got luaList(). An empty or hole-y stock list arrives from Lua as an
+ * OBJECT, `for...of` over an object throws, the throw lands in their own catch, and the planner
+ * silently concluded the settlement owns nothing. A duplicate that is merely unread is harmless; one
+ * that swallows its own bug in a catch block is not.
  */
 async function readStock(onUnreadable: 'empty' | 'throw'): Promise<Record<string, number>> {
-  const stock: Record<string, number> = {};
   try {
-    const res: any = await bridge.call('StorageMan', 'stock', {}, { timeoutMs: 8000 });
-    for (const d of luaList<any>(res?.detail ?? res?.data?.detail) ?? []) {
-      if (typeof d?.name === 'string') stock[d.name] = (stock[d.name] ?? 0) + (d.count ?? 0);
-    }
+    return await readStockMap(onUnreadable);
   } catch {
-    if (onUnreadable === 'throw') {
-      throw new ToolError('Cannot read storage, so cannot cost the work.', 'Check hive.nodes.');
-    }
+    // The shared reader throws a plain Error; tools must refuse with a ToolError so the caller is
+    // told what to check rather than seeing a stack trace.
+    throw new ToolError('Cannot read storage, so cannot cost the work.', 'Check hive.nodes.');
   }
-  return stock;
 }
 
 // ── order.build ────────────────────────────────────────────────────────────
@@ -2164,7 +2403,20 @@ registry.register({
       .describe('Which level. -1 is the sorted-storage cellar, 0 the ground/ingest floor.'),
     palette: z.enum(['cobble', 'brick', 'create']).default('cobble')
       .describe('cobble is tier 0: everything in it falls out of a mining shaft.'),
-    blocksPerTask: z.number().int().min(32).max(512).default(192)
+    // MINIMUM EIGHT, NOT THIRTY-TWO. A PATCH THAT CANNOT FINISH IS WORSE THAN A SMALL ONE.
+    //
+    // The floor is laid by whole patches, so a patch that never completes contributes nothing --
+    // and measured with the build instrumentation, a block costs 11-67 seconds depending on how
+    // much routing it needs. A 32-block patch therefore needs anywhere up to half an hour of
+    // UNINTERRUPTED work, and nothing in this settlement gets half an hour: fuel relief preempts
+    // (correctly -- a dry drone outranks a floor), a stand-down interrupts, a reassignment
+    // interrupts. Every patch was being pulled off part-done:
+    //
+    //   build: 24/32 blocks (16 placed, 8 skipped) in 500s   <- then preempted for a fuel relief
+    //
+    // Zero patches completed in an entire evening. Eight blocks finishes inside the gaps that
+    // actually exist, and a finished patch is the only kind that fills the floor in.
+    blocksPerTask: z.number().int().min(8).max(512).default(192)
       .describe('Blocks per build task. Must fit a drone: 192 is three stacks with room to work.'),
   }).strict(),
   returns: 'The level, what it costs, what was affordable, and the queued build tasks.',
@@ -2211,6 +2463,12 @@ registry.register({
     const { crafted, willHave, last: lastCraftTask } = await queueCrafting(cost, stock);
 
     const affordable = blocks.filter((b) => (stock[b.item] ?? 0) > 0 || willHave.has(b.item));
+
+    // Does the larder already cover the whole order? Counted over the blocks actually being
+    // queued, not the theoretical cost of a full level -- a partial floor is the normal case.
+    const required: Record<string, number> = {};
+    for (const b of blocks) required[b.item] = (required[b.item] ?? 0) + 1;
+    const shortfall = Object.entries(required).some(([item, n]) => (stock[item] ?? 0) < n);
     const skipped = blocks.length - affordable.length;
     if (!affordable.length) throw new ToolError(
       `Nothing in stock for a ${a.palette} level ${a.level}.`,
@@ -2225,6 +2483,8 @@ registry.register({
 
     const base = settlement.base;
     const origin = { x: base.x, y: base.y + a.level * spec.floorHeight, z: base.z };
+
+    const remaining = ordered;
 
     // CHUNKED, AND DELIBERATELY NOT CHAINED.
     //
@@ -2252,8 +2512,16 @@ registry.register({
     // If a future level genuinely needs the one below it finished first, chain the LEVELS -- do not
     // reintroduce ordering between patches of the same floor.
     const queued: any[] = [];
-    for (let i = 0; i < ordered.length; i += a.blocksPerTask) {
-      const part = ordered.slice(i, i + a.blocksPerTask);
+    // A REFUSAL IS A REASON, AND IT USED TO BE THROWN AWAY BY THE `break` BELOW.
+    //
+    // TaskMan answers a refusal with a STRING rather than an exception, and the break discarded it
+    // -- so a floor whose FIRST patch was refused returned `tasks: []`, which is byte-identical to
+    // "this floor is already built". The supply loop reads exactly that and increments
+    // supply.towerLevel, and nothing ever revisits a level the counter has passed. One refusal, one
+    // permanently missing floor, nothing in any log. Carry the reason out.
+    let refused: string | undefined;
+    for (let i = 0; i < remaining.length; i += a.blocksPerTask) {
+      const part = remaining.slice(i, i + a.blocksPerTask);
       const res: any = await bridge.call('TaskMan', 'Add', {
         name: `tower-L${a.level}-p${String(queued.length + 1).padStart(2, '0')}`,
         // TWO, NOT ONE. FUEL OUTRANKS BUILDING -- BUILDING IS WHAT SPENDS THE FUEL.
@@ -2286,7 +2554,15 @@ registry.register({
         // fuel starving because the tower took every drone -- is a real risk only when the fleet is
         // down to one or two workers, and that is now guarded properly by the missed-start
         // exclusion rather than by making the build unreachable.
-        priority: 1,
+        priority: 2,
+        // BACK TO TWO, and this time it is reachable. Raising it to 1 was a workaround for a
+        // scheduler bug, not a decision about importance: the same few unplaceable tasks at the
+        // head of the queue spent TaskMan's per-role placement budget on every pass, so nothing
+        // behind them was ever attempted and the only way to get a patch looked at was to put it
+        // at the front. That is fixed where it broke -- TaskMan now backs a refused task off for a
+        // minute so the queue falls through -- which restores the ordering this file's own test
+        // insists on: fuel work outranks the tower, because a settlement that cannot mine coal
+        // stops building anyway.
         // (superseded) TWO, then ONE. The settlement should be building its base before it gathers more ore
         // -- which it will otherwise do for ever, because there is always another material short.
         //
@@ -2294,18 +2570,34 @@ registry.register({
         // the patch before it, so the parallelism the note above insists on is untouched: the
         // moment the bricks exist, all thirteen patches are runnable at once. Without this they
         // start immediately, find no bricks, and abandon a half-laid floor.
-        dependsOn: lastCraftTask,
+        // ONLY WAIT FOR BRICKS THE LARDER DOES NOT ALREADY HAVE.
+        //
+        // This gated every patch on the craft unconditionally, and queueCrafting queues a step for
+        // any item in the cost that is short -- so one shortfall anywhere (a handful of stairs, a
+        // few walls) put the WHOLE floor behind a craft task, including the plain blocks that were
+        // sitting in a chest in their thousands. Observed exactly that: 29 patches all reading
+        //
+        //   blocked by: waiting on craft-stone_bricks (#10171)
+        //
+        // with 1,349 stone bricks in storage -- enough for 28 patches of 48 -- and the craft itself
+        // stuck at 0% because storage was down to 13 free slots and its output had nowhere to land.
+        // A full larder, a full queue, idle builders, and a floor with no blocks on it.
+        //
+        // The note below is still right that the patches must not start empty-handed. The fix is to
+        // ask whether THIS material is short, not whether anything is.
+        dependsOn: shortfall ? lastCraftTask : undefined,
         work: { build: { origin, blocks: part } },
       }, { timeoutMs: 12000 });
-      if (typeof res === 'string') break;      // TaskMan refused; stop rather than queue a gap
+      // TaskMan refused; stop rather than queue a gap -- but SAY SO.
+      if (typeof res === 'string') { refused = res; break; }
       queued.push({ task: res?.id, blocks: part.length });
     }
 
-    ctx.log('order.tower', { level: a.level, palette: a.palette, tasks: queued.length });
+    ctx.log('order.tower', { level: a.level, palette: a.palette, tasks: queued.length, refused });
     return {
       crafted, level: a.level, name: LEVELS.find((l) => l.index === a.level)?.name ?? String(a.level),
       origin, cost, affordable: affordable.length, skippedForMaterials: skipped,
-      tasks: queued,
+      tasks: queued, refused,
       note: skipped
         ? `${skipped} block(s) skipped -- no stock for them yet; reface when the smelters run`
         : 'everything affordable',
@@ -2448,13 +2740,22 @@ registry.register({
       'Allocate a bigger plot for this purpose, or name a different one.');
 
     // Cost it, and make anything missing.
-    let stock: Record<string, number> = {};
-    try {
-      const res: any = await bridge.call('StorageMan', 'stock', {}, { timeoutMs: 8000 });
-      for (const d of res?.detail ?? res?.data?.detail ?? []) {
-        if (typeof d?.name === 'string') stock[d.name] = (stock[d.name] ?? 0) + (d.count ?? 0);
-      }
-    } catch { stock = {}; }
+    //
+    // 'empty' here, not 'throw': this is the behaviour the inline copy had, and order.tower is the
+    // only caller that refuses on an unreadable store. Worth revisiting -- order.build dispatches a
+    // drone too -- but that is a decision, not a de-duplication.
+    // THROW, DO NOT PLAN ON A GUESS.
+    //
+    // 'empty' means "if storage cannot be read, assume it holds nothing" -- which for a PLANNER is
+    // the worst possible default: it queues gathering and crafting for materials already on the
+    // shelf, and every downstream decision inherits the false premise. readStock's own comment
+    // records how this bit before: a hole-y stock list arrives from Lua as an object, iterating it
+    // throws, the throw lands in the caller's catch, and the planner silently concluded the
+    // settlement owned nothing. order.tower already asks for 'throw'; these three are the survivors.
+    //
+    // Refusing to plan is recoverable -- the supply loop retries on the next tick. A confidently
+    // wrong plan sends the whole fleet to mine what is already in the chest.
+    const stock = await readStock('throw');
 
     const need = materials(bp);
     const { crafted, cannot, last: lastCraftTask } = await queueCrafting(need, stock);
@@ -2470,7 +2771,7 @@ registry.register({
       dependsOn: lastCraftTask,
       work: { build: { origin, blocks: placementOrder(bp) } },
     }, { timeoutMs: 12000 });
-    if (typeof build === 'string') throw new ToolError(`TaskMan refused the build: ${build}`, 'Check fleet.tasks.');
+    refuseIfString(build, 'build');
 
     plot.status = 'clearing';
     plot.owner = `build-${bp.name}`;
@@ -2542,7 +2843,7 @@ registry.register({
     }
     if (!a.from || !a.to) {
       const r: any = await bridge.call('StorageMan', 'GetRoutes', {}, { timeoutMs: 8000 });
-      return { routes: r?.routes ?? r?.data?.routes ?? [] };
+      return { routes: field(r, 'routes') ?? [] };
     }
     const r: any = await bridge.call('StorageMan', 'AddRoute',
       { from: a.from, to: a.to, item: a.item, keep: a.keep }, { timeoutMs: 8000 });
@@ -2607,6 +2908,14 @@ registry.register({
     // Make the derived links REAL wherever both ends already have chests. Lines without chests yet
     // keep the link as intent; factory.attach turns it into item movement.
     const wired: any[] = [];
+    // "REPORTED VIA THE LINKS LIST" MEANT "THE CALLER CAN DIFF TWO ARRAYS AND GUESS".
+    //
+    // A link present in `links` and absent from `wired` really did mean the route failed -- but
+    // only if you thought to compare them, and it never said WHY, so a StorageMan that was down
+    // and a pair of chests that are simply not on the wired network produced the identical answer.
+    // This is the same defect the factories had at the top level: `status: 'running'` on a line
+    // with no real item movement behind it. Name the failures.
+    const wireFailures: any[] = [];
     for (const l of chain(factories)) {
       const from = factories.find((f) => f.name === l.from);
       const to = factories.find((f) => f.name === l.to);
@@ -2615,12 +2924,16 @@ registry.register({
         await bridge.call('StorageMan', 'AddRoute',
           { from: from.output, to: to.input, item: l.item }, { timeoutMs: 8000 });
         wired.push(l);
-      } catch { /* reported via the links list; the route can be retried */ }
+      } catch (err) {
+        wireFailures.push({ ...l, error: (err as Error)?.message ?? String(err) });
+      }
     }
 
-    ctx.log('factory.create', { name, produces: a.produces });
-    return { factory, plot: r, links, wired, unmet,
-             note: 'attach chests with factory.attach to turn these links into real item movement' };
+    ctx.log('factory.create', { name, produces: a.produces, wired: wired.length, wireFailures: wireFailures.length });
+    return { factory, plot: r, links, wired, wireFailures, unmet,
+             note: wireFailures.length
+               ? `${wireFailures.length} route(s) could NOT be created -- the line is intent, not plant, until they are`
+               : 'attach chests with factory.attach to turn these links into real item movement' };
   },
 });
 
@@ -2729,9 +3042,9 @@ registry.register({
     takeaway: 'The build is not stuck -- it is waiting on planks, which are waiting on wood nobody has.',
   }],
   handler: async () => {
-    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    requireBridge();
     const t: any = await bridge.call('TaskMan', 'GetTasks', {}, { timeoutMs: 10000 });
-    const tasks = (luaList<any>(t?.tasks ?? t?.data?.tasks) ?? []).filter(Boolean);
+    const tasks = (luaList<any>(field(t, 'tasks')) ?? []).filter(Boolean);
     const drones = luaList<any>(
       (await bridge.call('DroneMan', 'GetDrones', {}, { timeoutMs: 8000 }) as any)?.drones,
     ) ?? [];
@@ -2827,7 +3140,7 @@ registry.register({
     takeaway: 'Most of the map was ground the fleet is not allowed to enter.',
   }],
   handler: async (a, ctx) => {
-    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    requireBridge();
     const r: any = await bridge.call('MapServer', 'prune',
       { margin: a.margin, aboveY: a.aboveY }, { timeoutMs: 60000 });
     if (typeof r === 'string') throw new ToolError(`MapServer refused: ${r}`, 'Does it have bounds yet?');
@@ -2861,7 +3174,7 @@ registry.register({
     takeaway: 'It can. Answered in seconds; the alternative cost three wrong implementations.',
   }],
   handler: async (a, ctx) => {
-    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    requireBridge();
     const r: any = await bridge.call('DroneMan', 'GoTo',
       { id: a.id, verb: 'Probe', pos: { x: 0, y: 0, z: 0 }, code: a.code }, { timeoutMs: 15000 });
     if (typeof r === 'string') throw new ToolError(`DroneMan refused: ${r}`, 'Check the drone id.');
@@ -2893,7 +3206,7 @@ registry.register({
     takeaway: 'Those were drones recorded as terrain, not real blocks.',
   }],
   handler: async (a, ctx) => {
-    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    requireBridge();
     const r: any = await bridge.call('MapServer', 'forget', { match: a.match }, { timeoutMs: 20000 });
     if (typeof r === 'string') throw new ToolError(`MapServer refused: ${r}`, 'Check the match string.');
     ctx.log('world.forget', { match: a.match, forgot: r?.forgot });
@@ -2926,7 +3239,7 @@ registry.register({
     takeaway: 'No chest involved -- the wood goes straight from the drone that has it to the one that needs it.',
   }],
   handler: async (a, ctx) => {
-    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    requireBridge();
     const drones = state.listDrones();
     const recipient = drones.find((d) => d.id === a.to);
     if (!recipient) throw new ToolError(`No drone ${a.to}.`, 'Check fleet.status.');
@@ -2987,7 +3300,7 @@ registry.register({
     takeaway: 'The wood existed all along; it was just inside a drone where nothing could see it.',
   }],
   handler: async (a, ctx) => {
-    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    requireBridge();
     const drones = state.listDrones();
     const holders = drones
       .map((d) => {
@@ -3047,7 +3360,7 @@ registry.register({
     takeaway: 'Rescues for D1 stop being generated, and the drones that still work go back to real jobs.',
   }],
   handler: async (a, ctx) => {
-    if (!bridge.connected) throw new ToolError('Bridge offline.', 'Check hive.pow/health.');
+    requireBridge();
     const r: any = await bridge.call('DroneMan', 'RetireDrone', { id: a.id }, { timeoutMs: 8000 });
     // CLEAR HQ'S OWN ROSTER FIRST, AND REGARDLESS OF WHAT DRONEMAN SAYS.
     //
@@ -3094,18 +3407,38 @@ registry.register({
         // why, because "it vanished" is indistinguishable from "it silently succeeded".
         // Find who is holding it BEFORE marking it done -- TaskDone clears the assignment, and
         // the drone still needs telling.
-        let holder: number | undefined;
-        try {
-          const tasks: any = await bridge.call('TaskMan', 'GetTasks', {}, { timeoutMs: 8000 });
-          const list = tasks?.tasks ?? tasks?.data?.tasks ?? [];
-          holder = list.find((t: any) => String(t.id) === String(id))?.assignedTo;
-        } catch { /* best effort; stopping the task still matters */ }
-
+        //
+        // NOT "best effort". This lookup is the ONLY thing that finds the drone, and the note below
+        // is explicit about what happens when the drone is not stopped: it keeps executing, never
+        // goes idle, and can never be given work again -- which is indistinguishable from the fleet
+        // having stopped working. Swallowed, a GetTasks timeout silently reopens exactly that hole
+        // while task.stop still answers `stopped: true`, which is the false success this tool's own
+        // verify-at-effect note exists to prevent.
+        // ASK THE MODULE THAT KNOWS, INSTEAD OF SEARCHING A WINDOW.
+        //
+        // This used to read GetTasks and find the task by id. GetTasks CAPS ITS REPLY AT 40 TASKS to
+        // fit the websocket frame, so for any task outside that window the search found nobody, the
+        // drone was never told to stop, and this tool still answered `stopped: true` -- the precise
+        // failure the note below is about, reintroduced by a cap nothing here could see. With 131
+        // tower patches queued it was the normal case rather than the edge one.
+        //
+        // TaskMan knows who held it: OnTaskDone now returns `heldBy` from the assignment it is
+        // clearing. One call, no window, and the answer comes from the same operation that did the
+        // work rather than from a snapshot taken beforehand.
+        //
         // abandon:true, not just ok:false. A plain failure goes through TaskMan's retry path --
         // it spends one of three attempts and requeues -- so "stopped" tasks kept being dispatched
         // and the queue could not be cleared at all.
-        const res: any = await bridge.call('TaskMan', 'TaskDone',
-          { id, ok: false, abandon: true, reason: a.reason }, { timeoutMs: 8000 });
+        let holderLookup: string | null = null;
+        let res: any;
+        try {
+          res = await bridge.call('TaskMan', 'TaskDone',
+            { id, ok: false, abandon: true, reason: a.reason }, { timeoutMs: 8000 });
+        } catch (err) {
+          holderLookup = (err as Error)?.message ?? String(err);
+          res = holderLookup;
+        }
+        const holder = numField(res, 'heldBy') ?? undefined;
 
         // STOP THE DRONE TOO. Cancelling the task in the queue does not reach the machine: it
         // keeps executing, never goes idle, and can never be given anything again -- which looks
@@ -3116,15 +3449,131 @@ registry.register({
             released = await bridge.call('DroneMan', 'Stop', { id: holder }, { timeoutMs: 12000 });
           } catch (err) { released = (err as Error)?.message ?? String(err); }
         }
-        out.push({ id, stopped: typeof res !== 'string', drone: holder ?? null, released });
+        out.push({
+          id, stopped: typeof res !== 'string', drone: holder ?? null, released,
+          // Only when it failed -- an absent field is the normal case and reads as "no problem".
+          ...(holderLookup ? { droneUnknown: `TaskMan did not answer: ${holderLookup} -- the drone was NOT told to stop and may still be running this task` } : {}),
+        });
       } catch (err) {
         out.push({ id, stopped: false, error: (err as Error)?.message ?? String(err) });
       }
     }
-    ctx.log('task.stop', { count: out.length });
-    return { stopped: out };
+    // verify-at-effect: re-reads the queue and reports `stopped` from whether the task is actually
+    // gone, not from whether TaskMan answered without an error string.
+    //
+    // It used to be `stopped: typeof res !== 'string'` -- an acknowledgement, not an outcome. On the
+    // night this was written it reported "stopped 25 of 25" for underground tower patches that went
+    // on being dispatched to drones for another two hours, and the queue I believed I was managing
+    // was not the queue TaskMan had. Every later measurement was taken against that false premise.
+    await confirmStopped(out, ctx);
+    const stuck = out.filter((r) => !r.stopped).map((r) => r.id);
+    ctx.log('task.stop', { count: out.length, stillQueued: stuck.length });
+    return { stopped: out, stillQueued: stuck };
   },
 });
+
+registry.register({
+  name: 'task.countNamed',
+  summary: 'How many queued tasks share a name prefix.',
+  description:
+    'Counts in TaskMan\'s own store, so the answer is the whole queue rather than the 40-task window ' +
+    'GetTasks returns. Use it whenever a DECISION depends on the count -- "is any of this floor still ' +
+    'outstanding" read off a capped list is a guess, and guessing low means ordering the work twice.',
+  params: z.object({ prefix: z.string().min(1).max(64) }).strict(),
+  returns: 'live and done counts for the prefix, and how many tasks were examined.',
+  danger: 'read',
+  handler: async (a, ctx) => {
+    requireBridge();
+    const res: any = await bridge.call('TaskMan', 'CountNamed', { prefix: a.prefix }, { timeoutMs: 15000 });
+    if (typeof res === 'string') throw new ToolError(res, 'Check TaskMan is up with hive.nodes.');
+    const out = {
+      prefix: a.prefix,
+      live: numField(res, 'live') ?? 0,
+      done: numField(res, 'done') ?? 0,
+      // Finished BADLY -- a task that exhausted its attempts is done with a failure on it, and the
+      // caller advances a tower level on "everything finished". Those are not the same answer.
+      failed: numField(res, 'failed') ?? 0,
+      scanned: numField(res, 'scanned') ?? 0,
+    };
+    ctx.log('task.countNamed', out);
+    return out;
+  },
+});
+
+registry.register({
+  name: 'task.stopNamed',
+  summary: 'Abandon every queued task whose name starts with a prefix.',
+  description:
+    'Use to clear a whole class of work at once -- a finished floor\'s leftover patches, a survey ' +
+    'campaign that is no longer wanted. Stopping them one id at a time cannot be made to work: ' +
+    'GetTasks caps its reply at 40 tasks and task.stop takes at most 32 ids, so a caller enumerating ' +
+    'a 131-task backlog sees a windowful, stops a windowful, and reports complete success.',
+  params: z.object({
+    prefix: z.string().min(1).max(64),
+    reason: z.string().max(200).default('stopped in bulk'),
+  }).strict(),
+  returns: 'How many were stopped, how many were examined, and which drones were released.',
+  danger: 'mutate',
+  bounds: 'Every live task whose name begins with the prefix. A short prefix matches a lot.',
+  handler: async (a, ctx) => {
+    requireBridge();
+    // verify-at-effect: TaskMan counts what it actually marked while walking its own store -- not
+    // what it was asked to mark -- and returns the holders it actually cleared. There is no window
+    // between the decision and the effect here, which is the entire point of the endpoint.
+    const res: any = await bridge.call('TaskMan', 'StopNamed',
+      { prefix: a.prefix, reason: a.reason }, { timeoutMs: 15000 });
+    if (typeof res === 'string') throw new ToolError(res, 'Check TaskMan is up with hive.nodes.');
+    const stopped = Number(field(res, 'stopped') ?? 0);
+
+    // STOP THE DRONES TOO -- see task.stop. Cancelling a task in the queue does not reach the
+    // machine: it keeps executing, never goes idle, and can never be given work again, which from
+    // outside is indistinguishable from the fleet having stopped working.
+    const held = [...new Set(luaList<number>(field(res, 'held')) ?? [])];
+    const released: any[] = [];
+    for (const id of held) {
+      try {
+        released.push({ id, stopped: await bridge.call('DroneMan', 'Stop', { id }, { timeoutMs: 12000 }) });
+      } catch (err) {
+        released.push({ id, error: (err as Error)?.message ?? String(err) });
+      }
+    }
+    ctx.log('task.stopNamed', { prefix: a.prefix, stopped, released: released.length });
+    return { prefix: a.prefix, stopped, scanned: field(res, 'scanned') ?? null, released };
+  },
+});
+
+// Re-read the queue and set `stopped` from whether each task is actually gone. Its own function so
+// the check is one testable thing rather than a branchy tail on an already-long handler.
+async function confirmStopped(p_Rows: any[], p_Ctx: any) {
+  try {
+    const after: any = await bridge.call('TaskMan', 'GetTasks', {}, { timeoutMs: 8000 });
+    const list = field(after, 'tasks') ?? [];
+    const live = new Set(list
+      .filter((t: any) => (t?.progress ?? 0) < 100 && t?.enabled !== false)
+      .map((t: any) => String(t.id)));
+    // ABSENT FROM A CAPPED LIST IS NOT GONE.
+    //
+    // GetTasks returns at most 40 tasks, so "this id is not in the reply" means EITHER it was
+    // stopped or it simply fell outside the window -- and with a full queue the second is far more
+    // likely. Reading absence as success turned this verifier into the false success it exists to
+    // catch, which is how a page of tasks was reported stopped while the fleet went on running them.
+    //
+    // A full page is the tell: at the cap the list is a sample, and a sample cannot prove a
+    // negative. Confirm the ones it can SEE are gone, and say the rest are unverified.
+    const capped = list.length >= 40;
+    for (const row of p_Rows) {
+      const seen = live.has(String(row.id));
+      if (seen) row.stopped = false;
+      else if (capped) row.verified = false;   // absence proves nothing here -- leave `stopped` as reported
+      else row.stopped = true;
+    }
+    if (capped) p_Ctx.log('task.stop', { unverified: p_Rows.length, why: 'queue reply hit its 40-task cap' });
+  } catch (err) {
+    // Say so rather than claiming success: an unverified stop is the very thing this fixes.
+    for (const row of p_Rows) row.verified = false;
+    p_Ctx.log('task.stop', { verifyFailed: (err as Error)?.message ?? String(err) });
+  }
+}
 
 // ── recover.dispatch ───────────────────────────────────────────────────────
 registry.register({
@@ -3147,7 +3596,7 @@ registry.register({
     takeaway: 'Recovery dispatched from its last known position. I will watch for drone-7 to re-register.',
   }],
   handler: async (a, ctx) => {
-    const target = state.listDrones().find((d) => d.id === a.id);
+    const target = droneById(a.id);
     if (!target) throw new ToolError(`No drone #${a.id}.`, 'Check hive.brief for drone ids.');
     if (target.status !== 'stranded' && target.status !== 'lost')
       return { skipped: true, reason: `#${a.id} is ${target.status}, not stranded or lost.` };

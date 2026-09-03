@@ -33,20 +33,44 @@ end
 -- "Source 'front' does not exist". Network names only.
 local SIDE_NAMES = {top = true, bottom = true, left = true, right = true, front = true, back = true}
 
+-- YIELD, OR THE HEART OF THE SETTLEMENT GETS KILLED MID-BEAT.
+--
+-- CC:T terminates a coroutine that runs ~10s without yielding, uncatchably: "Terminating computer
+-- #14 due to timeout (ran over by 22.328 seconds)". StorageMan died mid-scan, its bootloader never
+-- reached os.reboot(), and the computer sat POWERED OFF -- taking stock, smelting and every storage
+-- query in the settlement with it, while last-run.txt still read ok=true.
+--
+-- queueEvent/pullEvent rather than sleep(0): it satisfies the watchdog and resumes in the SAME
+-- tick, so a full rescan still costs no wall clock. Written out thirteen times before this; the
+-- tag stays a parameter because the existing ones are not all interchangeable.
+local function breathe(p_Tag)
+    -- dup: allow (three modules need this and CC has no shared library here -- giving them one
+    -- means a new os.loadAPI file deployed to every computer, which is a deployment change,
+    -- not a refactor. Two lines each is the cheaper of the two honest options.)
+    os.queueEvent(p_Tag) os.pullEvent(p_Tag)
+end
+
+-- A peripheral that has gone away must read as absent, not throw. Seven copies of this pcall.
+local function wrapped(p_Name)
+    local ok, p = pcall(peripheral.wrap, p_Name)
+    if ok then return p end
+    return nil
+end
+
 local function inventories()
     local s_Chests, s_Furnaces = {}, {}
     for _, name in ipairs(peripheral.getNames()) do
         -- The other half of the scan, and it runs BEFORE the chest loop -- getType plus a wrap for
         -- every peripheral on the wired network, each one a crossing into Java. Together these two
         -- loops are what ran computer #14 over its budget by 22 seconds and left it powered off.
-        os.queueEvent("scan") os.pullEvent("scan")
+        breathe("scan")
         if not SIDE_NAMES[name] then
             local s_Type = peripheral.getType(name)
             if s_Type and string.find(s_Type, "furnace") then
                 s_Furnaces[#s_Furnaces + 1] = name
             else
-                local ok, m = pcall(peripheral.wrap, name)
-                if ok and m and m.list and m.size then
+                local m = wrapped(name)
+                if m and m.list and m.size then
                     s_Chests[#s_Chests + 1] = name
                 end
             end
@@ -75,9 +99,9 @@ function BuildIndex()
         --
         -- queueEvent/pullEvent rather than sleep(0): it satisfies the watchdog and resumes in the
         -- SAME tick, so a full rescan still costs no wall clock.
-        os.queueEvent("rescan") os.pullEvent("rescan")
-        local ok, inv = pcall(peripheral.wrap, name)
-        if ok and inv then
+        breathe("rescan")
+        local inv = wrapped(name)
+        if inv then
             local ok2, items = pcall(inv.list)
             local ok3, size  = pcall(inv.size)
             if ok2 and items then
@@ -174,14 +198,14 @@ function OnProvide(p_ID, p_Message)
     local s_Given, s_Short = {}, {}
     for _, req in ipairs(s_Want) do
         -- A Provide can walk the whole index and push from several chests per requested item.
-        os.queueEvent("provide") os.pullEvent("provide")
+        breathe("provide")
         local s_Name  = req.name
         local s_Need  = tonumber(req.count) or 0
         local s_Moved = 0
 
         for name, e in pairs(m_Index) do
             if s_Moved >= s_Need then break end
-            os.queueEvent("provide") os.pullEvent("provide")
+            breathe("provide")
             -- Exact match here, NOT the substring matching Find uses. "iron" finding iron_ingot is
             -- helpful when a human is looking; a crafting grid filled with raw_iron because the
             -- recipe asked for iron_ingot produces nothing and wastes the trip.
@@ -263,7 +287,7 @@ function ServiceRoutes()
     for _, r in ipairs(s_Routes) do
         -- Each route is a wrap plus a pushItems. Same rule as every other loop in this file that
         -- crosses into Java: breathe, or the watchdog eventually catches this one instead.
-        os.queueEvent("route") os.pullEvent("route")
+        breathe("route")
         if r.enabled ~= false and r.from and r.to and r.from ~= r.to then
             local src = peripheral.wrap(r.from)
             if src == nil then
@@ -394,16 +418,27 @@ local function whereAdd(p_Name, p_Pos)
     DATA["where"][p_Name] = {x = p_Pos.x, y = p_Pos.y, z = p_Pos.z}
 end
 
-function OnDeposited(p_ID, p_Message)
-    local d = p_Message.data or {}
+-- Both ledger endpoints walk d.items the same way, and the MarkDirty is the part that must not be
+-- forgotten: a count that is not persisted is gone at the next reboot. p_Sign is the direction,
+-- p_Each the one thing each endpoint does on its own -- and it runs AFTER ledgerAdd, because
+-- OnWithdrawn's reads the ledger it has just changed.
+local function tallyLedger(p_Data, p_Sign, p_Each)
     local s_N = 0
-    for name, count in pairs(d.items or {}) do
-        ledgerAdd(name, tonumber(count) or 0)
-        if d.at then whereAdd(name, d.at) end
-        s_N = s_N + (tonumber(count) or 0)
+    for name, count in pairs(p_Data.items or {}) do
+        local n = tonumber(count) or 0
+        ledgerAdd(name, p_Sign * n)
+        if p_Each then p_Each(name, n) end
+        s_N = s_N + n
     end
     if s_N ~= 0 then PowNet.MarkDirty() end
     return true, {counted = s_N}
+end
+
+function OnDeposited(p_ID, p_Message)
+    local d = p_Message.data or {}
+    return tallyLedger(d, 1, function(name)
+        if d.at then whereAdd(name, d.at) end
+    end)
 end
 
 -- Which chest was the last to receive this. Substring match, so "oak_log" finds
@@ -448,9 +483,9 @@ function OnChestContents(p_ID, p_Message)
     if DATA["chestName"] == nil then DATA["chestName"] = {} end
     if DATA["chestName"][s_Key] == nil then
         for _, name in ipairs(peripheral.getNames()) do
-            os.queueEvent("scan") os.pullEvent("scan")
-            local ok, inv = pcall(peripheral.wrap, name)
-            if ok and inv and inv.list then
+            breathe("scan")
+            local inv = wrapped(name)
+            if inv and inv.list then
                 local ok2, l = pcall(inv.list)
                 if ok2 and sameContents(l, d.items) then
                     DATA["chestName"][s_Key] = name
@@ -489,22 +524,85 @@ end
 -- StorageMan can do what the turtle cannot, now that the modems are attached: address the chest
 -- over the wired network and rearrange it. One pushItems into a low slot turns an unreachable stack
 -- into the first thing suckDown hands over.
+-- Biggest holding first. Two copies of the same comparator answered this in one function, on the
+-- two branches that build `detail` -- the peripheral census and the ledger fallback -- so the two
+-- shapes of the SAME reply could have drifted into different orders without anything noticing.
+--
+-- Declared above its uses: a local declared below the function that uses it is a nil global here.
+local function sortByCount(p_List)
+    table.sort(p_List, function(a, b) return a.count > b.count end)
+end
+
+-- DID THE PUSH ACTUALLY MOVE ANYTHING?
+--
+-- `pcall(inv.pushItems, ...)` followed by the same two-part test was written out four times in this
+-- file, because pushItems has TWO separate ways of not working: it can THROW (the peripheral went
+-- away mid-operation, routine on a network drones are rearranging under it) and it can succeed
+-- while moving ZERO items (the destination slot was not as free as the caller believed). A copy
+-- that checks only one of them reports a move that never happened.
+--
+-- One of the four checked NEITHER -- it discarded the pcall and the count and then asserted the
+-- slot was free -- and the failure surfaced three branches later as "could not move %s from slot
+-- %d", naming the wrong chest, the wrong slot and the wrong cause.
+--
+-- Returns the number of items actually moved (0 on any failure) and the error when there was one,
+-- so a caller can say WHY nothing moved instead of only that nothing did.
+local function pushed(p_Inv, ...)
+    local s_Ok, s_Moved = pcall(p_Inv.pushItems, ...)
+    if not s_Ok then return 0, tostring(s_Moved) end
+    return tonumber(s_Moved) or 0, nil
+end
+
 -- Clear slot 1 of a chest by pushing whatever is in it anywhere else on the network.
 --
 -- Returns true if slot 1 is now free. Only used when the chest has no free slot of its own -- see
 -- the call site for why that happens and what it costs.
 local function evictLowSlot(p_Inv, p_Names, p_Self)
     for _, other in ipairs(p_Names) do
-        os.queueEvent("scan") os.pullEvent("scan")
+        breathe("scan")
         if other ~= p_Self then
-            local s_Ok, s_Moved = pcall(p_Inv.pushItems, other, 1, 64)
-            if s_Ok and (tonumber(s_Moved) or 0) > 0 then
+            if pushed(p_Inv, other, 1, 64) > 0 then
                 Log(("cleared slot 1 into %s to make room at the front"):format(other))
                 return true
             end
         end
     end
     return false
+end
+
+-- ONE ENTRY PER POSITION, AND THE BOUND ONE WINS.
+--
+-- A chest registered by position and later bound to its network name by OnChestContents left the
+-- original unbound entry behind, so the registry held -480,64,78 twice: once as chest_1 and once as
+-- an anonymous chest that looked exactly like a field cache. HQ's haul loop, which collects from
+-- unwired points, then hauled from a base chest into a base chest, one task at a time, for an hour.
+local function dedupeDeposits()
+    local s_Bound, s_Kept, s_Dropped = {}, {}, 0
+    for _, d in ipairs(DATA["deposits"]) do
+        if d.pos and d.peripheral then s_Bound[("%d:%d:%d"):format(d.pos.x, d.pos.y, d.pos.z)] = true end
+    end
+    for _, d in ipairs(DATA["deposits"]) do
+        local k = d.pos and ("%d:%d:%d"):format(d.pos.x, d.pos.y, d.pos.z)
+        if d.peripheral or not (k and s_Bound[k]) then
+            s_Kept[#s_Kept + 1] = d
+        else
+            s_Dropped = s_Dropped + 1
+        end
+    end
+    if s_Dropped > 0 then
+        DATA["deposits"] = s_Kept
+        PowNet.MarkDirty()
+        Log(("dropped %d unbound duplicate(s) of chests already bound to the network"):format(s_Dropped))
+    end
+end
+
+-- Where a drone should fly to reach a networked chest, when the registry knows. The network is
+-- the authority on what a chest HOLDS; the deposit registry only records where it IS.
+local function depositPosOf(p_Name)
+    for _, dep in ipairs(DATA["deposits"]) do          -- initialised at boot, never nil
+        if dep.peripheral == p_Name then return dep.pos end
+    end
+    return nil
 end
 
 function OnBringToFront(p_ID, p_Message)
@@ -528,20 +626,13 @@ function OnBringToFront(p_ID, p_Message)
             s_Names[#s_Names + 1] = name
         end
     end
-    -- Position for the reply, when we know it: the drone needs somewhere to fly to.
-    local function posOf(p_Name)
-        for _, dep in ipairs(DATA["deposits"] or {}) do
-            if dep.peripheral == p_Name then return dep.pos end
-        end
-        return nil
-    end
 
     for _, s_PName in ipairs(s_Names) do
-        os.queueEvent("scan") os.pullEvent("scan")
+        breathe("scan")
         do
-            local dep = {peripheral = s_PName, pos = posOf(s_PName)}
-            local ok, inv = pcall(peripheral.wrap, dep.peripheral)
-            if ok and inv and inv.list then
+            local dep = {peripheral = s_PName, pos = depositPosOf(s_PName)}
+            local inv = wrapped(dep.peripheral)
+            if inv and inv.list then
                 local ok2, l = pcall(inv.list)
                 if ok2 and type(l) == "table" then
                     local s_Slot, s_Name
@@ -564,8 +655,28 @@ function OnBringToFront(p_ID, p_Message)
                             local s_Size = (inv.size and select(2, pcall(inv.size))) or 27
                             for i = 17, (tonumber(s_Size) or 27) do if l[i] == nil then s_Tail = i break end end
                             if s_Tail then
-                                pcall(inv.pushItems, dep.peripheral, 1, 64, s_Tail)
-                                s_Free = 1
+                                -- CHECK THE SHUFFLE, THE WAY EVERY OTHER pushItems HERE IS CHECKED.
+                                --
+                                -- This discarded both the pcall AND the moved count and then
+                                -- declared `s_Free = 1` regardless -- so a push that moved nothing
+                                -- left the code certain slot 1 was empty when it still held the
+                                -- old stack. The final push then moved 0 and the caller was told
+                                -- "could not move %s from slot %d", which points at the wrong
+                                -- chest, the wrong slot and the wrong cause: the failure was the
+                                -- shuffle, three branches earlier.
+                                --
+                                -- Worse, it skipped the recovery that exists for exactly this. If
+                                -- the back of this chest will not take it, the other-chests path
+                                -- below can still surface the stack -- there were 29 free slots
+                                -- across six chests the day this was written, and asserting a free
+                                -- slot that is not free is what stopped any of them being tried.
+                                local s_Moved, s_Why = pushed(inv, dep.peripheral, 1, 64, s_Tail)
+                                if s_Moved > 0 then
+                                    s_Free = 1
+                                else
+                                    Log(("could not shuffle %s slot 1 to the back (%s) -- trying the other chests")
+                                        :format(tostring(dep.peripheral), tostring(s_Why or "moved nothing")))
+                                end
                             elseif evictLowSlot(inv, s_Names, dep.peripheral) then
                                 -- THE BACK OF THIS CHEST IS FULL TOO. USE SOMEBODY ELSE'S.
                                 --
@@ -593,10 +704,10 @@ function OnBringToFront(p_ID, p_Message)
                         -- network -- so send the stack somewhere with room and point the drone there.
                         if s_Free == nil then
                             for _, other in ipairs(s_Names) do
-                                os.queueEvent("scan") os.pullEvent("scan")
+                                breathe("scan")
                                 if other ~= dep.peripheral then
-                                    local ok4, oinv = pcall(peripheral.wrap, other)
-                                    if ok4 and oinv and oinv.list then
+                                    local oinv = wrapped(other)
+                                    if oinv and oinv.list then
                                         local ok5, ol = pcall(oinv.list)
                                         local osize = 27
                                         if oinv.size then local o6, sz = pcall(oinv.size) if o6 then osize = tonumber(sz) or 27 end end
@@ -605,11 +716,10 @@ function OnBringToFront(p_ID, p_Message)
                                             for i = 1, math.min(16, osize) do if ol[i] == nil then ofree = i break end end
                                         end
                                         if ofree then
-                                            local ok7, movedN = pcall(inv.pushItems, other, s_Slot, 64, ofree)
-                                            if ok7 and (tonumber(movedN) or 0) > 0 then
+                                            if pushed(inv, other, s_Slot, 64, ofree) > 0 then
                                                 Log(("brought %s forward into %s slot %d (from a full chest)")
                                                     :format(tostring(s_Name), other, ofree))
-                                                return true, {pos = posOf(other), slot = ofree,
+                                                return true, {pos = depositPosOf(other), slot = ofree,
                                                               item = s_Name, moved = true,
                                                               from = s_Slot, chest = other}
                                             end
@@ -619,9 +729,10 @@ function OnBringToFront(p_ID, p_Message)
                             end
                             return false, "every chest is full -- cannot surface " .. tostring(s_Name)
                         end
-                        local ok3, moved = pcall(inv.pushItems, dep.peripheral, s_Slot, 64, s_Free)
-                        if not ok3 or (tonumber(moved) or 0) == 0 then
-                            return false, ("could not move %s from slot %d"):format(tostring(s_Name), s_Slot)
+                        local s_Got, s_Why2 = pushed(inv, dep.peripheral, s_Slot, 64, s_Free)
+                        if s_Got == 0 then
+                            return false, ("could not move %s from slot %d: %s")
+                                :format(tostring(s_Name), s_Slot, tostring(s_Why2 or "moved nothing"))
                         end
                         return true, {pos = dep.pos, slot = s_Free, item = s_Name,
                                       moved = true, from = s_Slot}
@@ -633,18 +744,52 @@ function OnBringToFront(p_ID, p_Message)
     return false, "no chest holds: " .. s_Match
 end
 
+-- Which networked chest holds something matching, and where a drone flies to reach it. Reads the
+-- peripherals rather than any memory of them -- OnWhereIs says what the memory cost.
+local function networkedHolderOf(p_Match)
+    Rescan()
+    for name, e in pairs(m_Index) do
+        if e.total > 0 and name:find(p_Match, 1, true) then
+            for _, at in ipairs(e.at) do
+                local s_Pos = depositPosOf(at.where)
+                if s_Pos then return s_Pos, name, e.total end
+            end
+        end
+    end
+    return nil, "no networked chest holds " .. p_Match
+end
+
+-- A chest with no peripheral, remembered from the last drone that stood on it. Second choice: a
+-- memory can be stale, a peripheral cannot.
+local function observedHolderOf(p_Match)
+    for _, c in pairs(DATA["chestAt"] or {}) do
+        for name, count in pairs(c.items or {}) do
+            if (tonumber(count) or 0) > 0 and name:find(p_Match, 1, true) then
+                return c.pos, name, count
+            end
+        end
+    end
+    return nil, "no observed chest holds " .. p_Match
+end
+
 function OnWhereIs(p_ID, p_Message)
     local d = p_Message.data or {}
     local s_Match = tostring(d.match or "")
     if #s_Match < 2 then return false, "need something to look for" end
-    -- Observed chests first: a reading beats a running total that may have missed an event.
-    for _, c in pairs(DATA["chestAt"] or {}) do
-        for name, count in pairs(c.items or {}) do
-            if (tonumber(count) or 0) > 0 and name:find(s_Match, 1, true) then
-                return true, {pos = c.pos, item = name, count = count, source = "observed"}
-            end
-        end
-    end
+    -- THE NETWORK FIRST. A CHEST ON IT IS READ, NOT REMEMBERED.
+    --
+    -- This answered from chestAt -- what some drone last SAW in a chest -- and then from the
+    -- ledger, and never from the peripherals this module rescans on every other question. So with
+    -- 64 coal on the network two hops from the bay (Stock and Find both reported it), WhereIs sent
+    -- the drone to -520,63,34, a chest a drone had once seen coal in, 45 blocks out: "fetch: not at
+    -- -520,63,34 after all -- sweeping the bay", and D38 ran dry in the sweep. Same rule as
+    -- OnBringToFront's "SEARCH THE NETWORK, NOT THE REGISTRY": the observation is for chests that
+    -- have no peripheral, and it comes after.
+    local s_Pos, s_Name, s_Total = networkedHolderOf(s_Match)
+    if s_Pos then return true, {pos = s_Pos, item = s_Name, count = s_Total, source = "peripheral"} end
+    -- Observed chests next: a reading beats a running total that may have missed an event.
+    s_Pos, s_Name, s_Total = observedHolderOf(s_Match)
+    if s_Pos then return true, {pos = s_Pos, item = s_Name, count = s_Total, source = "observed"} end
     local L = ledger()
     for name, pos in pairs(DATA["where"] or {}) do
         if name:find(s_Match, 1, true) and (L[name] or 0) > 0 then
@@ -655,17 +800,11 @@ function OnWhereIs(p_ID, p_Message)
 end
 
 function OnWithdrawn(p_ID, p_Message)
-    local d = p_Message.data or {}
-    local s_N = 0
-    for name, count in pairs(d.items or {}) do
-        ledgerAdd(name, -(tonumber(count) or 0))
+    return tallyLedger(p_Message.data or {}, -1, function(name)
         -- Emptied: forget where it was, or the next lookup sends a drone to a chest that no longer
         -- has any -- which is exactly the wasted trip this index exists to prevent.
         if DATA["where"] and (ledger()[name] or 0) <= 0 then DATA["where"][name] = nil end
-        s_N = s_N + (tonumber(count) or 0)
-    end
-    if s_N ~= 0 then PowNet.MarkDirty() end
-    return true, {counted = s_N}
+    end)
 end
 
 function OnStock(p_ID, p_Message)
@@ -680,7 +819,7 @@ function OnStock(p_ID, p_Message)
         s_Items = s_Items + e.total
         s_Detail[#s_Detail + 1] = {name = name, count = e.total}
     end
-    table.sort(s_Detail, function(a, b) return a.count > b.count end)
+    sortByCount(s_Detail)
     for _, f in pairs(m_Free) do s_Slots = s_Slots + f end
     -- Chest NAMES and their free space, so a handover point can be chosen deliberately. Without
     -- this the network names are invisible from outside the world and `pickup` is unconfigurable.
@@ -701,7 +840,7 @@ function OnStock(p_ID, p_Message)
             s_Items = s_Items + count
             s_Detail[#s_Detail + 1] = {name = name, count = count}
         end
-        table.sort(s_Detail, function(a, b) return a.count > b.count end)
+        sortByCount(s_Detail)
     end
 
     return true, {chests = s_Chests, source = s_Source,
@@ -753,6 +892,7 @@ end
 
 function OnDepositPoints(p_ID, p_Message)
     Rescan()
+    dedupeDeposits()
     local s_Out = {}
     for _, d in ipairs(DATA["deposits"] or {}) do
         -- Ship the last OBSERVED contents alongside each point, so a drone sweeping for an item can
@@ -848,11 +988,35 @@ end
 
 function OnDepositPoint(p_ID, p_Message)
     Rescan()
-    local s_Usable = {}
+    -- A CACHE IS NOT STORAGE. WITHOUT A SITE, THE ANSWER IS A CHEST THE FLEET CAN SEE.
+    --
+    -- Cache chests placed at work sites register here with no peripheral, and pickDeposit ranks by
+    -- free space -- so with no `near` to anchor the distance, the emptiest chest won every time,
+    -- and the emptiest chest was a spoil cache 45 blocks from the bay. Every plain Deposit flew
+    -- there; RefuelAtStorage adopted it as HOME and flew there for fuel. Measured: 14 freshly felled
+    -- logs and 64 coal sitting in that chest, invisible to Stock, WhereIs, the smelter and the
+    -- factories, while storage read 0 logs and the drone that put them there declared storage dry.
+    -- Nothing deposited off the network takes part in the economy. So: a request with no site goes
+    -- to a networked chest; only a request FOR a site (spoil, EnsureCacheChest) may be answered
+    -- with a cache -- and only when no networked chest has room.
+    -- AND A SITE DOES NOT CHANGE THAT. The first version admitted caches whenever the request named
+    -- a site, so pickDeposit's "within 16 of the nearest option" rule chose the cache twelve blocks
+    -- from the lumber site over the networked chest forty blocks away -- and 9 logs went into the
+    -- same off-network chest the rule was written to avoid, ten minutes after it shipped. Spoil at a
+    -- work site was the reason caches exist; the price of sending it home is a longer flight. The
+    -- price of sending LOGS to a cache is that they leave the economy. A cache is used only when no
+    -- networked chest has room.
+    dedupeDeposits()
+    local s_Usable, s_Offline = {}, {}
     for _, d in ipairs(DATA["deposits"]) do
         local f = m_Free[d.peripheral]
-        if f == nil or f > 0 then s_Usable[#s_Usable + 1] = d end
+        if f == nil then
+            s_Offline[#s_Offline + 1] = d
+        elseif f > 0 then
+            s_Usable[#s_Usable + 1] = d
+        end
     end
+    if #s_Usable == 0 then s_Usable = s_Offline end
     if #s_Usable == 0 then
         return false, "no deposit point with free space -- add one with: p StorageMan deposit -pos x y z"
     end
@@ -897,6 +1061,30 @@ function OnDepositPoint(p_ID, p_Message)
     return true, {pos = s_Pick.pos, peripheral = s_Pick.peripheral,
                   free = m_Free[s_Pick.peripheral], points = #s_Usable,
                   message = "drop at " .. s_Pick.pos.x .. "," .. s_Pick.pos.y .. "," .. s_Pick.pos.z}
+end
+
+-- Drop a registered deposit point whose chest is gone -- or never was. -474,64,78 was registered
+-- with no block entity behind it (rcon), and because HQ hauls from the FARTHEST unwired point one
+-- task at a time, the fleet hauled from that empty square for ever while the real cache holding 64
+-- coal and 13 logs sat uncollected. A registry entry with nothing under it is worse than none.
+function OnForgetDeposit(p_ID, p_Message)
+    local d = p_Message.data or {}
+    local p = type(d.pos) == "table" and d.pos or {}
+    local x, y, z = tonumber(p.x), tonumber(p.y), tonumber(p.z)
+    if x == nil or y == nil or z == nil then return false, "Missing pos {x, y, z}" end
+    local s_Kept, s_Dropped = {}, 0
+    for _, dep in ipairs(DATA["deposits"]) do
+        if dep.pos and dep.pos.x == x and dep.pos.y == y and dep.pos.z == z then
+            s_Dropped = s_Dropped + 1
+        else
+            s_Kept[#s_Kept + 1] = dep
+        end
+    end
+    DATA["deposits"] = s_Kept
+    if DATA["chestAt"] then DATA["chestAt"][("%d:%d:%d"):format(x, y, z)] = nil end
+    PowNet.MarkDirty()
+    return true, {dropped = s_Dropped, remaining = #s_Kept,
+                  message = ("forgot %d deposit point(s) at %d,%d,%d"):format(s_Dropped, x, y, z)}
 end
 
 function OnAddDeposit(p_ID, p_Message)
@@ -1026,8 +1214,25 @@ local WOOD_CRAFT_RESERVE = 16
 -- The most a furnace takes from one input in a tick. Was written inline as 32.
 local SMELT_BATCH = 32
 
+-- Declared above reservedForCrafting, which now needs it: a `local` read above its declaration is
+-- a nil global in Lua, silently.
+local function fuelInStorage()
+    local s_Units = 0
+    for name, e in pairs(m_Index) do
+        if isFuel(name) then s_Units = s_Units + (e.total or 0) end
+    end
+    return s_Units
+end
+
+local SMELT_FUEL_RESERVE = 32
+
 local function reservedForCrafting(p_Name, p_Entry)
     if smeltCategory(p_Name) ~= "wood" then return false end
+    -- FUEL BEFORE FURNITURE. With no burnable on the shelf, sixteen logs held back for planks and
+    -- chests are sixteen logs that will never be crafted, because crafting needs a fuelled drone
+    -- too. Measured: 13 logs in storage, 0 fuel, four furnaces idle with "input=NONE", the whole
+    -- fleet grinding down. The reserve is for a settlement that can afford one.
+    if fuelInStorage() < SMELT_FUEL_RESERVE then return false end
     return (tonumber(p_Entry.total) or 0) <= WOOD_CRAFT_RESERVE
 end
 
@@ -1037,21 +1242,8 @@ end
 
 -- The best thing waiting to be smelted, or nil if there is nothing. Same contract as
 -- firstInStorage(isSmeltableInput), which is what this replaces at both call sites.
--- Burnable units in storage, counted so the furnaces can tell "we have fuel to spend" from "we are
--- spending the settlement's last fuel".
-local function fuelInStorage()
-    local s_Units = 0
-    for name, e in pairs(m_Index) do
-        if isFuel(name) then s_Units = s_Units + (e.total or 0) end
-    end
-    return s_Units
-end
-
--- Below this, the furnaces smelt ONLY what makes more fuel.
---
--- 32 coal is four stacks of smelting -- enough to convert a delivery of logs into charcoal and get
--- the fleet moving again, which is the only thing worth spending the last of it on.
-local SMELT_FUEL_RESERVE = 32
+-- (fuelInStorage and SMELT_FUEL_RESERVE -- "below this, the furnaces smelt ONLY what makes more
+-- fuel; 32 coal is four stacks of smelting" -- moved above reservedForCrafting, which reads them.)
 
 -- A RANK IS A PREFERENCE. A PREFERENCE IS NOT A LIMIT.
 --
@@ -1120,12 +1312,17 @@ local function smeltAllowance(p_Name, p_Entry)
     if p_Entry == nil then return 0 end
     if smeltCategory(tostring(p_Name)) ~= "wood" then return SMELT_BATCH end
     local n = tonumber(p_Entry.total) or 0
+    -- FUEL BEFORE FURNITURE, HERE TOO. reservedForCrafting yields its sixteen-log reserve while fuel
+    -- is short, and this held the same sixteen back a second time: five logs on the shelf, zero
+    -- fuel, "input=yes fuel=yes moved=0" -- the smelter had permission to start and an allowance of
+    -- nothing. The same rule must live in both places or it lives in neither.
+    if fuelInStorage() < SMELT_FUEL_RESERVE then return math.min(SMELT_BATCH, n) end
     return math.max(0, math.min(SMELT_BATCH, n - WOOD_CRAFT_RESERVE))
 end
 
 local function drainTo(p_Fur, p_Slot)
     for _, cname in ipairs(m_Chests) do
-        os.queueEvent("scan") os.pullEvent("scan")
+        breathe("scan")
         if (m_Free[cname] or 0) > 0 then
             local ok, moved = pcall(p_Fur.pushItems, cname, p_Slot)
             return ok and (moved or 0) or 0
@@ -1164,10 +1361,10 @@ local function furnaceSummary(p_Moved)
     local s_Fu = firstInStorage(isFuel)
     local s_Sizes = {}
     for _, fname in ipairs(m_Furnaces) do
-        os.queueEvent("scan") os.pullEvent("scan")
-        local ok, fur = pcall(peripheral.wrap, fname)
+        breathe("scan")
+        local fur = wrapped(fname)
         local okS, s_Size = false, nil
-        if ok and fur then okS, s_Size = pcall(fur.size) end
+        if fur then okS, s_Size = pcall(fur.size) end
         s_Sizes[#s_Sizes + 1] = fname .. ":" .. ((okS and tostring(s_Size)) or "unreadable")
     end
     return ("%d furnace(s) [%s] moved=%d input=%s fuel=%s"):format(
@@ -1186,6 +1383,10 @@ end
 -- matters most here, and leaving it in the furnace strands the settlement's renewable fuel inside
 -- the machine that made it.
 local KEEP_AS_FUEL = { ["minecraft:coal"] = true, ["minecraft:coal_block"] = true }
+-- Wood is fuel of last resort (see fillFor), so wood in the fuel slot stays too. Nothing wooden is
+-- ever a smelt PRODUCT, so keeping it by content cannot strand any output. Declared above
+-- wrongForFace, which reads it: a `local` read above its declaration is a nil global, silently.
+local function isWoodFuel(p_Name) return smeltCategory(p_Name) == "wood" end
 
 local function wrongForFace(p_Item, p_IsInputFace, p_Slot, p_Size)
     if p_Item == nil then return false end
@@ -1212,16 +1413,28 @@ local function wrongForFace(p_Item, p_IsInputFace, p_Slot, p_Size)
     -- product except the fuel we are deliberately keeping there. Charcoal is fuel AND product, and
     -- it belongs in storage where the whole fleet can reach it -- a furnace holding its own
     -- charcoal is 64 charcoal nobody can burn.
-    return not KEEP_AS_FUEL[p_Item.name]
+    return not (KEEP_AS_FUEL[p_Item.name] or isWoodFuel(p_Item.name))
 end
 
 -- The one thing this face is for.
+-- WOOD IS FURNACE FUEL OF LAST RESORT, SO ZERO COAL IS NOT A DEAD END.
+--
+-- The fuel face took only coal, charcoal and coal blocks. With none of those on the shelf and
+-- thirteen logs waiting, four furnaces sat at "input=NONE fuel=NONE" for an hour while the fleet
+-- ground to zero -- the settlement's only renewable fuel could not be turned into fuel because
+-- turning it into fuel needed fuel. A log burns for 1.5 smelts, so two logs smelt three logs into
+-- three charcoal, and one of those charcoal smelts the next eight. The loop bootstraps from wood
+-- alone; it only needs permission to burn the first two.
+local WOOD_FUEL_BATCH = 2
 local function fillFor(p_IsInputFace)
     if p_IsInputFace then
         local e, name = bestSmeltInput()
         return e, smeltAllowance(name, e)
     end
-    return firstInStorage(isFuel), 16
+    local s_Dense = firstInStorage(isFuel)
+    if s_Dense then return s_Dense, 16 end
+    if bestSmeltInput() == nil then return nil, 0 end
+    return firstInStorage(isWoodFuel), WOOD_FUEL_BATCH
 end
 
 function ServiceFurnaces()
@@ -1233,9 +1446,9 @@ function ServiceFurnaces()
     for _, fname in ipairs(m_Furnaces) do
         -- Same reason as the chest loop: each furnace is a wrap, a size, two lists and up to four
         -- item transfers, all crossing into Java, and this runs every tick.
-        os.queueEvent("smelt") os.pullEvent("smelt")
-        local ok, fur = pcall(peripheral.wrap, fname)
-        if ok and fur then
+        breathe("smelt")
+        local fur = wrapped(fname)
+        if fur then
             local okS, s_Size = pcall(fur.size)
             local ok2, items = pcall(fur.list)
             if okS and ok2 and s_Size then
@@ -1330,9 +1543,20 @@ local m_ServerEvents = {
         params = { item = { optional = false } }
     },
     stock = { func = OnStock, callable = true, params = {} },
+    forgetDeposit = {
+        func = OnForgetDeposit, callable = true,
+        params = { pos = { length = 3 } },
+    },
     deposit = {
         func = OnAddDeposit, callable = true,
-        params = { pos = { length = 3 }, peripheral = { optional = true } }
+        params = {
+             pos = { length = 3 }, peripheral = { optional = true },
+            -- DECLARED, OR IT NEVER ARRIVES. PowNet filters the payload to the fields named
+            -- here the moment a params block exists, silently, and the call still returns
+            -- success -- which is how order.build's dependsOn was dropped for months while
+            -- every call reported fine. See hq/test/wiring.test.ts.
+            gps = { optional = true },
+        },
     },
     smelt = {
         func = OnSmelt, callable = true,
@@ -1343,6 +1567,7 @@ local m_ServerEvents = {
 function Render()
     local m = monitor()
     if not m then return end
+    -- silent: allow (cosmetic text size on an already-optional monitor -- losing this costs a font size, not a decision)
     pcall(m.setTextScale, 0.5)
     m.setBackgroundColour(colors.black)
     m.clear()
@@ -1367,17 +1592,48 @@ function Render()
     end
 end
 
+-- What each tick pass last failed with, so a standing fault is logged once rather than every ten
+-- seconds. See tickPass().
+local m_PassFailed = {}
+
+-- RUN A TICK PASS, AND SAY WHEN ONE HAS STOPPED RUNNING.
+--
+-- Bare `pcall(fn)`, four times. The catch is right -- one bad pass must not kill the loop and take
+-- storage down with it -- but discarding the result made "ran and found nothing to do" and "threw
+-- on its first line, every ten seconds, for hours" the same observable event.
+--
+-- Rescan is the one that matters most. Stock here is OBSERVED, not accounted, and the whole
+-- settlement plans against it: a Rescan that has quietly stopped running leaves the index frozen at
+-- whatever it last saw, which is the "chest wrongly recorded as empty" case -- worse than an
+-- unknown one, because the fetch sweep SKIPS it. Six hours of supply decisions were made against a
+-- storage figure of 0 once already, and the reason it took six hours is that nothing said the read
+-- had failed.
+-- PowNet.WatchPass, not a third copy. This was one of the three that each independently wrote
+-- `s_Ok and nil or tostring(s_Err)` -- an expression that can never be nil, so every healthy pass
+-- reported itself failed. See the note on WatchPass. The wording below is StorageMan's and stays;
+-- the logic was never StorageMan's to own.
+local function tickPass(p_Name, p_Fn)
+    PowNet.WatchPass(m_PassFailed, p_Name, p_Fn, function(p_Pass, p_Why)
+        if p_Why then
+            Log(("%s FAILED -- %s (it has stopped running; anything downstream of it is now stale)")
+                :format(p_Pass, p_Why))
+        else
+            Log(("%s is running again"):format(p_Pass))
+        end
+    end)
+end
+
 -- Keep the index warm and run the furnaces. Nothing else ticks here: a query rescans anyway, so
 -- this exists for smelting and for the display being right when nobody has asked recently.
 local function Tick()
     while true do
         os.sleep(10)
-        pcall(Rescan)
-        pcall(ServiceFurnaces)
+        tickPass("Rescan", Rescan)
+        tickPass("ServiceFurnaces", ServiceFurnaces)
         -- Routes ride the same tick as smelting: both are just moving items between things on the
         -- wired network, and neither needs a drone to do it.
-        pcall(ServiceRoutes)
-        pcall(Render)
+        tickPass("ServiceRoutes", ServiceRoutes)
+        tickPass("Render", Render)
     end
 end
 

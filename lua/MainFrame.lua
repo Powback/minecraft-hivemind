@@ -10,6 +10,27 @@ trace("loaded PowNet")
 
 local m_LoadedCallable = {}
 
+-- What MainFrame is serving, or why it cannot say.
+--
+-- "serving 0 files" IS THE ALARM STATE, SO IT MUST NOT ALSO BE THE ERROR STATE.
+--
+-- MainFrame's disk is the source of truth the whole fleet pulls from on boot, and this figure is
+-- the only thing that reports it. The read was a bare pcall, so an unreadable disk answered
+-- `serving 0 files` -- indistinguishable from a disk that is genuinely empty, which is the single
+-- most alarming thing MainFrame can say and the one an operator acts on immediately, by
+-- re-deploying over a disk that was fine.
+--
+-- DECLARED ABOVE ITS USE, DELIBERATELY. The Status handler calls it ~110 lines below; a local
+-- declared after the function that uses it is a nil global here -- no error, no warning, the
+-- branch simply dead -- and that has caused nine separate outages in this project.
+local function servingLine()
+    local s_Files = 0
+    local s_Ok, s_Err = pcall(function() s_Files = #fs.list("disk") end)
+    if s_Ok then return ("serving %d files"):format(s_Files) end
+    return ("CANNOT READ disk: %s"):format(tostring(s_Err))
+end
+
+
 --===== LOAD VFS =====--
 if not VFS then
     if not os.loadAPI("disk/VFS") then
@@ -107,14 +128,13 @@ local function main()
             --
             -- Cheap to answer and it removes the special case rather than dressing it up.
             elseif message.type == PowNet.MESSAGE_TYPE.CALL and message.dataKey == "Status" then
-                local s_Files = 0
-                pcall(function() s_Files = #fs.list("disk") end)
+                local s_Serving = servingLine()
                 local replyMessage = newMessage(PowNet.MESSAGE_TYPE.CALL, message.ID, "Status", {
                     up = os.clock(),
                     id = os.getComputerID(),
                     label = os.getComputerLabel(),
                     faults = 0,
-                    monitor = ("serving %d files"):format(s_Files),
+                    monitor = s_Serving,
                     log = {},
                 })
                 replyMessage.reply = true
@@ -216,6 +236,7 @@ end
 local function dashboard()
     local mon = PowNet.Monitor()
     if not mon then return end
+    -- silent: allow (cosmetic text size on an optional monitor -- the dashboard still draws, so losing this costs a font size rather than a decision)
     pcall(mon.setTextScale, 0.5)
     mon.setBackgroundColour(colors.black)
     mon.clear()
@@ -279,9 +300,30 @@ local function dashboard()
     end
 end
 
+-- A FROZEN DASHBOARD IS WORSE THAN A BLANK ONE.
+--
+-- The pcall is right: a drawing fault must not end the render loop. Discarding it was not. The
+-- monitor keeps displaying the LAST frame that drew successfully, so a dashboard that started
+-- throwing five hours ago shows five-hour-old numbers with complete confidence and no indication
+-- that it has stopped updating -- the same rule as `fleet.status` replaying an old heartbeat, and
+-- the same trap: the numbers look freshest exactly when they matter least.
+--
+-- Written to the boot trace on CHANGE, so a standing fault is one line rather than 720 an hour.
+-- PowNet.WatchPass, not a third copy. This was one of three modules that each wrote
+-- `s_Ok and nil or tostring(s_Err)` by hand -- an expression that can never be nil, so a dashboard
+-- that was drawing perfectly reported itself failed every frame its return value changed. See the
+-- note on WatchPass. A table rather than the old single variable because that is what WatchPass
+-- keeps its state in; there is one pass here and it is named.
+local m_DashFailed = {}
 local function renderLoop()
     while true do
-        pcall(dashboard)
+        PowNet.WatchPass(m_DashFailed, "dashboard", dashboard, function(p_Pass, p_Why)
+            if p_Why then
+                trace(p_Pass .. " FAILED -- " .. p_Why .. " (the monitor is now showing a stale frame)")
+            else
+                trace(p_Pass .. " is drawing again")
+            end
+        end)
         os.sleep(5)
     end
 end

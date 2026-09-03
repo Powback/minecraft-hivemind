@@ -19,6 +19,19 @@ end
 -- Extra line under the map: who is flying, when there is anything to say.
 m_Overlay = nil
 
+-- YIELD, OR CC KILLS THE COROUTINE MID-WALK.
+--
+-- CC:T terminates anything that runs ~10s without yielding, uncatchably, and the computer is left
+-- POWERED OFF with a clean-looking last-run. queueEvent/pullEvent satisfies the watchdog and
+-- resumes in the SAME tick, so a full walk still costs no wall clock -- os.sleep(0) costs a tick
+-- per iteration and is refused by lua-hygiene for that reason. 9 hand-written copies before this.
+local function breathe(p_Tag)
+    -- dup: allow (three modules need this and CC has no shared library here -- giving them one
+    -- means a new os.loadAPI file deployed to every computer, which is a deployment change,
+    -- not a refactor. Two lines each is the cheaper of the two honest options.)
+    os.queueEvent(p_Tag) os.pullEvent(p_Tag)
+end
+
 function Init()
     -- Log each boot step. These go to MapServer.log, unlike print(), which goes to a terminal
     -- nobody is looking at -- and MapServer spent several boots hung with no way to tell WHICH
@@ -716,7 +729,7 @@ function OnPrune(p_ID, p_Message)
             s_Kept = s_Kept + 1
         end
         s_Walk = s_Walk + 1
-        if s_Walk % 2000 == 0 then os.queueEvent("walk") os.pullEvent("walk") end
+        if s_Walk % 2000 == 0 then breathe("walk") end
     end
     if s_Gone > 0 then PowNet.MarkDirty() end
     Log(("prune: dropped %d cell(s) outside %d..%d x %d..%d%s, kept %d")
@@ -785,7 +798,7 @@ function BackfillBlockAt()
     for name, e in pairs(m_BlockIndex or {}) do
         -- Same reason as IndexNames: this runs at boot over whatever the index has accumulated.
         s_Walked = s_Walked + 1
-        if s_Walked % 500 == 0 then os.queueEvent("walk") os.pullEvent("walk") end
+        if s_Walked % 500 == 0 then breathe("walk") end
         for _, q in ipairs(e.at or {}) do
             if q and q.x then
                 m_BlockAt[q.x .. ":" .. q.y .. ":" .. q.z] = name
@@ -809,7 +822,7 @@ function IndexNames(p_Detail)
     local s_Seen = 0
     for key, info in pairs(p_Detail) do
         s_Seen = s_Seen + 1
-        if s_Seen % 2000 == 0 then os.queueEvent("walk") os.pullEvent("walk") end
+        if s_Seen % 2000 == 0 then breathe("walk") end
         -- THE SHAPE EVERY MOVING DRONE ACTUALLY SENDS WAS THE ONE SHAPE THIS DID NOT ACCEPT.
         --
         -- pgps.detectAll records `{turtle.inspect()}`, which is {true, {name = "..."}} -- a plain
@@ -850,7 +863,7 @@ function IndexOccupancy(p_World)
             if ObserveBlock(key, nil) then s_Changed = s_Changed + 1 end
         end
         s_Walk = s_Walk + 1
-        if s_Walk % 2000 == 0 then os.queueEvent("caveStep") os.pullEvent("caveStep") end
+        if s_Walk % 2000 == 0 then breathe("caveStep") end
     end
     if s_Changed > 0 then PowNet.MarkDirty() end
     return s_Changed
@@ -995,7 +1008,7 @@ function OnRegionKnown(p_ID, p_Message)
                 end
             end
             -- Not os.sleep(0): that waits a whole game tick per x-slice. See the A* loop.
-            os.queueEvent("boxscan") os.pullEvent("boxscan")
+            breathe("boxscan")
         end
     else
         for k in pairs(s_World) do
@@ -1007,7 +1020,7 @@ function OnRegionKnown(p_ID, p_Message)
             s_Walk = s_Walk + 1
             -- Yield on a COUNT, not per column: this loop has no columns, and a table walk that
             -- never yields is the shape that has killed this module before.
-            if s_Walk % 2000 == 0 then os.queueEvent("walk") os.pullEvent("walk") end
+            if s_Walk % 2000 == 0 then breathe("walk") end
         end
     end
 
@@ -1063,7 +1076,7 @@ local function ComputeCaves(s_MinSize)
     local s_Walk = 0
     for key, v in pairs(s_World) do
         s_Walk = s_Walk + 1
-        if s_Walk % 2000 == 0 then os.queueEvent("caveStep") os.pullEvent("caveStep") end
+        if s_Walk % 2000 == 0 then breathe("caveStep") end
         if v == 1 then
             local x, y, z = parseKey(key)
             if x then
@@ -1077,7 +1090,7 @@ local function ComputeCaves(s_MinSize)
     s_Walk = 0
     for key, v in pairs(s_World) do
         s_Walk = s_Walk + 1
-        if s_Walk % 2000 == 0 then os.queueEvent("caveStep") os.pullEvent("caveStep") end
+        if s_Walk % 2000 == 0 then breathe("caveStep") end
         if v == 0 and not s_Seen[key] then
             local x0, y0, z0 = parseKey(key)
             local col = x0 and (x0 .. ":" .. z0)
@@ -1094,7 +1107,7 @@ local function ComputeCaves(s_MinSize)
                 local s_Fill = 0
                 while #s_Stack > 0 do
                     s_Fill = s_Fill + 1
-                    if s_Fill % 2000 == 0 then os.queueEvent("caveStep") os.pullEvent("caveStep") end
+                    if s_Fill % 2000 == 0 then breathe("caveStep") end
                     local c = table.remove(s_Stack)
                     s_Cells[#s_Cells + 1] = c
                     for _, o in ipairs(ADJACENT) do
@@ -1198,7 +1211,14 @@ local m_ServerEvents = {
     },
     gpshost = {
         func = OnAddGpsHost, callable = true,
-        params = { pos = { length = 3 } }
+        params = {
+             pos = { length = 3 },
+            -- DECLARED, OR IT NEVER ARRIVES. PowNet filters the payload to the fields named
+            -- here the moment a params block exists, silently, and the call still returns
+            -- success -- which is how order.build's dependsOn was dropped for months while
+            -- every call reported fine. See hq/test/wiring.test.ts.
+            gps = { optional = true },
+        },
     },
     bounds = {
         func = OnSetBounds, callable = true,
@@ -1255,6 +1275,8 @@ function Render()
     -- dimensions and the same code works before and after a monitor wall gets built.
     local s_Dev = PowNet.Monitor()
     local s_Fleet = nil
+    -- The map still draws the terrain without it, and that is the part anything depends on.
+    -- silent: allow (the fleet overlay is decoration on a monitor picture; Render's own failure is printed below)
     pcall(function() s_Fleet = fleet() end)
     local s_Ok, s_Err = pcall(MapRender.draw, s_Dev,
         PowGPSServer.getCachedWorld(), PowGPSServer.cachedWorldDetail, m_Overlay, s_Fleet)
@@ -1286,9 +1308,23 @@ PowNet.SetShutdownHook(function(p_Reason)
     -- the fleet -- and it was discarding the index without first writing the observations behind
     -- it. It cannot help against `computercraft shutdown`, which powers the computer off with no
     -- warning at all; the adaptive save interval above is what covers that case.
-    pcall(PowGPSServer.saveAll)
+    -- A FLUSH THAT FAILED IS NOT A FLUSH, AND THE LINE BELOW CLAIMED IT HAPPENED.
+    --
+    -- This was a bare pcall, and the print underneath announces "before write-back" whether or not
+    -- the write-back occurred. Everything observed since the last save lives only in memory at this
+    -- point; if saveAll throws, that is silently the moment it is lost, and the log records a clean
+    -- shutdown. A REMEMBERED BLOCK IS NOT A BLOCK -- and a block nobody managed to remember is a
+    -- region the fleet re-surveys from scratch with nothing to say why.
+    local s_Saved, s_Err = pcall(PowGPSServer.saveAll)
     m_BlockAt, m_BlockIndex = nil, nil
-    print("dropped the derived block index before write-back (" .. tostring(p_Reason) .. ")")
+    if s_Saved then
+        print("dropped the derived block index before write-back (" .. tostring(p_Reason) .. ")")
+    else
+        -- Log, not print: print goes to the in-game terminal only, and a stand-down that lost
+        -- observations is precisely the fault you go looking for from outside the game, hours later.
+        Log(("SAVE FAILED on shutdown (%s) -- observations since the last save are LOST (%s)")
+            :format(tostring(s_Err), tostring(p_Reason)))
+    end
 end)
 
 -- RENDER IS NOT THE POST-MESSAGE HOOK.
@@ -1309,6 +1345,8 @@ local function RenderIfWatched()
     local s_Now = os.clock()
     if s_Now - m_LastRender < 5 then return end
     m_LastRender = s_Now
+    -- This pcall exists only so a drawing fault cannot stop PowNet.main handling the next message.
+    -- silent: allow (Render prints its own failure -- see the print inside it -- and a monitor is never load-bearing here)
     pcall(Render)
 end
 

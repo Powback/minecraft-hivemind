@@ -32,10 +32,11 @@ import { createHash } from 'node:crypto';
 import { join, relative, extname } from 'node:path';
 import { registry } from './tools/registry.js';
 import { startSupplyLoop } from './agent/supply.js';
+import { startEconomySampler } from './agent/economy.js';
 import { startSentinel, sentinel, runSentinelTick } from './agent/sentinel.js';
 import { pushSettlement } from './world/settlement.js';
 import './tools/core.js';                 // side-effect: registers the core tools
-import { buildBrief } from './tools/core.js';
+import { buildBrief, refreshFleet } from './tools/core.js';
 import { getProfile, permits } from './agent/profiles.js';
 import { buildPriming, render } from './agent/priming.js';
 import { bridge } from './bridge/ws.js';
@@ -141,7 +142,10 @@ const server = createServer(async (req, res) => {
       });
     }
 
-    if (url.pathname === '/brief') return send(200, buildBrief());
+    // REFRESH BEFORE REPORTING. buildBrief describes whatever was last read, and on a cold start
+    // that is an empty fleet -- which has no unhealthy drones, so this answered `problems: ["none"]`
+    // before anything had been looked at. Measured: "none" while all seven drones sat at zero fuel.
+    if (url.pathname === '/brief') { await refreshFleet(); return send(200, buildBrief()); }
 
     /**
      * Everything a runner needs to start an agent: system prompt, tool schemas,
@@ -332,13 +336,18 @@ server.listen(PORT, '0.0.0.0', () => {
       const r = await pushSettlement((m, meth, args, opts) => bridge.call(m, meth, args as any, opts as any));
       // Against the expected count, not on its own: "15" is only legible next to "of 16".
       const short = r.failed.length ? ` -- FAILED: ${r.failed.join(' ')}` : '';
-      console.log(`[settlement] pushed to MapServer: bounds=${r.bounds} gpsHosts=${r.hosts}/${r.expected}${short}`);
+      // `bounds=false` said the push did not land and never said why, so a slow MapServer and a
+      // wedged one printed the same line. Wrong bounds read exactly like a dead fleet (see above),
+      // which makes this the single most misleading `false` in the boot log.
+      const why = r.boundsError ? ` (bounds push failed: ${r.boundsError})` : '';
+      console.log(`[settlement] pushed to MapServer: bounds=${r.bounds}${why} gpsHosts=${r.hosts}/${r.expected}${short}`);
     } catch (err) {
       console.log(`[settlement] could not push: ${String(err).slice(0, 120)}`);
     }
   });
 
   startSupplyLoop();
+  startEconomySampler();
   // The part that reads the system's own output. Nothing did, which is why every outage so far has
   // needed a person to spot a contradiction in a log.
   startSentinel();

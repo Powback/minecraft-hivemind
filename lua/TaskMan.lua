@@ -21,6 +21,20 @@ end
 print(os.loadAPI("ServerTasks/dig.lua"))
 Log("Starting...")
 
+-- IS THIS TASK STILL GOING TO HAPPEN?
+--
+-- The queue's most-asked question, and it had at least three different answers spread over eight
+-- call sites: some tested progress alone, most added `enabled ~= false`, one also excluded paused.
+-- They all drive the same decisions -- what to dispatch, what to count against a cap, what blocks
+-- a dependency -- so the disagreements are silent and only show up as a task that is live to one
+-- pass and finished to the next.
+--
+-- This is the majority form. The sites that test progress ALONE are deliberately left alone and
+-- marked, because "live regardless of enabled" is a different question, not a drifted copy.
+local function taskLive(p_Task)
+    return (p_Task.progress or 0) < 100 and p_Task.enabled ~= false
+end
+
 function Init()
     if DATA["tasks"] == nil then
         DATA["tasks"] = {}
@@ -96,7 +110,7 @@ function OnAddTask(p_ID, p_Message)
     -- queue noise, and it crowds out the work that matters behind it.
     for _, v in pairs(DATA["tasks"] or {}) do
         if v.name == s_Task.name and v.assignedTo == nil
-           and (v.progress or 0) < 100 and v.enabled ~= false then
+           and taskLive(v) then
             -- SAME NAME, NEW ORDERS: TAKE THE NEW ORDERS.
             --
             -- Refusing the duplicate is right -- it is the same job -- but the WORK was silently
@@ -274,7 +288,7 @@ end
 -- forever while the planks for them sat finished in storage.
 local function committed(p_DroneId)
     for _, t in pairs(DATA["tasks"] or {}) do
-        if t.assignedTo == p_DroneId and (t.progress or 0) < 100 and t.enabled ~= false then
+        if t.assignedTo == p_DroneId and taskLive(t) then
             return true
         end
     end
@@ -289,6 +303,8 @@ local function workPos(p_Task)
     if w.build and w.build.origin then return w.build.origin end
     if w.gather and w.gather.pos then return w.gather.pos end
     if w.rescue and w.rescue.pos then return w.rescue.pos end
+    if w.lumber and w.lumber.start then return w.lumber.start end
+    if w.haul and w.haul.pos then return w.haul.pos end
     if w.survey then
         if w.survey.pos then return w.survey.pos end
         if w.survey.min and w.survey.max then
@@ -349,11 +365,45 @@ end
 -- number: below this a drone cannot be sure of getting home, and above it, it can work.
 local DISPATCH_FUEL_FLOOR = 300
 
+-- How long an unknown fuel reading may still be given the benefit of the doubt.
+local FUEL_UNKNOWN_GRACE_MS = 90 * 1000
+
+-- THE FLOOR THIS DRONE ACTUALLY USES, not the one this file guesses at.
+--
+-- The constant below is a fallback for a drone on older code. The drone computes the real figure
+-- from where it is standing and whether storage has anything in it, and now reports it -- see the
+-- note beside fuelFloor in DroneLogic.SendHeartBeat for the band this opened when the two drifted.
+--
+-- ONE FUNCTION, because "how much fuel is enough" is asked twice in this file -- to decide whether
+-- to give a drone work, and to decide whether to send it fuel -- and those two answers disagreeing
+-- is precisely the failure: a drone can be simultaneously too low to work and too high to help.
+local function fuelFloorOf(d)
+    return tonumber(d.fuelFloor) or DISPATCH_FUEL_FLOOR
+end
+
 local function hasFuel(d)
-    -- Absent means unknown, not empty: an older DroneMan record with no fuel field must not take
-    -- the whole fleet out of service.
     local f = tonumber(d.fuel)
-    return f == nil or f >= DISPATCH_FUEL_FLOOR
+    if f ~= nil then return f >= fuelFloorOf(d) end
+
+    -- UNKNOWN IS ONLY HARMLESS WHILE THE RECORD IS FRESH.
+    --
+    -- This returned true for any missing fuel field, on the reasoning that an older DroneMan record
+    -- without one must not bench the whole fleet. That reasoning is sound and the test was not: the
+    -- drones whose fuel is missing are overwhelmingly the ones whose HEARTBEAT is missing, and a
+    -- drone that has stopped reporting is exactly the one that has run dry, wandered out of radio
+    -- range, or wedged. So the rule handed work preferentially to the drones least able to do it,
+    -- and the assignment then sat unstarted until the release pass took it back -- which reads from
+    -- outside as a scheduler that will not dispatch.
+    --
+    -- CLAUDE.md already records this trap for the same data, one layer up: fuel and position are
+    -- replayed from the last heartbeat a drone managed to get home, so "the numbers are freshest
+    -- exactly when they matter least". Absent is not a number at all.
+    --
+    -- Fresh record, no fuel field: an old schema, believe it. Stale record: unknown means unknown,
+    -- and unknown must not be treated as ready.
+    local s_Seen = tonumber(d.lastSeen)
+    if s_Seen == nil then return false end
+    return (os.epoch("utc") - s_Seen) < FUEL_UNKNOWN_GRACE_MS
 end
 
 -- A RESCUER NEEDS FAR MORE THAN THE DISPATCH FLOOR.
@@ -367,6 +417,50 @@ end
 -- at the far end and a margin -- the parts that do not depend on how far away the casualty is.
 -- pickDrone adds RELIEF_PER_BLOCK for every block of the trip the chosen candidate would fly.
 local RELIEF_FUEL_FLOOR = 300
+
+-- WHAT A JOB COSTS, DECIDED HERE AND NOWHERE ELSE.
+--
+-- The drone's floor answers "can I get home"; nothing answered "can I do this job and get home".
+-- So a drone with 456 fuel was handed a lumber run forty blocks out, flew there, broke off under
+-- its floor without felling anything, and flew back: the whole tank spent on a round trip that
+-- produced nothing, three times in one evening. The scheduler is the only party that knows both
+-- the job and the fleet, so the estimate lives with it. Round trip at ROUTE blocks per block of
+-- distance (a route is not a straight line), plus the work, plus a margin. Deliberately rough --
+-- being 30% wrong costs one refuel trip; not asking cost every job that failed this way.
+local JOB_FUEL_MARGIN = 100
+local function workCost(p_Task)
+    local w = (p_Task and p_Task.work) or {}
+    if w.lumber then
+        return (tonumber(w.lumber.w) or 8) * (tonumber(w.lumber.l) or 8) * 2 + 60
+    end
+    if w.dig then
+        return (tonumber(w.dig.w) or 8) * (tonumber(w.dig.l) or 8) * (tonumber(w.dig.depth) or 4)
+    end
+    if w.gather then return (tonumber(w.gather.limit) or 64) * 4 end
+    if w.build then return 200 end
+    if w.rescue or w.haul then return 40 end
+    return 100
+end
+-- Why nobody took the job, in the words that send a reader to the right place. "Cannot afford it"
+-- used to be reported as "busy", which sent people looking for a stuck job that did not exist.
+local function noDroneReason(p_Role, p_Busy, p_Poor, p_PoorNeed)
+    if p_Poor then
+        return ("no %s can afford it: %s has %s fuel, the job needs ~%d from there")
+            :format(p_Role, tostring(p_Poor.name), tostring(p_Poor.fuel), p_PoorNeed or 0)
+    end
+    if p_Busy then return "every " .. p_Role .. " is busy (" .. tostring(p_Busy.name) .. ")" end
+    return "no " .. p_Role .. " in the fleet -- one drone needs a "
+        .. (p_Role == "scout" and "geo scanner" or "pickaxe")
+end
+
+-- The minimum a drone must hold AT THE SITE, before distance. pickDrone adds the round trip per
+-- block of distance from where the drone actually is.
+local function jobMinFuel(p_Task)
+    local w = (p_Task and p_Task.work) or {}
+    local s_Min = workCost(p_Task) + JOB_FUEL_MARGIN
+    if w.rescue and w.rescue.fuel then s_Min = math.max(s_Min, RELIEF_FUEL_FLOOR) end
+    return s_Min
+end
 
 -- Three fuel out and three back, matching the rate the drones' own FuelFloorNow charges for the
 -- journey home. A round trip is the whole point of the reserve: a rescuer that arrives and cannot
@@ -432,9 +526,9 @@ end
 local function pickDrone(p_Role, p_Pos, p_Avoid, p_MinFuel)
     local s_Counts = roleCounts()
     local s_Busy, s_Best, s_BestD = nil, nil, nil
-    local s_Fallback = nil
+    local s_Fallback, s_Poor, s_PoorNeed = nil, nil, nil
     for _, d in ipairs(fleet()) do
-        local s_Enough = hasFuel(d)
+        local s_Enough, s_Need = hasFuel(d), fuelFloorOf(d)
         if s_Enough and p_MinFuel then
             local f = tonumber(d.fuel)
             -- SCALE THE REQUIREMENT TO THE TRIP THIS CANDIDATE WOULD ACTUALLY MAKE.
@@ -454,17 +548,21 @@ local function pickDrone(p_Role, p_Pos, p_Avoid, p_MinFuel)
             -- away needs ~420; one two hundred blocks away needs ~1,500 and is still correctly
             -- refused. The original worry stands and is now priced properly -- fuel-D2 went to D3 at
             -- 714 fuel, sixty blocks out, and stranded beside the drone it was sent to save.
-            local s_Need = p_MinFuel + RELIEF_PER_BLOCK * distTo(d, p_Pos)
+            s_Need = p_MinFuel + RELIEF_PER_BLOCK * distTo(d, p_Pos)
             s_Enough = (f == nil) or (f >= s_Need)
         end
         if RoleFits(d, p_Role) then
-            if d.status == "idle" and not committed(d.id) and s_Enough then
+            local s_Free = d.status == "idle" and not committed(d.id)
+            if s_Free and s_Enough then
                 if p_Avoid ~= nil and d.id == p_Avoid then
                     s_Fallback = s_Fallback or d
                 else
                     local s_D = pickCost(d, p_Pos, s_Counts)
                     if s_BestD == nil or s_D < s_BestD then s_Best, s_BestD = d, s_D end
                 end
+            elseif s_Free then
+                -- Idle but cannot afford it. Reported separately: this used to count as "busy".
+                s_Poor, s_PoorNeed = d, s_Need
             else
                 s_Busy = s_Busy or d
             end
@@ -472,7 +570,7 @@ local function pickDrone(p_Role, p_Pos, p_Avoid, p_MinFuel)
     end
     if s_Best then return s_Best end
     if s_Fallback then return s_Fallback end
-    return nil, s_Busy
+    return nil, s_Busy, s_Poor, s_PoorNeed
 end
 
 -- Every idle drone of a role that ACTUALLY ANSWERS, so a site can be worked by the whole shift
@@ -490,13 +588,43 @@ end
 --
 -- Its own function so it reads as the sibling of anyoneForRescue below, which is what it is: both
 -- are "prefer that role, but do not make it a requirement".
+-- Is there crafting queued that nobody has picked up?
+local function craftIsWaiting()
+    for _, t in pairs(DATA["tasks"] or {}) do
+        if type(t) == "table" and t.work and t.work.craft and t.assignedTo == nil and taskLive(t) then
+            return true
+        end
+    end
+    return false
+end
+
+-- A CRAFTER THAT IS BUILDING IS A CRAFTER THAT IS NOT CRAFTING -- AND THE BUILD IS USUALLY WAITING
+-- ON WHAT IT WOULD HAVE CRAFTED.
+--
+-- This tried "crafter" FIRST, so the settlement's single crafter was the first drone taken whenever
+-- no miner was free. Measured on the ground floor: 295 tower patches every one of which asks for
+-- minecraft:stone_bricks, storage holding NONE, drones logging
+--
+--   JOB Build THREW ran out of minecraft:stone_bricks partway through
+--   fetch: storage holds none of it -- not flying 11 chest(s) to confirm that
+--
+-- while TaskMan reported `craft-stone_bricks could not be placed: no free crafter` on every single
+-- pass. The crafter was laying blocks for the very patches that were short of the bricks it was the
+-- only drone in the settlement able to make. The tower could not advance and the reason was that it
+-- was being built.
+--
+-- Same rule as fuel relief never outranking the coal gather it depends on: work that CONSUMES a
+-- material must not take the drone that PRODUCES it. So crafter LAST, and only when the craft queue
+-- is empty -- a crafter with nothing to craft should absolutely be laying blocks.
 local function anyoneForBuild(p_Task, p_Where)
     if p_Task.work == nil or p_Task.work.build == nil then return nil end
-    for _, alt in ipairs({"crafter", "loader", "scout"}) do
-        local d = pickDrone(alt, p_Where)
-        if d ~= nil then
-            Log("build going to a " .. alt .. " -- no miner free")
-            return d
+    for _, alt in ipairs({"loader", "scout", "crafter"}) do
+        if alt ~= "crafter" or not craftIsWaiting() then
+            local d = pickDrone(alt, p_Where)
+            if d ~= nil then
+                Log("build going to a " .. alt .. " -- no miner free")
+                return d
+            end
         end
     end
     return nil
@@ -535,6 +663,53 @@ local function anyoneForRescue(p_Task, p_Where, p_MinFuel, p_Role)
          .. "than a tunnel"):format(tostring(w.drone), tostring(d.name), tostring(d.role),
                                     tostring(p_Role)))
     return d
+end
+
+-- Declared HERE, above pickDrones, not down beside OnStartTask where it was written. A `local`
+-- read above its declaration is a nil GLOBAL in Lua: `not tooManyMissedStarts(d)` threw nothing,
+-- logged nothing, and simply never excluded anybody -- so a drone that kept accepting work and
+-- never starting it stayed in the pool forever, which is the exact failure this counter exists
+-- to stop. See CLAUDE.md: this trap has caused nine separate outages.
+-- WHO WAS FREED, FOR WHAT, AND WHEN.
+--
+-- placeBlockers preempts a working drone when a task that other work depends on cannot be placed,
+-- then returns with "place it on the next tick, once the drone is idle". It never recorded that it
+-- had done so -- so on the next tick, if the blocker still was not placeable (the freed drone was
+-- still winding down, or the ordinary placement loop had already taken it), it preempted somebody
+-- ELSE. And again on the tick after that.
+--
+-- That is a livelock, and it is what stopped the tower. Every in-flight job in the fleet was
+-- collateral: builds died seconds after starting, over and over, and the floor never gained a
+-- block while TaskMan logged nothing worse than a routine-looking interrupt:
+--
+--   interrupting D4 on craft-glass_pane -- craft-oak_planks is blocking other work
+--   blocker craft-oak_planks could not be placed: no free crafter, and nothing preemptable
+--
+-- One preempt per blocker, then WAIT for it to land. The grace has to outlast a drone's shutdown
+-- and one placement pass; too short and the storm comes straight back.
+local m_PreemptedFor = {}
+local PREEMPT_GRACE_MS = 20000
+
+local function preemptedRecently(p_BlockerId)
+    local r = m_PreemptedFor[tostring(p_BlockerId)]
+    if r == nil then return false end
+    if (os.epoch("utc") - r.at) >= PREEMPT_GRACE_MS then
+        m_PreemptedFor[tostring(p_BlockerId)] = nil
+        return false
+    end
+    return true
+end
+
+local function mayPreemptFor(p_Candidate, p_BlockerId)
+    if p_Candidate == nil then return false end
+    return not preemptedRecently(p_BlockerId)
+end
+
+local m_MissedStarts = {}
+local MAX_MISSED_STARTS = 3
+
+local function tooManyMissedStarts(p_Drone)
+    return (m_MissedStarts[tostring(p_Drone.id)] or 0) >= MAX_MISSED_STARTS
 end
 
 local function pickDrones(p_Role)
@@ -659,7 +834,8 @@ elseif s_Task.work.lumber then
     -- Wood gates chests, planks and sticks, and therefore every factory the fleet might
     -- build. Nothing else produces it.
     local w = s_Task.work.lumber
-    s_Verb, s_Payload = "Lumber", {w = w.w, l = w.l, drop = w.drop, pos = w.start, taskId = s_Task.id}
+    s_Verb, s_Payload = "Lumber", {w = w.w, l = w.l, drop = w.drop, pos = w.start,
+                                   targets = w.targets, taskId = s_Task.id}
 elseif s_Task.work.haul then
     -- GO AND EMPTY A FIELD CACHE. WITHOUT THIS, CACHING LOSES THE MATERIAL IT SAVES.
     --
@@ -727,13 +903,11 @@ function OnStartTask(p_ID, p_Message)
     end
 
     local s_Where = workPos(s_Task)
-    -- A fuel relief needs a rescuer that can complete the round trip, not merely one allowed to
-    -- take orders. See RELIEF_FUEL_FLOOR.
-    local s_MinFuel = nil
-    if s_Task.work and s_Task.work.rescue and s_Task.work.rescue.fuel then
-        s_MinFuel = RELIEF_FUEL_FLOOR
-    end
-    local s_Drone, s_Busy = pickDrone(s_Role, s_Where, s_Task.lastFailedBy, s_MinFuel)
+    -- Every job needs a drone that can complete it and the round trip, not merely one allowed to
+    -- take orders. jobMinFuel is the estimate; pickDrone adds the distance from each candidate.
+    local s_MinFuel = jobMinFuel(s_Task)
+    local s_Drone, s_Busy, s_Poor, s_PoorNeed =
+        pickDrone(s_Role, s_Where, s_Task.lastFailedBy, s_MinFuel)
 
     -- A DRONE MUST NOT BE SENT TO RESCUE ITSELF.
     --
@@ -757,15 +931,7 @@ function OnStartTask(p_ID, p_Message)
 
     -- A rescue prefers a miner but must not REQUIRE one -- see anyoneForRescue.
     s_Drone = s_Drone or anyoneForRescue(s_Task, s_Where, s_MinFuel, s_Role)
-    if s_Drone == nil then
-        if s_Busy then
-            return false, "every " .. s_Role .. " is busy (" .. tostring(s_Busy.name) .. ")"
-        end
-        -- Naming the missing capability beats "no drone available": the fix is to fit a scanner
-        -- or a pickaxe to something, and that is not guessable from a generic failure.
-        return false, "no " .. s_Role .. " in the fleet -- one drone needs a " ..
-               (s_Role == "scout" and "geo scanner" or "pickaxe")
-    end
+    if s_Drone == nil then return false, noDroneReason(s_Role, s_Busy, s_Poor, s_PoorNeed) end
 
     local s_Verb, s_Payload = verbFor(s_Task, s_Role)
 
@@ -866,6 +1032,13 @@ local function summariseWork(p_Work, p_Depth)
     return out
 end
 
+-- Blocks this settlement has actually placed, ever. Zero until the first build reports one, which
+-- is why the fallback lives here rather than at the call site: a caller reading it must never have
+-- to decide what a missing count means. See notePlaced.
+local function placedTotal()
+    return tonumber(DATA["placedTotal"]) or 0
+end
+
 function OnGetTasks(p_ID, p_Message)
     local d = p_Message and p_Message.data or {}
     local s_Offset = tonumber(d.offset) or 0
@@ -875,6 +1048,8 @@ function OnGetTasks(p_ID, p_Message)
     local s_Live, s_Done, s_Total = {}, {}, 0
     for k,v in pairs(DATA["tasks"]) do
         s_Total = s_Total + 1
+        -- Progress ALONE, not taskLive: this splits the queue for display, and a disabled task
+        -- is still something a human wants to see listed rather than filed under Done.
         if (v.progress or 0) < 100 then s_Live[#s_Live + 1] = v else s_Done[#s_Done + 1] = v end
     end
     local s_Ordered = {}
@@ -932,8 +1107,12 @@ function OnGetTasks(p_ID, p_Message)
     end
 
     local s_Next = s_Offset + #s_List
+    -- placedTotal rides along because it is the ONLY honest answer to "is building happening".
+    -- Every caller that has tried to infer it -- from the world map, from storage draw -- inferred
+    -- something correlated with placing rather than placing itself, and each was wrong in a way
+    -- that stalled the tower. See notePlaced.
     return true, {tasks = s_List, count = #s_List, total = s_Total, live = #s_Live,
-                  liveNames = s_Names,
+                  liveNames = s_Names, placedTotal = placedTotal(),
                   offset = s_Offset, next = (s_Next < #s_Ordered) and s_Next or nil}
 end
 
@@ -1079,24 +1258,70 @@ end
 -- fuel" -- that question has already been answered three different ways in this file, and the
 -- predicate is a plain string test that reads item names as happily as task names.
 -- Burnable items in storage above which the settlement is not in a fuel emergency and fuel work
--- stops outranking everything else. 64 charcoal is a little over 5,000 fuel -- two full tanks --
--- which is enough that interrupting a gather cannot strand anybody.
-local FUEL_COMFORTABLE = 64
+-- stops outranking everything else.
+--
+-- 64 -> 160, in step with HQ's FUEL_EMERGENCY_BELOW (fuel-fetchable.test.ts holds them equal). Two
+-- full tanks was the old reasoning, and two tanks is what the FLEET absorbs the moment fuel appears:
+-- a top-up takes twenty, a relief takes a stack, and 192 coal was in tanks and payloads within three
+-- minutes of arriving while the tower, "not in an emergency", kept ordering floors. Comfortable has
+-- to mean "after every tank is full there is still a stack on the shelf" -- seven tanks at 1,600 are
+-- 140 -- or the line is crossed by the first drone that refuels.
+local FUEL_COMFORTABLE = 160
+
+-- The minimum CollectFuel gives FetchItems for a fuel item. Below this the collection provably
+-- returns nothing, so a relief queued against a smaller pile cannot deliver whatever the total says.
+-- 8 -> 1: at 8, twelve burnable units on the shelf (7 coal, 5 charcoal) were unfetchable by rule
+-- and a drone died two blocks from them. One lump is a relief; the rule must say so.
+local FUEL_FETCH_MIN = 1
 
 local FUEL_STOCK_TTL = 30
-local m_FuelStock, m_FuelStockAt = nil, -1000
+local m_FuelStock, m_FuelBest, m_FuelStockAt = nil, nil, -1000
 
-local function storageFuelCount()
-    if m_FuelStock ~= nil and (os.clock() - m_FuelStockAt) < FUEL_STOCK_TTL then return m_FuelStock end
+-- One read, two numbers, because two different questions are asked of it.
+local function readFuelStock()
+    if m_FuelStock ~= nil and (os.clock() - m_FuelStockAt) < FUEL_STOCK_TTL then
+        return m_FuelStock, m_FuelBest
+    end
     local s_Res = PowNet.sendAndWaitForResponse("StorageMan",
         PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "GetStock", {}), PowNet.SERVER_PROTOCOL, 5)
-    if type(s_Res) ~= "table" or type(s_Res.detail) ~= "table" then return nil end
-    local s_Total = 0
+    if type(s_Res) ~= "table" or type(s_Res.detail) ~= "table" then return nil, nil end
+    local s_Total, s_Best = 0, 0
     for _, e in ipairs(s_Res.detail) do
-        if taskProducesFuel(e.name) then s_Total = s_Total + (tonumber(e.count) or 0) end
+        if taskProducesFuel(e.name) then
+            local n = tonumber(e.count) or 0
+            s_Total = s_Total + n
+            if n > s_Best then s_Best = n end
+        end
     end
-    m_FuelStock, m_FuelStockAt = s_Total, os.clock()
+    m_FuelStock, m_FuelBest, m_FuelStockAt = s_Total, s_Best, os.clock()
+    return s_Total, s_Best
+end
+
+-- HOW MUCH burnable material is in storage. The right question for "is the settlement comfortable".
+local function storageFuelCount()
+    local s_Total = readFuelStock()
     return s_Total
+end
+
+-- IS THERE ACTUALLY ENOUGH OF ONE THING TO CARRY? The right question for "is a relief worth sending".
+--
+-- "not zero" was the test, and it is not the same question. CollectFuel asks FetchItems for each
+-- fuel item with a minimum of FUEL_FETCH_MIN, so a store holding four coal and four logs has a
+-- total of eight and can deliver NOTHING -- every individual ask falls short and the drone returns
+-- "storage had nothing burnable".
+--
+-- Measured at the bottom of a fuel spiral: storage held ONE acacia log. storageFuelCount returned 1,
+-- `1 ~= 0` was true, and TaskMan went on queueing fuel reliefs -- five of them -- each one taken by
+-- one of the only two drones in the settlement still able to move, while the single lumber task that
+-- would have ended the shortage sat unassigned. One stray log kept the whole fleet in a loop it
+-- could not leave.
+--
+-- nil stays "unknown", and unknown must not block a rescue: an unanswered query is not evidence the
+-- store is empty, and stranding a drone on silence is the worse mistake.
+local function fuelIsDeliverable()
+    local _, s_Best = readFuelStock()
+    if s_Best == nil then return true end
+    return s_Best >= FUEL_FETCH_MIN
 end
 
 -- Does this drone still need rescuing, given what the settlement can actually send?
@@ -1111,7 +1336,8 @@ local m_ToldDry = {}
 
 local function stillTrapped(p_Drone, p_Trapped, p_Dry)
     if not p_Trapped or not p_Dry then return p_Trapped end
-    if storageFuelCount() ~= 0 then
+    -- ENOUGH OF ONE THING TO CARRY, not "more than zero in total" -- see fuelIsDeliverable.
+    if fuelIsDeliverable() then
         m_ToldDry[tostring(p_Drone.id)] = nil
         return p_Trapped
     end
@@ -1238,13 +1464,94 @@ end
 -- One function because this exact pcall was written out SEVEN times, and a cancellation path that
 -- forgets it is indistinguishable from one that works right up until the fleet quietly runs out of
 -- drones.
+-- ABORT A DRONE. THE pcall IS THE POINT.
+--
+-- A cancellation path that forgets it is indistinguishable from one that works, right up until the
+-- fleet quietly runs out of drones -- and a drone that has gone quiet is exactly the one you are
+-- most likely to be cancelling.
+--
+-- abortAssigned was extracted to stop this being written out seven times, and then FOUR call sites
+-- went on doing it by hand anyway, because they abort a drone by id rather than a task. That gap --
+-- helper exists, copies survive, next fix lands in only one of them -- is the defect this codebase
+-- keeps re-living, so the id-shaped version gets a name too and abortAssigned is built on it.
+-- SAY WHETHER THE DRONE WAS ACTUALLY TOLD.
+--
+-- The pcall is the point and stays. What could not stay is discarding its result: an abort that
+-- never landed leaves precisely the state the note above describes -- a drone still "working" on
+-- cancelled work, holding nothing anyone can see, skipped by pickDrone for ever because that only
+-- chooses idle drones -- and the caller was given no way to know the difference. Both miners were
+-- in that state once with four tasks sitting unassigned, and nothing in any log said an abort had
+-- failed, because nothing was capable of saying so.
+--
+-- Returns whether it landed. Callers may ignore it; the log line cannot be ignored by accident.
+local function sendAbort(p_Id)
+    PowNet.sendAndWaitForResponse(p_Id,
+        PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Abort", {}),
+        PowNet.SERVER_PROTOCOL, 3)
+end
+
+local function abortDrone(p_Id)
+    if p_Id == nil then return false end
+    local s_Sent, s_Why = pcall(sendAbort, p_Id)
+    if not s_Sent then
+        Log("abort NOT delivered to drone " .. tostring(p_Id) .. " -- " .. tostring(s_Why)
+            .. " (it may still be running the cancelled job)")
+    end
+    return s_Sent
+end
+
+-- Tell a relieved casualty to climb out, and say whether the order actually went.
+--
+-- "telling it to climb out" used to be logged BEFORE the send and regardless of it, with the send
+-- itself in a bare pcall. So a failed send left a log line claiming the instruction had gone out
+-- and a drone sitting in a corridor it could now walk out of, indefinitely -- which is the exact
+-- outcome the rescue exists to prevent, recorded as a success.
+--
+-- Its own function so OnTaskDone does not carry the branch.
+local function sendClimbOut(p_Rescue)
+    PowNet.SendToDrone(p_Rescue.id,
+        PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Rescue", {up = 8}))
+end
+
+local function orderClimbOut(p_Rescue)
+    local s_Who = tostring(p_Rescue.drone)
+    if pcall(sendClimbOut, p_Rescue) then
+        Log("rescue reached " .. s_Who .. " -- told it to climb out")
+    else
+        Log("rescue reached " .. s_Who .. " but the climb order did NOT send -- still stuck in the tunnel")
+    end
+end
+
 local function abortAssigned(p_Task)
-    if p_Task == nil or p_Task.assignedTo == nil then return end
-    pcall(function()
-        PowNet.sendAndWaitForResponse(p_Task.assignedTo,
-            PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Abort", {}),
-            PowNet.SERVER_PROTOCOL, 3)
-    end)
+    if p_Task == nil then return end
+    abortDrone(p_Task.assignedTo)
+end
+
+-- SWEEP THE RESCUE TASKS AND DROP THE ONES A PREDICATE CONDEMNS.
+--
+-- Three passes -- unknown drone, recovered drone, unfulfillable rescue -- each wrote out the same
+-- four steps, and all four have to happen together: abort the drone that is already flying the
+-- rescue, SAY why in the log, delete the task, count it. A copy that deletes without aborting leaves
+-- a drone executing a task that no longer exists, which is how the fleet's only miner was held
+-- indefinitely; one that deletes without logging makes the whole pass invisible.
+--
+-- p_Condemn(w, v) returns the log line to write, or nil to keep the task -- the reason is per-task
+-- and names the drone, so it cannot be hoisted out of the loop. Predicates may have side effects
+-- (settledHealthy counts consecutive passes), so it is called exactly once per rescue task, in
+-- iteration order, as the inline copies did.
+local function dropRescuesWhere(p_Condemn)
+    local n = 0
+    for k, v in pairs(DATA["tasks"] or {}) do
+        local w = v.work and v.work.rescue
+        local s_Why = w and p_Condemn(w, v)
+        if s_Why then
+            abortAssigned(v)
+            Log(s_Why)
+            DATA["tasks"][k] = nil
+            n = n + 1
+        end
+    end
+    return n
 end
 
 -- Drop rescues whose casualty is no longer in the fleet at all.
@@ -1254,18 +1561,12 @@ end
 -- success, the task stayed, and it held the fleet's only miner indefinitely. D1 and D2 were both
 -- written off and their rescues went on consuming D3 afterwards.
 local function dropRescuesForUnknownDrones(p_Known)
-    local n = 0
-    for k, v in pairs(DATA["tasks"] or {}) do
-        local w = v.work and v.work.rescue
-        if w and w.id ~= nil and not p_Known[tostring(w.id)] then
-            abortAssigned(v)
-            Log(("rescue for %s dropped -- that drone is no longer in the fleet")
-                :format(tostring(w.drone)))
-            DATA["tasks"][k] = nil
-            n = n + 1
+    return dropRescuesWhere(function(w)
+        if w.id ~= nil and not p_Known[tostring(w.id)] then
+            return ("rescue for %s dropped -- that drone is no longer in the fleet")
+                :format(tostring(w.drone))
         end
-    end
-    return n
+    end)
 end
 
 -- CANCEL A RESCUE THE MOMENT IT IS NOT NEEDED.
@@ -1310,17 +1611,14 @@ local function settledHealthy(p_Id, p_Healthy)
 end
 
 local function cancelRecoveredRescues(p_Healthy)
-    local n = 0
-    for k, v in pairs(DATA["tasks"] or {}) do
-        local w = v.work and v.work.rescue
-        if w and (v.progress or 0) < 100 and settledHealthy(w.id, p_Healthy) then
-            abortAssigned(v)
-            Log(("rescue for %s cancelled -- it recovered on its own"):format(tostring(w.drone)))
-            DATA["tasks"][k] = nil
-            n = n + 1
+    -- settledHealthy COUNTS consecutive healthy passes, so the `progress < 100` test has to stay in
+    -- front of it: asking about a finished rescue would advance the counter for a drone this pass
+    -- was never about.
+    return dropRescuesWhere(function(w, v)
+        if (v.progress or 0) < 100 and settledHealthy(w.id, p_Healthy) then
+            return ("rescue for %s cancelled -- it recovered on its own"):format(tostring(w.drone))
         end
-    end
-    return n
+    end)
 end
 
 -- DROP A RESCUE THE SETTLEMENT CANNOT PERFORM.
@@ -1335,19 +1633,13 @@ end
 -- so nothing that keys off the task name could ever recognise them. This asks about the drone as it
 -- is now, which is the only thing that was ever true.
 local function dropUnfulfillableRescues(p_Dry)
-    if storageFuelCount() ~= 0 then return 0 end
-    local n = 0
-    for k, v in pairs(DATA["tasks"] or {}) do
-        local w = v.work and v.work.rescue
-        if w and w.id ~= nil and p_Dry[tostring(w.id)] then
-            abortAssigned(v)
-            Log(("rescue for %s dropped -- it is dry and storage has no fuel to bring it, and the "
-                 .. "drone this holds is the one that could go and make some"):format(tostring(w.drone)))
-            DATA["tasks"][k] = nil
-            n = n + 1
+    if fuelIsDeliverable() then return 0 end
+    return dropRescuesWhere(function(w)
+        if w.id ~= nil and p_Dry[tostring(w.id)] then
+            return ("rescue for %s dropped -- it is dry and storage has no fuel to bring it, and the "
+                 .. "drone this holds is the one that could go and make some"):format(tostring(w.drone))
         end
-    end
-    return n
+    end)
 end
 
 -- A FLICKER IS NOT A FAULT. LET IT SETTLE FIRST.
@@ -1380,22 +1672,71 @@ local function settledTrapped(p_Drone, p_Trapped)
     return s_N >= RESCUE_SETTLE
 end
 
+-- IS THIS DRONE OUT OF FUEL? ONE ANSWER, NOT TWO.
+--
+-- rescueNeeded computed this TWICE, in the same function, with OPPOSITE handling of an unknown
+-- reading -- `f ~= nil and f < FLOOR` where it decides what to clean up, and `f == nil or
+-- f < FLOOR` where it decides what to dispatch -- and only the second carried the reasoning:
+--
+--   d.fuel is replayed from the last heartbeat that reached base, so it is stalest for exactly the
+--   drones in trouble; a stale HIGH reading is the NORMAL case for a casualty, and NO reading is
+--   weaker still. The error is not symmetric: calling a dry drone "trapped" names the task rescue-,
+--   which pins it to a MINER -- and the thing that empties one miner's tank is an empty larder,
+--   which empties all of them at once, so the task is unassignable precisely when it is needed.
+--   Calling a trapped drone "dry" sends someone with coal, which any drone can carry; if that was
+--   the wrong guess the attempt fails cheaply and rescueTries escalates.
+--
+-- So unknown counts as DRY, and the disagreement had a cost: the cleanup pass classed an
+-- unknown-fuel drone as NOT dry, so dropUnfulfillableRescues never dropped its fuel- rescue even
+-- with an empty larder -- which is the "held the fleet's only miner indefinitely" failure this
+-- file's own comments describe two hundred lines further down.
+-- THE SAME LINE hasFuel USES, INVERTED. A drone that is too low to be given work is BY DEFINITION
+-- low enough to need fuel brought to it -- those are one question with one answer, and this file
+-- answering it two different ways is what stranded the settlement's only crafter at 507 fuel:
+-- refused work for being under its ~700 floor, refused fuel for being over TaskMan's 300.
+local function droneIsDry(p_Drone)
+    local f = tonumber(p_Drone.fuel)
+    return (f == nil) or (f < fuelFloorOf(p_Drone))
+end
+
+-- Role defaults to miner in five separate places; ask here instead.
+local function isMiner(p_Drone)
+    return (p_Drone.role or "miner") == "miner"
+end
+
+-- A rescue task that is still going to happen: not finished, not disabled, not blocked on a
+-- dependency. Written out identically twice inside rescueNeeded, once to suppress duplicates and
+-- once to count the live ones against their caps -- so the two could disagree about what "live"
+-- means while both drove the same decision.
+local function liveRescue(p_Task)
+    local w = p_Task.work and p_Task.work.rescue
+    if not w then return nil end
+    if (p_Task.progress or 0) >= 100 then return nil end
+    if p_Task.enabled == false then return nil end
+    if not dependencyMet(p_Task) then return nil end
+    return w
+end
+
+-- How many rescues the settlement can afford to have running at once: (miners, everyone else).
+local function rescueBudget()
+    if (storageFuelCount() or 0) < FUEL_COMFORTABLE then return 1, 0 end
+    return 2, 3
+end
+
 local function rescueNeeded()
     -- One live rescue per drone. Without this the pass creates a fresh task every fifteen seconds
     -- for a drone that stays stuck -- which it will, right up until the miner arrives.
     local s_Pending = {}
     for _, v in pairs(DATA["tasks"] or {}) do
-        local w = v.work and v.work.rescue
-        if w and (v.progress or 0) < 100 and v.enabled ~= false and dependencyMet(v) then
-            s_Pending[tostring(w.id)] = true
-        end
+        local w = liveRescue(v)
+        if w then s_Pending[tostring(w.id)] = true end
     end
 
     -- No miner, no rescue. Queuing work that nothing in the fleet can perform just grows a backlog
     -- and hides the real problem, which in that case is "the fleet has no miner".
     local s_HasMiner = false
     for _, d in ipairs(fleet()) do
-        if (d.role or "miner") == "miner" and not d.offline then s_HasMiner = true break end
+        if isMiner(d) and not d.offline then s_HasMiner = true break end
     end
     if not s_HasMiner then return 0 end
 
@@ -1418,8 +1759,8 @@ local function rescueNeeded()
     -- a rescuer and freeing a scout does not.
     local s_LiveMiner, s_LiveOther = 0, 0
     for _, v in pairs(DATA["tasks"] or {}) do
-        local w = v.work and v.work.rescue
-        if w and (v.progress or 0) < 100 and v.enabled ~= false and dependencyMet(v) then
+        local w = liveRescue(v)
+        if w then
             if w.role == "miner" then s_LiveMiner = s_LiveMiner + 1
             else s_LiveOther = s_LiveOther + 1 end
         end
@@ -1428,10 +1769,10 @@ local function rescueNeeded()
     -- Miners first, so their allowance is spent on them before anything else is considered.
     local s_Order = {}
     for _, d in ipairs(fleet()) do
-        if (d.role or "miner") == "miner" then s_Order[#s_Order + 1] = d end
+        if isMiner(d) then s_Order[#s_Order + 1] = d end
     end
     for _, d in ipairs(fleet()) do
-        if (d.role or "miner") ~= "miner" then s_Order[#s_Order + 1] = d end
+        if not isMiner(d) then s_Order[#s_Order + 1] = d end
     end
 
     -- CANCEL A RESCUE THE MOMENT IT IS NOT NEEDED.
@@ -1465,8 +1806,7 @@ local function rescueNeeded()
         -- cannot move. So the moment relief was queued for D1 this pass saw a healthy idle drone
         -- and cancelled it, freeing the only fuelled drone to go back to mining while D1 sat at
         -- zero. The relief was dispatched correctly and withdrawn before it could be performed.
-        local f = tonumber(d.fuel)
-        local s_Dry = f ~= nil and f < DISPATCH_FUEL_FLOOR
+        local s_Dry = droneIsDry(d)
         -- Recorded for every drone, not just the dry ones: false is falsy and reads the same at
         -- the only place that asks, and a branch here would grow the file's largest function.
         s_DryNow[tostring(d.id)] = s_Dry
@@ -1487,13 +1827,35 @@ local function rescueNeeded()
     s_Cancelled = s_Cancelled + dropUnfulfillableRescues(s_DryNow)
     if s_Cancelled > 0 then PowNet.MarkDirty() end
 
+    -- RESCUING COSTS FUEL AND RETURNS NONE, SO THE CAPS CANNOT BE CONSTANTS.
+    --
+    -- Two miner rescues plus three others is five concurrent rescues, and this fleet has seven
+    -- drones. When fuel is plentiful that is a fine trade -- get everyone working again. When it is
+    -- scarce it is a treadmill, and the settlement rode it into the ground:
+    --
+    --   JOB Relieve x9, JOB Gather x1
+    --
+    -- Nine tenths of the fleet's labour spent rescuing itself, every relief run thrashing through
+    -- the bay (a quarter of every drone log is "no progress toward"), the rescuers stranding
+    -- themselves, and each newly stranded drone queueing another rescue. 192 coal -- fifteen
+    -- thousand fuel, hand-fed into storage -- was converted into rescue miles inside fifteen minutes
+    -- and the fleet came out the far side flat again with nothing mined and nothing felled.
+    --
+    -- So while fuel is short the budget goes to income. ONE miner rescue is still allowed, because
+    -- freeing a miner adds a drone that can mine and fell; freeing anything else does not, so that
+    -- allowance drops to zero. The parked drones lose nothing by waiting -- stillTrapped already
+    -- keeps them honest about why -- and they are recovered the moment there is surplus to do it
+    -- with. Same rule as everywhere else here: work that CONSUMES fuel must not outrank the work
+    -- that PRODUCES it.
+    local s_CapMiner, s_CapOther = rescueBudget()
+
     local s_Made = 0
     for _, d in ipairs(s_Order) do
-        local s_IsMiner = (d.role or "miner") == "miner"
+        local s_IsMiner = isMiner(d)
         if s_IsMiner then
-            if s_LiveMiner >= 2 then goto continue end
+            if s_LiveMiner >= s_CapMiner then goto continue end
         else
-            if s_LiveOther >= 3 then goto continue end
+            if s_LiveOther >= s_CapOther then goto continue end
         end
         -- SILENCE AT DEPTH IS NOT DISTRESS.
         --
@@ -1510,21 +1872,6 @@ local function rescueNeeded()
         local s_Deep = d.pos and tonumber(d.pos.y) and tonumber(d.pos.y) < RADIO_FLOOR_Y
         local s_Trapped = RESCUE_STATES[tostring(d.status)] or (d.offline and not s_Deep)
 
-        -- AN EMPTY TANK IS NOT AN ENTOMBMENT, AND A RESCUE PARTY CANNOT FIX IT.
-        --
-        -- The party carries a chunk loader, a GPS relay and a pickaxe -- the three things a drone
-        -- that cannot MOVE might be missing. None of them is fuel. Sent to a drone that simply ran
-        -- dry, it arrives, digs a tunnel to a drone that is not walled in, and leaves it exactly as
-        -- immobile as it found it.
-        --
-        -- That is not merely useless, it is actively harmful, and it livelocked this fleet: with
-        -- two of three drones dry, the rescue pass generated a rescue for each of them and handed
-        -- it to the ONLY drone that still had fuel -- the same drone that would otherwise have gone
-        -- and mined the coal that fixes the actual problem. Cancel one and it queued the other
-        -- within a minute. The fleet had exactly one way out and rescue kept spending it.
-        --
-        -- So a fuel casualty is not a rescue candidate. It still shows as stuck, it still reports
-        -- Distress, and refuelling is a job for the fuel path -- not for a tunnel.
         -- A DRY DRONE NEEDS FUEL, NOT A TUNNEL -- SO SEND IT FUEL.
         --
         -- This used to skip fuel casualties entirely, because a rescue party carries a chunk
@@ -1536,26 +1883,8 @@ local function rescueNeeded()
         -- Relief is the missing third kind of rescue. The rescuer loads coal from storage, stands
         -- on top of the casualty and drops it; the casualty's own fuel watchdog sucks it up and
         -- burns it without needing to know a rescue happened. See OnRelieve.
-        local s_Fuel = tonumber(d.fuel)
-        -- TRUST A LOW FUEL READING. DO NOT TRUST A HIGH ONE.
-        --
-        -- d.fuel is replayed from the last heartbeat that reached base, so it is stalest for exactly
-        -- the drones in trouble -- a stale HIGH reading is the NORMAL case for a casualty. D21 was
-        -- on the books at 2,534 fuel while a probe of the turtle itself returned 0. Requiring
-        -- s_Trapped on top of that made it stricter again.
-        --
-        -- Getting this wrong is not symmetric, which is what makes the old test dangerous:
-        --   * calling a DRY drone "trapped" names the task rescue-, which pins it to a MINER -- and
-        --     the thing that empties one miner's tank is an empty larder, which empties all of them
-        --     at once. The task is then unassignable precisely when it is needed. Measured just now:
-        --     rescue-D9, rescue-D20 and rescue-D21 all queued, all role=miner, all unassigned, with
-        --     D15 and D12 sitting at a probed ZERO and the only fuelled drone in the settlement a
-        --     crafter holding 948.
-        --   * calling a TRAPPED drone "dry" sends someone with coal, which any drone can carry. If
-        --     that was the wrong guess the attempt fails cheaply and rescueTries escalates.
-        --
-        -- So: unknown fuel counts as dry, and being trapped is no longer a precondition for it.
-        local s_Dry = (s_Fuel == nil) or (s_Fuel < DISPATCH_FUEL_FLOOR)
+        -- Unknown fuel counts as DRY; the reasoning lives on droneIsDry, once.
+        local s_Dry = droneIsDry(d)
         -- STRANDED MINERS GET RESCUED TOO.
         --
         -- This skipped them on the theory that a miner can dig itself out. It can, right up until it
@@ -1724,7 +2053,7 @@ end
 local function blockers()
     local s_Needed = {}
     for _, v in pairs(DATA["tasks"] or {}) do
-        if v.dependsOn ~= nil and (v.progress or 0) < 100 and v.enabled ~= false
+        if v.dependsOn ~= nil and taskLive(v)
            and not dependencyMet(v) then
             s_Needed[tostring(v.dependsOn)] = true
         end
@@ -1732,7 +2061,7 @@ local function blockers()
     local s_Out = {}
     for _, v in pairs(DATA["tasks"] or {}) do
         if s_Needed[tostring(v.id)] and v.assigned == nil
-                and (v.progress or 0) < 100 and v.enabled ~= false and not v.paused then
+                and taskLive(v) and not v.paused then
             s_Out[#s_Out + 1] = v
         end
     end
@@ -1833,14 +2162,13 @@ local function placeBlockers()
                     end
                 end
             end
-            if s_Best then
+            -- Already freed somebody for this blocker? Give that drone time to actually be given
+            -- the work before taking a second one off its job. See m_PreemptedFor.
+            if mayPreemptFor(s_Best, v.id) then
+                m_PreemptedFor[tostring(v.id)] = {drone = s_Best.id, at = os.epoch("utc")}
                 Log(("interrupting %s on %s -- %s is blocking other work")
                     :format(tostring(s_Best.name), tostring(s_BestTask.name), tostring(v.name)))
-                pcall(function()
-                    PowNet.sendAndWaitForResponse(s_Best.id,
-                        PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Abort", {}),
-                        PowNet.SERVER_PROTOCOL, 3)
-                end)
+                abortDrone(s_Best.id)
                 s_BestTask.assigned, s_BestTask.assignedTo, s_BestTask.assignedAt = nil, nil, nil
                 PowNet.MarkDirty()
                 return s_Placed          -- place it on the next tick, once the drone is idle
@@ -1873,7 +2201,7 @@ local function placeRescues()
     local s_Mine, s_Rest = {}, {}
     for _, v in pairs(DATA["tasks"] or {}) do
         if v.work and v.work.rescue and v.assigned == nil
-                and (v.progress or 0) < 100 and v.enabled ~= false then
+                and taskLive(v) then
             if v.work.rescue.role == "miner" then s_Mine[#s_Mine + 1] = v
             else s_Rest[#s_Rest + 1] = v end
         end
@@ -1941,11 +2269,7 @@ local function placeRescues()
                         if preemptable(t, d.id) then
                             Log(("preempting %s on %s -- %s is out of fuel and needs relief")
                                 :format(tostring(t.name), tostring(d.name), tostring(s_Wanted.work.rescue.drone)))
-                            pcall(function()
-                                PowNet.sendAndWaitForResponse(d.id,
-                                    PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Abort", {}),
-                                    PowNet.SERVER_PROTOCOL, 3)
-                            end)
+                            abortDrone(d.id)
                             t.assigned, t.assignedTo, t.assignedAt = nil, nil, nil
                             PowNet.MarkDirty()
                             -- Place it on the next tick, once the drone has actually gone idle.
@@ -1974,7 +2298,7 @@ local function dedupeQueue()
     local s_Seen, s_Dropped = {}, 0
     for k, v in pairs(DATA["tasks"] or {}) do
         local s_Name = v.name
-        if type(s_Name) == "string" and (v.progress or 0) < 100 and v.enabled ~= false then
+        if type(s_Name) == "string" and taskLive(v) then
             if v.assigned ~= nil then
                 s_Seen[s_Name] = true             -- the assigned copy is the one that survives
             elseif s_Seen[s_Name] then
@@ -2061,11 +2385,26 @@ end
 -- Availability is not what a drone says about itself; it is whether work given to it gets done. So
 -- count the misses, and stop offering to a drone that keeps failing to start. The count resets the
 -- moment it completes anything, so a drone that recovers rejoins the pool by itself.
-local m_MissedStarts = {}
-local MAX_MISSED_STARTS = 3
 
-local function tooManyMissedStarts(p_Drone)
-    return (m_MissedStarts[tostring(p_Drone.id)] or 0) >= MAX_MISSED_STARTS
+-- Placement cooldown, keyed by task id. Declared here, above the placement pass that reads it --
+-- a `local` read above its declaration is a nil global in Lua (see CLAUDE.md).
+local m_PlaceBackoff = {}
+local PLACE_BACKOFF_MS = 60000
+
+-- The three reasons a queued task is not offered to anybody on this pass, in one predicate:
+-- the fleet is too low on fuel to afford anything but fuel work; the task is cooling off after a
+-- refusal; or its role has already been written off. This lived inline as a three-branch if/elseif
+-- chain in the middle of the placement pass, which is the single most complex function in the file
+-- and the one it is hardest to read a scheduling decision out of. One question, one function.
+local function notPlaceableNow(p_Task, p_Role, p_NoDrone)
+    if fleetFuelLow() then
+        local s_IsFuelWork = (p_Task.work and p_Task.work.rescue ~= nil)
+            or taskProducesFuel(p_Task.name)
+        if not s_IsFuelWork then return true end
+    end
+    local s_Off = m_PlaceBackoff[tostring(p_Task.id)]
+    if s_Off ~= nil and (os.epoch("utc") - s_Off) < PLACE_BACKOFF_MS then return true end
+    return p_NoDrone[p_Role] == true
 end
 
 local m_StalledAssignedSince = nil
@@ -2079,7 +2418,7 @@ local function releaseStalledAssignments()
         local s_Key = tostring(v.id)
         local d = v.assignedTo ~= nil and s_By[tostring(v.assignedTo)] or nil
         local s_Why = heldForNothing(d)
-        local s_Stalled = s_Why ~= nil and (v.progress or 0) < 100 and v.enabled ~= false
+        local s_Stalled = s_Why ~= nil and taskLive(v)
         if s_Stalled then
             m_StalledAssignedSince[s_Key] = m_StalledAssignedSince[s_Key] or os.epoch("utc")
             if (os.epoch("utc") - m_StalledAssignedSince[s_Key]) > 60000 then
@@ -2108,6 +2447,8 @@ end
 local function freeOrphanedDrones()
     local s_Held = {}
     for _, v in pairs(DATA["tasks"] or {}) do
+        -- Progress ALONE, not taskLive: a DISABLED task still holds the drone it was given to.
+        -- Treating it as not-live here would free a drone that is still executing the order.
         if v.assignedTo ~= nil and (v.progress or 0) < 100 then s_Held[tostring(v.assignedTo)] = true end
     end
     for _, d in ipairs(fleet()) do
@@ -2128,8 +2469,14 @@ local function freeOrphanedDrones()
         -- nothing except clearing the distress that marks it as needing rescue. D2 was aborted once
         -- a minute for exactly that reason, flipping between "stuck" and "idle" and destabilising
         -- the rescue bookkeeping that was trying to get fuel to it.
-        local f = tonumber(d.fuel)
-        if f ~= nil and f < DISPATCH_FUEL_FLOOR then s_Busy = false end
+        --
+        -- ASK hasFuel, which is the function that decides it. This tested the bare constant while
+        -- pickDrone tested the drone's own reported floor, so the two disagreed for any drone
+        -- between them -- and this pass then aborted, once a minute, precisely the drones it had
+        -- just decided could not be given work. "D4 is stuck with no task -- aborting so it can be
+        -- given work", over and over, for a crafter that pickDrone would refuse the moment it
+        -- became idle.
+        if not hasFuel(d) then s_Busy = false end
         if s_Busy and not d.offline and not s_Held[tostring(d.id)] then
             m_OrphanSince = m_OrphanSince or {}
             local s_Key = tostring(d.id)
@@ -2139,11 +2486,7 @@ local function freeOrphanedDrones()
             if (os.epoch("utc") - m_OrphanSince[s_Key]) > 60000 then
                 Log(("%s is %s with no task -- aborting so it can be given work")
                     :format(tostring(d.name), tostring(d.status)))
-                pcall(function()
-                    PowNet.sendAndWaitForResponse(d.id,
-                        PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Abort", {}),
-                        PowNet.SERVER_PROTOCOL, 3)
-                end)
+                abortDrone(d.id)
                 m_OrphanSince[s_Key] = nil
             end
         elseif m_OrphanSince then
@@ -2205,18 +2548,75 @@ local function orderedTasks()
     return s_List
 end
 
+-- What each maintenance pass last failed with, so a standing fault is logged once and not 240
+-- times an hour. See maintenance().
+local m_PassFailed = {}
+
+-- RUN A MAINTENANCE PASS. A PASS THAT THREW MUST NOT DO IT QUIETLY.
+--
+-- Each of these was a bare `pcall(fn)`. Catching is right -- an error in one pass must not kill the
+-- Tick coroutine and take the whole queue down with it -- but the result was discarded, so a pass
+-- that threw on its FIRST line every fifteen seconds looked exactly like a pass that ran and found
+-- nothing to do. There is no third state and nothing anywhere to tell them apart.
+--
+-- These are not bookkeeping. rescueNeeded is what notices a stranded drone; placeBlockers is what
+-- unjams a pipeline; releaseStalledAssignments is what stops a task being held by a drone that will
+-- never finish it. Any one of them silently dead is a whole class of recovery that stops happening
+-- while TaskMan reports healthy -- which is the same shape as `tooManyMissedStarts` being a nil
+-- global and switching off the missed-start filter with no error and no warning.
+--
+-- Logged on CHANGE, not every tick: a standing failure repeats every 15 seconds, and 240 identical
+-- lines an hour would push everything else out of the log the fault needs to be read next to.
+-- PowNet.WatchPass, not a fourth copy of it. This function WAS that copy, and it carried the bug
+-- the other two carried:
+--
+--     local s_Now = s_Ok and nil or tostring(s_Err)
+--
+-- `x and nil` is nil for EVERY x, so the `or` branch always won -- and pcall's second return on
+-- SUCCESS is the function's return value. Every healthy pass was reported as failed, with its
+-- return value as the reason:
+--
+--   maintenance pass releaseStalledAssignments FAILED -- 0
+--   maintenance pass rescueNeeded FAILED -- 1
+--   maintenance pass pruneFinished FAILED -- nil
+--
+-- and because it reports on CHANGE, a pass whose return value alternated logged for ever. The one
+-- mechanism that exists to say "a maintenance pass has silently died and a whole class of recovery
+-- has stopped happening" had never once worked, and a real failure was indistinguishable from a
+-- pass doing its job. Three modules, one bug, three times.
+--
+-- The wording stays here because it is this module's; the logic does not, because it was never
+-- this module's to get wrong.
+local function maintenance(p_Name, p_Fn)
+    return PowNet.WatchPass(m_PassFailed, p_Name, p_Fn, function(p_Pass, p_Why)
+        if p_Why then
+            Log(("maintenance pass %s FAILED -- %s (it has stopped running; whatever it fixes is no longer being fixed)")
+                :format(p_Pass, p_Why))
+        else
+            Log(("maintenance pass %s is running again"):format(p_Pass))
+        end
+    end)
+end
+
+-- IN ORDER, AND AS DATA. The sequence matters -- placeBlockers sits straight after the rescues
+-- because a drone that cannot move is the only thing more urgent than a pipeline that cannot
+-- progress -- and a table keeps that order visible in one place instead of spreading it over seven
+-- near-identical call lines that a reader has to diff by eye.
+-- Every one of these is a `local function` declared ABOVE this table, which is the only reason
+-- naming them here is safe: a local referenced before its declaration is a nil global, silently,
+-- and this list would turn seven working passes into seven no-ops with no error anywhere.
+local m_Passes = {
+    {"pruneFinished", pruneFinished}, {"dedupeQueue", dedupeQueue},
+    {"freeOrphanedDrones", freeOrphanedDrones},
+    {"releaseStalledAssignments", releaseStalledAssignments},
+    {"rescueNeeded", rescueNeeded}, {"placeRescues", placeRescues},
+    {"placeBlockers", placeBlockers},
+}
+
 function Tick()
     while true do
         os.sleep(TICK_SECONDS)
-        pcall(pruneFinished)
-        pcall(dedupeQueue)
-        pcall(freeOrphanedDrones)
-        pcall(releaseStalledAssignments)
-        pcall(rescueNeeded)
-        pcall(placeRescues)
-        -- Straight after rescues: a drone that cannot move is the only thing more urgent than a
-        -- pipeline that cannot progress.
-        pcall(placeBlockers)
+        for _, s_Pass in ipairs(m_Passes) do maintenance(s_Pass[1], s_Pass[2]) end
         local s_Ok, s_Err = pcall(function()
             local s_NoDrone, s_Started = {}, 0
             -- How many tasks of a role may fail to place before the role is written off for this
@@ -2234,7 +2634,7 @@ function Tick()
                 -- task sat forever behind planks that had already been made. If the drone we gave
                 -- it to has gone idle again and the task still shows no progress, the order did
                 -- not take; put it back in the queue rather than leaving it stranded.
-                if v.assigned ~= nil and (v.progress or 0) < 100 and v.enabled ~= false then
+                if v.assigned ~= nil and taskLive(v) then
                     -- No stamp means the task was assigned before assignments were stamped -- i.e. long ago.
                     -- Defaulting that to 0 reads as "just assigned" and makes exactly the oldest,
                     -- most definitely-stuck tasks the only ones that can never be reclaimed.
@@ -2373,8 +2773,7 @@ function Tick()
                     if dep ~= nil and (dep.progress or 0) < 100 then s_Blocked = true end
                 end
 
-                if v.enabled ~= false and not v.paused and v.assigned == nil
-                   and not s_Blocked and (v.progress or 0) < 100 then
+                if taskLive(v) and not v.paused and v.assigned == nil and not s_Blocked then
                     -- ONE ROLE, ONCE. Do not re-ask for a role that has already said "nobody free"
                     -- this pass.
                     --
@@ -2393,13 +2792,10 @@ function Tick()
                     --
                     -- Rescues are exempt: relief is how a drone that has already run dry gets
                     -- moving again, and it is fuel work by definition.
-                    local s_FuelOnly = fleetFuelLow()
-                    local s_IsFuelWork = (v.work and v.work.rescue ~= nil)
-                        or taskProducesFuel(v.name)
                     local s_Role = RoleForWork(v.work)
-                    if s_FuelOnly and not s_IsFuelWork then
-                        -- skip: the fleet cannot afford this right now
-                    elseif not s_NoDrone[s_Role] then
+                    if notPlaceableNow(v, s_Role, s_NoDrone) then
+                        -- skipped for one of the three reasons in notPlaceableNow
+                    else
                         local s_Ok, s_Why = OnStartTask(0, {data = {id = v.id}})
                         if s_Ok then
                             s_Started = s_Started + 1
@@ -2443,6 +2839,23 @@ function Tick()
                                     tostring(v.name), tostring(s_Role),
                                     tostring(s_Why or "OnStartTask gave no reason")))
                             end
+                            -- AND THE SAME FOUR TASKS MUST NOT BURN THE BUDGET EVERY PASS.
+                            --
+                            -- The role budget above is a sound circuit-breaker and a terrible
+                            -- scheduler. Placement is attempted in priority order, eligibility is
+                            -- decided PER TASK (reach, fuel for that distance, materials), and a
+                            -- task that is unplaceable for its own reasons is unplaceable again on
+                            -- the next pass, and the next. So a handful of permanently-refused
+                            -- tasks at the head of the queue spent the whole role budget on every
+                            -- tick, for ever, and nothing behind them was ever attempted -- the
+                            -- tower patches sat unreachable for hours with idle, fuelled drones and
+                            -- a full larder, and the log said only "every miner is busy", which was
+                            -- not true and pointed the search at the fleet instead of the queue.
+                            --
+                            -- Backing a refused task off for a minute lets the queue fall through
+                            -- to whatever is behind it. The task is not cancelled or deprioritised;
+                            -- it is simply not allowed to keep paying for the same answer.
+                            m_PlaceBackoff[tostring(v.id)] = os.epoch("utc")
                             if s_Fails[s_Role] >= TRIES_PER_ROLE then s_NoDrone[s_Role] = true end
                         end
                     end
@@ -2485,6 +2898,30 @@ end
 local function saysNothingAboutTheTask(p_Reason)
     return (p_Reason:find("busy") or p_Reason:find("executing") or p_Reason:find("refused")
             or p_Reason:find("nothing burnable") or p_Reason:find("no fuel to deliver")) ~= nil
+end
+
+-- HOW MANY BLOCKS THIS SETTLEMENT HAS ACTUALLY PLACED, EVER.
+--
+-- The one number that says whether building is happening, and until now nothing kept it. Every
+-- attempt to answer "is this floor finished" used a PROXY instead, and each proxy failed for the
+-- same reason -- it measured something correlated with placing rather than placing itself:
+--
+--   the world map      remembers blocks that were mined, does not know the atrium is meant to be
+--                      open, and cannot know the module row at z=76 can never take a block
+--   storage delta      material LEAVING storage is not material placed: measured 79 units gone
+--                      from the shelves with 66 of them sitting in drone inventories, carried to
+--                      squares that turned out to be occupied and carried back
+--
+-- The drones have always known the true figure -- OnBuild returns `placed` and `skipped`, and the
+-- drone already sends it here in `result`. It was stored on the task and then thrown away when the
+-- task was purged five minutes later. This keeps the running total, so a caller can ask the only
+-- question that matters: has anything been built since I last looked?
+local function notePlaced(p_Task, p_Result)
+    if type(p_Result) ~= "table" then return end
+    local n = tonumber(p_Result.placed)
+    if n == nil or n <= 0 then return end
+    DATA["placedTotal"] = (tonumber(DATA["placedTotal"]) or 0) + n
+    PowNet.MarkDirty()
 end
 
 function OnTaskDone(p_ID, p_Message)
@@ -2548,6 +2985,7 @@ function OnTaskDone(p_ID, p_Message)
         s_Task.progress = 100
         s_Task.result   = d.result
         s_Task.failure  = nil
+        notePlaced(s_Task, d.result)
         -- THE TUNNEL IS NOT THE RESCUE. GETTING THE DRONE TO USE IT IS.
         --
         -- The miner has arrived, so there is now a walkable two-high tunnel from the surface to
@@ -2569,11 +3007,7 @@ function OnTaskDone(p_ID, p_Message)
             -- there. Saying nothing is the correct instruction.
             Log(("fuel delivered to %s -- leaving it to refuel"):format(tostring(s_R.drone)))
         elseif s_R and s_R.id then
-            Log(("rescue reached %s -- telling it to climb out"):format(tostring(s_R.drone)))
-            pcall(function()
-                PowNet.SendToDrone(s_R.id,
-                    PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Rescue", {up = 8}))
-            end)
+            orderClimbOut(s_R)
         end
     else
         -- A FAILURE IS NOT A COMPLETION.
@@ -2602,13 +3036,23 @@ function OnTaskDone(p_ID, p_Message)
         -- three times over. Clearing a fourteen-task backlog that way is impossible, and a rescue
         -- for a drone that no longer exists came back every time it was cancelled.
         if d.abandon then
+            -- SAY WHO WAS HOLDING IT. Cancelling a task in the queue does not reach the machine --
+            -- the drone keeps executing, never goes idle, and can never be given work again.
+            -- task.stop knows this and looked the holder up through GetTasks first, which CAPS ITS
+            -- REPLY AT 40 TASKS: for any task outside that window the lookup found nothing, the
+            -- drone was never stopped, and task.stop still reported `stopped: true`. With 131
+            -- tower patches queued that is most of them.
+            --
+            -- The answer was here the whole time. The module holding the data reports it instead of
+            -- shipping the queue out to be searched through a window it does not fit in.
+            local s_Held = s_Task.assignedTo
             s_Task.progress   = 100
             s_Task.finishedAt = os.epoch("utc")
             s_Task.failure    = s_Reason
             s_Task.assigned, s_Task.assignedTo, s_Task.assignedAt = nil, nil, nil
             Log(("task %s ABANDONED: %s"):format(tostring(d.id), s_Reason))
             PowNet.MarkDirty()
-            return true, {id = d.id, abandoned = true}
+            return true, {id = d.id, abandoned = true, heldBy = s_Held}
         end
 
         s_Task.failure  = s_Reason
@@ -2660,6 +3104,88 @@ end
 
 
 
+-- STOP EVERY LIVE TASK WHOSE NAME STARTS WITH A PREFIX -- WHERE THE TASKS ACTUALLY ARE.
+--
+-- HQ did this by reading the queue out and sending back a list of ids to stop. GetTasks CAPS ITS
+-- REPLY AT 40 TASKS to stay inside the 61,440-byte websocket frame, and task.stop's id array is
+-- capped at 32 on top of that -- so with 131 tower patches queued the caller could see, and
+-- therefore stop, at most a windowful per pass while reporting complete success for the ones it had
+-- asked about. Clearing a finished floor's leftovers is what unblocks the next floor, so the tower
+-- sat at level 0 behind 131 dead patches and every report said the clear had worked.
+--
+-- The answer is not a bigger window. "Which tasks are named like this" is a question about the
+-- queue, and the queue is here. Shipping it out to be searched was the whole defect.
+local function OnStopNamed(p_ID, p_Message)
+    local d = p_Message.data or {}
+    local s_Prefix = tostring(d.prefix or "")
+    -- NO PREFIX MEANS EVERY TASK. Refuse rather than interpret: an empty string matches the whole
+    -- queue, and a dropped field is exactly how an empty string gets here.
+    if s_Prefix == "" then return false, "no prefix given -- refusing to match the whole queue" end
+    local s_Reason  = tostring(d.reason or "stopped in bulk")
+    local s_Stopped, s_Scanned = 0, 0
+    local s_Held = {}
+    for _, t in pairs(DATA["tasks"]) do
+        s_Scanned = s_Scanned + 1
+        -- CC kills a coroutine that runs over 10s without yielding, uncatchably, and this walks the
+        -- entire queue -- which is precisely the case where it is large.
+        if s_Scanned % 200 == 0 then os.queueEvent("stopNamed") os.pullEvent("stopNamed") end
+        if type(t) == "table" and type(t.name) == "string" and (tonumber(t.progress) or 0) < 100
+                and t.name:sub(1, #s_Prefix) == s_Prefix then
+            -- SAY WHO WAS HOLDING IT, for the same reason OnTaskDone does: cancelling a task in the
+            -- queue does not reach the machine. An unstopped drone keeps executing, never goes
+            -- idle, and can never be given work again.
+            if t.assignedTo ~= nil then s_Held[#s_Held + 1] = t.assignedTo end
+            t.progress   = 100
+            t.finishedAt = os.epoch("utc")
+            t.failure    = s_Reason
+            t.assigned, t.assignedTo, t.assignedAt = nil, nil, nil
+            s_Stopped = s_Stopped + 1
+        end
+    end
+    if s_Stopped > 0 then
+        PowNet.MarkDirty()
+        Log(("stopped %d of %d task(s) named %s*: %s"):format(s_Stopped, s_Scanned, s_Prefix, s_Reason))
+    end
+    return true, {stopped = s_Stopped, scanned = s_Scanned, held = s_Held, prefix = s_Prefix}
+end
+
+-- HOW MUCH WORK OF ONE KIND IS OUTSTANDING -- counted here, for the same reason StopNamed acts here.
+--
+-- The supply loop decides two things from this: whether to order the next floor (which needs the
+-- current one's queue to be EMPTY) and whether a floor is finished. It was reading them off
+-- GetTasks, which returns at most 40 tasks -- so with 295 patches outstanding it saw a windowful,
+-- and had the window happened to fill with other work it would have read "nothing queued" and
+-- ordered another 295 on top. A miscount here is not a wrong number, it is a queue explosion or a
+-- permanently skipped floor.
+local function OnCountNamed(p_ID, p_Message)
+    local d = p_Message.data or {}
+    local s_Prefix = tostring(d.prefix or "")
+    if s_Prefix == "" then return false, "no prefix given -- refusing to count the whole queue" end
+    local s_Live, s_Done, s_Failed, s_Scanned = 0, 0, 0, 0
+    for _, t in pairs(DATA["tasks"]) do
+        s_Scanned = s_Scanned + 1
+        -- CC kills a coroutine that runs over 10s without yielding, and this walks the whole queue.
+        if s_Scanned % 200 == 0 then os.queueEvent("countNamed") os.pullEvent("countNamed") end
+        if type(t) == "table" and type(t.name) == "string" and t.name:sub(1, #s_Prefix) == s_Prefix then
+            if (tonumber(t.progress) or 0) < 100 then
+                s_Live = s_Live + 1
+            else
+                s_Done = s_Done + 1
+                -- FINISHED AND FINISHED WELL ARE NOT THE SAME THING.
+                --
+                -- A task that exhausts its attempts is marked done with a `failure` on it, so
+                -- "every patch completed" covers both "the fleet went to every square and did what
+                -- it could" and "the fleet gave up on every square because it had no bricks". Only
+                -- the first means the floor is finished, and the caller advances a level on that
+                -- answer -- a level nothing ever revisits.
+                if t.failure ~= nil then s_Failed = s_Failed + 1 end
+            end
+        end
+    end
+    return true, {live = s_Live, done = s_Done, failed = s_Failed,
+                  scanned = s_Scanned, prefix = s_Prefix}
+end
+
 local m_DroneEvents = {
     Reboot = {
         func = OnReboot,
@@ -2696,6 +3222,22 @@ local m_ServerEvents = { -- Runs on a different thread so that we can interrupt 
     GetTasks = { func = OnGetTasks },
     Abandoned = { func = OnAbandoned, callable = true, params = {} },
     TaskDone = { func = OnTaskDone },
+    CountNamed = {
+        func = OnCountNamed,
+        -- DECLARED, OR IT NEVER ARRIVES -- PowNet drops undeclared fields silently and the call
+        -- still succeeds, which here would mean an empty prefix and a refusal on every call.
+        params = { prefix = { optional = false, type = "string" } },
+    },
+    StopNamed = {
+        func = OnStopNamed,
+        -- DECLARED, OR IT NEVER ARRIVES. PowNet drops any field not named here, silently, and the
+        -- call still returns success -- which for this endpoint would mean an empty prefix and a
+        -- refusal, on every call, for ever.
+        params = {
+            prefix = { optional = false, type = "string" },
+            reason = { optional = true,  type = "string" },
+        },
+    },
     TaskProgress = { func = OnTaskProgress },
     TaskRefused = { func = OnTaskRefused },
     StartTask = { func = OnStartTask },
@@ -2758,7 +3300,14 @@ local m_ServerEvents = { -- Runs on a different thread so that we can interrupt 
                     }
                 }
             },
-        },
+                    -- DECLARED, OR IT NEVER ARRIVES. PowNet filters the payload to the fields named
+            -- here the moment a params block exists, silently, and the call still returns
+            -- success -- which is how order.build's dependsOn was dropped for months while
+            -- every call reported fine. See hq/test/wiring.test.ts.
+            after = {
+                optional = true
+            },
+},
         func = OnAddTask
     },
     Start = {

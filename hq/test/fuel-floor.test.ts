@@ -32,27 +32,34 @@ function floorBody(): string {
 }
 
 describe('fuel floor', () => {
-  it('collapses to the trip home when storage is known dry', () => {
+  // THE FLOOR ANSWERS ONE QUESTION: CAN I STILL GET HOME.
+  //
+  // It used to be trip + 300 reserve + 400 search allowance, with a branch that collapsed it when
+  // storage was "known dry". The 700 was tuned for a bay where finding fuel took a dozen hops; that
+  // bay is gone (WhereIs reads the network, the deposit point is networked), and what the 700 did
+  // meanwhile was refuse work to every drone holding 400-800 fuel -- the settlement's defining
+  // deadlock, measured on D38 (607, 23 blocks from home, "stuck") and D40 (821 under a floor of
+  // 838). Whether a drone can AFFORD a job is TaskMan's call (jobMinFuel); this only says whether it
+  // can come back. So: one return, distance times a per-block rate plus a margin, nothing else.
+  it('is the trip home plus a margin, and nothing else', () => {
     const body = floorBody();
-
-    // The whole fix: the floor asks whether there is anything to reserve FOR.
-    expect(body, 'FuelFloorNow must consult StorageKnownDry').toMatch(/StorageKnownDry\(/);
-
-    const dry = body.split('\n').find((l) => l.includes('StorageKnownDry('));
-    expect(dry).toBeTruthy();
-
-    // The dry branch must return, and must NOT re-add the flat reserve -- adding it back is the
-    // bug wearing the fix's clothes, and would read as guarded while changing nothing.
-    expect(dry!, 'the dry branch must return a floor').toMatch(/return/);
-    expect(dry!, 'the dry branch must not re-add FUEL_RESERVE').not.toMatch(/FUEL_RESERVE/);
+    expect(body).not.toMatch(/FUEL_SEARCH_ALLOWANCE/);
+    expect(body).not.toMatch(/StorageKnownDry\(/);
+    const returns = body.split('\n').filter((l) => /^\s*return/.test(l));
+    // Two early returns for "home/position unknown" (a flat reserve is all that can be said), then
+    // the one real answer.
+    expect(returns.at(-1)).toMatch(/return d \* FUEL_PER_BLOCK_HOME \+ FUEL_DRY_MARGIN/);
+    expect(returns.at(-1)).not.toMatch(/FUEL_RESERVE/);
   });
 
-  it('still charges the full reserve when storage has fuel', () => {
-    const body = floorBody();
-    // The last return is the normal path and must keep the protection that the 900 was added for:
-    // a drone far from home, with a stocked larder, should still break off in time to reach it.
-    const returns = body.split('\n').filter((l) => /return/.test(l));
-    expect(returns.at(-1), 'the normal path keeps the flat reserve').toMatch(/FUEL_RESERVE/);
+  it('TaskMan, not the drone, decides whether a job is affordable', () => {
+    const taskman = readFileSync(path.join(__dirname, '../../lua/TaskMan.lua'), 'utf8');
+    expect(taskman).toMatch(/local function jobMinFuel\(p_Task\)/);
+    expect(taskman).toMatch(/local s_MinFuel = jobMinFuel\(s_Task\)/);
+    // pickDrone charges the round trip on top, per block from where the candidate actually is
+    expect(taskman).toMatch(/s_Need = p_MinFuel \+ RELIEF_PER_BLOCK \* distTo\(d, p_Pos\)/);
+    // and an idle drone that cannot afford it is reported as exactly that, not as "busy"
+    expect(taskman).toMatch(/no %s can afford it/);
   });
 
   it('keeps StorageKnownDry declared above FuelFloorNow', () => {

@@ -69,8 +69,18 @@ describe('tower patches are independent', () => {
    * Work that CONSUMES fuel must never outrank the work that PRODUCES it -- the same inversion as
    * fuel relief preempting the coal gather it depended on.
    */
+  /*
+   * The blanket "no priority: 1 anywhere in this tool" above was the right lesson enforced in the
+   * wrong place. order.tower now queues the CRAFT that feeds the patches as well as the patches
+   * themselves, and that craft must sit one above the build it supplies -- otherwise the two
+   * compete, the builds win, and drones are dispatched to place bricks that nothing is making.
+   * Grepping the whole tool could not tell the two apart, so it failed on the fix.
+   *
+   * Assert the thing that actually matters: the tower PATCH is the task that must not outrank fuel.
+   */
   it('queues the patches BELOW fuel work, at priority 2', () => {
-    expect(tower).toMatch(/priority:\s*2/);
-    expect(tower).not.toMatch(/^\s*priority:\s*1\s*,/m);
+    const patch = tower.slice(tower.indexOf('`tower-L${a.level}-p$'));
+    expect(patch.slice(0, 300)).toMatch(/priority:\s*2/);
+    expect(patch.slice(0, 300)).not.toMatch(/priority:\s*1\s*,/);
   });
 });
