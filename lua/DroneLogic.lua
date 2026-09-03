@@ -2773,13 +2773,27 @@ end
 -- breaks the job first, exactly so this hand-over is orderly).
 -- A global, not a `local`: DroneLogic is at Lua's 200-local limit for the main chunk.
 TravelOwner = nil
+TravelSince = nil
+TravelTakenAt = nil
+-- A journey that has held the turtle this long is not a journey. A coroutine parked inside a
+-- network wait with no timeout (a GetPath to a MapServer mid-reboot) keeps the lock for ever and
+-- every other routine is told "busy" until the drone reboots: D35 sat idle holding 51 items,
+-- refused its own deposit once a minute for twenty minutes. Release it and say so.
+local TRAVEL_LOCK_MAX_S = 240
 -- Is somebody ELSE moving the drone right now? Callers that would otherwise escalate a failed
 -- arrival -- ask others to make way, climb, dig -- must ask this first: "travel busy" is not
 -- terrain, and treating it as terrain is how D40 went 235 -> 56 fuel forcing a route to a chest
 -- while another routine was already flying it there.
 function TravelIsBusy()
-    return TravelOwner ~= nil and TravelOwner ~= coroutine.running()
-        and coroutine.status(TravelOwner) ~= "dead"
+    if TravelOwner == nil or TravelOwner == coroutine.running() then return false end
+    if coroutine.status(TravelOwner) == "dead" then TravelOwner = nil return false end
+    if TravelSince and (os.clock() - TravelSince) > TRAVEL_LOCK_MAX_S then
+        trace(("travel: the lock has been held for %ds by a routine that is not moving -- releasing it. Taken at: %s")
+            :format(math.floor(os.clock() - TravelSince), tostring(TravelTakenAt or "?")))
+        TravelOwner, TravelSince, TravelTakenAt = nil, nil, nil
+        return false
+    end
+    return true
 end
 function TravelTo(p_X, p_Y, p_Z, p_Ceiling)
     if TravelIsBusy() then
@@ -2787,9 +2801,11 @@ function TravelTo(p_X, p_Y, p_Z, p_Ceiling)
             :format(tostring(p_X), tostring(p_Y), tostring(p_Z)))
         return false, "travel busy"
     end
-    TravelOwner = coroutine.running()
+    TravelOwner, TravelSince = coroutine.running(), os.clock()
+    -- Who took it, for the day it is never given back. One line of the caller's stack.
+    TravelTakenAt = (debug and debug.traceback) and (debug.traceback("", 2):match("\n%s*([^\n]+)") or "?") or "?"
     local ok, a, b = pcall(TravelToBody, p_X, p_Y, p_Z, p_Ceiling)
-    TravelOwner = nil
+    TravelOwner, TravelSince, TravelTakenAt = nil, nil, nil
     if not ok then error(a, 0) end
     return a, b
 end
@@ -2990,6 +3006,13 @@ end
 -- select(1) at the end is the part a copy forgets: a drone left holding slot 14 selected crafts
 -- whatever happens to be there. p_Last bounds the walk; 12 stops short of the crafting staging
 -- slots. The detail is NOT read here, because the fuel-relief walk does not need it.
+-- How many items are aboard, all slots. Written out as a loop in three places before this.
+function CarriedCount()
+    local n = 0
+    for i = 1, 16 do n = n + turtle.getItemCount(i) end
+    return n
+end
+
 function eachCarriedSlot(p_Do, p_Last)
     for i = 1, (p_Last or 16) do
         local n = turtle.getItemCount(i)
@@ -7094,25 +7117,26 @@ function OnRelieve(p_ID, p_Message)
     end)
 end
 
+-- A JOB LIKE THE OTHERS. This ran outside RunJob: no "JOB Haul start" in the log, `executing`
+-- never set, the heartbeat still saying idle -- so TaskMan reclaimed the task as "never started"
+-- while the drone was mid-haul, re-dispatched it, and the same cache was emptied twice in a row
+-- with nothing in either log to say so. RunJob reports, refuses when busy, and deposits after.
 function OnHaul(p_ID, p_Message)
-    local d = p_Message.data or {}
-    if d.pos == nil then return false, "Missing pos" end
-    if executing then return false, "busy" end
-    m_Status = "hauling"
-    TaskStart()
-    local ok = TravelTo(tonumber(d.pos.x), tonumber(d.pos.y) + 1, tonumber(d.pos.z), (tonumber(d.pos.y) or 64) + 4)
-    if ok == false then
-        TaskEnd() m_Status = "idle"
-        Distress("cannot reach pickup", tostring(d.pos.x))
-        return false, "unreachable"
-    end
-    -- Take everything, through the primitive: it fills free slots before judging, which is
-    -- what gets the leading stacks out of the chest instead of cycling the same one.
-    TakeFromChest(function() return true end)
-    local s_Ok = Deposit()
-    TaskEnd()
-    m_Status = "idle"
-    return s_Ok, {message = s_Ok and "hauled" or "haul failed"}
+    return RunJob("Haul", p_Message.data, {status = "hauling"}, function(d)   -- dup: allow (the RunJob call is the job convention; a handler that does not look like this is the bug)
+        if d.pos == nil then return nil, "no pickup position" end
+        local ok = TravelTo(tonumber(d.pos.x), tonumber(d.pos.y) + 1, tonumber(d.pos.z), (tonumber(d.pos.y) or 64) + 4)
+        if ok == false then
+            Distress("cannot reach pickup", tostring(d.pos.x))
+            return nil, "could not reach the cache"
+        end
+        -- Take everything, through the primitive: it fills free slots before judging, which is
+        -- what gets the leading stacks out of the chest instead of cycling the same one.
+        local s_Before = CarriedCount()
+        TakeFromChest(function() return true end)
+        local s_After = CarriedCount()
+        trace(("haul: took %d item(s) from the cache"):format(s_After - s_Before))
+        return {message = ("hauled %d"):format(s_After - s_Before), taken = s_After - s_Before}
+    end)
 end
 
 -- SAY WHO SENT IT.
@@ -8777,8 +8801,7 @@ local function idleDockLoop()
                 -- was waiting on -- while storage reported none and the next task blocked for want
                 -- of them. Whatever put the drone in this state, carrying it into a park is always
                 -- wrong, and here is the one place every idle drone passes through.
-                local s_Cargo = 0
-                for i = 1, 16 do s_Cargo = s_Cargo + turtle.getItemCount(i) end
+                local s_Cargo = CarriedCount()
                 if s_Cargo > 0 then
                     trace(("idle while holding %d item(s) -- depositing before parking"):format(s_Cargo))
                     -- Stock inside a drone is invisible to planning, so a failed deposit hides the
