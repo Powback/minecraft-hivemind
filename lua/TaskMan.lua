@@ -461,8 +461,17 @@ local function noDroneReason(p_Role, p_Busy, p_Poor, p_PoorNeed)
         -- per-block rates are not integers; the first fractional need threw "bad argument #5 (not a
         -- number in proper range)" out of the tick every 15 s and stopped the blocker-placement pass
         -- for the rest of the night, while the tests fed it whole numbers. Floor it.
-        return ("no %s " .. UNAFFORDABLE .. ": %s has %s fuel, the job needs ~%d from there")
-            :format(p_Role, tostring(p_Poor.name), tostring(p_Poor.fuel), math.floor(p_PoorNeed or 0))
+        -- And a need of math.huge -- a candidate with no known position prices the trip as infinite
+        -- -- has no integer representation either. %s with a guarded string, never %d with a number
+        -- the caller computed.
+        local s_Need = tonumber(p_PoorNeed)
+        if s_Need == nil or s_Need ~= s_Need or s_Need == math.huge or s_Need == -math.huge then
+            s_Need = "an unknown amount (its position is unknown)"
+        else
+            s_Need = ("~%d"):format(math.floor(s_Need))
+        end
+        return ("no %s " .. UNAFFORDABLE .. ": %s has %s fuel, the job needs %s from there")
+            :format(p_Role, tostring(p_Poor.name), tostring(p_Poor.fuel), s_Need)
     end
     if p_Busy then return "every " .. p_Role .. " is busy (" .. tostring(p_Busy.name) .. ")" end
     return "no " .. p_Role .. " in the fleet -- one drone needs a "
