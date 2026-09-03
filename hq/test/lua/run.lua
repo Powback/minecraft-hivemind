@@ -428,6 +428,19 @@ test("TaskMan.noDroneReason survives a fractional fuel need", function()
     truthy(nan:find("unknown", 1, true), "so is a NaN: " .. nan)
 end)
 
+test("DroneLogic.RefuelAtStorage asks storage over the network and does not fly to an empty shelf", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 300 })
+    env.__world.replies.StorageMan = env.__world.replies.StorageMan or {}
+    env.__world.replies.StorageMan.GetStock = { detail = { { name = "minecraft:stone", count = 800 } } }
+    env.__world.replies.StorageMan.DepositPoint = { pos = { x = 0, y = 64, z = 0 } }
+    local moves = 0
+    local counted = function() moves = moves + 1 return true end
+    env.pgps.moveTo, env.pgps.flyTo, env.pgps.digTo, env.pgps.forward = counted, counted, counted, counted
+    env.RefuelAtStorage()
+    eq(moves, 0, "no flight to a shelf the network says is dry")
+    truthy(env.StorageKnownDry(nil), "and the shelf is marked dry for the others")
+end)
+
 test("DroneLogic.FellTargets stops at an abort and when the tank is the trip home", function()
     local env, D = loadModule("DroneLogic.lua", { fuel = 500, pos = { x = 10, y = 64, z = 0 } })
     D.setHome({ x = 0, y = 64, z = 0 })                    -- floor 150 here

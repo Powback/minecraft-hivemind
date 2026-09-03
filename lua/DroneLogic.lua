@@ -6794,6 +6794,26 @@ end
 -- useful. It exists precisely because this logic kept being rewritten, and this was the fifth copy
 -- -- the one that looked in the wrong place.
 local function CollectFuel()
+    -- ASK BEFORE FLYING. FetchItems flies to the chest that last held fuel, finds it empty, and
+    -- sweeps the bay -- 14 to 59 fuel per attempt, measured on four drones the night the shelf sat
+    -- at zero, and the attempt repeated every time a job ended or the dry flag aged out. StorageMan
+    -- indexes every networked chest for every other question; one network call answers this one
+    -- for nothing, and a "no" marks the shelf dry so nobody else asks with their tank for a while.
+    -- A failed call falls through to the old path: no answer is not "no fuel".
+    local s_Stock = PowNet.sendAndWaitForResponse("StorageMan",
+        PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "GetStock", {}), PowNet.SERVER_PROTOCOL)
+    if type(s_Stock) == "table" and type(s_Stock.detail) == "table" then
+        local s_Burnable = 0
+        for _, e in pairs(s_Stock.detail) do
+            if type(e) == "table" and (FUEL_NAMES[e.name] or IsBurnableWood(e.name)) then
+                s_Burnable = s_Burnable + (tonumber(e.count) or 0)
+            end
+        end
+        if s_Burnable == 0 then
+            m_StorageDryAt = os.clock()
+            return 0, "storage had nothing burnable (asked over the network, did not fly)"
+        end
+    end
     -- UNLOAD BEFORE LOADING.
     --
     -- A miner arrives from a shaft with sixteen slots of cobblestone, so there is nowhere to put the
