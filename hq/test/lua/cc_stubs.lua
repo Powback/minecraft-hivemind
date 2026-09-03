@@ -231,8 +231,12 @@ function M.makeEnv(p_Opts)
     env.keys = setmetatable({}, { __index = function() return 0 end })
     env.shell = { run = yes, getRunningProgram = function() return "test" end }
     env.settings = { get = function() return nil end, set = noop }
-    env.redstone = setmetatable({}, { __index = function() return noop end })
+    env.redstone = setmetatable({
+        getSides = function() return { "left", "right", "top", "bottom", "front", "back" } end,
+    }, { __index = function() return noop end })
     env.rs = env.redstone
+    -- A wireless modem on the left, so startGPS finds one and gps.locate has something to speak through.
+    world.peripherals["left"] = { type = "modem", api = { isWireless = yes, isOpen = yes, open = noop, close = noop } }
     env.http = { get = function() return nil end, post = function() return nil end }
     env.print = function(...) local t = {} for i = 1, select("#", ...) do t[#t + 1] = tostring(select(i, ...)) end world.logs[#world.logs + 1] = table.concat(t, "\t") end
     env.printError = env.print

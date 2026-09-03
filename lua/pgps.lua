@@ -1031,6 +1031,10 @@ local function auditHeading(x, y, z)
     end
 end
 
+-- How many consecutive fixes must disagree with the bookkeeping by exactly one block before the
+-- fix wins. See verifyPosition. Declared above it: a `local` below its use is a nil global.
+local SMALL_DRIFT_CONFIRM = 3
+local m_SmallDriftRuns = 0
 function verifyPosition(p_Force)
     if not p_Force and m_FixFailedAt and (os.clock() - m_FixFailedAt) < GPS_RETRY_AFTER then
         return nil, "no gps fix (backing off)"
@@ -1059,6 +1063,24 @@ function verifyPosition(p_Force)
     x, y, z = math.floor(x), math.floor(y), math.floor(z)
     if cachedX ~= nil then
         m_Drift = math.abs(x - cachedX) + math.abs(y - cachedY) + math.abs(z - cachedZ)
+        -- ONE BLOCK OF DISAGREEMENT IS GPS NOISE UNTIL IT PERSISTS.
+        --
+        -- Measured on a drone that had not moved: six fixes in two seconds read -496, -496, -496,
+        -- -496, -497, -497. The trilateration lands within a fraction of a block and the floor
+        -- above flips it. Every flip was adopted as a correction, the audit then found the
+        -- bookkeeping "disagreed" with a fix that was simply wrong, and re-checked the heading by
+        -- stepping forward and back: two fuel and a replan per flip, forty-eight flips in two
+        -- hundred log lines on D37 and D35. A turtle's own move count is exact when forward()
+        -- returns true; it outranks a one-block fix until three fixes in a row say otherwise. Two
+        -- blocks or more is a real discrepancy (a missed move, a push) and is adopted at once.
+        if m_Drift == 1 then
+            m_SmallDriftRuns = m_SmallDriftRuns + 1
+            if m_SmallDriftRuns < SMALL_DRIFT_CONFIRM then
+                m_LastFix = os.clock()        -- still a fix: the position is confirmed to within one
+                return true, 0
+            end
+        end
+        m_SmallDriftRuns = 0
         if m_Drift > 0 then
             ptrace(("position corrected by %d: %d,%d,%d -> %d,%d,%d")
                 :format(m_Drift, cachedX, cachedY, cachedZ, x, y, z))

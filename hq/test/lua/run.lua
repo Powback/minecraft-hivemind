@@ -353,6 +353,30 @@ test("pgps.setLocation with no heading keeps the heading it has", function()
     eq(d2, env.HEADINGS.north, "still north")
 end)
 
+test("pgps.verifyPosition treats a one-block GPS disagreement as noise until it persists", function()
+    local env = loadModule("pgps.lua")
+    env.setLocation(0, 64, 0, "north")
+    env.__world.gps = { x = 1, y = 64, z = 0 }                 -- the fix flips one block east
+    for i = 1, 2 do
+        local ok, drift = env.verifyPosition(true)
+        truthy(ok, "fix " .. i .. " accepted") eq(drift, 0, "fix " .. i .. " drift reported")
+        local x = env.getCachedPosition()
+        eq(x, 0, "fix " .. i .. ": bookkeeping kept")
+    end
+    local ok, drift = env.verifyPosition(true)
+    truthy(ok, "third fix") eq(drift, 1, "third consecutive disagreement is adopted")
+    eq((env.getCachedPosition()), 1, "position corrected on the third fix")
+end)
+
+test("pgps.verifyPosition adopts a two-block disagreement at once", function()
+    local env = loadModule("pgps.lua")
+    env.setLocation(0, 64, 0, "north")
+    env.__world.gps = { x = 2, y = 64, z = 0 }
+    local ok, drift = env.verifyPosition(true)
+    truthy(ok, "fix") eq(drift, 2, "drift")
+    eq((env.getCachedPosition()), 2, "adopted immediately")
+end)
+
 -- ================================================================================================
 local failed = 0
 for _, r in ipairs(results) do if not r.ok then failed = failed + 1 end end
