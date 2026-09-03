@@ -2465,6 +2465,11 @@ local function releaseStalledAssignments()
     return s_Freed
 end
 
+-- Statuses that are NOT a drone holding a job nobody gave it. Idle and docking are waiting;
+-- refuelling is the idle top-up (DroneLogic.TopUpWhileIdle), which was being aborted mid-fetch
+-- every sixty seconds as "refuelling with no task" -- the one thing that makes it useful next.
+local NOT_AN_ORPHAN = { idle = true, offline = true, docking = true, refuelling = true }
+
 local function freeOrphanedDrones()
     local s_Held = {}
     for _, v in pairs(DATA["tasks"] or {}) do
@@ -2481,8 +2486,10 @@ local function freeOrphanedDrones()
         -- every sixty seconds just fights the drone: "D3 is docking with no task -- aborting so it
         -- can be given work", over and over, while the queue was empty and there was no work to
         -- give. A docked drone is already available; RunJob undocks it the instant it accepts a job.
-        local s_Busy = d.status ~= nil and d.status ~= "idle" and d.status ~= "offline"
-            and d.status ~= "docking"
+        -- NOR THE ONES REFUELLING: a drone refuelling with no task is doing the one thing that
+        -- makes it useful next. The idle top-up (DroneLogic.TopUpWhileIdle) looks exactly like
+        -- this and was aborted mid-fetch every sixty seconds.
+        local s_Busy = d.status ~= nil and not NOT_AN_ORPHAN[d.status]
         -- NOT THE ONES THAT HAVE NO FUEL.
         --
         -- The whole point of this pass is to make a drone available for work. A drone below the

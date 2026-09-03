@@ -52,8 +52,8 @@
         25,
         19,
         18,
-        18,
         17,
+        16,
         16
       ],
       "names": [
@@ -64,9 +64,9 @@
         "OnStartTask",
         "verbFor",
         "pickDrone",
-        "freeOrphanedDrones",
         "placeBlockers",
-        "releaseStalledAssignments"
+        "releaseStalledAssignments",
+        "freeOrphanedDrones"
       ]
     },
     "hq/src/agent/sentinel.ts": {
