@@ -166,7 +166,10 @@ export const DEFAULT_RULES: SupplyRule[] = [
  * retried instantly. Three minutes is enough for that, and ten meant five idle drones and two
  * materials at 0/32 sitting out most of every hour.
  */
-const COOLDOWN_MS = 3 * 60 * 1000;
+// 3 min -> 1 min. The server runs at `tick rate 60` while the settlement is being brought up, so
+// the drones live three times faster than HQ's wall clock; a three-minute cooldown between queuing
+// the same rule twice was nine minutes of drone time with an idle miner beside a queued chest.
+const COOLDOWN_MS = 60 * 1000;
 
 /**
  * What the fleet is carrying, summed by item name. PURE, so it can be tested without a world.
@@ -2368,6 +2371,7 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
   return { acted: false, reason: 'nothing to dispatch' };
 }
 
-export function startSupplyLoop(intervalMs = 60_000) {
+// 60 s -> 20 s: at `tick rate 60` a minute of wall clock is three minutes of drone time.
+export function startSupplyLoop(intervalMs = 20_000) {
   setInterval(() => { runSupplyTick().catch(() => { /* reported via note() */ }); }, intervalMs).unref();
 }
