@@ -1405,7 +1405,11 @@ function ApproachFromSide(p_Target, p_FlyBudget)
             -- Measured: "gather: 32/192 checked" and "33/192 checked" two hundred seconds apart --
             -- one candidate per three minutes, with MapServer dropping out under the load. The
             -- fleet was not slow at cutting wood; it was slow at asking permission to walk.
-            local s_Try = reachAdjacent(x, p_Target.y, z, p_FlyBudget)
+            -- A side approach is a hop to the cell NEXT to the target. reachAdjacent's default
+            -- flight budget was 64 steps, and a failed side spends it all before the next side is
+            -- tried -- up to 256 fuel to decide one trunk is boxed in. Sixteen is four times the
+            -- longest legitimate detour around it.
+            local s_Try = reachAdjacent(x, p_Target.y, z, p_FlyBudget or 16)
             if s_Try ~= false then
                 pgps.turnTo(pgps.HEADINGS[s_Side.face])
                 return s_Try
@@ -4610,6 +4614,14 @@ local function RunJobNow(p_Name, p_Data, p_Opts, p_Body)
     local o = p_Opts or {}
 
     trace(("JOB %s start %s"):format(p_Name, describePayload(d)))
+    -- WHAT DID IT COST. Every job line below carries the fuel it spent, net of any refuel inside
+    -- it. The fleet burned 3-4x what its routes should cost and nothing said which job did it.
+    local s_FuelAtStart = turtle.getFuelLevel()
+    local function spent()
+        local f = turtle.getFuelLevel()
+        if type(f) ~= "number" or type(s_FuelAtStart) ~= "number" then return "?" end
+        return tostring(s_FuelAtStart - f)
+    end
     m_Job = {verb = p_Name, data = d}
     -- Leaving the berth is exactly here: a job has been accepted and the drone is about to move.
     undock()
@@ -4723,7 +4735,7 @@ local function RunJobNow(p_Name, p_Data, p_Opts, p_Body)
     local s_Res, s_Why = s_Ret[2], s_Ret[3]
     if bodyReportedFailure(s_Res) then
         local s_Reason = tostring(s_Why or "job returned no result and gave no reason")
-        trace(("JOB %s FAILED %s"):format(p_Name, s_Reason))
+        trace(("JOB %s FAILED %s -- %s fuel spent"):format(p_Name, s_Reason, spent()))
         Distress(p_Name .. " failed", s_Reason, false)
         return finish(false, s_Reason)
     end
@@ -4751,10 +4763,10 @@ local function RunJobNow(p_Name, p_Data, p_Opts, p_Body)
     -- work -- placed blocks are memoised, felled trees are gone. Marking it done costs the work
     -- permanently, and silently.
     if not executing then
-        trace(("JOB %s INTERRUPTED -- returning it to the queue"):format(p_Name))
+        trace(("JOB %s INTERRUPTED -- returning it to the queue (%s fuel spent)"):format(p_Name, spent()))
         return finish(false, "interrupted before it finished")
     end
-    trace(("JOB %s done"):format(p_Name))
+    trace(("JOB %s done -- %s fuel spent"):format(p_Name, spent()))
     return finish(true, s_Res)
 end
 
