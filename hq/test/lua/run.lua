@@ -130,6 +130,15 @@ test("TaskMan: while the fleet is low, a haul and a plant are still placeable", 
     falsy(T.notPlaceableNow({ id = 3, name = "lumber:oak_log", work = { lumber = {} } }, "miner", {}), "lumber is fuel work")
 end)
 
+test("TaskMan: while the fleet is low, a crafter's job is placeable and a miner's non-fuel job is held", function()
+    local _, T = taskManWithFleet({
+        { id = 1, name = "D1", role = "miner", status = "idle", fuel = 300, pos = { x = 0, y = 64, z = 0 } },
+        { id = 2, name = "D4", role = "crafter", status = "docking", fuel = 1200, pos = { x = 0, y = 64, z = 0 } },
+    }, {})
+    falsy(T.notPlaceableNow({ id = 4, name = "craft-stone_bricks", work = { craft = {} } }, "crafter", {}), "a craft costs no fuel anyone else could use")
+    truthy(T.notPlaceableNow({ id = 5, name = "dig:stone", work = { mine = { pos = {} } } }, "miner", {}), "a miner's dig waits for fuel work")
+end)
+
 -- ================================================================================================
 -- StorageMan
 -- ================================================================================================

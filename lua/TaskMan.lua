@@ -2454,7 +2454,13 @@ local function notPlaceableNow(p_Task, p_Role, p_NoDrone)
         local w = p_Task.work or {}
         local s_IsFuelWork = w.rescue ~= nil or w.haul ~= nil or w.plant ~= nil
             or taskProducesFuel(p_Task.name)
-        if not s_IsFuelWork then return true end
+        -- HOLD THE MINERS, NOT THE FLEET. Fuel is not transferable between tanks, so a crafter's
+        -- brick job at the bay saves no fuel for the felling that has to happen -- it only idles the
+        -- one drone that could build. Measured 2026-09-04: D4 sat docked with 1,600 fuel while 818
+        -- stone waited to become the tower's bricks, for the whole of a fuel emergency, because this
+        -- gate held every non-fuel task for every role. Miners are the fuel-makers; their work is
+        -- what the emergency is for. Everyone else's work is cheap, or it is what finds the forest.
+        if not s_IsFuelWork and p_Role == "miner" then return true end
     end
     local s_Off = m_PlaceBackoff[tostring(p_Task.id)]
     if s_Off ~= nil and (os.epoch("utc") - s_Off) < PLACE_BACKOFF_MS then return true end
