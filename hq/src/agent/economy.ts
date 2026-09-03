@@ -20,25 +20,37 @@ const BURNABLE = /coal|_log|planks/;
 const SAMPLE_MS = 60_000;
 const KEEP = 120;                 // two hours
 
-type Sample = { t: number; burnable: number | null; fleetFuel: number; blocks: number; working: number };
+type PerDrone = { burn: number; blocks: number };
+type Sample = { t: number; burnable: number | null; fleetFuel: number; blocks: number; working: number;
+                perDrone: Record<string, PerDrone> };
 
 const ring: Sample[] = [];
 const lastPos = new Map<number, { x: number; y: number; z: number }>();
+const lastFuel = new Map<number, number>();
 
 /** One reading. Exported so a test (or a tick) can drive it without the timer. */
 export async function sampleEconomy(): Promise<Sample> {
   const drones = state.listDrones() as any[];
   let fleetFuel = 0, blocks = 0, working = 0;
+  const perDrone: Record<string, PerDrone> = {};
   for (const d of drones) {
-    fleetFuel += Number(d.fuel) || 0;
+    const fuel = Number(d.fuel) || 0;
+    fleetFuel += fuel;
     if (d.status === 'working') working++;
     const p = d.pos;
     const prev = lastPos.get(d.id);
-    if (p && prev) blocks += Math.abs(p.x - prev.x) + Math.abs(p.y - prev.y) + Math.abs(p.z - prev.z);
+    const moved = (p && prev) ? Math.abs(p.x - prev.x) + Math.abs(p.y - prev.y) + Math.abs(p.z - prev.z) : 0;
+    blocks += moved;
+    // WHO IS BURNING IT. The fleet total said 10 fuel per block and could not say which drone; per
+    // drone, a decrease is consumption and an increase is a refuel, and only the first is burn.
+    const pf = lastFuel.get(d.id);
+    const burn = pf != null && fuel < pf ? pf - fuel : 0;
+    perDrone[d.name ?? String(d.id)] = { burn, blocks: moved };
     if (p) lastPos.set(d.id, { x: p.x, y: p.y, z: p.z });
+    lastFuel.set(d.id, fuel);
   }
   const burnable = await readStockWhere((n) => BURNABLE.test(n), () => undefined);
-  const s = { t: Date.now(), burnable, fleetFuel, blocks, working };
+  const s = { t: Date.now(), burnable, fleetFuel, blocks, working, perDrone };
   // An empty fleet is HQ not knowing yet, not a fleet with no fuel. The first sample after a
   // restart read 0 and made the window report "burn -6732" -- a gain of 6,732 fuel from nowhere.
   if (drones.length > 0) ring.push(s);
@@ -63,7 +75,22 @@ export function economySummary(p_WindowMin = 20) {
   const fuelPerBlock = moved > 0 && burn > 0 ? Math.round((burn / moved) * 10) / 10 : null;
   const working = Math.round(win.reduce((n, s) => n + s.working, 0) / win.length);
   return { samples: win.length, windowMin: p_WindowMin, burnable: last.burnable, fleetFuel: last.fleetFuel,
-           income, burn, fuelPerBlock, working };
+           income, burn, fuelPerBlock, working, drones: perDroneOverWindow(win) };
+}
+
+/** Per drone over the window, worst burner first: "D31 burned 843 moving 60 blocks" is a lead; a fleet total is not. */
+function perDroneOverWindow(win: Sample[]) {
+  const per: Record<string, PerDrone> = {};
+  for (const s of win.slice(1)) {
+    for (const [name, v] of Object.entries(s.perDrone ?? {})) {
+      const acc = (per[name] ??= { burn: 0, blocks: 0 });
+      acc.burn += v.burn; acc.blocks += v.blocks;
+    }
+  }
+  return Object.entries(per)
+    .map(([name, v]) => ({ name, burn: v.burn, blocks: v.blocks,
+                           fuelPerBlock: v.blocks > 0 ? Math.round((v.burn / v.blocks) * 10) / 10 : null }))
+    .sort((a, b) => b.burn - a.burn);
 }
 
 /**
