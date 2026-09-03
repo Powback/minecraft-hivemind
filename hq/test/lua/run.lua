@@ -120,6 +120,19 @@ test("TaskMan.pickDrone prices work with no site as no trip, so a crafter can af
     eq(poor, nil, "not reported as poor")
 end)
 
+test("TaskMan.anyoneForBuild prices the build for the fallback drone too", function()
+    local _, T = taskManWithFleet({
+        { id = 3, name = "D39", role = "scout", status = "idle", fuel = 290, fuelFloor = 120, pos = { x = 0, y = 64, z = 0 } },
+    })
+    local build = { id = 9, name = "tower-L0-p1", work = { build = { origin = { x = 14, y = 64, z = 0 } } } }
+    eq(T.anyoneForBuild(build, { x = 14, y = 64, z = 0 }, 300), nil, "a 384-fuel build is not handed to a 290-fuel scout")
+    local _, T2 = taskManWithFleet({
+        { id = 3, name = "D39", role = "scout", status = "idle", fuel = 1200, fuelFloor = 120, pos = { x = 0, y = 64, z = 0 } },
+    })
+    local d = T2.anyoneForBuild(build, { x = 14, y = 64, z = 0 }, 300)
+    eq(d and d.name, "D39", "a scout that can afford it builds")
+end)
+
 test("TaskMan.pickDrone offers the job to a drone that can afford it", function()
     local _, T = taskManWithFleet({
         { id = 1, name = "D1", role = "miner", status = "idle", fuel = 1000, pos = { x = 0, y = 64, z = 0 } },

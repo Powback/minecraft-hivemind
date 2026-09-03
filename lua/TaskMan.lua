@@ -658,11 +658,14 @@ end
 -- Same rule as fuel relief never outranking the coal gather it depends on: work that CONSUMES a
 -- material must not take the drone that PRODUCES it. So crafter LAST, and only when the craft queue
 -- is empty -- a crafter with nothing to craft should absolutely be laying blocks.
-local function anyoneForBuild(p_Task, p_Where)
+local function anyoneForBuild(p_Task, p_Where, p_MinFuel)
     if p_Task.work == nil or p_Task.work.build == nil then return nil end
     for _, alt in ipairs({"loader", "scout", "crafter"}) do
         if alt ~= "crafter" or not craftIsWaiting() then
-            local d = pickDrone(alt, p_Where)
+            -- THE FALLBACK PRICES THE JOB LIKE THE FIRST CHOICE DID. Without p_MinFuel this offered a
+            -- 384-fuel build to scouts holding 290 and 270; both burned to the watchdog's floor and
+            -- were pulled off the tower with the patch unfinished (2026-09-04, 173 and 149 fuel).
+            local d = pickDrone(alt, p_Where, nil, p_MinFuel)
             if d ~= nil then
                 Log("build going to a " .. alt .. " -- no miner free")
                 return d
@@ -972,7 +975,7 @@ function OnStartTask(p_ID, p_Message)
     -- one role. Building needs neither -- every turtle can place -- and routing it to "miner" left
     -- a build queued indefinitely while a crafter and a loader sat idle on their docks. Prefer a
     -- miner, then take whoever is free.
-    s_Drone = s_Drone or anyoneForBuild(s_Task, s_Where)
+    s_Drone = s_Drone or anyoneForBuild(s_Task, s_Where, s_MinFuel)
 
     -- A rescue prefers a miner but must not REQUIRE one -- see anyoneForRescue.
     s_Drone = s_Drone or anyoneForRescue(s_Task, s_Where, s_MinFuel, s_Role)
@@ -3466,6 +3469,7 @@ if HiveMindTest then
     HiveMindTest.TaskMan = {
         jobMinFuel = jobMinFuel, workPos = workPos, workCost = workCost, pickDrone = pickDrone,
         noDroneReason = noDroneReason, notPlaceableNow = notPlaceableNow, fleetFuelLow = fleetFuelLow,
+        anyoneForBuild = anyoneForBuild,
     }
 end
 
