@@ -18,6 +18,10 @@ read_globals = {
     "PowNet", "pgps", "PowGPSServer", "MapRender", "VFS", "lama", "egps", "Log", "SetStatus",
 }
 
+-- The test seam: hq/test/lua/run.lua sets it and each module fills in its own table; nil in the
+-- world. Writable, because the modules assign a field of it.
+globals = { "HiveMindTest" }
+
 -- Noise we are not spending the ratchet on yet: unused variables and arguments, whitespace,
 -- line length. Everything else -- undefined reads, unreachable code, a numeric-for control
 -- variable assigned (a real CC trap), empty branches -- is on.

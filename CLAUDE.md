@@ -44,8 +44,18 @@ added to a file at the 200-local limit.
 
 **A test that greps the source for a line is a comment with a CI bill.** Most of the older guards
 here are that. They break on every rename while the behaviour stands, and pass when the behaviour is
-wrong. Prefer: luacheck for scope, `luac -p` for syntax, and tests that RUN the Lua under `lua` with
-stubbed `turtle`/`peripheral`/`rednet` and assert on what a function returns.
+wrong. The Lua is now RUN: `hq/test/lua/run.lua` loads each module under a stub ComputerCraft world
+(`hq/test/lua/cc_stubs.lua`: a turtle with an inventory and fuel values, fake peripherals with
+inventories, an in-memory `fs`, a `PowNet` whose replies the test chooses, a `pgps` that always knows
+where it is) and calls the real functions -- "a drone with 400 fuel is not offered a 588-fuel job,
+and the reason names the number". `hq/test/lua-behaviour.test.ts` runs it under **Lua 5.4** and turns
+each result into a vitest case. Locals worth testing are exported by the module itself through the
+`HiveMindTest` seam at its tail (nil in the world). To add a test: add a `test(...)` to `run.lua`;
+if it needs a local, add it to that module's seam.
+
+Lua 5.4 enforces the 200-local limit exactly; Cobalt in-game is more lenient. So the test runner is
+the binding constraint on `DroneLogic.lua`'s main chunk, and it is why several helpers there are
+globals (`TravelToBody`, `FellTargets`, `RelieveBody`, `BurnAboard`...) rather than `local function`.
 
 ## Verify at the effect, never at the call
 

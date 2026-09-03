@@ -3400,6 +3400,15 @@ PowNet.RegisterEvents(m_ServerEvents, m_DroneEvents, Render)
 SetStatus("Connected!", colors.green)
 Render()
 
+-- TEST SEAM. hq/test/lua/run.lua loads this file under a stub ComputerCraft world with HiveMindTest
+-- set and exercises the locals below directly -- a test that RUNS the scheduler, rather than one
+-- that greps this file for a line. In the world HiveMindTest is nil and this does nothing.
+if HiveMindTest then
+    HiveMindTest.TaskMan = {
+        jobMinFuel = jobMinFuel, workPos = workPos, workCost = workCost, pickDrone = pickDrone,
+        noDroneReason = noDroneReason, notPlaceableNow = notPlaceableNow, fleetFuelLow = fleetFuelLow,
+    }
+end
 
 parallel.waitForAny(PowNet.main, PowNet.droneMain, PowNet.control, Tick)
 

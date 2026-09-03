@@ -2708,7 +2708,7 @@ local function riseToCeiling(p_Ceiling)
     return true
 end
 
-local function travelToBody(p_X, p_Y, p_Z, p_Ceiling)
+function TravelToBody(p_X, p_Y, p_Z, p_Ceiling)
     -- DO NOT ASK THE PATHFINDER TO CROSS THE ROOM.
     --
     -- moveTo is an A* request to MapServer, which is holding 207,574 cells: a 1,331-cell region
@@ -2788,7 +2788,7 @@ function TravelTo(p_X, p_Y, p_Z, p_Ceiling)
         return false, "travel busy"
     end
     TravelOwner = coroutine.running()
-    local ok, a, b = pcall(travelToBody, p_X, p_Y, p_Z, p_Ceiling)
+    local ok, a, b = pcall(TravelToBody, p_X, p_Y, p_Z, p_Ceiling)
     TravelOwner = nil
     if not ok then error(a, 0) end
     return a, b
@@ -4921,7 +4921,7 @@ function FellTrunkAt(p_T)
 end
 
 -- Work a list of recorded trunks. Returns trees, logs, gone, unreachable.
-local function fellTargets(p_Targets)
+function FellTargets(p_Targets)
     local s_Trees, s_Logs, s_Gone, s_Unreached = 0, 0, 0, 0
     for _, t in ipairs(p_Targets) do
         if not depositIfFull() then break end
@@ -6639,7 +6639,7 @@ function OnLumber(p_ID, p_Message)
         -- about (see lumber.ts); each is approached from the side and climbed. The sweep below is
         -- the fallback for a task that carries none.
         if type(d.targets) == "table" and #d.targets > 0 then
-            s_Trees, s_Logs = fellTargets(d.targets)
+            s_Trees, s_Logs = FellTargets(d.targets)
         else
         Serpentine(s_W, s_L, function()
             if not depositIfFull() then return false end
@@ -7028,7 +7028,7 @@ function ReachCasualty(p_Name, p_X, p_Y, p_Z)
     return s_Now.x, s_Now.y, s_Now.z
 end
 
-local function relieveBody(d)
+function RelieveBody(d)
     if not (d.pos and d.pos.x) then return nil, "no casualty position" end
 
     local s_Got, s_Why = CollectFuel()
@@ -7087,7 +7087,7 @@ function OnRelieve(p_ID, p_Message)
         -- Flagged for the whole run and cleared however it ends: an error escaping with the flag
         -- set would leave the next job's watchdog refusing to refuel. See burnFrom.
         m_Relieving = true
-        local ok, r1, r2 = pcall(relieveBody, d)
+        local ok, r1, r2 = pcall(RelieveBody, d)
         m_Relieving = false
         if not ok then error(r1, 0) end
         return r1, r2
@@ -9439,5 +9439,13 @@ for _, e in ipairs(s_Loops) do
             :format(e[1], type(e[2])), 0)
     end
     s_Fns[#s_Fns + 1] = e[2]
+end
+-- TEST SEAM. hq/test/lua/run.lua loads this file under a stub world with HiveMindTest set; the
+-- setters let a test place the drone's home and mark it as carrying relief, which are locals here.
+if HiveMindTest then
+    HiveMindTest.DroneLogic = {
+        setHome = function(p) m_HomePos = p end,
+        setRelieving = function(v) m_Relieving = v end,
+    }
 end
 parallel.waitForAny(table.unpack(s_Fns))

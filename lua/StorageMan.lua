@@ -1643,6 +1643,14 @@ PowNet.RegisterEvents(m_ServerEvents, m_DroneEvents, Render)
 SetStatus("Connected!", colors.green)
 Render()
 
+-- TEST SEAM. See TaskMan's: hq/test/lua/run.lua runs this file under a stub world and calls these.
+if HiveMindTest then
+    HiveMindTest.StorageMan = {
+        dedupeDeposits = dedupeDeposits, reservedForCrafting = reservedForCrafting,
+        smeltAllowance = smeltAllowance, fillFor = fillFor,
+    }
+end
+
 parallel.waitForAny(PowNet.main, PowNet.droneMain, PowNet.control, Tick)
 
 print("Unhosting")

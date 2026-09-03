@@ -53,7 +53,7 @@ describe('the four fuel leaks stay closed', () => {
     expect(logic).toMatch(/if m_Relieving and turtle\.getFuelLevel\(\) >= FuelFloorNow\(\) then return end/);
     // Set for the run and cleared on every exit, including an error.
     const body = logic.slice(relieve, logic.indexOf('function OnHaul('));
-    expect(body).toMatch(/m_Relieving = true\s*\n\s*local ok, r1, r2 = pcall\(relieveBody, d\)\s*\n\s*m_Relieving = false/);
+    expect(body).toMatch(/m_Relieving = true\s*\n\s*local ok, r1, r2 = pcall\(RelieveBody, d\)\s*\n\s*m_Relieving = false/);
   });
 
   it('moveLeg measures progress against the best distance so far, not the last step', () => {
@@ -124,11 +124,11 @@ describe('the four fuel leaks stay closed', () => {
   // Four coroutines could each call TravelTo; D31's last minute was "no progress toward" four
   // different targets in ten seconds. The first to start a journey owns the turtle until it returns.
   it('one coroutine moves the turtle at a time', () => {
-    expect(logic).toMatch(/^local function travelToBody\(p_X, p_Y, p_Z, p_Ceiling\)/m);
+    expect(logic).toMatch(/^function TravelToBody\(p_X, p_Y, p_Z, p_Ceiling\)/m);
     const fn = logic.slice(logic.indexOf('function TravelTo('), logic.indexOf('-- TRAVEL, THEN CHECK YOU ACTUALLY GOT THERE'));
     expect(logic).toMatch(/^function TravelIsBusy\(\)/m);
     expect(fn).toMatch(/return false, "travel busy"/);
-    expect(fn).toMatch(/TravelOwner = coroutine\.running\(\)\s*\n\s*local ok, a, b = pcall\(travelToBody, p_X, p_Y, p_Z, p_Ceiling\)\s*\n\s*TravelOwner = nil/);
+    expect(fn).toMatch(/TravelOwner = coroutine\.running\(\)\s*\n\s*local ok, a, b = pcall\(TravelToBody, p_X, p_Y, p_Z, p_Ceiling\)\s*\n\s*TravelOwner = nil/);
     // and "busy" is not terrain: neither the arrival helper nor the deposit escalates on it
     const arrive = logic.slice(logic.indexOf('function ArriveAt('), logic.indexOf('function ArriveAt(') + 400);
     expect(arrive).toMatch(/if TravelIsBusy\(\) then return false end/);
