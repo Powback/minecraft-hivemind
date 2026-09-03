@@ -1738,6 +1738,15 @@ local function rescueBudget()
     return 2, 3
 end
 
+-- Is this drone trapped right now. ZERO FUEL IS TRAPPED, WHATEVER THE STATUS SAYS: D4, the
+-- settlement's only crafter, sat at 0 fuel reporting "idle" for forty minutes with 240 coal on the
+-- shelf and six fuelled drones idle beside it, because a rescue needed the WORD stuck. A drone that
+-- cannot move is stranded; the word is a detail. (RESCUE_STATES must be declared above this.)
+local function trappedNow(p_Drone, p_Deep)
+    return RESCUE_STATES[tostring(p_Drone.status)] or (p_Drone.offline and not p_Deep)
+        or (tonumber(p_Drone.fuel) == 0)
+end
+
 local function rescueNeeded()
     -- One live rescue per drone. Without this the pass creates a fresh task every fifteen seconds
     -- for a drone that stays stuck -- which it will, right up until the miner arrives.
@@ -1885,7 +1894,11 @@ local function rescueNeeded()
         -- counts. What no longer counts is silence alone from somewhere we know a radio cannot
         -- reach. If it is stuck down there it will report it the moment it surfaces into range.
         local s_Deep = d.pos and tonumber(d.pos.y) and tonumber(d.pos.y) < RADIO_FLOOR_Y
-        local s_Trapped = RESCUE_STATES[tostring(d.status)] or (d.offline and not s_Deep)
+        -- ZERO FUEL IS TRAPPED, WHATEVER THE STATUS SAYS. D4, the settlement's only crafter, sat
+        -- at 0 fuel reporting "idle" for forty minutes with 240 coal on the shelf and six fuelled
+        -- drones idle beside it, because a rescue needed the WORD stuck. A drone that cannot move
+        -- is stranded; the word is a detail.
+        local s_Trapped = trappedNow(d, s_Deep)
 
         -- A DRY DRONE NEEDS FUEL, NOT A TUNNEL -- SO SEND IT FUEL.
         --
