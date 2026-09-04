@@ -434,6 +434,18 @@ with three drones docked. Both sides are fixed: `ClearStuckExecuting` clears a j
 300 game seconds without movement, and TaskMan's `heldForNothing` reclaims from a drone that has
 not moved for three real minutes whatever it reports.
 
+**THE REACH IS 60 (2026-09-04, 22:05).** Every tree inside 56 was gone; the nearest real trunks
+(a 27-log column at -525,29 among 17 tall columns) stand 51-58 blocks out. `HIVE_REACH=60` in
+`hq/docker-compose.yml`; HQ pushes it to MapServer at start and drones fetch bounds at boot, so a
+reach change needs `redeploy.sh Drones` to reach the fleet (`pgps: coverage: ... reach 60` confirms).
+The mast's radio is 64 at ground level; the two drones lost before were at 82.
+
+**A DRONE THE BRIEF CALLS LOST WHILE ITS COMPUTER IS ON IS HUNG.** D37 sat 28 minutes at y=81 with
+96 coal aboard, fuel 0, log stopped mid-deposit, computer on. `computercraft shutdown <id>` then
+`turn-on <id>` brought it back in ten seconds (`turn-off` is not a command). The faucet does this
+for any "lost" drone present in the dump. D35 is the other kind: `computercraft dump 52` says no
+such computer -- it is in an unloaded chunk somewhere its last heartbeat did not say.
+
 **A monitor that prints to a file is not a monitor.** `bin/fleet-watch.sh` logged 79 fault changes
 that night -- `FUEL SPIRAL`, `OUT OF FUEL` for six drones -- into a background task file nobody was
 reading, and the sentinel counted 20,059 "self-resolved" incidents. Neither reached a person. A
