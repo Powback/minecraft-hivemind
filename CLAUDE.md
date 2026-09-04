@@ -552,6 +552,17 @@ request, for as long as the flag has existed: a coal ore under five blocks of di
 have been dug. Two minutes after the fix D40 mined the first coal of the settlement's day. When a
 capability "never works", read the handler that receives the request before the code that sends it.
 
+**A REPLY WAIT MUST NOT EAT THE MAIL (2026-09-04, 03:20).** `PowNet.sendAndWaitForResponse` loops
+`rednet.receive(protocol, timeout)`, and every message that was not the awaited reply -- another
+drone's GetPath, an observation upload, a job report -- fell off the end of its if/elseif and was
+gone. Every module and every drone does this, so a module waiting on a peer discarded the fleet's
+requests for the length of the wait. It was invisible at a one-second window and became the whole
+story at ten: path requests reaching MapServer fell from ~100 a minute to 1-3 while drones logged
+"did not answer" 146 times in five minutes, uploads were "not taken" 203 times, and HQ's own
+FindBlocks got "no response" -- with MapServer idle and answering every request it heard in 0-2 ms.
+Held messages are now requeued as `rednet_message` events when the wait ends. When a service looks
+overloaded, count what REACHES it before tuning what it does.
+
 **TIMEOUTS ON THE COMPUTERS ARE GAME TIME.** `rednet.receive`'s timeout is a tick timer, so at
 `/tick rate 200` a six-second reply window is 0.6 real seconds and "pathfinder did not answer" came
 back (36 in ten minutes) while MapServer answered everything it heard in 0-2 ms. `PATH_REPLY_S` is
