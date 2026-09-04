@@ -910,11 +910,22 @@ end
 -- hauls as often as scouts and left ore and wood standing while a scout sat idle. Miners mine; caches
 -- come home on whoever else has fuel (the user, 2026-09-04: "scouts can help haul"). Everything else
 -- is the plain pick for the task's role.
+-- ...unless the cache is underground. A scout has no pickaxe; sent down the shaft for the cache at
+-- y=8 it was walled in at -503,17,41 with a full tank (D38, 2026-09-04 23:35). Below HAUL_SURFACE_Y
+-- the haul is a miner's.
+local HAUL_SURFACE_Y = 56
 local function pickForTask(p_Task, p_Role, p_Where, p_MinFuel)
     if p_Task.work and p_Task.work.haul then
-        local s_Hauler = pickDrone("scout", p_Where, p_Task.lastFailedBy, p_MinFuel)
-                      or pickDrone("crafter", p_Where, p_Task.lastFailedBy, p_MinFuel)
+        local s_Deep = p_Where ~= nil and tonumber(p_Where.y) ~= nil and p_Where.y < HAUL_SURFACE_Y
+        local s_Hauler
+        if s_Deep then
+            s_Hauler = pickDrone("miner", p_Where, p_Task.lastFailedBy, p_MinFuel)
+        else
+            s_Hauler = pickDrone("scout", p_Where, p_Task.lastFailedBy, p_MinFuel)
+                    or pickDrone("crafter", p_Where, p_Task.lastFailedBy, p_MinFuel)
+        end
         if s_Hauler then return s_Hauler end
+        if s_Deep then return nil, nil, nil, nil end
     end
     return pickDrone(p_Role, p_Where, p_Task.lastFailedBy, p_MinFuel)
 end

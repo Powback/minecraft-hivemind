@@ -154,6 +154,17 @@ test("TaskMan: a haul goes to a free scout before a free miner", function()
     eq(env.DATA.tasks[7].assignedTo, 2, "the scout took it, though the miner was nearer")
 end)
 
+test("TaskMan: a haul from an underground cache goes to a miner, never a scout", function()
+    local env, T = taskManWithFleet({
+        { id = 1, name = "D1", role = "miner", status = "idle", fuel = 1500, pos = { x = -480, y = 64, z = 80 } },
+        { id = 2, name = "D9", role = "scout", status = "idle", fuel = 1500, pos = { x = -480, y = 64, z = 84 } },
+    })
+    env.DATA.tasks = { [8] = { id = 8, name = "haul:-480,8,87", work = { haul = { pos = { x = -480, y = 8, z = 87 } } }, progress = 0, priority = 1 } }
+    local ok = env.OnStartTask(0, { data = { id = 8 } })
+    truthy(ok, "placed")
+    eq(env.DATA.tasks[8].assignedTo, 1, "the miner, though the scout was nearer: a scout cannot dig its way out")
+end)
+
 test("TaskMan.pickDrone offers the job to a drone that can afford it", function()
     local _, T = taskManWithFleet({
         { id = 1, name = "D1", role = "miner", status = "idle", fuel = 1000, pos = { x = 0, y = 64, z = 0 } },
