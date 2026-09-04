@@ -2389,6 +2389,28 @@ async function readStock(onUnreadable: 'empty' | 'throw'): Promise<Record<string
 // than one that never started: the site is validated against the plot registry, the cost is
 // expanded through the recipe graph, and any missing material is CRAFTED first. The build itself is
 // queued to depend on those craft steps, so it cannot begin and stall halfway.
+/**
+ * Which of a floor's squares the shared map already has as solid (any block). Asks MapServer in
+ * chunks that fit a rednet frame; an unanswered chunk counts as "nothing known there", so a map
+ * outage builds too much rather than skipping squares.
+ */
+async function squaresAlreadySolid(
+  blocks: Array<{ dx: number; dy: number; dz: number }>,
+  origin: { x: number; y: number; z: number },
+  ctx: { log: (m: string) => void },
+): Promise<Set<number>> {
+  const built = new Set<number>();
+  const CHUNK = 300;
+  for (let start = 0; start < blocks.length; start += CHUNK) {
+    const slice = blocks.slice(start, start + CHUNK);
+    const positions = slice.map((b) => ({ x: origin.x + b.dx, y: origin.y + b.dy, z: origin.z + b.dz }));
+    const r: any = await bridge.call('MapServer', 'BlocksSolid', { positions }, { timeoutMs: 15000 })
+      .catch((err) => { ctx.log(`tower: BlocksSolid unanswered -- ${(err as Error)?.message ?? err}`); return null; });
+    const solid = luaList<number>(field(r, 'solid')) ?? [];
+    for (const idx of solid) if (typeof idx === 'number') built.add(start + idx - 1);
+  }
+  return built;
+}
 registry.register({
   name: 'order.tower',
   summary: 'Build one floor of the tower, in cobblestone, as a chain of drone-sized build tasks.',
@@ -2431,7 +2453,21 @@ registry.register({
   handler: async (a, ctx) => {
     const spec = specForLevel(a.level);
     const mats = PALETTES[a.palette]!;
-    const blocks = towerFloor(spec, a.level, mats);
+    const planned = towerFloor(spec, a.level, mats);
+    // ONLY THE SQUARES THE MAP DOES NOT ALREADY HAVE. Ordering every square of the blueprint sent
+    // drones to squares other drones had filled hours earlier, to read "occupied"; the floor never
+    // counted as finished because some patch always consumed a brick somewhere, and level 1 took
+    // 3,014 bricks for a floor of ~2,200 without advancing (2026-09-04). A floor with no open square
+    // left returns zero tasks, which is what makes the level advance.
+    const floorOrigin = { x: settlement.base.x, y: settlement.base.y + a.level * spec.floorHeight, z: settlement.base.z };
+    const built = await squaresAlreadySolid(planned, floorOrigin, ctx);
+    const blocks = planned.filter((_, i) => !built.has(i));
+    if (!blocks.length) {
+      ctx.log(`tower level ${a.level}: all ${planned.length} squares already hold a block on the map`);
+      return { dispatched: false, tasks: [], alreadyBuilt: planned.length,
+               message: `level ${a.level}: every square already holds a block on the map -- nothing to queue` };
+    }
+    if (built.size) ctx.log(`tower level ${a.level}: ${built.size} of ${planned.length} squares already built -- not re-ordering them`);
     const cost = floorCost(blocks);
 
     // WHAT THE FLEET CAN ACTUALLY AFFORD, not what the design asks for.

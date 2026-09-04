@@ -952,6 +952,26 @@ end
 -- was taking down the link for everything else.
 local BLOCKAT_PAGE = 400
 
+-- WHICH OF THESE SQUARES ALREADY HOLD A BLOCK. HQ orders a tower floor as every square of the
+-- blueprint; drones then fly to squares other drones filled hours ago to read "occupied", the floor
+-- never counts as finished because some patch always consumes a brick somewhere, and level 1 took
+-- 3,014 bricks for a floor of ~2,200 and still had not advanced (2026-09-04, overnight). The shared
+-- map knows. Positions in, 1-based indices of the solid ones out -- indices, so `false` never has
+-- to survive serialisation.
+function OnBlocksSolid(p_ID, p_Message)
+    local d = p_Message.data or {}
+    local s_Positions = d.positions or {}
+    local s_Solid, s_Known = {}, 0
+    local s_World = PowGPSServer.cachedWorld or {}
+    for i, p in ipairs(s_Positions) do
+        local k = p.x .. ":" .. p.y .. ":" .. p.z
+        local s_Cell = s_World[k]
+        if s_Cell ~= nil then s_Known = s_Known + 1 end
+        if s_Cell == 1 or (m_BlockAt ~= nil and m_BlockAt[k] ~= nil) then s_Solid[#s_Solid + 1] = i end
+        if i % 200 == 0 then breathe("blocks_solid") end   -- a floor is ~2,200 squares
+    end
+    return true, {solid = s_Solid, known = s_Known, asked = #s_Positions}
+end
 function OnBlockAt(p_ID, p_Message)
     local d = p_Message.data or {}
     local s_Offset = tonumber(d.offset) or 0
@@ -1229,6 +1249,7 @@ local m_ServerEvents = {
     FindCaves  = { func = OnFindCaves },
     RegionKnown = { func = OnRegionKnown },
     BlockAt    = { func = OnBlockAt },
+    BlocksSolid = { func = OnBlocksSolid },
     forget = {
         func = OnForget, callable = true,
         params = { match = {} }
