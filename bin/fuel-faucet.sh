@@ -10,16 +10,26 @@ MC=/Users/macback/Projects/minecraft-create121
 CHEST="-475 64 78"
 rc() { (cd "$MC" && docker compose exec -T mc rcon-cli "$1" </dev/null 2>&1 | tr -d '\r' | sed 's/\x1b\[[0-9;]*m//g'); }
 while true; do
-  items=$(rc "data get block $CHEST Items")
-  coal=$(echo "$items" | grep -o 'count: [0-9]*, Slot: [0-9]*b, id: "minecraft:coal"' | awk '{s+=$2} END{print s+0}')
-  used=$(echo "$items" | grep -o 'Slot: [0-9]*b' | grep -o '[0-9]*' | tr '\n' ' ')
-  added=0
+  # Coal across the whole bay row: the first chest filled with stone overnight and the faucet sat
+  # saying "added 0" for hours while the fleet ran down. Count coal in every chest of the row and
+  # put new stacks into whichever has free slots.
+  coal=0; added=0
+  for x in -480 -479 -478 -477 -476 -475 -474; do
+    items=$(rc "data get block $x 64 78 Items"); echo "$items" | grep -q 'block data' || continue
+    c=$(echo "$items" | grep -o 'count: [0-9]*, Slot: [0-9]*b, id: "minecraft:coal"' | awk '{s+=$2} END{print s+0}')
+    coal=$((coal + c)); sleep 0.3
+  done
   if [ "$coal" -lt "$TARGET" ]; then
     need=$(( (TARGET - coal + 63) / 64 ))
-    for s in $(seq 0 26); do
+    for x in -476 -475 -477 -478 -479 -480 -474; do
       [ $need -le 0 ] && break
-      echo " $used " | grep -q " $s " && continue
-      sleep 1; rc "item replace block $CHEST container.$s with minecraft:coal 64" >/dev/null; added=$((added+64)); need=$((need-1))
+      items=$(rc "data get block $x 64 78 Items"); echo "$items" | grep -q 'block data' || continue
+      used=$(echo "$items" | grep -o 'Slot: [0-9]*b' | grep -o '[0-9]*' | tr '\n' ' ')
+      for s in $(seq 0 26); do
+        [ $need -le 0 ] && break
+        echo " $used " | grep -q " $s " && continue
+        sleep 1; rc "item replace block $x 64 78 container.$s with minecraft:coal 64" >/dev/null; added=$((added+64)); need=$((need-1))
+      done
     done
   fi
   revived=""
