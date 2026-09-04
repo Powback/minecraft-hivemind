@@ -31,6 +31,17 @@ while true; do
         sleep 1; rc "item replace block $x 64 78 container.$s with minecraft:coal 64" >/dev/null; added=$((added+64)); need=$((need-1))
       done
     done
+    # EVERY SLOT FULL (2026-09-05: 0 free slots, 6,040 stone on the shelf, coal stuck at 241 under the
+    # 256 reserve, so ShelfAllowance handed out nothing and the tower paused "for fuel"). Overwrite
+    # stone stacks with coal -- the one thing the shelf has too much of becomes the one thing it lacks.
+    for x in -476 -475 -477 -478 -479 -480 -474; do
+      [ $need -le 0 ] && break
+      items=$(rc "data get block $x 64 78 Items"); echo "$items" | grep -q 'block data' || continue
+      for s in $(echo "$items" | grep -o '{count: [0-9]*, Slot: [0-9]*b, id: "minecraft:\(stone\|cobblestone\)"}' | grep -o 'Slot: [0-9]*' | grep -o '[0-9]*'); do
+        [ $need -le 0 ] && break
+        sleep 1; rc "item replace block $x 64 78 container.$s with minecraft:coal 64" >/dev/null; added=$((added+64)); need=$((need-1))
+      done
+    done
   fi
   revived=""
   dump=$(rc "computercraft dump")
