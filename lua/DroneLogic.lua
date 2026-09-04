@@ -7358,21 +7358,12 @@ function RelieveBody(d)
     end
     s_X, s_Y, s_Z = s_Fx, s_Fy, s_Fz
 
-    local s_Dropped = 0
-    eachCarriedSlot(function(i, s_N)
-        -- HandTo, NOT PutDown. PutDown refuses to drop unless ContainerBelow() says there
-        -- is a chest or barrel underneath -- and what is underneath a rescue is a DRONE, so
-        -- it returned false every single time. Fuel relief has therefore never delivered
-        -- anything in the history of this fleet: the rescuer flew out with 64 coal, hovered
-        -- over the casualty, refused its own handover, and flew home still carrying it,
-        -- reporting "arrived but dropped nothing" -- which read as a navigation fault and
-        -- sent us looking at positions for hours.
-        --
-        -- HandTo exists for exactly this case and its own comment claims "the fuel relief
-        -- already solved this shape". It did not; HandTo was generalised from a manoeuvre
-        -- that was broken. This is the call site that was supposed to be using it.
-        if isFuelSelected(i) and HandTo() then s_Dropped = s_Dropped + s_N end
-    end)
+    -- A casualty with every slot full cannot take the fuel: D37 sat at 0 fuel with 16 stacks of
+    -- cobble aboard and four reliefs in a row "arrived but dropped nothing". A turtle is an
+    -- inventory: take one stack out of it, then hand the fuel down. HandTo exists for exactly
+    -- this manoeuvre; this is its call site.
+    local s_Dropped = HandFuelDown()
+    if s_Dropped == 0 and MakeRoomBelow() then s_Dropped = HandFuelDown() end
     if s_Dropped == 0 then return nil, "arrived but dropped nothing" end
 
     trace(("relieve: dropped %d fuel onto %s"):format(s_Dropped, tostring(d.drone or "?")))
@@ -7381,6 +7372,28 @@ function RelieveBody(d)
     return {message = ("delivered %d fuel"):format(s_Dropped), dropped = s_Dropped}
 end
 
+-- Hand every fuel stack aboard down to the turtle below; returns how many items went.
+function HandFuelDown()
+    local s_Dropped = 0
+    eachCarriedSlot(function(i, s_N)
+        if isFuelSelected(i) and HandTo() then s_Dropped = s_Dropped + s_N end
+    end)
+    return s_Dropped
+end
+-- Pull one stack out of the turtle below so a drop can land. Needs a free slot of our own.
+function MakeRoomBelow()
+    local ok, blk = turtle.inspectDown()
+    if not ok or type(blk) ~= "table" or blk.name == nil or blk.name:find("turtle") == nil then return false end
+    if FreeSlots() == 0 then return false end
+    for i = 1, 16 do
+        if turtle.getItemCount(i) == 0 then turtle.select(i) break end
+    end
+    -- lua-hygiene: allow (the thing below is a DRONE, verified above -- TakeFromChest is for chests)
+    local s_Took = turtle.suckDown()
+    turtle.select(1)
+    if s_Took then trace("relieve: the casualty was full -- took one stack out of it to make room for the fuel") end
+    return s_Took
+end
 function OnRelieve(p_ID, p_Message)
     return RunJob("Relieve", p_Message.data,
         {status = "hauling", travel = false, settle = false, deposit = false}, function(d)
