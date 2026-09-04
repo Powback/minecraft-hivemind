@@ -418,6 +418,22 @@ since: tower level 0 with 67 blocks placed all day, 546 stone bricks and 121 cob
 are not being built.** The economy is not fuel-positive at 1.2-2.8 fuel per block with trees 40-60
 blocks out, and no amount of scheduler correctness changes that; the grove and the movement cost do.
 
+**THE MONITOR IS A COMPOSE SERVICE NOW: `hive-fleet-watch`** (`hq/watch/`, `docker compose logs -f
+fleet-watch`). `bin/fleet-watch.sh` run as a terminal background task died with the session at
+03:38 on 2026-09-04 and nobody knew for ten hours; the service polls HQ on the compose network
+and raises alarm-class faults in-game over RCON on the game server's network (`.env` holds the
+password, gitignored). Two lessons from the same morning: `pkill -f` with a pattern that includes
+the arguments misses the copies started with different arguments -- twelve fuel faucets were
+running at once; and a script that fetches from INSIDE a container is right to say localhost.
+
+**A DRONE THAT REPORTS BUSY AND DOES NOT MOVE IS NOT BUSY.** `OnGoTo` and `OnSurvey` set
+`executing` without RunJob's `finish`; an early return left it set, the heartbeat reported "busy"
+with a detail line from a job hours gone, every dispatch was refused, and TaskMan -- which only
+reclaimed idle or fuel-less drones -- logged "reclaim? held by 58: busy" every 15 s for 44 minutes
+with three drones docked. Both sides are fixed: `ClearStuckExecuting` clears a job-less flag after
+300 game seconds without movement, and TaskMan's `heldForNothing` reclaims from a drone that has
+not moved for three real minutes whatever it reports.
+
 **A monitor that prints to a file is not a monitor.** `bin/fleet-watch.sh` logged 79 fault changes
 that night -- `FUEL SPIRAL`, `OUT OF FUEL` for six drones -- into a background task file nobody was
 reading, and the sentinel counted 20,059 "self-resolved" incidents. Neither reached a person. A
