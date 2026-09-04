@@ -594,6 +594,14 @@ test("DroneLogic.FetchSkip: fetches search networked chests, never caches", func
     falsy(env.FetchSkip({ pos = {}, peripheral = "minecraft:chest_2", items = { ["minecraft:coal"] = 3 } }, wantsCoal), "a chest known to hold it is searched")
 end)
 
+test("DroneLogic.FuelAllowsAnotherTarget: a gather leaves when the tank is the trip home plus one approach", function()
+    local env, D = loadModule("DroneLogic.lua", { fuel = 500, pos = { x = 10, y = 64, z = 0 } })
+    D.setHome({ x = 0, y = 64, z = 0 })                    -- floor 150 here
+    truthy(env.FuelAllowsAnotherTarget(), "500 > 150 + 60")
+    env.__world.turtle.fuel = 200
+    falsy(env.FuelAllowsAnotherTarget(), "200 is not 150 + 60")
+end)
+
 test("DroneLogic.FellTargets stops at an abort and when the tank is the trip home", function()
     local env, D = loadModule("DroneLogic.lua", { fuel = 500, pos = { x = 10, y = 64, z = 0 } })
     D.setHome({ x = 0, y = 64, z = 0 })                    -- floor 150 here

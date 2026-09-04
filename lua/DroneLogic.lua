@@ -5060,6 +5060,20 @@ end
 --
 -- Blocks are approached from ABOVE and dug downward: a turtle cannot occupy the target, and the
 -- space above it is the one position reachable for anything with air over it.
+-- A GATHER STOPS ITSELF AT THE FLOOR. It had no fuel check of its own: the watchdog was the only
+-- stop, and the watchdog's remedy -- fly home from underground, no GPS, through unknown rock -- cost
+-- more than the floor had allowed for. D37: "JOB Gather INTERRUPTED (1004 fuel spent)", then
+-- "fuel at 0 (floor 342)" four times in a row (2026-09-04 23:20). The next candidate is worth up to
+-- an approach on top of the trip home; below that, bank what was taken. A global: this file is at
+-- Lua's 200-local limit.
+function FuelAllowsAnotherTarget()
+    local f = turtle.getFuelLevel()
+    return type(f) ~= "number" or f > FuelFloorNow() + 60
+end
+-- The gather loop's continue condition, in one place: checks left, not aborted, fuel for one more.
+function GatherMayContinue(p_Checked, p_MaxChecks)
+    return p_Checked < p_MaxChecks and executing and FuelAllowsAnotherTarget()
+end
 function OnGather(p_ID, p_Message)
     return RunJob("Gather", p_Message.data,
         {status = "mining", travel = false, settle = false}, function(d)
@@ -5117,7 +5131,7 @@ function OnGather(p_ID, p_Message)
         -- blocked on GPS timeouts indistinguishable from one mining happily. Throttled, because one
         -- line per candidate would be hundreds.
         local s_LastTrace = 0
-        while #s_Queue > 0 and s_Got < s_Limit and s_Checked < s_MaxChecks and executing do
+        while #s_Queue > 0 and s_Got < s_Limit and GatherMayContinue(s_Checked, s_MaxChecks) do
             s_Checked = s_Checked + 1
 
             -- NEAREST FIRST, not last-pushed.
