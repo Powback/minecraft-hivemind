@@ -2111,7 +2111,12 @@ async function collectFieldCaches(
   // A cache a drone has already read as EMPTY is not worth a trip; one nobody has read yet is.
   const holdsSomething = (q: any) =>
     q.items == null || Object.values(q.items as Record<string, unknown>).some((n) => Number(n) > 0);
-  const caches = points.filter((q: any) => q?.pos && !q.peripheral && withinReach(q.pos) && holdsSomething(q));
+  // SURFACE CACHES ONLY, IN EVERY MODE. A cache at y=8 is reached through a mine shaft the pathfinder
+  // does not know; the side approach tunnelled toward it and D31 logged "approach: 784 fuel spent on
+  // the sides of -480,8,87 -- giving it up as unreachable" (2026-09-04). Underground caches come up
+  // with the miner that filled them, or not at all.
+  const surface = (q: any) => q.pos.y >= settlement.base.y - 4;
+  const caches = points.filter((q: any) => q?.pos && !q.peripheral && withinReach(q.pos) && surface(q) && holdsSomething(q));
   if (!caches.length) return null;
 
   // Furthest first: those are the ones a drone would otherwise refuse to haul from, and the ones
@@ -2133,7 +2138,7 @@ async function collectFieldCaches(
   // now reports what it leaves, so a cache worth a trip becomes known the first time it is read.
   const holdsFuel = (q: any) => q.items != null && Object.entries(q.items as Record<string, unknown>)
     .some(([n, c]) => BURNABLE.test(n) && Number(c) > 0);
-  const usable = emergency ? caches.filter((q: any) => q.pos.y >= b.y - 4 && holdsFuel(q)) : caches;
+  const usable = emergency ? caches.filter((q: any) => holdsFuel(q)) : caches;
   if (!usable.length) return null;
   // And a cache a drone has SEEN burnable in outranks distance while fuel is short: the one at
   // -520,63,34 was observed holding 64 coal, and it was fourth in line behind three near-base
