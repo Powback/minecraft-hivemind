@@ -761,3 +761,25 @@ Fixed without bans or zones (the user: "base is mutable, drones just shouldn't b
 
 Do not "fix" digging by protecting materials or fencing the footprint. The planner's price and the
 order of asks are the controls.
+
+## The loops of 2026-09-05, and what each one was
+
+Every one was found by `JitterWatch` (heartbeat) and, from 00:43, by its "moved by <file:line>"
+tally in pgps. Do not diagnose a bouncing drone from its position trail; read the JITTER line.
+
+| what the user saw | cause | fix |
+|---|---|---|
+| tower floors shredded | planner priced a dug cell like air; TravelTo asked for a digging plan first under 32 blocks; straight hops (<=3) dug up/down/forward raw; blind climbs dug straight up | `DIG_STEP_COST` 12, open route first, straight hop never digs, `RouteUpTo` before any blind climb |
+| D4 "stepping back and forth from the furnace" | chest full; idle loop deposited every 15 s, unloaded nothing | `NoteDepositOutcome` -> 10-min backoff |
+| D39 move/turn/move/turn at a face | mid-job deposit unloaded nothing, returned true, mining loop went back to the face | `RoomAfterUnload` fails the deposit, job ends |
+| D31 spinning at the bay, 0 moves | 0 fuel; every refused leg still turned to face it | `moveTo` refuses at 0 fuel before turning; `RefuelAtStorage` holds still |
+| D38 patch "done" with nothing placed | job started while the heartbeat's fuel trip held the travel lock; 32 squares skipped as "another routine is moving" | `RunBodyWhenFree` waits/fails; `FailIfNothingReached`; top-up reports "refuelling" |
+| crafter aborted mid-craft | jitter watch counted chest-hopping (6 cells) as a loop | crafting exempt, `maxCells` 4 |
+
+Repairs: `repairLowerFloors` (HQ) re-orders every finished level every 10 min; lower-level patches
+are repairs, not stale. Storage: HQ reuses the one pending storage plot and retired the 50 others;
+`order.build chest-row` on it is what was missing.
+
+The visualizer the user means is `~/Projects/McWebViewer` (http://mcwebviewer.pow), not HQ's
+`/map`. Its bridge needs `MCWV_RCON_PASSWORD` in its `.env` equal to `rcon.password` in
+`minecraft-create121/data/server.properties`, and `MCWV_FLUSH_ENABLE=1` or the map goes stale.
