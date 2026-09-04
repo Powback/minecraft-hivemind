@@ -776,5 +776,27 @@ test("DroneLogic: a crafter shuttling between the bay's chests is work, not jitt
     eq(s_Broken, 0, "six cells of chest-hopping is never a loop")
 end)
 
+
+test("DroneLogic: a deposit that unloads nothing backs off instead of retrying every tick", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.NoteDepositOutcome(327, 100)
+    eq(env.DepositBackoffUntil, 0, "unloading some is progress -- no backoff")
+    env.NoteDepositOutcome(327, 327)
+    truthy(env.DepositBackoffUntil > env.os.clock(), "unloading nothing sets a backoff")
+end)
+
+test("DroneLogic: a job body waits for the travel lock and fails honestly when it stays held", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.TRAVEL_WAIT_S = 0
+    local s_Ran = false
+    eq(env.RunBodyWhenFree(function() s_Ran = true return "ok" end, {}), "ok", "free: the body runs")
+    truthy(s_Ran, "ran")
+    env.TravelOwner = coroutine.create(function() coroutine.yield() end)   -- alive, not us
+    env.TravelSince = env.os.clock()
+    local ok, err = pcall(env.RunBodyWhenFree, function() return "ok" end, {})
+    eq(ok, false, "held: the body does not run")
+    truthy(tostring(err):find("kept the drone moving", 1, true) ~= nil, "and the reason names the lock: " .. tostring(err))
+end)
+
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))
 os.exit(failed == 0 and 0 or 1)

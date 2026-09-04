@@ -2243,6 +2243,18 @@ async function collectFieldCaches(
   return { acted: true, reason: `queued a haul from the cache at ${where}` };
 }
 
+/** Keep one pending storage plot (its name is returned for reuse) and retire the rest. */
+function retireExtraStoragePlots(p_Pending: any[]): string | undefined {
+  if (!p_Pending.length) return undefined;
+  const keep = p_Pending[0].name;
+  if (p_Pending.length > 1) {
+    const before = city.plots.length;
+    (city as any).plots = (city.plots as any[]).filter((p) => !(p.purpose === 'storage' && p.status !== 'active' && p.name !== keep));
+    saveCity();
+    note(`storage: retired ${before - city.plots.length} pending storage plot(s) nobody was building; keeping ${keep}`);
+  }
+  return keep;
+}
 async function expandStorageIfFull(
   live: any[], queued: Set<string>,
 ): Promise<{ acted: boolean; reason: string } | null> {
@@ -2269,13 +2281,16 @@ async function expandStorageIfFull(
   // chests to build it from, the next tick allocated another: 52 storage plots "clearing" by the
   // evening of 2026-09-04, none built. The unfinished one is the expansion; wait for it.
   const pending = (city.plots as any[]).filter((p) => p.purpose === 'storage' && p.status !== 'active');
-  if (pending.length) {
-    note(`storage down to ${free} free slot(s) -- ${pending.length} storage plot(s) already ${pending[0].status}; not allocating more`);
-    return null;
-  }
-  note(`storage down to ${free} free slot(s) -- expanding before everything jams behind it`);
+  // A PENDING PLOT IS ONLY PROGRESS IF SOMETHING IS BUILDING IT. This used to stop here whenever
+  // a storage plot was not yet active -- and 51 of them sat "clearing" for a day while the shelf
+  // held 0 free slots, because the one chest-row build that existed had vanished from TaskMan and
+  // nothing ever ordered another. Now: reuse the first pending plot (the build task is what was
+  // missing, not the land), and retire every other pending storage plot -- nothing references
+  // them and each one would have been another reason to do nothing.
+  const reuse = retireExtraStoragePlots(pending);
+  note(`storage down to ${free} free slot(s) -- ${reuse ? `re-ordering the chest-row on ${reuse}` : 'expanding'} before everything jams behind it`);
   try {
-    const r: any = await callTool('order.build', { blueprint: 'chest-row' });
+    const r: any = await callTool('order.build', { blueprint: 'chest-row', ...(reuse ? { plot: reuse } : {}) });
     if (r?.ok === false) {
       note(`storage expansion refused -- ${r?.error ?? '?'}`);
       return null;

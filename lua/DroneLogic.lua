@@ -216,6 +216,42 @@ end
 -- minutes reporting busy with a job's detail line from hours before, each holding a tower patch
 -- TaskMan could not reclaim (2026-09-04). A GoTo or Survey that ended on a path without TaskEnd
 -- is the way in; this, called from the heartbeat, is the way out.
+-- A JOB DOES NOT START WHILE ANOTHER ROUTINE IS DRIVING. The heartbeat's fuel top-up holds the
+-- travel lock while it flies to the shelf, and TaskMan -- told the drone was idle -- handed D38 a
+-- build in the middle of it. Every one of the 32 squares answered "another routine is already
+-- moving the drone", all 32 were skipped in 0.05s, and the patch was reported DONE with nothing
+-- placed. Wait for the lock; if it is still held after TRAVEL_WAIT_S the job fails honestly and
+-- TaskMan requeues it.
+TRAVEL_WAIT_S = 60
+function RunBodyWhenFree(p_Body, p_Data)
+    local s_Began = os.clock()
+    while TravelIsBusy() do
+        if os.clock() - s_Began >= TRAVEL_WAIT_S then
+            error(("another routine kept the drone moving for %ds -- taken at %s"):format(
+                TRAVEL_WAIT_S, tostring(TravelTakenAt or "?")), 0)
+        end
+        os.sleep(1)
+    end
+    return p_Body(p_Data)
+end
+
+-- A DEPOSIT THAT UNLOADS NOTHING IS NOT RETRIED EVERY TICK. With the shelf at 0 free slots, D4
+-- flew to a full chest, "arrived, unloading", unloaded nothing, went idle, was told it still held
+-- 327 items, and flew back -- 262 moves between two cells in one jitter window, the "stepping
+-- back and forth from the furnace" the user watched. Full is full; try again in ten minutes and
+-- say so once.
+DEPOSIT_BACKOFF_S = 600
+DepositBackoffUntil = 0
+function WantsDepositNow(p_Cargo)
+    return p_Cargo > 0 and os.clock() >= DepositBackoffUntil
+end
+function NoteDepositOutcome(p_Before, p_After)
+    if p_After < p_Before then return end
+    DepositBackoffUntil = os.clock() + DEPOSIT_BACKOFF_S
+    trace(("deposit unloaded nothing -- storage has no room; holding %d item(s) and trying again in %ds")
+        :format(p_After, DEPOSIT_BACKOFF_S))
+end
+
 -- A DRONE THAT KEEPS MOVING WITHOUT GETTING ANYWHERE IS STUCK, AND NOTHING SAID SO.
 --
 -- D37 spent minutes stepping between y=22 and y=25 in one column; D31 rode up and down the storage
@@ -4831,7 +4867,7 @@ local function RunJobNow(p_Name, p_Data, p_Opts, p_Body)
     -- happened, and the shortfall surfaces much later as something inexplicable.
     --
     -- So both conventions are honoured: throwing reports, and returning nil/false reports.
-    local s_Ret = table.pack(pcall(p_Body, d))
+    local s_Ret = table.pack(pcall(RunBodyWhenFree, p_Body, d))
     if not s_Ret[1] then
         -- A job that throws must report, not vanish: the drone is left somewhere unexpected and
         -- somebody has to know why.
@@ -6533,6 +6569,13 @@ end
 function noteSkip(p_Tally, p_Reason)
     p_Tally[p_Reason] = (p_Tally[p_Reason] or 0) + 1
 end
+-- A build that reached none of its squares built nothing, and "done" would tell TaskMan the
+-- opposite (D38: 32 squares skipped for "no route" in 0.05s, patch marked complete).
+function FailIfNothingReached(p_Placed, p_Total, p_Why)
+    if p_Placed > 0 or p_Total == 0 then return end
+    if (p_Why["no route to the square"] or 0) < p_Total then return end
+    error(("could not reach any of the %d squares -- nothing was built"):format(p_Total), 0)
+end
 
 function alreadyThatBlock(p_What, p_Item)
     if p_What == nil then return false end
@@ -6815,6 +6858,7 @@ function OnBuild(p_ID, p_Message)
         -- Throw instead. The patch goes back on the queue and the coordinates already placed are
         -- memoised, so the retry finishes the remainder rather than starting over.
         reportSkips(s_Why)
+        FailIfNothingReached(s_Placed, #s_Blocks, s_Why)
         return {message = ("built %d of %d blocks (%d skipped)")
                     :format(s_Placed, #s_Blocks, s_Skipped),
                 placed = s_Placed, skipped = s_Skipped, total = #s_Blocks}
@@ -8971,6 +9015,7 @@ function TopUpWhileIdle()
     -- 482 fuel and flew to the empty shelf every 15 s, 14-34 fuel a time, down to 179 (2026-09-04).
     -- An idle drone is not stranding; it waits for the shelf to report something.
     if s_F == "unlimited" or s_F >= REFUEL_TARGET or StorageKnownDry(nil) then return false end
+    m_Status = "refuelling"        -- not idle: TaskMan must not hand this drone a job mid-flight
     Tried("top up while idle", RefuelAtStorage)
     m_Status = "idle"
     return true
@@ -9053,12 +9098,13 @@ local function idleDockLoop()
                 -- of them. Whatever put the drone in this state, carrying it into a park is always
                 -- wrong, and here is the one place every idle drone passes through.
                 local s_Cargo = CarriedCount()
-                if s_Cargo > 0 then
+                if WantsDepositNow(s_Cargo) then
                     trace(("idle while holding %d item(s) -- depositing before parking"):format(s_Cargo))
                     -- Stock inside a drone is invisible to planning, so a failed deposit hides the
                     -- cargo from every supply decision while the log says it was put away.
                     Tried("deposit the load before parking", Deposit)
                     s_IdleSince = nil
+                    NoteDepositOutcome(s_Cargo, CarriedCount())
                 end
 
                 local f = turtle.getFuelLevel()
