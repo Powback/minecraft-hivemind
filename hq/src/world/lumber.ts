@@ -22,7 +22,7 @@
  * this project has now been bitten by four times: when a question matters to more than one file,
  * it gets exactly one answer.
  */
-import { withinReach } from './settlement.js';
+import { withinReach, settlement } from './settlement.js';
 import { field } from '../lua-table.js';
 
 /** How far a single sweep reaches from its start, in blocks. */
@@ -50,7 +50,10 @@ async function knownTrunks(
     { match, limit: 400 }, { timeoutMs: 15000 });
   const hits = field(found, 'hits') ?? [];
   const list = Array.isArray(hits) ? hits : Object.values(hits ?? {});
-  return (list as any[]).filter((h: any) => h && typeof h.x === 'number' && withinReach(h));
+  // SURFACE WOOD ONLY. An oak_log at y=19 is a mineshaft beam; a lumber job was sent to one
+  // (2026-09-04) and the drone would have had to tunnel 45 blocks down for a single log.
+  const surface = (h: any) => typeof h.y !== 'number' || h.y >= settlement.base.y - 4;
+  return (list as any[]).filter((h: any) => h && typeof h.x === 'number' && withinReach(h) && surface(h));
 }
 
 /**
