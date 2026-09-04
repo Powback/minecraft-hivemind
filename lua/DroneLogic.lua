@@ -1361,12 +1361,16 @@ local SHORT_HOP = 32
 -- order, in the function the gather actually calls per candidate.
 --
 -- Its own function so ApproachFromSide keeps its shape and the complexity gate stays quiet.
+-- THE LAST STRETCH IS A FEW BLOCKS, NOT A SHAFT. An unbounded digTo here tunnelled 56 blocks toward a
+-- cache at y=8 and cost 784 fuel before the side-approach cap could even be consulted (2026-09-04).
+-- A global: this file is at Lua's 200-local limit.
+APPROACH_DIG_MAX = 24
 local function reachAdjacent(p_X, p_Y, p_Z, p_Budget)
     local s_Cx, s_Cy, s_Cz = pgps.getCachedPosition()
     local s_Near = s_Cx ~= nil and
         (Blocks(s_Cx, s_Cy, s_Cz, p_X, p_Y, p_Z)) <= SHORT_HOP
     if s_Near and CanDig() then
-        local s_Dug = pgps.digTo(p_X, p_Y, p_Z)
+        local s_Dug = pgps.digTo(p_X, p_Y, p_Z, APPROACH_DIG_MAX)
         if s_Dug ~= false then return s_Dug end
     end
     if s_Near then
@@ -1379,7 +1383,7 @@ local function reachAdjacent(p_X, p_Y, p_Z, p_Budget)
     -- bounces on them for its whole budget. A miner digs leaves for free (no fuel, and saplings drop),
     -- so it tunnels the last stretch; the flight is the tool-less drone's last resort.
     if CanDig() then
-        local s_Dug = pgps.digTo(p_X, p_Y, p_Z)
+        local s_Dug = pgps.digTo(p_X, p_Y, p_Z, APPROACH_DIG_MAX)
         if s_Dug ~= false then return s_Dug end
     end
     return pgps.flyTo(p_X, p_Y, p_Z, p_Budget or 64)
@@ -6793,6 +6797,27 @@ end
 -- sweeps the other chests when the answer is wrong, and stops as soon as it holds enough to be
 -- useful. It exists precisely because this logic kept being rewritten, and this was the fifth copy
 -- -- the one that looked in the wrong place.
+-- The shelf keeps SHELF_RESERVE burnable from any drone that is above its floor; a drone below its
+-- floor may take what it needs to live. A global: this file is at Lua's 200-local limit.
+-- How much burnable the shelf holds, by asking StorageMan -- nil when it did not answer, which is
+-- not "none". A global: this file is at Lua's 200-local limit.
+function ShelfBurnable()
+    local s_Stock = PowNet.sendAndWaitForResponse("StorageMan",
+        PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "GetStock", {}), PowNet.SERVER_PROTOCOL)
+    if type(s_Stock) ~= "table" or type(s_Stock.detail) ~= "table" then return nil end
+    local s_Burnable = 0
+    for _, e in pairs(s_Stock.detail) do
+        if type(e) == "table" and (FUEL_NAMES[e.name] or IsBurnableWood(e.name)) then
+            s_Burnable = s_Burnable + (tonumber(e.count) or 0)
+        end
+    end
+    return s_Burnable
+end
+function ShelfReserveKeeps(p_Burnable)
+    local SHELF_RESERVE = 192
+    local s_F = turtle.getFuelLevel()
+    return type(s_F) == "number" and s_F >= FuelFloorNow() and (tonumber(p_Burnable) or 0) <= SHELF_RESERVE
+end
 local function CollectFuel()
     -- ASK BEFORE FLYING. FetchItems flies to the chest that last held fuel, finds it empty, and
     -- sweeps the bay -- 14 to 59 fuel per attempt, measured on four drones the night the shelf sat
@@ -6800,19 +6825,12 @@ local function CollectFuel()
     -- indexes every networked chest for every other question; one network call answers this one
     -- for nothing, and a "no" marks the shelf dry so nobody else asks with their tank for a while.
     -- A failed call falls through to the old path: no answer is not "no fuel".
-    local s_Stock = PowNet.sendAndWaitForResponse("StorageMan",
-        PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "GetStock", {}), PowNet.SERVER_PROTOCOL)
-    if type(s_Stock) == "table" and type(s_Stock.detail) == "table" then
-        local s_Burnable = 0
-        for _, e in pairs(s_Stock.detail) do
-            if type(e) == "table" and (FUEL_NAMES[e.name] or IsBurnableWood(e.name)) then
-                s_Burnable = s_Burnable + (tonumber(e.count) or 0)
-            end
-        end
-        if s_Burnable == 0 then
-            m_StorageDryAt = os.clock()
-            return 0, "storage had nothing burnable (asked over the network, did not fly)"
-        end
+    local s_Burnable = ShelfBurnable()
+    if s_Burnable == 0 then
+        m_StorageDryAt = os.clock()
+        return 0, "storage had nothing burnable (asked over the network, did not fly)"
+    elseif s_Burnable ~= nil and ShelfReserveKeeps(s_Burnable) then
+        return 0, ("storage holds %d burnable, all of it reserve (did not fly)"):format(s_Burnable)
     end
     -- UNLOAD BEFORE LOADING.
     --
@@ -9576,6 +9594,7 @@ if HiveMindTest then
         setHome = function(p) m_HomePos = p end,
         setRelieving = function(v) m_Relieving = v end,
         setExecuting = function(v) executing = v end,
+        collectFuel = CollectFuel,
     }
 end
 parallel.waitForAny(table.unpack(s_Fns))

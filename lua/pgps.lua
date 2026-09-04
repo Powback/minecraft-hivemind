@@ -2111,6 +2111,7 @@ end
 -- way -- digging is a PASSABILITY MODE, not a different way of travelling. digTo used to be a
 -- separate greedy axis-walker that consulted no map at all, which is why a drone could walk into the
 -- same chest for ever no matter how many times the fleet recorded it.
+local PATH_REPLY_S = 6
 local function moveLeg(_targetX, _targetY, _targetZ, _targetDir, changeDir, discover, p_Dig)
     changeDir = changeDir or false
     local s_Replans, s_Stalls, s_BestDist = 0, 0, nil
@@ -2172,7 +2173,13 @@ local function moveLeg(_targetX, _targetY, _targetZ, _targetDir, changeDir, disc
         -- because that is the shape OnGetPath already reads.
         local s_Request = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "GetPath",
             {cachedX, cachedY, cachedZ, _targetX, _targetY, _targetZ, discover, nil, p_Dig and true or nil})
-        local s_Response = PowNet.sendAndWaitForResponse("MapServer", s_Request)
+        -- SIX SECONDS, NOT ONE. PowNet's default reply window is REDNET_TIMEOUT = 1 s of real time.
+        -- A* on MapServer yields every 200 nodes and may expand 20,000, i.e. up to a hundred ticks of
+        -- yields before it answers, behind whatever else the one computer is doing for six other
+        -- drones. Nineteen "did not answer" in ten minutes were requests that were still being worked
+        -- when the drone gave up and flew blind instead (2026-09-04). Waiting costs nothing; the
+        -- blind flight cost the fuel.
+        local s_Response = PowNet.sendAndWaitForResponse("MapServer", s_Request, nil, PATH_REPLY_S)
         if (not s_Response) then
             -- SAY IT OUT LOUD, AND DO NOT KEEP GRINDING.
             --

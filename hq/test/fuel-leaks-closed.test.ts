@@ -63,8 +63,9 @@ describe('fuel-economy invariants that are about shape', () => {
   // HQ: the supply tick's functions are not exported for calling yet. Until they are, two decisions
   // are pinned by shape: no miner goes underground during a fuel emergency, and a haul from a cache
   // known to hold burnable is NAMED as fuel work so TaskMan ranks it as such.
-  it('HQ does not send a miner underground during a fuel emergency', () => {
-    expect(supply).toMatch(/\/_ore\$\/\.test\(rule\.match\) && \(await fuelEmergency\(\)\) === true/);
+  it('HQ does not send a miner underground for a non-fuel ore during a fuel emergency -- coal goes', () => {
+    expect(supply).toMatch(/oreWaitsForFuel\(rule\.match\) && \(await fuelEmergency\(\)\) === true/);
+    expect(supply).toMatch(/return \/_ore\$\/\.test\(match\) && !producesFuel\(match\)/);
   });
 
   it('a haul from a cache holding fuel is named as fuel work', () => {

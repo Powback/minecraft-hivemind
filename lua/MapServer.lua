@@ -376,9 +376,33 @@ function OnLoadWorld(p_ID, p_Message)
                   next = (s_Next < s_N) and s_Next or nil}
 end
 
+-- COUNT THE PATHS, NOT JUST THE COMPLAINTS. Drones log "pathfinder did not answer" and "no path",
+-- and nothing logged a success, so "how many pathfinds fail?" had no answer (2026-09-04: 19 timeouts
+-- and one refusal in ten minutes, out of an unknown total). Every request lands here; tally it and
+-- print the tally once a minute so the rate is a number in MapServer.log.
+local m_PathStats = {asked = 0, ok = 0, failed = 0, why = {}, ms = 0, worstMs = 0, since = os.clock()}
+local function notePath(p_Ok, p_Why, p_Ms)
+    m_PathStats.asked = m_PathStats.asked + 1
+    m_PathStats.ms = m_PathStats.ms + p_Ms
+    if p_Ms > m_PathStats.worstMs then m_PathStats.worstMs = p_Ms end
+    if p_Ok then m_PathStats.ok = m_PathStats.ok + 1
+    else
+        m_PathStats.failed = m_PathStats.failed + 1
+        local k = tostring(p_Why or "?"):gsub("%d+", "N")
+        m_PathStats.why[k] = (m_PathStats.why[k] or 0) + 1
+    end
+    if os.clock() - m_PathStats.since >= 60 then
+        local s_Parts = {}
+        for k, v in pairs(m_PathStats.why) do s_Parts[#s_Parts + 1] = v .. "x " .. k end
+        Log(("paths: %d asked, %d ok, %d failed [%s], avg %dms, worst %dms")
+            :format(m_PathStats.asked, m_PathStats.ok, m_PathStats.failed, table.concat(s_Parts, "; "),
+                    m_PathStats.asked > 0 and math.floor(m_PathStats.ms / m_PathStats.asked) or 0,
+                    m_PathStats.worstMs))
+        m_PathStats = {asked = 0, ok = 0, failed = 0, why = {}, ms = 0, worstMs = 0, since = os.clock()}
+    end
+end
 function OnGetPath(p_ID, p_Message)
-    print(p_ID)
-    print("Get Path")
+    local s_T0 = os.epoch("utc")
     local x1 = p_Message.data[1]
     local y1 = p_Message.data[2]
     local z1 = p_Message.data[3]
@@ -392,12 +416,10 @@ function OnGetPath(p_ID, p_Message)
     PowGPSServer.noteDroneAt(p_ID, x1, y1, z1)
     local s_Path, s_Why = PowGPSServer.a_star(x1, y1, z1, x2, y2, z2, discover, priority, p_ID)
     if(s_Path == false) then
-        -- Pass the SEARCH's reason through. "failed to find path" is the same string whether the
-        -- goal was solid, the budget ran out, or there is genuinely no route -- three problems
-        -- with three different fixes, reported identically.
+        notePath(false, s_Why, os.epoch("utc") - s_T0)
         return false, {message = tostring(s_Why or "failed to find path")}
     end
-    print(#s_Path)
+    notePath(true, nil, os.epoch("utc") - s_T0)
     return true, {path = s_Path}
 end
 

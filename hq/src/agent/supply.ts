@@ -779,6 +779,10 @@ async function dispatchSurvey(rule: SupplyRule, have: number, ctx: SupplyCtx): P
   return true;
 }
 
+/** An ore that does not burn waits out a fuel emergency; coal does not wait -- see dispatchRule. */
+function oreWaitsForFuel(match: string): boolean {
+  return /_ore$/.test(match) && !producesFuel(match);
+}
 /** One rule, start to finish. Throwing is contained by the caller so one bad rule cannot end the tick. */
 async function dispatchRule(rule: SupplyRule, have: number, ctx: SupplyCtx): Promise<boolean> {
   if (rule.action === 'mine') return dispatchMine(rule, have, ctx);
@@ -798,9 +802,14 @@ async function dispatchRule(rule: SupplyRule, have: number, ctx: SupplyCtx): Pro
   // recorded coal_ore that was not there, then breaking off at 821 fuel under a floor of 838 with
   // no fix. Wood is on the surface, in GPS range, and verified standing before a sweep is ordered.
   // So while fuel is short the fleet fells, and ore waits.
-  if (/_ore$/.test(rule.match) && (await fuelEmergency()) === true) {
+  // COAL IS THE FUEL. This refused EVERY ore during a fuel emergency, coal included, because
+  // underground is where a drone cannot be rescued -- and the emergency never ended, so the only
+  // fuel source the fleet was allowed was wood 50 blocks away at 15 fuel a log, while the index knew
+  // 1,143 coal ore blocks, 88 of them inside the circle at y 45-59 and the nearest vein 10 blocks
+  // from the origin (2026-09-04). An ore that burns is fuel work; the others still wait.
+  if (oreWaitsForFuel(rule.match) && (await fuelEmergency()) === true) {
     supply.cooldowns[rule.match] = ctx.now + COOLDOWN_MS;
-    note(`${rule.match}: ${have}/${rule.min} -- not sending a miner underground during a fuel emergency; lumber first`);
+    note(`${rule.match}: ${have}/${rule.min} -- not sending a miner underground during a fuel emergency; fuel first`);
     return false;
   }
   return dispatchGather(rule, have, ctx);

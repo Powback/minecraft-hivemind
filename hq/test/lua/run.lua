@@ -481,6 +481,18 @@ test("DroneLogic.RefuelAtStorage asks storage over the network and does not fly 
     truthy(env.StorageKnownDry(nil), "and the shelf is marked dry for the others")
 end)
 
+test("DroneLogic.CollectFuel leaves the shelf its reserve unless the drone is below its floor", function()
+    local env, D = loadModule("DroneLogic.lua", { fuel = 1000, pos = { x = 0, y = 64, z = 0 } })
+    D.setHome({ x = 0, y = 64, z = 0 })
+    env.__world.replies.StorageMan = env.__world.replies.StorageMan or {}
+    env.__world.replies.StorageMan.GetStock = { detail = { { name = "minecraft:coal", count = 100 } } }
+    local got, why = D.collectFuel()
+    eq(got, 0, "nothing taken") truthy(why:find("reserve", 1, true), "100 coal is reserve for a drone at 1000: " .. why)
+    env.__world.turtle.fuel = 50                             -- under the floor: survival comes first
+    local _, why2 = D.collectFuel()
+    truthy(not why2 or not why2:find("reserve", 1, true), "a drone below its floor is not refused the reserve: " .. tostring(why2))
+end)
+
 test("DroneLogic.FellTargets stops at an abort and when the tank is the trip home", function()
     local env, D = loadModule("DroneLogic.lua", { fuel = 500, pos = { x = 10, y = 64, z = 0 } })
     D.setHome({ x = 0, y = 64, z = 0 })                    -- floor 150 here
