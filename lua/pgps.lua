@@ -1687,15 +1687,23 @@ end
 -- savePose loses the pose across a reboot; one that forgets detectAll leaves the map describing the
 -- cell we left. p_Straight says whether this step is evidence about FACING -- see auditHeading;
 -- only forward() is, which is why back and the verticals pass false.
+local m_StepMismatches, m_StepMismatchAt = 0, 0
 local function stepTaken(p_X, p_Y, p_Z, p_Dx, p_Dy, p_Dz, p_Straight)
     -- COMMIT THE DELTA, NOT THE TARGET. The caller computed p_X from the cache BEFORE its move and
     -- yielded for the animation; if another coroutine (a make-way step, the dock loop) committed a
     -- step meanwhile, writing p_X here threw that step away -- the intent kept both, the cache kept
     -- one, and the next fix read "audit matched (V) yet the fix moved us 1 -- both cannot be right",
     -- fifty-five times in ten minutes in the bay (2026-09-04). The delta is what this step did.
+    -- Counted, not printed per step: it fired 206 times in five minutes once the path executor was
+    -- following nodes computed before a mid-path fix moved the cache -- which is exactly the case the
+    -- delta commit exists for, and not news. One line a minute with the count is.
     if cachedX ~= nil and (cachedX + p_Dx ~= p_X or cachedY + p_Dy ~= p_Y or cachedZ + p_Dz ~= p_Z) then
-        ptrace(("step landed on a cache another routine had moved (%d,%d,%d vs %d,%d,%d) -- keeping both")
-            :format(cachedX + p_Dx, cachedY + p_Dy, cachedZ + p_Dz, p_X, p_Y, p_Z))
+        m_StepMismatches = m_StepMismatches + 1
+        if os.clock() - m_StepMismatchAt >= 60 then
+            ptrace(("%d step(s) landed on a cache that had moved since their target was computed -- deltas kept")
+                :format(m_StepMismatches))
+            m_StepMismatches, m_StepMismatchAt = 0, os.clock()
+        end
     end
     cachedX, cachedY, cachedZ = (cachedX or p_X - p_Dx) + p_Dx, (cachedY or p_Y - p_Dy) + p_Dy, (cachedZ or p_Z - p_Dz) + p_Dz
     notePlannedStep(p_Dx, p_Dy, p_Dz, p_Straight)
