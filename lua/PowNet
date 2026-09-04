@@ -729,12 +729,23 @@ function sendAndWaitForResponse(p_Recipient, message, protocol, p_Timeout)
         Forget(p_Recipient)
         return false, "Failed to send message"
     end
+    -- A WAIT MUST NOT EAT THE MAIL. rednet.receive hands this loop EVERY message on the protocol,
+    -- and anything that was not the awaited reply -- another drone's GetPath, an upload, a job report
+    -- -- fell off the end of the if/elseif and was gone. Every module and every drone does this, so
+    -- while MapServer waited on DroneMan it discarded the fleet's path requests, and when the reply
+    -- window grew from one game second to ten the loss grew with it: path requests reaching
+    -- MapServer fell from ~100 a minute to 1-3 while the drones logged "did not answer" 146 times in
+    -- five minutes (2026-09-04 03:14). Messages that are not ours are held and put back on the
+    -- event queue when this wait ends, in order, for the receive loop that was meant to have them.
+    local s_Held = {}
+    local function release()
+        for _, h in ipairs(s_Held) do os.queueEvent("rednet_message", h[1], h[2], h[3]) end
+    end
     local attemptNumber = 1
     while true do
-        local senderID, reply = rednet.receive(protocol, s_Timeout)
-        if senderID == s_RecipientID and reply.ID == message.ID then
-            -- AN ANSWER WITH NO PAYLOAD IS STILL AN ANSWER.
-            --
+        local senderID, reply, s_Proto = rednet.receive(protocol, s_Timeout)
+        if senderID == s_RecipientID and type(reply) == "table" and reply.ID == message.ID then
+            release()
             -- This returned reply.data and nothing else, so a handler that ends `return true` --
             -- succeeded, nothing to report -- came back as nil, which is the SAME value this
             -- function returns for "nobody replied". The caller cannot tell a healthy exchange
@@ -758,9 +769,12 @@ function sendAndWaitForResponse(p_Recipient, message, protocol, p_Timeout)
             else
                 -- Three silent attempts against a module that should be there: assume the id is
                 -- wrong rather than the module dead, and make the next call re-resolve it.
+                release()
                 Forget(p_Recipient)
                 return false
             end
+        else
+            s_Held[#s_Held + 1] = {senderID, reply, s_Proto}
         end
     end
 end
