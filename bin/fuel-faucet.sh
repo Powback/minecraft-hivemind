@@ -24,12 +24,21 @@ while true; do
   fi
   revived=""
   dump=$(rc "computercraft dump")
+  # Who is dry, from HQ's brief (fuel 0) rather than from the tail of a log that may be saying
+  # something else at that moment. Falls back to the log tail when HQ is unreachable.
+  dry=$(curl -s --max-time 8 http://hive.pow/brief | python3 -c 'import sys,json
+try:
+    b=json.load(sys.stdin); print(" ".join(str(x["id"]) for x in b["fleet"]["drones"] if (x.get("fuel") or 0) == 0))
+except Exception: print("")' 2>/dev/null)
   for d in "$MC"/data/world/computercraft/computer/*/; do
     id=$(basename "$d"); [ -f "$d/DroneLogic.lua" ] || continue
     line=$(echo "$dump" | grep "^#$id "); [ -z "$line" ] && continue
-    fuel=$(grep -o 'fuel at 0\|MOVE REFUSED: Out of fuel' "$d/drone.log" 2>/dev/null | tail -1)
-    last=$(tail -3 "$d/drone.log" 2>/dev/null | grep -c 'Out of fuel\|fuel at 0 (')
-    [ "$last" -gt 0 ] || continue
+    if [ -n "$dry" ]; then
+      echo " $dry " | grep -q " $id " || continue
+    else
+      last=$(tail -3 "$d/drone.log" 2>/dev/null | grep -c 'Out of fuel\|fuel at 0 (')
+      [ "$last" -gt 0 ] || continue
+    fi
     pos=$(echo "$line" | awk -F'|' '{gsub(/,/,"",$3); print $3}' | xargs)
     its=$(rc "data get block $pos Items"); echo "$its" | grep -q 'block data' || continue
     u=$(echo "$its" | grep -o 'Slot: [0-9]*b' | grep -o '[0-9]*' | tr '\n' ' '); slot=""
