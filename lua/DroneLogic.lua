@@ -3360,6 +3360,21 @@ function CarriedTally(p_Want)
     return s_Got
 end
 
+-- Which deposit points a fetch does not visit. A CACHE IS NOT STORAGE: it is where a miner drops
+-- spoils so it can keep mining, and haulers bring it home. A build fetching 32 bricks swept every
+-- deposit point whose contents it did not know, including the cache at the bottom of the mine shaft
+-- (-480,8,87), 55 blocks down, and nearly stranded (2026-09-04, 22:30). Materials live in the
+-- networked chests; only those are searched. A chest whose contents are on record and hold none of
+-- what we want is skipped too. A global: this file is at Lua's 200-local limit.
+function FetchSkip(p_Point, p_Match)
+    if p_Point.peripheral == nil then return true end
+    local seen = p_Point.items
+    if type(seen) ~= "table" then return false end
+    for nm, n in pairs(seen) do
+        if (tonumber(n) or 0) > 0 and p_Match(nm) then return false end
+    end
+    return true
+end
 function FetchItems(p_Want, p_Min)
     local s_Match = function(nm)
         for w in pairs(p_Want) do if SameItem(w, nm) then return true end end
@@ -3469,15 +3484,7 @@ function FetchItems(p_Want, p_Min)
     -- unknown ones is how the item stays lost.
     local s_Order = {}
     for _, pt in ipairs(s_List) do
-        local seen = pt.items
-        local skip = false
-        if type(seen) == "table" then
-            skip = true
-            for nm, n in pairs(seen) do
-                if (tonumber(n) or 0) > 0 and s_Match(nm) then skip = false break end
-            end
-        end
-        if not skip then s_Order[#s_Order + 1] = pt end
+        if not FetchSkip(pt, s_Match) then s_Order[#s_Order + 1] = pt end
     end
     if #s_Order < #s_List then
         trace(("fetch: %d of %d chests are known not to hold it -- skipping them")

@@ -2477,7 +2477,22 @@ local PLACE_BACKOFF_MS = 60000
 -- refusal; or its role has already been written off. This lived inline as a three-branch if/elseif
 -- chain in the middle of the placement pass, which is the single most complex function in the file
 -- and the one it is hardest to read a scheduling decision out of. One question, one function.
+-- FUEL WORK OUTRANKS BUILDING, BUT NOT WITH THE WHOLE FLEET. orderedTasks puts every lumber and coal
+-- job ahead of every tower patch, and with wood perpetually short there is always one queued, so
+-- all four miners spent the evening felling and mining while the tower got one build an hour
+-- (2026-09-04). Outside a fuel emergency two miners on fuel work is plenty; the rest build.
+local FUEL_WORKERS_MAX = 2
+local function fuelWorkersBusy()
+    local n = 0
+    for _, t in pairs(DATA["tasks"] or {}) do
+        if t.assignedTo ~= nil and taskLive(t) and taskProducesFuel(t.name) then n = n + 1 end
+    end
+    return n
+end
 local function notPlaceableNow(p_Task, p_Role, p_NoDrone)
+    if not fleetFuelLow() and taskProducesFuel(p_Task.name) and fuelWorkersBusy() >= FUEL_WORKERS_MAX then
+        return true
+    end
     if fleetFuelLow() then
         -- Hauling a cache home and planting saplings are fuel work too, whatever the name says.
         -- With the fleet low, six idle drones holding 300-900 each sat beside a queued haul of a

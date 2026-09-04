@@ -172,6 +172,20 @@ test("TaskMan: while the fleet is low, a crafter's job is placeable and a miner'
     falsy(T.notPlaceableNow({ id = 6, name = "tower-L0-3", work = { build = { origin = {} } } }, "miner", {}), "a build of stocked bricks is placeable; anyoneForBuild hands it on")
 end)
 
+test("TaskMan: outside an emergency, a third fuel job waits while two miners already fell or mine", function()
+    local env, T = taskManWithFleet({
+        { id = 1, name = "D1", role = "miner", status = "working", fuel = 1500, pos = { x = 0, y = 64, z = 0 } },
+        { id = 2, name = "D2", role = "miner", status = "working", fuel = 1500, pos = { x = 0, y = 64, z = 0 } },
+        { id = 3, name = "D3", role = "miner", status = "idle", fuel = 1500, pos = { x = 0, y = 64, z = 0 } },
+    }, { { name = "minecraft:coal", count = 500 } })
+    env.DATA.tasks = {
+        [1] = { id = 1, name = "lumber:oak_log", work = { lumber = {} }, assignedTo = 1, progress = 0 },
+        [2] = { id = 2, name = "gather:coal_ore", work = { gather = {} }, assignedTo = 2, progress = 0 },
+    }
+    truthy(T.notPlaceableNow({ id = 3, name = "lumber:oak_log", work = { lumber = {} } }, "miner", {}), "third fuel job waits")
+    falsy(T.notPlaceableNow({ id = 4, name = "tower-L2-p1", work = { build = { origin = {} } } }, "miner", {}), "the build goes")
+end)
+
 -- ================================================================================================
 -- StorageMan
 -- ================================================================================================
@@ -558,6 +572,15 @@ test("DroneLogic: an executing flag with no job and no movement is cleared by th
     env.__world.clock = env.__world.clock + 400
     env.SendHeartBeat()
     truthy(not D.isExecuting(), "still there 400 s later with no job: cleared")
+end)
+
+test("DroneLogic.FetchSkip: fetches search networked chests, never caches", function()
+    local env = loadModule("DroneLogic.lua")
+    local wantsCoal = function(nm) return nm == "minecraft:coal" end
+    truthy(env.FetchSkip({ pos = { x = -480, y = 8, z = 87 } }, wantsCoal), "a cache (no peripheral) is skipped even with unknown contents")
+    truthy(env.FetchSkip({ pos = {}, peripheral = "minecraft:chest_0", items = { ["minecraft:stone"] = 64 } }, wantsCoal), "a chest known to hold none is skipped")
+    falsy(env.FetchSkip({ pos = {}, peripheral = "minecraft:chest_1" }, wantsCoal), "a networked chest of unknown contents is searched")
+    falsy(env.FetchSkip({ pos = {}, peripheral = "minecraft:chest_2", items = { ["minecraft:coal"] = 3 } }, wantsCoal), "a chest known to hold it is searched")
 end)
 
 test("DroneLogic.FellTargets stops at an abort and when the tank is the trip home", function()

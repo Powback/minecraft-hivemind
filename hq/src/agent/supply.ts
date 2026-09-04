@@ -1103,6 +1103,14 @@ async function dispatchCaveSurvey(ctx: SupplyCtx, c: any, box: any, pct: number)
  */
 async function surveyCaves(ctx: SupplyCtx): Promise<void> {
   if (!ctx.scoutFree) return;
+  // THE TOWER IS THE SETTLEMENT'S PURPOSE; CAVES ARE FOR A SHAFT NOBODY IS DIGGING YET. With every
+  // miner on lumber and coal (fuel work outranks building), scouts are the tower's only free hands
+  // through anyoneForBuild -- and this sent them underground instead, where one was walled in for an
+  // hour (D39, 2026-09-04). In the last hour TaskMan dispatched 1 build. Caves wait while patches queue.
+  if ([...ctx.queued].some((n) => n.startsWith('tower-L'))) {
+    ctx.waiting.push('cave survey: tower patches queued, scouts build first');
+    return;
+  }
   try {
     const caves: any = await callTool('world.caves', { min: 8 });
     for (const { cave, box } of caveCandidates(caves?.data?.caves ?? [])) {
@@ -2142,12 +2150,11 @@ async function collectFieldCaches(
   // A cache a drone has already read as EMPTY is not worth a trip; one nobody has read yet is.
   const holdsSomething = (q: any) =>
     q.items == null || Object.values(q.items as Record<string, unknown>).some((n) => Number(n) > 0);
-  // SURFACE CACHES ONLY, IN EVERY MODE. A cache at y=8 is reached through a mine shaft the pathfinder
-  // does not know; the side approach tunnelled toward it and D31 logged "approach: 784 fuel spent on
-  // the sides of -480,8,87 -- giving it up as unreachable" (2026-09-04). Underground caches come up
-  // with the miner that filled them, or not at all.
-  const surface = (q: any) => q.pos.y >= settlement.base.y - 4;
-  const caches = points.filter((q: any) => q?.pos && !q.peripheral && withinReach(q.pos) && surface(q) && holdsSomething(q));
+  // CACHES ARE WHERE MINERS DROP SPOILS SO THEY KEEP MINING; HAULING THEM HOME IS THE DESIGN. A
+  // surface-only filter briefly lived here after D31 spent 784 fuel tunnelling sideways toward the
+  // shaft-bottom cache at -480,8,87 -- but that was the dig flag never reaching the planner, fixed
+  // since, not the cache's fault. Every cache in reach is haulable; the shaft is the route.
+  const caches = points.filter((q: any) => q?.pos && !q.peripheral && withinReach(q.pos) && holdsSomething(q));
   if (!caches.length) return null;
 
   // Furthest first: those are the ones a drone would otherwise refuse to haul from, and the ones
