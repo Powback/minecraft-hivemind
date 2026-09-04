@@ -1633,7 +1633,10 @@ async function orderFloor(p_Level: number): Promise<{ res: unknown } | { failed:
   };
   try {
     return { res: await registry.invoke('order.tower',
-      { level: p_Level, palette: 'brick', blocksPerTask: 8 }, ctx) };
+      // 32, not 8: a patch pays a trip to the shelf and a climb to the floor whatever its size, and
+      // at 8 blocks that overhead was ~250 fuel for 8 bricks -- 30 fuel a block, 250 trips a floor.
+      // Eight was chosen when relief preemptions kept cutting jobs short; the shelf is stocked now.
+      { level: p_Level, palette: 'brick', blocksPerTask: 32 }, ctx) };
   } catch (err) {
     return { failed: (err as Error)?.message ?? String(err) };
   }
