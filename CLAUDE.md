@@ -518,7 +518,38 @@ fix to make quietly.
   build fallback prices the job like the first choice** (it did not, and sent a 384-fuel patch to
   scouts holding 290 and 270, who burned to the watchdog's floor).
 
-**Why the tower still has 67 blocks (2026-09-04, 01:35).** With every gate above opened, three
+**THE FUEL PROBLEM WAS A POLICY, NOT A SHORTAGE (2026-09-04, 02:00).** The index knows 1,143 coal
+ore blocks -- 88 inside the circle at y 45-59, the nearest vein 10 blocks from the tower, about
+90,000 fuel in total -- and `dispatchRule` refused EVERY ore during a fuel emergency, coal included,
+because underground is where a drone cannot be rescued. The emergency never ended, so the only fuel
+source the fleet was allowed was wood 50 blocks away at 15 fuel a log. Coal is fuel work now
+(`oreWaitsForFuel`), and a fuel-ore gather is QUEUED even when no miner is free, because TaskMan
+ranks it ahead of building and hands it to the next miner; waiting for a free miner at tick time
+meant it was never queued while every miner laid bricks ("none known -> survey", with 1,143 known).
+Lava is 1,000 fuel a bucket and the map has none indexed; that is the next fuel source to look for.
+
+**THE PATHFINDER IS NOT THE PROBLEM; ASKING IT FOR A SOLID GOAL IS.** MapServer now tallies every
+request once a minute (`paths: N asked, ok, failed [why], avg ms, worst ms`). Measured with seven
+drones building: 23-104 requests a minute, 0-16 failures, EVERY failure "goal is solid", average
+0-2 ms, worst 31 ms, no request over its node budget. "pathfinder did not answer" (19 in ten
+minutes before) was PowNet's one-second reply window against a computer also indexing observation
+uploads from seven drones; the window is six seconds now (`PATH_REPLY_S`) and the count went to
+zero. What remains costs fuel: a caller that asks for a route INTO a brick it just placed, a chest
+or leaves gets "goal is solid" and falls back to blind flight. Route to the free neighbour instead.
+
+**THE SHELF KEEPS A RESERVE, AND A RELIEVER MAY BREAK IT.** Seven drones topping up to 1,600 took 173
+of 227 coal off the shelf within a minute and re-triggered the emergency that paused the tower.
+`CollectFuel` asks StorageMan how much burnable there is (`ShelfBurnable`) and a drone above its
+floor leaves 192; a drone below its floor, or one fetching for a relief (`m_Relieving`), takes what
+it needs -- the first ten minutes of the reserve left two drones dead behind "no fuel to deliver:
+all of it reserve".
+
+**A tower patch costs 36-910 fuel for eight bricks (avg ~250) -- 30 fuel a block.** That is the
+next number to bring down: each patch fetches its own bricks from the bay and climbs to the floor;
+22 patches in ten minutes cost ~5,000 fuel. Batching bricks for several patches per trip, and
+routing to the free neighbour of a solid goal, are the two levers.
+
+**Why the tower still had 67 blocks at 01:35.** With every gate above opened, three
 builds ran and placed nothing: `short hop of 19 failed direct -- falling back to the map`,
 `pathfinder did not answer -- MapServer may be overloaded` (136 times across the fleet that night),
 `blocked by something unidentified at -480,64,64 -- asking it to move`. The tower's origin column IS
