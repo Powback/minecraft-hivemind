@@ -39,10 +39,30 @@ services:
       - default
       - traefik
 
+  # The fault monitor, as a service: it outlives terminal sessions, which the bin/ script does not.
+  # RCON_PASSWORD comes from .env (gitignored); the game server's network is joined for tellraw.
+  fleet-watch:
+    build: ./watch
+    container_name: hive-fleet-watch
+    env_file: .env
+    environment:
+      - HQ_URL=http://hq:4400
+      - POLL=60
+      - RCON_HOST=mc-create121
+    depends_on:
+      - hq
+    restart: unless-stopped
+    networks:
+      - default
+      - minecraft
+
 networks:
   default: {}
   traefik:
     external: true
+  minecraft:
+    external: true
+    name: minecraft-create121_default
 
 volumes:
   hive-state:
