@@ -898,7 +898,7 @@ function RecoverLink()
             -- Short hops, testing after each: the moment anyone answers we stop and resume work,
             -- rather than trekking all the way back for nothing.
             local tx, tz = HomewardLeg(cx, cz, hx, hz)
-            if pgps.flyTo(tx, hy, tz, 64) == false then
+            if pgps.flyTo(tx, hy + 2, tz, 64) == false then
                 if CanDig() then pgps.digTo(tx, hy, tz) end
             end
             cx, cy, cz = pgps.getCachedPosition()
@@ -2845,6 +2845,8 @@ local function riseToCeiling(p_Ceiling)
 end
 
 function TravelToBody(p_X, p_Y, p_Z, p_Ceiling)
+    -- A dry drone does not turn to face a step it cannot take (D37: 48 turns, 0 moves per window).
+    if turtle.getFuelLevel() == 0 then return false, "out of fuel" end
     -- THE DIG-FIRST SHORT HOP IS GONE.
     --
     -- Below SHORT_HOP this used to call digTo before anything else, on the argument that a direct
@@ -9073,7 +9075,9 @@ local function goHomeIfOutside()
     -- and the box corners sit ~82 blocks out against a 64-block modem range -- so a drone that
     -- fails to get home from here may never be heard from again. Swallowed, the log's last word on
     -- the subject was "heading home", which is not what happened.
-    Tried("fly home from outside the region", TravelTo, hx, hy, hz)
+    -- Two above the centre, not the centre: the centre is the floor block itself, and D2 spent an
+    -- hour "blocked by something unidentified at -480,63,64" trying to fly into it.
+    Tried("fly home from outside the region", TravelTo, hx, hy + 2, hz)
 end
 
 -- Idle, under target, fuel available: go and fill up. See the caller for what it cost not to. A
