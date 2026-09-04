@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { TOWER_TOP, BANDS, towerFloor, specForLevel, PALETTES } from '../src/world/tower.js';
+import { towerWorkFor } from '../src/agent/supply.js';
 
 const supply = readFileSync(join(__dirname, '../src/agent/supply.ts'), 'utf8');
 const core = readFileSync(join(__dirname, '../src/tools/core.ts'), 'utf8');
@@ -35,9 +36,9 @@ describe('the tower counter cannot outrun the queue', () => {
     s.split('\n').filter((l) => !l.trim().startsWith('//') && !l.trim().startsWith('*')).join('\n');
 
   it('judges queued work per level, not per prefix', () => {
-    const part = codeOf(slice('towerWorkFor'));
-    expect(part).toMatch(/at\(n\) === p_Level/);       // "this floor's work"
-    expect(part).toMatch(/at\(n\) !== p_Level/);        // "any floor we are not building"
+    // a patch for another level is not "this floor's work", whichever side of the counter it sits
+    expect(towerWorkFor(new Set(['tower-L0-1', 'tower-L3-0']), 2).stillQueued).toBe(false);
+    expect(towerWorkFor(new Set(['tower-L2-7']), 2).stillQueued).toBe(true);
     // the level-blind test must be gone from the decision itself
     expect(codeOf(slice('keepTowerOrdered')))
       .not.toMatch(/stillQueued = \[\.\.\.queued\]\.some\(\(n\) => n\.startsWith\('tower-'\)\)/);
@@ -110,17 +111,17 @@ describe('the tower design has a top', () => {
  * exactly as thoroughly as the below-level leftovers had blocked levels 1 and 2, and the filter
  * written for that very bug could not see them because they sat on the other side of the comparison.
  */
-describe('leftovers are cleared in both directions', () => {
-  const fn = (() => {
-    const i = supply.indexOf('function towerWorkFor');
-    if (i < 0) throw new Error('towerWorkFor is gone -- move this assertion, do not delete it');
-    return supply.slice(i, supply.indexOf('\n}\n', i) + 3);
-  })();
-  const code = fn.split('\n').filter((l) => !l.trim().startsWith('//') && !l.trim().startsWith('*')).join('\n');
-
-  it('counts work for any floor that is not the current one as a leftover', () => {
-    expect(code).toMatch(/at\(n\) !== p_Level/);
-    expect(code).not.toMatch(/at\(n\) < p_Level/);   // one-directional, and it missed half the cases
+describe('leftovers are cleared upward; downward they are repairs', () => {
+  /**
+   * 2026-09-05: the rule changed shape once more. Patches for a level the counter has not reached
+   * are still leftovers (the operator lowered the counter; they would block nothing but they are
+   * wrong). Patches for a level BELOW the counter are no longer leftovers: repairLowerFloors
+   * re-orders the holes drones dug through finished floors, and those patches carry the finished
+   * level's name. Clearing them would undo every repair the moment it was queued.
+   */
+  it('counts work for a floor above the counter as a leftover, and work below it as a repair', () => {
+    const { stale } = towerWorkFor(new Set(['tower-L0-4', 'tower-L1-2', 'tower-L2-0', 'tower-L3-9']), 2);
+    expect(stale).toEqual(['tower-L3-9']);
   });
 
   /** The operator control that makes downward movement possible, and therefore makes this needed. */

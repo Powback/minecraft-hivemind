@@ -216,6 +216,46 @@ end
 -- minutes reporting busy with a job's detail line from hours before, each holding a tower patch
 -- TaskMan could not reclaim (2026-09-04). A GoTo or Survey that ended on a path without TaskEnd
 -- is the way in; this, called from the heartbeat, is the way out.
+-- A DRONE THAT KEEPS MOVING WITHOUT GETTING ANYWHERE IS STUCK, AND NOTHING SAID SO.
+--
+-- D37 spent minutes stepping between y=22 and y=25 in one column; D31 rode up and down the storage
+-- access column at the bay for a quarter of an hour ("moveTo: no progress toward -475,66,78", over
+-- and over). Both burned fuel, both reported a status that read as work, and no watchdog fired,
+-- because every one of ours looks for a drone that does NOT move. This one looks for a drone
+-- that moves without covering ground: many moves (or many turns) over a handful of cells in a
+-- window of heartbeats. It aborts the job so TaskMan reassigns it, and after three windows in a
+-- row raises a distress the panel can show.
+JITTER = {beats = 8, minSteps = 16, maxCells = 6, minTurns = 40}
+JitterState = {beats = 0, events = 0}
+function JitterWatch()
+    JitterState.beats = JitterState.beats + 1
+    if JitterState.beats < JITTER.beats then return false end
+    JitterState.beats = 0
+    local s_Steps, s_Turns, s_Cells = pgps.motionWindow()
+    pgps.motionReset()
+    local s_Bouncing = s_Steps >= JITTER.minSteps and s_Cells <= JITTER.maxCells
+    local s_Spinning = s_Turns >= JITTER.minTurns and s_Cells <= 2
+    if not (s_Bouncing or s_Spinning) then
+        JitterState.events = 0
+        return false
+    end
+    JitterState.events = JitterState.events + 1
+    local jx, jy, jz = pgps.getCachedPosition()
+    trace(("JITTER: %d move(s) and %d turn(s) over only %d cell(s) around %s,%s,%s in %d heartbeats -- %s")
+        :format(s_Steps, s_Turns, s_Cells, tostring(jx), tostring(jy), tostring(jz), JITTER.beats,
+                executing and "aborting the job" or "breaking the trip"))
+    if executing then
+        AbortJobAndWait(3)
+    else
+        pgps.BreakExec()
+        pgps.StartExec()
+    end
+    if JitterState.events >= 3 then
+        Distress("jitter", ("bounced on the spot through %d windows in a row"):format(JitterState.events), false)
+    end
+    return true
+end
+
 function ClearStuckExecuting()
     -- m_Refuelling is the same shape: RefuelAtStorage sets it and clears it at "refuel sequence
     -- finished"; a sequence that never finishes (deposit into a full shelf that never succeeds) leaves
@@ -482,6 +522,7 @@ function SendHeartBeat()
         m_DockingSince = nil
     end
     ClearStuckExecuting()
+    JitterWatch()
 
     -- AN IDLE DRONE IS NOT STILL DOING THE LAST THING.
     --
@@ -2753,31 +2794,24 @@ local function riseToCeiling(p_Ceiling)
 end
 
 function TravelToBody(p_X, p_Y, p_Z, p_Ceiling)
-    -- DO NOT ASK THE PATHFINDER TO CROSS THE ROOM.
+    -- THE DIG-FIRST SHORT HOP IS GONE.
     --
-    -- moveTo is an A* request to MapServer, which is holding 207,574 cells: a 1,331-cell region
-    -- query measured at 5.8 SECONDS and a full-region one does not answer at all. Every drone's
-    -- every leg queued behind that, so the fleet spent its life waiting on a search rather than
-    -- moving -- D3 sat 900 seconds trying to travel TWELVE BLOCKS to the mine head, with clear air
-    -- on all four sides, while three other drones queued behind it for the same service.
+    -- Below SHORT_HOP this used to call digTo before anything else, on the argument that a direct
+    -- hop "needs nobody's help" while a mapped route queues behind MapServer. That argument died
+    -- when pgps became one implementation: digTo IS moveTo with digging allowed, the same A*
+    -- request to the same server. What the "direct first" order actually did was ask for a plan
+    -- with digging ALLOWED on every trip around the base -- deposit, dock, patch, chest -- at a
+    -- time when the planner charged a dug cell nothing extra. The shortest line to anything behind
+    -- a wall or under a floor was through it, and the tower's floors were what stood in the way.
     --
-    -- A mapped route earns its cost when there is something to route around. For a short hop it is
-    -- pure latency: digTo and flyTo go straight there, need nobody's help, and cannot be starved by
-    -- another drone's search. So the order is reversed below SHORT_HOP -- direct first, A* only as
-    -- the fallback it should always have been for this case.
+    -- Now every hop asks for an open route first. A digging plan is the last resort below, after
+    -- the ceiling retry, and it pays DIG_STEP_COST per cut cell (PowGPSServer), so even then the
+    -- planner walks around through any opening within that trade.
     local cx, cy, cz = pgps.getCachedPosition()
-
     if cx ~= nil then
         local s_D = Blocks(cx, cy, cz, p_X, p_Y, p_Z)
-        -- Adjacent squares first, with no network call at all. See stepStraightTo.
         if s_D <= STRAIGHT_HOP and stepStraightTo(p_X, p_Y, p_Z) then return true end
-        if s_D <= SHORT_HOP then
-            if CanDig() and pgps.digTo(p_X, p_Y, p_Z) ~= false then return true end
-            if hardStop("travel") then return false end
-            trace(("travel: short hop of %d failed direct -- falling back to the map"):format(s_D))
-        end
     end
-
     if pgps.moveTo(p_X, p_Y, p_Z) ~= false then return true end
     if hardStop("travel") then return false end
 
@@ -3983,19 +4017,31 @@ end
 -- moveTo and flyTo both work properly.
 -- p_Why only names the caller in the log; the climb is the same one either way. TravelTo's
 -- riseToCeiling was a second copy of this loop and drifted only in its trace line.
+-- The map first. Both climbs below used to cut straight up from wherever the drone stood --
+-- through a floor when it stood under one -- before the planner was asked anything. Now the way
+-- up is a route like any other: open cells if they exist, a planned dig if not, and only then a
+-- blind climb for whatever the map could not route.
+function RouteUpTo(p_X, p_Y, p_Ceiling, p_Z)
+    if p_X == nil or p_Y == nil or p_Y >= p_Ceiling then return false end
+    if pgps.moveTo(p_X, p_Ceiling, p_Z) ~= false then return true end
+    return CanDig() and pgps.digTo(p_X, p_Ceiling, p_Z) ~= false
+end
 function ClimbToOpenAir(p_Ceiling, p_Why)
-    local s_Rose = 0
+    local sx, s_From, sz = pgps.getCachedPosition()
+    RouteUpTo(sx, s_From, p_Ceiling, sz)
+    local s_Blind = 0
     while true do
         local _, cy = pgps.getCachedPosition()
         if cy == nil or cy >= p_Ceiling then break end
         DigUp()
         if not pgps.up() then break end
-        s_Rose = s_Rose + 1
-        if s_Rose > 128 then break end                  -- bounded: never an unbounded climb
+        s_Blind = s_Blind + 1
+        if s_Blind > 128 then break end                 -- bounded: never an unbounded climb
     end
     local _, cy = pgps.getCachedPosition()
-    trace(("%s: rose %d block(s) to y=%s"):format(p_Why or "deposit", s_Rose, tostring(cy)))
-    return s_Rose
+    trace(("%s: rose to y=%s (%d block(s) cut blind, the rest routed by the map)")
+        :format(p_Why or "deposit", tostring(cy), s_Blind))
+    return (cy or s_From or 0) - (s_From or 0)
 end
 
 -- ANY CHEST WILL DO. A BLOCKED ONE IS NOT A REASON TO GIVE UP.
@@ -8840,6 +8886,9 @@ local function surfaceIfBuried()
     end
     trace(("idle and buried at %d,%d,%d -- climbing toward the surface to get a fix back")
           :format(px, py, pz))
+    -- The map first, for the same reason ClimbToOpenAir asks it first: under the base, "up" is
+    -- through a floor, and the planner knows the way round that this loop does not.
+    RouteUpTo(px, py, hy or 63, pz)
     local s_Rose = 0
     while s_Rose < CLIMB_MAX do
         local _, cy = pgps.getCachedPosition()

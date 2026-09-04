@@ -267,6 +267,19 @@ local m_Chunks, m_Gps
 -- A radius costs a fifth of the area and removes the trap entirely.
 local m_Reach = nil          -- horizontal radius from the settlement centre, if one was given
 local m_Centre = nil
+-- Moves, turns and distinct cells since the last motionReset() -- the heartbeat's jitter watch
+-- reads them (DroneLogic.JitterWatch). A drone that made 20 moves over 3 cells is bouncing.
+local m_Motion = {steps = 0, turns = 0, cells = {}, distinct = 0}
+function motionWindow() return m_Motion.steps, m_Motion.turns, m_Motion.distinct end
+function motionReset() m_Motion = {steps = 0, turns = 0, cells = {}, distinct = 0} end
+local function motionStep(p_X, p_Y, p_Z)
+    m_Motion.steps = m_Motion.steps + 1
+    local k = p_X .. ":" .. p_Y .. ":" .. p_Z
+    if not m_Motion.cells[k] then
+        m_Motion.cells[k] = true
+        m_Motion.distinct = m_Motion.distinct + 1
+    end
+end
 
 local function withinReach(x, z)
     if m_Reach == nil or m_Centre == nil then return true end
@@ -974,7 +987,7 @@ function notePlannedStep(dx, dy, dz, p_Straight)
     m_IntDX, m_IntDY, m_IntDZ = m_IntDX + dx, m_IntDY + dy, m_IntDZ + dz
     if p_Straight then m_StraightFwd = m_StraightFwd + 1 else m_StraightFwd = -1 end
 end
-function noteTurn() m_TurnsSinceFix = m_TurnsSinceFix + 1 m_StraightFwd = -1 end
+function noteTurn() m_TurnsSinceFix = m_TurnsSinceFix + 1 m_StraightFwd = -1 m_Motion.turns = m_Motion.turns + 1 end
 
 local function resetAudit(x, y, z)
     m_FixAtX, m_FixAtY, m_FixAtZ = x, y, z
@@ -1706,6 +1719,7 @@ local function stepTaken(p_X, p_Y, p_Z, p_Dx, p_Dy, p_Dz, p_Straight)
         end
     end
     cachedX, cachedY, cachedZ = (cachedX or p_X - p_Dx) + p_Dx, (cachedY or p_Y - p_Dy) + p_Dy, (cachedZ or p_Z - p_Dz) + p_Dz
+    motionStep(cachedX, cachedY, cachedZ)
     notePlannedStep(p_Dx, p_Dy, p_Dz, p_Straight)
     breadcrumb()
     detectAll()
@@ -2845,4 +2859,10 @@ function locate()
     else
         return cachedX, cachedY, cachedZ, cachedDir
     end
+end
+-- TEST SEAM (as in TaskMan.lua): hq/test/lua/run.lua loads this file under a stub world with
+-- HiveMindTest set and reads the motion counters through it. In the world HiveMindTest is nil and
+-- this does nothing.
+if HiveMindTest ~= nil then
+    HiveMindTest.pgps = {motionWindow = motionWindow, motionReset = motionReset}
 end

@@ -38,9 +38,9 @@
         "refixLoop",
         "DescribeJob",
         "stageFromChest",
-        "TravelToBody",
         "(anonymous)",
-        "meshForward"
+        "meshForward",
+        "surfaceIfBuried"
       ]
     },
     "lua/TaskMan.lua": {
@@ -111,7 +111,7 @@
     },
     "lua/PowGPSServer.lua": {
       "cc": [
-        36,
+        35,
         24,
         16
       ],

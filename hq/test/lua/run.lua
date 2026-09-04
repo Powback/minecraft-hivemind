@@ -661,5 +661,84 @@ end)
 -- ================================================================================================
 local failed = 0
 for _, r in ipairs(results) do if not r.ok then failed = failed + 1 end end
+
+-- PowGPSServer: the planner's dig cost
+test("PowGPSServer: with digging allowed the planner still walks around a wall it could cut through", function()
+    local env = loadModule("PowGPSServer.lua")
+    -- A wall on x=1, three tall and seven wide, between the start (0,64,0) and the goal (2,64,0).
+    -- Cutting through is 3 steps; going over is about 8. It must go over.
+    for z = -3, 3 do for y = 63, 65 do env.cachedWorld["1:" .. y .. ":" .. z] = 1 end end
+    local s_Path = env.a_star(0, 64, 0, 2, 64, 0, 1, false, 99, true)
+    truthy(type(s_Path) == "table", "a path came back: " .. tostring(s_Path))
+    local x, y, z = 0, 64, 0
+    local s_Deltas = { [0] = {0, 0, -1}, [1] = {-1, 0, 0}, [2] = {0, 0, 1}, [3] = {1, 0, 0}, [4] = {0, 1, 0}, [5] = {0, -1, 0} }
+    local s_Cut = 0
+    for _, dir in ipairs(s_Path) do
+        local d = s_Deltas[dir]
+        x, y, z = x + d[1], y + d[2], z + d[3]
+        if env.cachedWorld[x .. ":" .. y .. ":" .. z] == 1 then s_Cut = s_Cut + 1 end
+    end
+    eq(s_Cut, 0, "no wall cell on the route")
+    eq(x .. "," .. y .. "," .. z, "2,64,0", "and it arrives")
+end)
+
+test("PowGPSServer: when nothing but rock leads to the goal the planner does dig", function()
+    local env = loadModule("PowGPSServer.lua")
+    -- Encase the goal completely: the only way in is through a cell of rock.
+    for dx = -1, 1 do for dy = -1, 1 do for dz = -1, 1 do
+        if not (dx == 0 and dy == 0 and dz == 0) then env.cachedWorld[(5 + dx) .. ":" .. (64 + dy) .. ":" .. dz] = 1 end
+    end end end
+    local s_Path = env.a_star(0, 64, 0, 5, 64, 0, 1, false, 99, true)
+    truthy(type(s_Path) == "table", "a digging path came back: " .. tostring(s_Path))
+    local s_Blocked = env.a_star(0, 64, 0, 5, 64, 0, 1, false, 99, false)
+    truthy(s_Blocked == false or s_Blocked == nil, "without digging there is no route")
+end)
+
+-- DroneLogic: travel asks for an open route before a digging one
+test("DroneLogic: TravelTo never asks for a digging plan when an open route exists", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    local s_Calls = {}
+    env.pgps.moveTo = function() s_Calls[#s_Calls + 1] = "moveTo" return true end
+    env.pgps.digTo = function() s_Calls[#s_Calls + 1] = "digTo" return true end
+    local px, py, pz = env.pgps.getCachedPosition()
+    truthy(env.TravelToBody(px + 12, py, pz + 5), "arrived")
+    eq(table.concat(s_Calls, ","), "moveTo", "one open-route plan, no digging plan")
+end)
+
+test("DroneLogic: TravelTo digs only after the open-route plans have failed", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    local s_Calls = {}
+    env.pgps.moveTo = function() s_Calls[#s_Calls + 1] = "moveTo" return false end
+    env.pgps.digTo = function() s_Calls[#s_Calls + 1] = "digTo" return true end
+    local px, py, pz = env.pgps.getCachedPosition()
+    truthy(env.TravelToBody(px + 12, py, pz + 5), "arrived by digging in the end")
+    truthy(s_Calls[1] == "moveTo", "the first ask was for an open route: " .. table.concat(s_Calls, ","))
+    local s_FirstDig
+    for i, c in ipairs(s_Calls) do if c == "digTo" and s_FirstDig == nil then s_FirstDig = i end end
+    truthy(s_FirstDig ~= nil and s_FirstDig > 1, "digging came after the open-route attempts")
+end)
+
+-- DroneLogic: the jitter watch
+test("DroneLogic: a drone that moves a lot over a few cells gets its trip broken after one window", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    local s_Broken = 0
+    env.pgps.motionWindow = function() return 22, 4, 3 end
+    env.pgps.BreakExec = function() s_Broken = s_Broken + 1 end
+    env.executing = false
+    -- the module's own start-up already ran one heartbeat, so the window closes within 8 calls
+    local s_Fired = false
+    for _ = 1, 8 do if env.JitterWatch() then s_Fired = true end end
+    truthy(s_Fired, "the window closed on jitter")
+    eq(s_Broken, 1, "the trip was broken once")
+end)
+
+test("DroneLogic: a drone covering ground is never called jittery", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.pgps.motionWindow = function() return 40, 12, 38 end
+    local s_Fired = false
+    for _ = 1, 16 do if env.JitterWatch() then s_Fired = true end end
+    truthy(not s_Fired, "40 moves over 38 cells is travel")
+end)
+
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))
 os.exit(failed == 0 and 0 or 1)

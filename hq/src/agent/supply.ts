@@ -1377,6 +1377,7 @@ async function maintenancePhases(
     ?? (await bringFactoriesOnline())
     ?? (await runFactories(queued))
     ?? (await keepTowerOrdered(live, queued))
+    ?? (await repairLowerFloors(queued))
     ?? (await collectFieldCaches(live, queued));
 }
 
@@ -1711,7 +1712,7 @@ function taskLevel(p_Name: string): number | null {
  * An unparseable name counts as the current floor: a tower task nobody can place is work in
  * progress, not scrap, and guessing "stale" would have it stopped.
  */
-function towerWorkFor(p_Queued: Set<string>, p_Level: number): { stillQueued: boolean; stale: string[] } {
+export function towerWorkFor(p_Queued: Set<string>, p_Level: number): { stillQueued: boolean; stale: string[] } {
   const tower = [...p_Queued].filter((n) => n.startsWith('tower-'));
   // An unparseable name counts as the CURRENT floor: a tower task nobody can attribute is work in
   // progress, not scrap, and guessing "stale" would have it stopped.
@@ -1724,7 +1725,9 @@ function towerWorkFor(p_Queued: Set<string>, p_Level: number): { stillQueued: bo
   // patches became work for a floor nobody was building. Ordering waits for an empty tower queue,
   // so they blocked level 0 exactly as thoroughly as the below-level leftovers had, and the filter
   // written for that bug could not see them because they were on the wrong side of it.
-  return { stillQueued: tower.some((n) => at(n) === p_Level), stale: tower.filter((n) => at(n) !== p_Level) };
+  // Patches BELOW the current level are repairs (repairLowerFloors), not leftovers: only a patch
+  // for a level the counter has not reached yet is out of place.
+  return { stillQueued: tower.some((n) => at(n) === p_Level), stale: tower.filter((n) => at(n) > p_Level) };
 }
 
 /**
@@ -1769,6 +1772,32 @@ async function outstandingFor(p_Level: number): Promise<{ live: number; failed: 
   }
 }
 
+/**
+ * FINISHED FLOORS GET HOLES, AND UNTIL NOW NOBODY LOOKED BACK. The level counter only ever moved
+ * up: once level 0 counted as done its squares were never ordered again, so every block a drone
+ * dug out of it on its way somewhere stayed out. order.tower already skips squares the map says
+ * are solid, so re-ordering a finished level queues exactly the holes. Each finished level is
+ * looked at every REPAIR_EVERY_MS while nothing of its own is queued.
+ */
+const REPAIR_EVERY_MS = 10 * 60_000;
+const repairCheckedAt = new Map<number, number>();
+export async function repairLowerFloors(p_Queued: Set<string>): Promise<{ acted: boolean; reason: string } | null> {
+  const level = supply.towerLevel ?? 0;
+  for (let l = 0; l < level; l++) {
+    if (towerWorkFor(p_Queued, l).stillQueued) continue;
+    if (Date.now() - (repairCheckedAt.get(l) ?? 0) < REPAIR_EVERY_MS) continue;
+    repairCheckedAt.set(l, Date.now());
+    const ordered = await orderFloor(l);
+    if ('failed' in ordered) {
+      note(`repair: level ${l} could not be re-ordered -- ${ordered.failed}`);
+      continue;
+    }
+    const res: any = ordered.res;
+    const holes = (res?.data?.tasks ?? res?.tasks ?? []).length;
+    if (holes > 0) return { acted: true, reason: `repair: level ${l} had holes -- ${holes} patch(es) re-ordered` };
+  }
+  return null;
+}
 /** Clear patches belonging to floors already advanced past. Reports the shortfall rather than
  *  returning a bare count, because a partial clear leaves the tower just as blocked as no clear. */
 async function clearStaleFloors(p_Stale: string[]): Promise<{ acted: boolean; reason: string }> {

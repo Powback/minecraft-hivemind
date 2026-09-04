@@ -1322,6 +1322,17 @@ end
 -- is the right trade here: a turtle walking three blocks further costs three fuel, while a search
 -- that does not return costs the drone entirely. Kept modest so paths stay sensible.
 local ASTAR_WEIGHT = 1.35
+-- WHAT A DUG CELL COSTS. Until 2026-09-04 nothing: a cell the drone would have to cut through
+-- scored the same single step as open air, so with digging allowed the shortest route to anything
+-- behind a wall or under a floor was straight through it -- and TravelTo asked for a digging plan
+-- FIRST on every hop under 32 blocks. Floor 0 of the tower ended up "swiss cheese" (the user's
+-- words). A tunnel cell now costs as much as a detour of this many open cells, so the planner
+-- walks around through any opening within that trade and digs only where nothing else reaches.
+local DIG_STEP_COST = 12
+-- What one step into a known cell costs, by what the map says is there: open air 1, a cell a drone
+-- walked lately (2) is free, rock that must be cut pays the tunnel price. Unknown cells cost
+-- `discover`, set per request.
+local STEP_COST = {[0] = 1, [1] = 1 + DIG_STEP_COST, [2] = 0, [3] = 1}
 
 -- How far outside the start/goal box the search may wander. Without this an unreachable goal makes
 -- the frontier expand in every direction until the node limit, which is slow AND useless -- if the
@@ -1335,7 +1346,7 @@ local ASTAR_MARGIN = 24
 -- small and greedy; a normal search that needs more than 6,000 nodes in a 24-block margin box is a
 -- route that does not exist.
 local ASTAR_MAX_NODES = 6000
-local ASTAR_MAX_NODES_DIG = 2500
+local ASTAR_MAX_NODES_DIG = 5000
 local ASTAR_WEIGHT_DIG = 2.0
 
 -- WHERE THE OTHER DRONES ARE, RIGHT NOW.
@@ -1483,8 +1494,7 @@ function a_star(x1, y1, z1, x2, y2, z2, discover, priority, asker, dig)
                        and s_Passable
                        and (s_Busy[idx_neighbor] == nil or idx_neighbor == idx_goal)
                        and not closedset[idx_neighbor] then
-                        local s_Step = (s_Cell == nil) and discover or 1
-                        if s_Cell == 2 then s_Step = s_Step - 1 end
+                        local s_Step = (s_Cell == nil) and discover or STEP_COST[s_Cell]
                         local tentative = g_score[idx_current] + s_Step
                         if g_score[idx_neighbor] == nil or tentative < g_score[idx_neighbor] then
                             cameFrom[idx_neighbor] = {dir, idx_current}
