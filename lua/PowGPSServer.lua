@@ -1366,6 +1366,10 @@ end
 -- at all, so it walked into the same protected blocks for ever no matter how many times the fleet
 -- recorded them. Making it a PASSABILITY MODE of the one pathfinder is the whole fix: one map, one
 -- search, and "we are not allowed through there" is a fact the router already has.
+-- A digging drone may be sent INTO rock: the cell above an ore is dirt, and that is the point.
+local function goalOpen(p_Cell, p_Dig)
+    return p_Dig or p_Cell == nil or p_Cell == 0 or p_Cell == 2
+end
 function a_star(x1, y1, z1, x2, y2, z2, discover, priority, asker, dig)
     discover = discover or 1
     local s_Busy = occupiedByOthers(asker)
@@ -1382,7 +1386,7 @@ function a_star(x1, y1, z1, x2, y2, z2, discover, priority, asker, dig)
 
     -- Goal must be somewhere a turtle can BE: air, unknown, or occupied by another turtle.
     local s_GoalCell = cachedWorld[idx_goal]
-    if not (s_GoalCell == nil or s_GoalCell == 0 or s_GoalCell == 2) then
+    if not goalOpen(s_GoalCell, dig) then
         return false, "goal is solid"
     end
 

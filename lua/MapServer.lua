@@ -411,10 +411,16 @@ function OnGetPath(p_ID, p_Message)
     local z2 = p_Message.data[6]
     local discover = p_Message.data[7]
     local priority =p_Message.data[8]
+    -- THE DIG FLAG NEVER REACHED THE PLANNER. pgps sends it as data[9] for every digTo; this handler
+    -- read seven and eight and called a_star without it, so the planner treated every solid cell as
+    -- a wall and every digTo failed at the request: a coal ore under five blocks of dirt was
+    -- "unreachable" after 392 fuel, and every canopy log the same (2026-09-04). The whole
+    -- dig-through capability was dead at this line.
+    local dig = p_Message.data[9] == true
     -- The request already tells us where the asker IS -- record it, so every other drone's next
     -- path plans around this one instead of through it. Free: no new endpoint, no extra traffic.
     PowGPSServer.noteDroneAt(p_ID, x1, y1, z1)
-    local s_Path, s_Why = PowGPSServer.a_star(x1, y1, z1, x2, y2, z2, discover, priority, p_ID)
+    local s_Path, s_Why = PowGPSServer.a_star(x1, y1, z1, x2, y2, z2, discover, priority, p_ID, dig)
     if(s_Path == false) then
         notePath(false, s_Why, os.epoch("utc") - s_T0)
         return false, {message = tostring(s_Why or "failed to find path")}

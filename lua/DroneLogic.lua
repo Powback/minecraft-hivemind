@@ -5194,8 +5194,11 @@ function OnGather(p_ID, p_Message)
                 -- Which face we ended up on, so the inspect and the dig agree with the approach.
                 local s_FromBelow = false
                 local s_FromSide  = false
+                -- SAY WHICH MOVER FAILED AND WHY. D31 spent 392 fuel and 110 s of silence on one coal
+                -- ore six blocks down under dirt, then logged only "could not reach" (2026-09-04).
+                local s_WhyRoute, s_WhyDig, s_WhyFly = "not tried", "not tried", "not tried"
                 if s_Cx == nil or s_Near > SHORT_HOP then
-                    s_At = pgps.moveTo(t.x, t.y + 1, t.z)
+                    s_At, s_WhyRoute = pgps.moveTo(t.x, t.y + 1, t.z)
                 end
                 if s_At == false and CanDig() then
                     -- BUDGET THE DIG BY DISTANCE.
@@ -5211,7 +5214,7 @@ function OnGather(p_ID, p_Message)
                     if s_Cx then
                         s_D = Blocks(t.x, t.y, t.z, s_Cx, s_Cy, s_Cz)
                     end
-                    s_At = pgps.digTo(t.x, t.y + 1, t.z, math.min(96, s_D * 2 + 16))
+                    s_At, s_WhyDig = pgps.digTo(t.x, t.y + 1, t.z, math.min(96, s_D * 2 + 16))
                 end
                 -- Declared here, above the branch that computes it: the "from underneath" and "from
                 -- the side" branches below read it too, and as a `local` inside the first branch it
@@ -5232,7 +5235,7 @@ function OnGather(p_ID, p_Message)
                     if s_Cx then
                         s_FlyBudget = math.min(128, (Blocks(t.x, t.y, t.z, s_Cx, s_Cy, s_Cz)) * 3 + 16)
                     end
-                    s_At = pgps.flyTo(t.x, t.y + 1, t.z, s_FlyBudget)
+                    s_At, s_WhyFly = pgps.flyTo(t.x, t.y + 1, t.z, s_FlyBudget)
                 end
 
                 -- IF ABOVE IS SOLID, COME AT IT FROM UNDERNEATH.
@@ -5362,7 +5365,8 @@ function OnGather(p_ID, p_Message)
                         end
                     end
                 else
-                    trace(("gather: could not reach %d,%d,%d"):format(t.x, t.y, t.z))
+                    trace(("gather: could not reach %d,%d,%d -- route: %s; dig: %s; fly: %s")
+                        :format(t.x, t.y, t.z, tostring(s_WhyRoute), tostring(s_WhyDig), tostring(s_WhyFly)))
                     s_Missed = s_Missed + 1
                     -- STOP PAYING FOR CANDIDATES WE CANNOT REACH.
                     --
@@ -6814,7 +6818,9 @@ function ShelfBurnable()
     return s_Burnable
 end
 function ShelfReserveKeeps(p_Burnable)
-    local SHELF_RESERVE = 192
+    -- 256, ABOVE HQ's EMERGENCY LINE OF 160 WITH ROOM: at 192 the shelf sat at 147-161 and the
+    -- emergency flapped on and off, pausing and resuming the tower every tick (2026-09-04 02:28).
+    local SHELF_RESERVE = 256
     -- A RELIEF IS SOMEBODY ELSE'S SURVIVAL. The reserve exists so a full drone does not top up on the
     -- last coal; a reliever fetching for a drone at zero is exactly what the last coal is for. The
     -- first ten minutes of the reserve left two drones dead while "Relieve FAILED no fuel to
