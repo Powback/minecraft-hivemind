@@ -2111,7 +2111,11 @@ end
 -- way -- digging is a PASSABILITY MODE, not a different way of travelling. digTo used to be a
 -- separate greedy axis-walker that consulted no map at all, which is why a drone could walk into the
 -- same chest for ever no matter how many times the fleet recorded it.
-local PATH_REPLY_S = 6
+-- GAME SECONDS, NOT REAL ONES: rednet's timeout is a tick timer. At /tick rate 200 six game seconds
+-- are 0.6 real seconds and "did not answer" came back (36 in ten minutes, 2026-09-04 02:46) while
+-- MapServer answered every request it heard in 0-2 ms. Twenty game seconds is two real seconds at
+-- 10x and twenty at 1x -- long enough either way, and a drone waiting is a drone not burning fuel.
+local PATH_REPLY_S = 20
 local function moveLeg(_targetX, _targetY, _targetZ, _targetDir, changeDir, discover, p_Dig)
     changeDir = changeDir or false
     local s_Replans, s_Stalls, s_BestDist = 0, 0, nil
