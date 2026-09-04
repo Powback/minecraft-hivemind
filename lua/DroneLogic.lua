@@ -8724,6 +8724,13 @@ local FUEL_WATCH_EVERY = 20
 -- A GLOBAL, because depositIfFull is defined ~1,800 lines above this and needs it. A `local
 -- function` here is invisible up there -- the trap that has cost this codebase seven outages.
 function RefuelAtStorage()
+    -- At zero there is no trip to make: the sweep of the bay was "a list of places we cannot go"
+    -- (its own words), and it ran every heartbeat, spinning the drone on the spot between refused
+    -- steps. Report it once and hold still; TaskMan's fuel relief is the way out of an empty tank.
+    if turtle.getFuelLevel() == 0 then
+        Distress("out of fuel", "tank empty -- holding still for relief")
+        return false
+    end
     trace("refuel: heading to storage")
     local s_Res = PowNet.sendAndWaitForResponse("StorageMan",
         PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "DepositPoint", {}), PowNet.SERVER_PROTOCOL)

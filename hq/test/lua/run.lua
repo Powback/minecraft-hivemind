@@ -740,5 +740,30 @@ test("DroneLogic: a drone covering ground is never called jittery", function()
     truthy(not s_Fired, "40 moves over 38 cells is travel")
 end)
 
+
+-- A dry drone does not try
+test("pgps.moveTo at zero fuel refuses before turning or asking for a path", function()
+    local env = loadModule("pgps.lua")
+    env.setLocation(0, 64, 0, "north")
+    env.turtle.fuel = 0
+    local s_Turns = 0
+    env.turtle.turnLeft = function() s_Turns = s_Turns + 1 return true end
+    env.turtle.turnRight = function() s_Turns = s_Turns + 1 return true end
+    local ok, why = env.moveTo(5, 64, 5)
+    eq(ok, false, "refused")
+    eq(why, "out of fuel", "and said why")
+    eq(s_Turns, 0, "without a single turn")
+end)
+
+test("DroneLogic: RefuelAtStorage at zero fuel raises a distress and makes no trip", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.turtle.fuel = 0
+    local s_Asked = false
+    env.__world.replies.StorageMan = { DepositPoint = function() s_Asked = true return { pos = { x = 0, y = 64, z = 0 } } end }
+    local ok = env.RefuelAtStorage()
+    eq(ok, false, "no refuel")
+    truthy(not s_Asked, "StorageMan was not asked for a deposit point")
+end)
+
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))
 os.exit(failed == 0 and 0 or 1)

@@ -2162,7 +2162,6 @@ local function moveLeg(_targetX, _targetY, _targetZ, _targetDir, changeDir, disc
             ptrace("moveTo: giving up after " .. s_Replans .. " replans")
             return false, "unreachable"
         end
-        if cachedX == nil then return false, "lost the position fix part-way" end
         local s_Dist = math.abs(cachedX - _targetX)
                      + math.abs(cachedY - _targetY)
                      + math.abs(cachedZ - _targetZ)
@@ -2428,6 +2427,11 @@ local MOVE_STUCK   = 4       -- legs without progress before giving up
 -- THE one implementation of "get from here to there". p_Dig only changes which cells the PLANNER is
 -- allowed to route through; the travelling itself is identical, which is the entire point.
 function moveTo(_targetX, _targetY, _targetZ, _targetDir, changeDir, discover, p_Dig)
+    -- A DRY DRONE DOES NOT TRY. Every leg used to plan, turn to face the first step, have the step
+    -- refused ("MOVE REFUSED: Out of fuel", 50-90 times a minute), replan and turn again: D31 spent
+    -- a window of 42 turns and 0 moves spinning at the bay. Turning is free, so nothing stopped it.
+    -- There is no route around an empty tank; say so before the first turn and let relief come.
+    if turtle.getFuelLevel() == 0 then return false, "out of fuel" end
     if cachedX == nil then return false, "no position fix" end
     if _targetX == nil or _targetY == nil or _targetZ == nil then
         return false, "incomplete destination"
