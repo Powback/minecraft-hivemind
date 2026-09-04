@@ -2778,12 +2778,12 @@ end
 -- pathfinder to handle anything that actually needs routing.
 local STRAIGHT_HOP = 3
 
+-- THE STRAIGHT HOP DOES NOT DIG. Until 2026-09-05 every hop of STRAIGHT_HOP blocks or less dug
+-- up, down or forward before moving -- no map, no plan, whatever was there. A drone one block
+-- under a floor slab, sent one block up, put a hole in the floor. A blocked straight step now
+-- simply fails and the hop falls through to the planner, which prices a dug cell at 13 steps.
 local function stepVertically(p_Cy, p_Y)
-    if p_Cy < p_Y then
-        DigUp()
-        return pgps.up()
-    end
-    DigDown()
+    if p_Cy < p_Y then return pgps.up() end
     return pgps.down()
 end
 
@@ -2800,7 +2800,6 @@ local function stepHorizontally(p_Cx, p_Cz, p_X, p_Z)
     local s_H = headingToward(p_Cx, p_Cz, p_X, p_Z)
     if s_H == nil then return false end
     if pgps.turnTo(s_H) == false then return false end
-    DigForward()
     return pgps.forward()
 end
 

@@ -798,5 +798,22 @@ test("DroneLogic: a job body waits for the travel lock and fails honestly when i
     truthy(tostring(err):find("kept the drone moving", 1, true) ~= nil, "and the reason names the lock: " .. tostring(err))
 end)
 
+
+test("DroneLogic: a short straight hop never digs -- a blocked step falls through to the planner", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    local s_Digs = 0
+    env.turtle.digUp = function() s_Digs = s_Digs + 1 return true end
+    env.turtle.digDown = function() s_Digs = s_Digs + 1 return true end
+    env.turtle.dig = function() s_Digs = s_Digs + 1 return true end
+    env.turtle.detectUp = function() return true end
+    env.pgps.up = function() return false end            -- something solid overhead
+    local s_Planned = false
+    env.pgps.moveTo = function() s_Planned = true return true end
+    local px, py, pz = env.pgps.getCachedPosition()
+    truthy(env.TravelToBody(px, py + 2, pz), "arrived")
+    eq(s_Digs, 0, "nothing was dug on the way")
+    truthy(s_Planned, "the planner was asked instead")
+end)
+
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))
 os.exit(failed == 0 and 0 or 1)
