@@ -21,7 +21,7 @@ HQ="${HQ:-hive-hq}"
 
 read_faults() {
   docker exec "$HQ" node -e "
-    fetch((process.env.HIVE_URL || 'http://hive.pow') + '/brief')
+    fetch('http://localhost:4400/brief')   // inside the HQ container; the port is not published on the Mac
       .then(r => r.json())
       .then(b => {
         const p = (b.problems || []).filter(x => String(x) !== 'none');
