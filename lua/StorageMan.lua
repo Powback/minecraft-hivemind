@@ -945,6 +945,7 @@ end
 -- emptiest chest wins and drones spread out; beyond it, the closer chest wins and a miner stops
 -- flying its spoil fifty blocks up a shaft.
 local DEPOSIT_NEAR = 16
+local DEPOSIT_SPREAD = 6        -- how many of the roomiest near chests the fleet spreads over
 
 -- LOCALITY FIRST, THEN EMPTIEST. A CACHE AT THE WORK SITE IS THE POINT OF HAVING ONE.
 --
@@ -962,7 +963,12 @@ local DEPOSIT_NEAR = 16
 --
 -- Its own function because OnDepositPoint is already over the complexity gate, and because
 -- "which chest should this drone use" is a question worth being able to read in one place.
-local function pickDeposit(p_Usable, p_Near, p_FreeOf)
+-- SEVEN DRONES, ONE CHEST. "Most free space among the nearest" is the same answer for every asker
+-- at the same moment, so the whole fleet queued over -476,64,78 and logged "could not reach
+-- -476,65,78 -- asking anyone in the way to move" 27 times in six minutes while five other chests
+-- with room sat two blocks away (2026-09-04). Among the near candidates with room, the asker's id
+-- picks the chest, so seven drones spread over up to six columns.
+local function pickDeposit(p_Usable, p_Near, p_FreeOf, p_Asker)
     local function dist(d)
         if p_Near == nil or d.pos == nil then return 0 end
         return math.abs(d.pos.x - p_Near.x) + math.abs(d.pos.y - p_Near.y)
@@ -973,17 +979,17 @@ local function pickDeposit(p_Usable, p_Near, p_FreeOf)
         local dd = dist(d)
         if s_Closest == nil or dd < s_Closest then s_Closest = dd end
     end
-    local s_Pick, s_Best = nil, nil
+    local s_Cands = {}
     for _, d in ipairs(p_Usable) do
         local f = p_FreeOf(d)
-        -- "Close" means within a short walk of the nearest option, not a fixed radius of base: the
-        -- drone may legitimately be working a long way from anything.
-        if f ~= nil and f > 0 and dist(d) <= (s_Closest + DEPOSIT_NEAR)
-           and (s_Best == nil or f > s_Best) then
-            s_Pick, s_Best = d, f
+        if f ~= nil and f > 0 and dist(d) <= (s_Closest + DEPOSIT_NEAR) then
+            s_Cands[#s_Cands + 1] = d
         end
     end
-    return s_Pick
+    if #s_Cands == 0 then return nil end
+    table.sort(s_Cands, function(x, y) return (p_FreeOf(x) or 0) > (p_FreeOf(y) or 0) end)
+    local s_Spread = math.min(#s_Cands, DEPOSIT_SPREAD)
+    return s_Cands[(math.abs(tonumber(p_Asker) or 0) % s_Spread) + 1]
 end
 
 function OnDepositPoint(p_ID, p_Message)
@@ -1046,7 +1052,7 @@ function OnDepositPoint(p_ID, p_Message)
         if rec == nil or rec.used == nil then return nil end
         return math.max(0, (tonumber(rec.size) or 27) - tonumber(rec.used))
     end
-    local s_Pick = pickDeposit(s_Usable, p_Message.data and p_Message.data.near, freeOf)
+    local s_Pick = pickDeposit(s_Usable, p_Message.data and p_Message.data.near, freeOf, p_ID)
     -- Nothing with known free space: fall back to a point of unknown fullness rather than refuse,
     -- but skip the ones we KNOW are full.
     if s_Pick == nil then

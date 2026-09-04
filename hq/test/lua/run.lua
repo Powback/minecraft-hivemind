@@ -253,6 +253,20 @@ test("StorageMan.fillFor: dense fuel first when it exists", function()
     eq(batch, 16, "a normal batch")
 end)
 
+test("StorageMan.OnDepositPoint spreads seven askers over the roomy chests instead of one", function()
+    local env = storageWithChests()
+    local picks = {}
+    for id = 40, 46 do
+        local ok, r = env.OnDepositPoint(id, { data = {} })
+        truthy(ok, "asker " .. id .. " got a point")
+        local k = r.peripheral or tostring(r.pos.x)
+        picks[k] = (picks[k] or 0) + 1
+    end
+    local distinct = 0
+    for _ in pairs(picks) do distinct = distinct + 1 end
+    truthy(distinct >= 2, "two networked chests with room, seven askers: both get used (" .. distinct .. ")")
+end)
+
 -- ================================================================================================
 -- DroneLogic
 -- ================================================================================================
