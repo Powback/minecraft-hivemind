@@ -906,6 +906,18 @@ end
     return s_Verb, s_Payload
 end
 
+-- SCOUTS HAUL. A haul is any-role work and the any-role pick is "nearest free drone", so miners took
+-- hauls as often as scouts and left ore and wood standing while a scout sat idle. Miners mine; caches
+-- come home on whoever else has fuel (the user, 2026-09-04: "scouts can help haul"). Everything else
+-- is the plain pick for the task's role.
+local function pickForTask(p_Task, p_Role, p_Where, p_MinFuel)
+    if p_Task.work and p_Task.work.haul then
+        local s_Hauler = pickDrone("scout", p_Where, p_Task.lastFailedBy, p_MinFuel)
+                      or pickDrone("crafter", p_Where, p_Task.lastFailedBy, p_MinFuel)
+        if s_Hauler then return s_Hauler end
+    end
+    return pickDrone(p_Role, p_Where, p_Task.lastFailedBy, p_MinFuel)
+end
 function OnStartTask(p_ID, p_Message)
     local s_Id = p_Message.data and p_Message.data.id
     if s_Id == nil then return false, "Missing id" end
@@ -954,8 +966,10 @@ function OnStartTask(p_ID, p_Message)
     -- Every job needs a drone that can complete it and the round trip, not merely one allowed to
     -- take orders. jobMinFuel is the estimate; pickDrone adds the distance from each candidate.
     local s_MinFuel = jobMinFuel(s_Task)
-    local s_Drone, s_Busy, s_Poor, s_PoorNeed =
-        pickDrone(s_Role, s_Where, s_Task.lastFailedBy, s_MinFuel)
+    -- SCOUTS HAUL. A haul is any-role work and the any-role pick is "nearest free drone", so miners
+    -- took hauls as often as scouts and left ore and wood standing while a scout sat idle. Miners
+    -- mine; caches come home on whoever else has fuel (the user, 2026-09-04: "scouts can help haul").
+    local s_Drone, s_Busy, s_Poor, s_PoorNeed = pickForTask(s_Task, s_Role, s_Where, s_MinFuel)
 
     -- A DRONE MUST NOT BE SENT TO RESCUE ITSELF.
     --

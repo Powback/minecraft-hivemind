@@ -143,6 +143,17 @@ test("TaskMan.heldForNothing: a busy drone that has not moved for three minutes 
     eq(T.heldForNothing(d), nil, "it moved: not stalled")
 end)
 
+test("TaskMan: a haul goes to a free scout before a free miner", function()
+    local env, T = taskManWithFleet({
+        { id = 1, name = "D1", role = "miner", status = "idle", fuel = 1500, pos = { x = -468, y = 64, z = 43 } },
+        { id = 2, name = "D9", role = "scout", status = "idle", fuel = 1500, pos = { x = -475, y = 64, z = 50 } },
+    })
+    env.DATA.tasks = { [7] = { id = 7, name = "haul:-469,64,41", work = { haul = { pos = { x = -469, y = 64, z = 41 } } }, progress = 0, priority = 1 } }
+    local ok, r = env.OnStartTask(0, { data = { id = 7 } })
+    truthy(ok, "placed: " .. tostring(r and (r.message or r) or "?"))
+    eq(env.DATA.tasks[7].assignedTo, 2, "the scout took it, though the miner was nearer")
+end)
+
 test("TaskMan.pickDrone offers the job to a drone that can afford it", function()
     local _, T = taskManWithFleet({
         { id = 1, name = "D1", role = "miner", status = "idle", fuel = 1000, pos = { x = 0, y = 64, z = 0 } },
