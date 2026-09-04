@@ -1,4 +1,9 @@
-REDNET_TIMEOUT = 1
+-- GAME SECONDS, NOT REAL ONES: rednet.receive's timeout is a tick timer, so at /tick rate 200 one
+-- game second is a tenth of a real second -- less than a busy module's turnaround. "no response
+-- from DroneMan.Stop", "MapServer did not take N observations" and "pathfinder did not answer" all
+-- came from this one number once the world ran at 10x (2026-09-04). Ten game seconds is one real
+-- second at 10x and ten at 1x; a reply that takes longer than that is a module that is down.
+REDNET_TIMEOUT = 10
 --===== SET REDNET PROTOCOL =====--
 SERVER_PROTOCOL = "PowNet:Server"
 DRONE_PROTOCOL = "PowNet:Drone"

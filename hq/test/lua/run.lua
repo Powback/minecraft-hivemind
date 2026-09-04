@@ -456,6 +456,32 @@ test("pgps.verifyPosition refuses a fix while a move is in flight, whoever asks"
     truthy(ok, "a fix between moves is accepted") eq(drift, 0, "and agrees with the bookkeeping")
 end)
 
+test("pgps: a step commits its own delta, so another routine's step in flight is not lost", function()
+    local env = loadModule("pgps.lua")
+    env.setLocation(0, 64, 0, "north")
+    env.__world.gps = { x = 0, y = 64, z = 0 }
+    -- While our forward step is in flight, another coroutine commits a step east.
+    env.turtle.forward = function() env.noteExternalStep(1, 0, 0) return true end
+    truthy(env.forward(), "our step")
+    local x, _, z = env.getCachedPosition()
+    eq(x, 1, "the other routine's step is kept") eq(z, -1, "and so is ours")
+end)
+
+test("pgps: the travel audit does not rotate the heading after a run that turned", function()
+    local env = loadModule("pgps.lua")
+    env.setLocation(0, 64, 0, "north")
+    env.__world.gps = { x = 0, y = 64, z = 0 }
+    truthy(env.verifyPosition(true), "anchor the audit")
+    env.turtle.forward = function() return true end
+    truthy(env.forward(), "one north")                        -- intent (0,0,-1)
+    truthy(env.turnRight(), "turn")                           -- now east
+    truthy(env.forward(), "one east")                         -- intent (1,0,-1)
+    env.__world.gps = { x = 1, y = 64, z = 0 }                -- GPS says the north step never happened
+    env.verifyPosition(true)
+    local _, _, _, d = env.getCachedPosition()
+    eq(d, env.HEADINGS.east, "the heading is kept: a turned run cannot be inverted")
+end)
+
 test("pgps.ensureHeading reads the heading from a clean probe step and refuses one disturbed by another mover", function()
     local env = loadModule("pgps.lua")
     env.setLocation(0, 64, 0, "north")

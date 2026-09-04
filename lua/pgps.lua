@@ -1013,6 +1013,11 @@ local function axisOf(dx, dz)
 end
 
 local function correctFromTravel(adx, adz)
+    -- ONLY A STRAIGHT RUN CAN BE INVERTED. After a turn the intent vector is a sum over two
+    -- headings and its axis means nothing; rotating a correct heading by it produced "heading was
+    -- E, we actually travelled E -- rotating 3 quarter-turn(s) to S" in the bay, where every deposit
+    -- dance turns, and each false rotation sent the next leg the wrong way (2026-09-04, D38).
+    if m_TurnsSinceFix > 0 then return false end
     local want = axisOf(m_IntDX, m_IntDZ)
     local got  = axisOf(adx, adz)
     if want == nil or got == nil or want == got then return false end
@@ -1683,7 +1688,16 @@ end
 -- cell we left. p_Straight says whether this step is evidence about FACING -- see auditHeading;
 -- only forward() is, which is why back and the verticals pass false.
 local function stepTaken(p_X, p_Y, p_Z, p_Dx, p_Dy, p_Dz, p_Straight)
-    cachedX, cachedY, cachedZ = p_X, p_Y, p_Z
+    -- COMMIT THE DELTA, NOT THE TARGET. The caller computed p_X from the cache BEFORE its move and
+    -- yielded for the animation; if another coroutine (a make-way step, the dock loop) committed a
+    -- step meanwhile, writing p_X here threw that step away -- the intent kept both, the cache kept
+    -- one, and the next fix read "audit matched (V) yet the fix moved us 1 -- both cannot be right",
+    -- fifty-five times in ten minutes in the bay (2026-09-04). The delta is what this step did.
+    if cachedX ~= nil and (cachedX + p_Dx ~= p_X or cachedY + p_Dy ~= p_Y or cachedZ + p_Dz ~= p_Z) then
+        ptrace(("step landed on a cache another routine had moved (%d,%d,%d vs %d,%d,%d) -- keeping both")
+            :format(cachedX + p_Dx, cachedY + p_Dy, cachedZ + p_Dz, p_X, p_Y, p_Z))
+    end
+    cachedX, cachedY, cachedZ = (cachedX or p_X - p_Dx) + p_Dx, (cachedY or p_Y - p_Dy) + p_Dy, (cachedZ or p_Z - p_Dz) + p_Dz
     notePlannedStep(p_Dx, p_Dy, p_Dz, p_Straight)
     breadcrumb()
     detectAll()

@@ -7498,7 +7498,7 @@ function UploadWorld(p_Force)
         {cachedWorld = s_World, cachedWorldDetail = s_Detail})
     -- One attempt: observations are re-queued on failure (below), so a retry here only duplicates
     -- traffic against a MapServer that is already the busiest module in the fleet.
-    local s_Ok = PowNet.sendAndWaitForResponse("MapServer", s_Message, PowNet.SERVER_PROTOCOL, 5, 1)
+    local s_Ok = PowNet.sendAndWaitForResponse("MapServer", s_Message, PowNet.SERVER_PROTOCOL, 20, 1)
     if(not s_Ok) then
         -- Put them back rather than lose them: an unreachable MapServer should cost a retry, not
         -- a hole in the map that nothing will ever revisit.
