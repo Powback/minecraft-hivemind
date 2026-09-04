@@ -687,7 +687,11 @@ async function dispatchLumber(rule: SupplyRule, have: number, ctx: SupplyCtx): P
 
 async function dispatchGather(rule: SupplyRule, have: number, ctx: SupplyCtx): Promise<boolean> {
   // Ask for the dig first, but only if a miner could actually take it.
-  if (ctx.minerFree) {
+  // FUEL ORE IS QUEUED EVEN WHEN NO MINER IS FREE. TaskMan ranks fuel work ahead of building and
+  // hands it to the next miner that frees up; waiting for a free miner here meant that while every
+  // miner was laying bricks the coal gather was never even queued, and the tick logged "coal_ore:
+  // 161/800, none known -> survey" with 1,143 coal ore blocks in the index (2026-09-04).
+  if (ctx.minerFree || producesFuel(rule.match)) {
     const r: any = await callTool('order.gather', { match: rule.match, limit: rule.limit ?? 64 });
     if (r?.ok !== false) {
       supply.cooldowns[rule.match] = ctx.now + COOLDOWN_MS;

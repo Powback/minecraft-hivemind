@@ -6815,6 +6815,11 @@ function ShelfBurnable()
 end
 function ShelfReserveKeeps(p_Burnable)
     local SHELF_RESERVE = 192
+    -- A RELIEF IS SOMEBODY ELSE'S SURVIVAL. The reserve exists so a full drone does not top up on the
+    -- last coal; a reliever fetching for a drone at zero is exactly what the last coal is for. The
+    -- first ten minutes of the reserve left two drones dead while "Relieve FAILED no fuel to
+    -- deliver: storage holds 163 burnable, all of it reserve" (2026-09-04).
+    if m_Relieving then return false end
     local s_F = turtle.getFuelLevel()
     return type(s_F) == "number" and s_F >= FuelFloorNow() and (tonumber(p_Burnable) or 0) <= SHELF_RESERVE
 end

@@ -491,6 +491,10 @@ test("DroneLogic.CollectFuel leaves the shelf its reserve unless the drone is be
     env.__world.turtle.fuel = 50                             -- under the floor: survival comes first
     local _, why2 = D.collectFuel()
     truthy(not why2 or not why2:find("reserve", 1, true), "a drone below its floor is not refused the reserve: " .. tostring(why2))
+    env.__world.turtle.fuel = 1000
+    D.setRelieving(true)                                     -- fetching for a drone at zero
+    local _, why3 = D.collectFuel()
+    truthy(not why3 or not why3:find("reserve", 1, true), "a reliever is not refused the reserve: " .. tostring(why3))
 end)
 
 test("DroneLogic.FellTargets stops at an abort and when the tank is the trip home", function()
