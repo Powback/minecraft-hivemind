@@ -217,7 +217,10 @@ end
 -- TaskMan could not reclaim (2026-09-04). A GoTo or Survey that ended on a path without TaskEnd
 -- is the way in; this, called from the heartbeat, is the way out.
 function ClearStuckExecuting()
-    if not executing or InJob then return false end
+    -- m_Refuelling is the same shape: RefuelAtStorage sets it and clears it at "refuel sequence
+    -- finished"; a sequence that never finishes (deposit into a full shelf that never succeeds) leaves
+    -- the drone "refuelling" for ever, refusing work (D40, 29 minutes, 2026-09-04 22:50).
+    if not (executing or m_Refuelling) or InJob then return false end
     local EXEC_STILL_S = 300
     local cx, cy, cz = pgps.getCachedPosition()
     local s_Key = tostring(cx) .. ":" .. tostring(cy) .. ":" .. tostring(cz)
@@ -226,9 +229,10 @@ function ClearStuckExecuting()
         return false
     end
     if (os.clock() - (ExecStillSince or os.clock())) <= EXEC_STILL_S then return false end
-    trace(("executing flag left behind by a %s that has not moved for %ds and runs no job -- clearing")
-        :format(tostring(m_Status), math.floor(os.clock() - ExecStillSince)))
+    trace(("%s flag left behind by a %s that has not moved for %ds and runs no job -- clearing")
+        :format(m_Refuelling and "refuelling" or "executing", tostring(m_Status), math.floor(os.clock() - ExecStillSince)))
     TaskEnd()
+    m_Refuelling = false
     m_Status = "idle"
     m_Detail = nil
     return true

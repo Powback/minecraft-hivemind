@@ -1336,9 +1336,11 @@ async function observedFreeSlots(): Promise<number | null> {
  */
 async function storageHasNoRoom(): Promise<boolean> {
   const free = await observedFreeSlots();
-  if (free === null || free > 0) return false;
-  note('storage has no free slot -- gathering only fuel until there is room');
-  return true;
+  // "No room" at the same floor expansion uses, not at zero: with 2 free slots the field-cache hauls
+  // still ran and every deposit behind them failed (2026-09-04, 22:50).
+  const noRoom = free !== null && free <= FREE_SLOTS_FLOOR;
+  if (noRoom) note(`storage down to ${free} free slot(s) -- gathering only fuel until there is room`);
+  return noRoom;
 }
 
 /**
@@ -2227,6 +2229,14 @@ async function expandStorageIfFull(
   const free = await observedFreeSlots();
   if (free === null || free > FREE_SLOTS_FLOOR) return null;
 
+  // ONE UNFINISHED STORAGE PLOT AT A TIME. Each chest-row order allocated a fresh plot and, with no
+  // chests to build it from, the next tick allocated another: 52 storage plots "clearing" by the
+  // evening of 2026-09-04, none built. The unfinished one is the expansion; wait for it.
+  const pending = (city.plots as any[]).filter((p) => p.purpose === 'storage' && p.status !== 'active');
+  if (pending.length) {
+    note(`storage down to ${free} free slot(s) -- ${pending.length} storage plot(s) already ${pending[0].status}; not allocating more`);
+    return null;
+  }
   note(`storage down to ${free} free slot(s) -- expanding before everything jams behind it`);
   try {
     const r: any = await callTool('order.build', { blueprint: 'chest-row' });
