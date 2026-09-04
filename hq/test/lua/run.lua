@@ -815,5 +815,16 @@ test("DroneLogic: a short straight hop never digs -- a blocked step falls throug
     truthy(s_Planned, "the planner was asked instead")
 end)
 
+
+test("DroneLogic: a mid-job deposit that unloads nothing into a full inventory fails and backs off", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.FreeSlots = function() return 0 end
+    truthy(env.RoomAfterUnload(12), "unloading something is progress")
+    eq(env.RoomAfterUnload(0), false, "nothing unloaded, no free slot: no room")
+    truthy(env.DepositBackoffUntil > env.os.clock(), "and the next deposit waits")
+    env.FreeSlots = function() return 3 end
+    truthy(env.RoomAfterUnload(0), "nothing unloaded but room aboard: the job can go on")
+end)
+
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))
 os.exit(failed == 0 and 0 or 1)

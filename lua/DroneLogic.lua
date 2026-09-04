@@ -245,6 +245,17 @@ DepositBackoffUntil = 0
 function WantsDepositNow(p_Cargo)
     return p_Cargo > 0 and os.clock() >= DepositBackoffUntil
 end
+-- A MID-JOB DEPOSIT THAT UNLOADS NOTHING INTO A FULL INVENTORY HAS FAILED. It used to return
+-- true anyway (resumeAtFace always does), so the mining loop went straight back to the face,
+-- found every slot still full, and deposited again: D39 made 198 moves and 197 turns between
+-- the chest and the face in one window. Say no room, back off, and let the job end.
+function RoomAfterUnload(p_Unloaded)
+    if (p_Unloaded or 0) > 0 or FreeSlots() > 0 then return true end
+    DepositBackoffUntil = os.clock() + DEPOSIT_BACKOFF_S
+    trace(("deposit: unloaded nothing and every slot is full -- storage has no room; ending the job, next deposit in %ds")
+        :format(DEPOSIT_BACKOFF_S))
+    return false
+end
 function NoteDepositOutcome(p_Before, p_After)
     if p_After < p_Before then return end
     DepositBackoffUntil = os.clock() + DEPOSIT_BACKOFF_S
@@ -2922,7 +2933,9 @@ function TravelTo(p_X, p_Y, p_Z, p_Ceiling)
     end
     TravelOwner, TravelSince = coroutine.running(), os.clock()
     -- Who took it, for the day it is never given back. One line of the caller's stack.
-    TravelTakenAt = (debug and debug.traceback) and (debug.traceback("", 2):match("\n%s*([^\n]+)") or "?") or "?"
+    -- the second line: the first is the "stack traceback:" header, which is what every "taken at"
+    -- trace showed until 2026-09-05
+    TravelTakenAt = (debug and debug.traceback) and (debug.traceback("", 2):match("\n%s*[^\n]+\n%s*([^\n]+)") or "?") or "?"
     local ok, a, b = pcall(TravelToBody, p_X, p_Y, p_Z, p_Ceiling)
     TravelOwner, TravelSince, TravelTakenAt = nil, nil, nil
     if not ok then error(a, 0) end
@@ -4452,7 +4465,7 @@ function DepositNow()
         s_Res.pos.x, s_Res.pos.y + 1, s_Res.pos.z, (s_Res.pos.y or 64) + 4, "deposit")
     if s_Arrived then
         trace("deposit: arrived, unloading")
-        UnloadInto()
+        if not RoomAfterUnload(UnloadInto()) then return false, "storage full" end
         -- silent: allow (a convenience errand -- the drone works fine without a spare chest, it just caches less efficiently)
         pcall(TakeCacheChest)          -- leave with a chest for the next work site
         return resumeAtFace(hx, hy, hz)
@@ -4482,7 +4495,7 @@ function DepositNow()
         return false
     end
     trace("deposit: arrived, unloading")
-    UnloadInto()
+    if not RoomAfterUnload(UnloadInto()) then return false, "storage full" end
     return resumeAtFace(hx, hy, hz)
 end
 
