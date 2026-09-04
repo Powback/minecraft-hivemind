@@ -2118,6 +2118,13 @@ async function collectFieldCaches(
 ): Promise<{ acted: boolean; reason: string } | null> {
   // No !live.length guard on purpose: a queued haul costs nothing and waits for whoever frees up.
   if (!mayQueue(queued, 'haul:', '__haul')) return null;
+  // A FULL SHELF DOES NOT WANT A CACHE OF STONE. With 2 free slots across six chests, hauls kept
+  // bringing 64 stone a trip from the field cache and every deposit after them failed; drones sat
+  // "refuelling" for hours because the refuel unloads first and had nowhere to unload (2026-09-04).
+  if (await storageHasNoRoom()) {
+    note('field caches: storage has no room -- not hauling anything in');
+    return null;
+  }
 
   // luaList, not Array.isArray -- an empty deposit list serialises to {} rather than [], the same
   // trap that once made a fresh world refuse to dispatch anything at all.
