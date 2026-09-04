@@ -560,6 +560,12 @@ tower patches were queued at once. Until the docks are built away from the footp
 drones are relieved, ordering the tower spends the last tank on replans. Stopped and dispatch
 paused; D4 holds 905 fuel, the rest hold 117 and five zeros.
 
+**THE WORLD RUNS AT 10x.** `/tick rate 200` (measured 2.3 ms per tick against a 5 ms budget on
+2026-09-04). Everything on the in-world computers is game time -- `os.clock()` is ticks/20, so a
+"45 s" refix interval is 4.5 real seconds and a log timestamp of 600 is one real minute after boot.
+HQ is wall-clock: its supply tick is 10 s and its rule cooldown 30 s, chosen so it still takes
+several turns per game-minute. Reading a drone log against a wall clock, divide by ten.
+
 ## Environment invariants
 
 - **Wired modems need BOTH blockstates: `modem=true` AND `peripheral=true`.** For weeks this was

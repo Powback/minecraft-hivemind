@@ -169,7 +169,9 @@ export const DEFAULT_RULES: SupplyRule[] = [
 // 3 min -> 1 min. The server runs at `tick rate 60` while the settlement is being brought up, so
 // the drones live three times faster than HQ's wall clock; a three-minute cooldown between queuing
 // the same rule twice was nine minutes of drone time with an idle miner beside a queued chest.
-const COOLDOWN_MS = 60 * 1000;
+// WALL-CLOCK, WHILE THE WORLD RUNS AT 10x. Every drone timer is game time (os.clock is ticks/20) and
+// the server runs /tick rate 200, so a 60 s cooldown here was ten game-minutes of nothing queued.
+const COOLDOWN_MS = 30 * 1000;
 
 /**
  * What the fleet is carrying, summed by item name. PURE, so it can be tested without a world.
@@ -1954,7 +1956,7 @@ async function orderAndRecord(
   level: number, bricks: number | null,
 ): Promise<{ acted: boolean; reason: string }> {
   const ordered = await orderFloor(level);
-  supply.cooldowns['__tower'] = Date.now() + 120_000;
+  supply.cooldowns['__tower'] = Date.now() + 60_000;
   if ('failed' in ordered) {
     note(`tower level ${level}: order failed -- ${ordered.failed} (level NOT advanced)`);
     return { acted: false, reason: `tower level ${level} could not be ordered -- ${ordered.failed}` };
@@ -2427,6 +2429,6 @@ export async function runSupplyTick(): Promise<{ acted: boolean; reason: string 
 }
 
 // 60 s -> 20 s: at `tick rate 60` a minute of wall clock is three minutes of drone time.
-export function startSupplyLoop(intervalMs = 20_000) {
+export function startSupplyLoop(intervalMs = 10_000) {
   setInterval(() => { runSupplyTick().catch(() => { /* reported via note() */ }); }, intervalMs).unref();
 }
