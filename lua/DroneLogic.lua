@@ -6834,17 +6834,25 @@ function ShelfBurnable()
     end
     return s_Burnable
 end
-function ShelfReserveKeeps(p_Burnable)
-    -- 256, ABOVE HQ's EMERGENCY LINE OF 160 WITH ROOM: at 192 the shelf sat at 147-161 and the
-    -- emergency flapped on and off, pausing and resuming the tower every tick (2026-09-04 02:28).
+-- HOW MANY FUEL UNITS THE SHELF WILL PART WITH, nil for "as many as you want". Above the reserve:
+-- unlimited. At or below it: enough to reach WORKING_FUEL and no more -- so a drone can still mine
+-- the coal that refills the shelf. The first version refused everything above the drone's floor,
+-- and the fleet deadlocked overnight: four drones at 150-300 fuel, 172 coal on the shelf they were
+-- not allowed to touch, and nobody with the fuel to mine more (2026-09-04, 13:58). Relievers and
+-- drones below their floor are never limited: those are survival.
+function ShelfAllowance(p_Burnable)
     local SHELF_RESERVE = 256
-    -- A RELIEF IS SOMEBODY ELSE'S SURVIVAL. The reserve exists so a full drone does not top up on the
-    -- last coal; a reliever fetching for a drone at zero is exactly what the last coal is for. The
-    -- first ten minutes of the reserve left two drones dead while "Relieve FAILED no fuel to
-    -- deliver: storage holds 163 burnable, all of it reserve" (2026-09-04).
-    if m_Relieving then return false end
+    local WORKING_FUEL = 600
+    local FUEL_PER_COAL = 80
     local s_F = turtle.getFuelLevel()
-    return type(s_F) == "number" and s_F >= FuelFloorNow() and (tonumber(p_Burnable) or 0) <= SHELF_RESERVE
+    if m_Relieving or type(s_F) ~= "number" or s_F < FuelFloorNow() then return nil end
+    if (tonumber(p_Burnable) or 0) > SHELF_RESERVE then return nil end
+    return math.ceil(math.max(0, WORKING_FUEL - s_F) / FUEL_PER_COAL)
+end
+-- The smaller of what we want and what the shelf allows.
+function UnitsWithin(p_Want, p_Allow)
+    if p_Allow == nil then return p_Want end
+    return math.min(p_Want, p_Allow)
 end
 local function CollectFuel()
     -- ASK BEFORE FLYING. FetchItems flies to the chest that last held fuel, finds it empty, and
@@ -6857,7 +6865,9 @@ local function CollectFuel()
     if s_Burnable == 0 then
         m_StorageDryAt = os.clock()
         return 0, "storage had nothing burnable (asked over the network, did not fly)"
-    elseif s_Burnable ~= nil and ShelfReserveKeeps(s_Burnable) then
+    end
+    local s_Allow = ShelfAllowance(s_Burnable)
+    if s_Allow == 0 then
         return 0, ("storage holds %d burnable, all of it reserve (did not fly)"):format(s_Burnable)
     end
     -- UNLOAD BEFORE LOADING.
@@ -6902,7 +6912,7 @@ local function CollectFuel()
         -- come back empty over a rounding decision" -- and it did exactly that: D31 ran to zero two
         -- blocks from a chest holding 7 coal and 5 charcoal, 960 fuel it was not allowed to touch.
         -- TaskMan's FUEL_FETCH_MIN is the same number and fuel-fetchable.test.ts holds them equal.
-        local s_Got = FetchItems({[s_Name] = FuelUnitsWanted()}, {[s_Name] = 1})
+        local s_Got = FetchItems({[s_Name] = UnitsWithin(FuelUnitsWanted(), s_Allow)}, {[s_Name] = 1})
         for _, n in pairs(s_Got or {}) do s_Fuel = s_Fuel + n end
         if s_Fuel > 0 then break end
     end

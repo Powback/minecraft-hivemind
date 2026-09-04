@@ -669,7 +669,11 @@ async function dispatchLumber(rule: SupplyRule, have: number, ctx: SupplyCtx): P
     return false;
   }
 
-  const sweep = await queueLumberSweep(bridge, rule.match, 1, { leftovers: ctx.fuelCritical });
+  // LEFTOVERS WHENEVER WOOD IS SHORT, NOT ONLY IN A FUEL EMERGENCY. With the emergency over the picker
+  // went back to "no standing trees known -> survey" while 30 leftover logs stood inside the circle,
+  // the chest craft sat short of planks, storage could not expand, and 4,394 stone filled every chest
+  // to 27/27 (2026-09-04, overnight). This rule only runs when oak_log is below its minimum.
+  const sweep = await queueLumberSweep(bridge, rule.match, 1, { leftovers: true });
   if (sweep.reason) {
     note(`${rule.match}: ${have}/${rule.min}, ${sweep.reason} -> survey`);
     return dispatchSurvey(rule, have, ctx);

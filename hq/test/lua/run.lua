@@ -521,20 +521,23 @@ test("DroneLogic.RefuelAtStorage asks storage over the network and does not fly 
     truthy(env.StorageKnownDry(nil), "and the shelf is marked dry for the others")
 end)
 
-test("DroneLogic.CollectFuel leaves the shelf its reserve unless the drone is below its floor", function()
+test("DroneLogic.CollectFuel: a shelf at or below its reserve gives a working tank, not a full one, and nothing to a full drone", function()
     local env, D = loadModule("DroneLogic.lua", { fuel = 1000, pos = { x = 0, y = 64, z = 0 } })
     D.setHome({ x = 0, y = 64, z = 0 })
     env.__world.replies.StorageMan = env.__world.replies.StorageMan or {}
     env.__world.replies.StorageMan.GetStock = { detail = { { name = "minecraft:coal", count = 100 } } }
     local got, why = D.collectFuel()
-    eq(got, 0, "nothing taken") truthy(why:find("reserve", 1, true), "100 coal is reserve for a drone at 1000: " .. why)
-    env.__world.turtle.fuel = 50                             -- under the floor: survival comes first
-    local _, why2 = D.collectFuel()
-    truthy(not why2 or not why2:find("reserve", 1, true), "a drone below its floor is not refused the reserve: " .. tostring(why2))
+    eq(got, 0, "a drone at 1000 takes nothing") truthy(why:find("reserve", 1, true), "and is told why: " .. why)
+    eq(env.ShelfAllowance(100), 0, "allowance 0 at 1000 fuel")
+    env.__world.turtle.fuel = 300                            -- above its floor, below a working tank
+    eq(env.ShelfAllowance(100), 4, "300 -> 600 is four coal")
+    env.__world.turtle.fuel = 50                             -- below the floor: unlimited
+    eq(env.ShelfAllowance(100), nil, "survival is not rationed")
     env.__world.turtle.fuel = 1000
-    D.setRelieving(true)                                     -- fetching for a drone at zero
-    local _, why3 = D.collectFuel()
-    truthy(not why3 or not why3:find("reserve", 1, true), "a reliever is not refused the reserve: " .. tostring(why3))
+    D.setRelieving(true)
+    eq(env.ShelfAllowance(100), nil, "a reliever is not rationed")
+    D.setRelieving(false)
+    eq(env.ShelfAllowance(500), nil, "above the reserve nobody is rationed")
 end)
 
 test("DroneLogic.FellTargets stops at an abort and when the tank is the trip home", function()

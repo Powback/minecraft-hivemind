@@ -39,7 +39,7 @@ describe('a fuel top-up is bounded by need, not by stack size', () => {
       'CollectFuel must size its request from the tank deficit (FuelUnitsWanted), not ask for a',
       'flat 64 units. Asking for 64 is what let one scout drain 46 charcoal and strand the relief',
       'run that was carrying fuel to a miner at zero.',
-    ].join('\n')).toMatch(/FetchItems\(\{\s*\[s_Name\]\s*=\s*FuelUnitsWanted\(\)/);
+    ].join('\n')).toMatch(/FetchItems\(\{\[s_Name\] = UnitsWithin\(FuelUnitsWanted\(\), s_Allow\)\}/);
   });
 
   it('the cap is declared before CollectFuel uses it', () => {
