@@ -841,5 +841,20 @@ test("DroneLogic: a build that placed nothing fails with its reasons; a walled-i
     truthy(tostring(err2):find("walled in", 1, true) ~= nil, tostring(err2))
 end)
 
+
+test("DroneLogic: a drone with no fix but a known home walks home by reckoning instead of searching", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.__world.pos = { x = -657, y = 121, z = 62 }
+    env.pgps.positionVerified = function() return false end
+    local s_Legs = {}
+    env.pgps.flyTo = function(x, y, z) s_Legs[#s_Legs + 1] = { x = x, y = y, z = z }; env.__world.pos.x = x; env.__world.pos.z = z; return true end
+    local s_Fixes = 0
+    env.pgps.verifyPosition = function() s_Fixes = s_Fixes + 1 return s_Fixes >= 3 end
+    truthy(env.SeekCoverage(), "placed again")
+    eq(#s_Legs, 3, "three legs toward home before the fix came")
+    truthy(s_Legs[1].x > -657, "the first leg went toward home (east)")
+    truthy(s_Legs[1].y >= 121, "and did not descend")
+end)
+
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))
 os.exit(failed == 0 and 0 or 1)

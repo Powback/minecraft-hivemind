@@ -897,8 +897,7 @@ function RecoverLink()
         for _ = 1, 12 do
             -- Short hops, testing after each: the moment anyone answers we stop and resume work,
             -- rather than trekking all the way back for nothing.
-            local tx = cx + math.max(-16, math.min(16, hx - cx))
-            local tz = cz + math.max(-16, math.min(16, hz - cz))
+            local tx, tz = HomewardLeg(cx, cz, hx, hz)
             if pgps.flyTo(tx, hy, tz, 64) == false then
                 if CanDig() then pgps.digTo(tx, hy, tz) end
             end
@@ -3829,8 +3828,37 @@ end
 -- worst case is a few hundred moves, which is cheap against a drone that is otherwise lost for good.
 local SEEK_LEG  = 32          -- how far to probe down one direction
 local SEEK_STEP = 8           -- test for a fix this often along the way
+-- One 16-block leg of the way home, in the x/z plane. Shared by every routine that walks home
+-- by reckoning so the clamp lives in one place.
+function HomewardLeg(p_Cx, p_Cz, p_Hx, p_Hz)
+    return p_Cx + math.max(-16, math.min(16, p_Hx - p_Cx)), p_Cz + math.max(-16, math.min(16, p_Hz - p_Cz))
+end
+-- NO FIX, BUT WE KNOW WHERE HOME IS: GO THERE. Six drones woken in far chunks on 2026-09-05 (D3,
+-- D7, D11 at x=-657, 180 blocks out) searched for GPS by walking a cross pattern -- digging as they
+-- went -- and each walked 32 blocks FURTHER out, left its loaded chunk and froze again. The saved
+-- pose and the region centre are on disk; a drone that knows roughly where it is and where home is
+-- walks home, high (wireless and GPS both reach further with altitude), and takes a fix as soon as
+-- one appears.
+function SeekHomeward()
+    local hx, hy, hz = HomeXYZ()
+    local cx, cy, cz = pgps.getCachedPosition()
+    if cx == nil or hx == nil or Blocks(cx, cy, cz, hx, hy, hz) <= 16 then return false end
+    trace(("no fix and no peers -- heading home toward %d,%d,%d by reckoning to find the GPS"):format(hx, hy, hz))
+    for _ = 1, 12 do
+        local tx, tz = HomewardLeg(cx, cz, hx, hz)
+        pgps.flyTo(tx, math.max(cy, (hy or 64) + 12), tz, 64)
+        if pgps.verifyPosition(true) then
+            trace("found GPS on the way home -- we are placed again")
+            return true
+        end
+        cx, cy, cz = pgps.getCachedPosition()
+        if cx == nil then return false end
+    end
+    return false
+end
 function SeekCoverage()
     if pgps.positionVerified() then return true end
+    if SeekHomeward() then return true end
     trace("no fix and no peers -- walking to find out where the GPS is")
 
     for _ = 1, 4 do
@@ -3838,8 +3866,7 @@ function SeekCoverage()
         while s_Went < SEEK_LEG do
             local s_Step = 0
             while s_Step < SEEK_STEP do
-                if CanDig() then DigForward() end
-                if not pgps.forward() then break end
+                if not pgps.forward() then break end       -- no digging: a blocked way is a wrong way
                 s_Step = s_Step + 1
             end
             s_Went = s_Went + s_Step
@@ -3856,7 +3883,6 @@ function SeekCoverage()
         if s_Went > 0 then
             pgps.turnRight() pgps.turnRight()
             for _ = 1, s_Went do
-                if CanDig() then DigForward() end
                 if not pgps.forward() then break end
             end
             pgps.turnRight() pgps.turnRight()

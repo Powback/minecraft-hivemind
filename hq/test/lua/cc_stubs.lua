@@ -282,7 +282,7 @@ function M.makeEnv(p_Opts)
         motionWindow = function() return 0, 0, 0 end, motionReset = noop, motionCallers = function() return "" end, setRecovering = noop, startGPS = yes,
         noteObservation = noop, noteBlocked = noop, noteCleared = noop, noteExternalStep = noop,
         requeueObservations = noop, takeWorldDelta = function() return {}, {} end,
-        cachedWorld = {}, cachedWorldDetail = {}, centre = function() return world.pos.x, world.pos.z end,
+        cachedWorld = {}, cachedWorldDetail = {}, centre = function() return world.centre end,
         getBounds = function() return nil end, setBounds = noop, loadRegion = noop,
         setLocation = yes, setLocationFromGPS = yes, setHeading = yes, ensureHeading = yes,
         headingDelta = function() return 0 end, holdFixes = noop, releaseFixes = noop, isProtectedBlock = no, clearMoveError = noop,
