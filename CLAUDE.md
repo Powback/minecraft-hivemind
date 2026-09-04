@@ -460,6 +460,13 @@ such computer -- it is in an unloaded chunk somewhere its last heartbeat did not
   blocks down, and nearly stranded. Forgetting caches to stop that was the wrong fix and was undone.
 - **One pickup chest for six drones queues** ("access is occupied 6/6"); StorageMan spreads
   deposits by asker, so materials spread over chests with time.
+- **Scouts haul.** A haul is any-role work and the any-role pick was "nearest free drone", so miners
+  took hauls as often as scouts. `pickForTask` offers a haul to a free scout, then the crafter, then
+  anyone (the user: "scouts can help haul").
+- **A job stops itself at the floor.** The gather had no fuel check; the watchdog was the only stop,
+  and its trip home from underground cost more than the floor allowed: D37 "JOB Gather INTERRUPTED
+  (1004 fuel spent)" then "fuel at 0 (floor 342)" four times running. `GatherMayContinue` leaves
+  when the tank is the trip home plus one approach, as `FellTargets` already did.
 
 **A monitor that prints to a file is not a monitor.** `bin/fleet-watch.sh` logged 79 fault changes
 that night -- `FUEL SPIRAL`, `OUT OF FUEL` for six drones -- into a background task file nobody was
