@@ -783,3 +783,17 @@ are repairs, not stale. Storage: HQ reuses the one pending storage plot and reti
 The visualizer the user means is `~/Projects/McWebViewer` (http://mcwebviewer.pow), not HQ's
 `/map`. Its bridge needs `MCWV_RCON_PASSWORD` in its `.env` equal to `rcon.password` in
 `minecraft-create121/data/server.properties`, and `MCWV_FLUSH_ENABLE=1` or the map goes stale.
+
+More of the same night, all named by the "moved by" tally:
+
+| what | cause | fix |
+|---|---|---|
+| every idle drone bouncing over the bay chests, 200-400 moves/window | `TopUpWhileIdle` flew to the shelf each heartbeat; the shelf sat at exactly its reserve so `ShelfAllowance` gave nothing | `NoteTopUpOutcome` -> 5-min backoff; faucet target raised to 512 (above the 256 reserve) |
+| a build "done" with nothing placed (chest-row with no chests; D38's 32 no-route squares) | skips counted as done | `FailIfNothingPlaced`; `NoteNoRoute` stops a walled-in build after 6 squares |
+| relief "arrived but dropped nothing" | the casualty had 16 full slots | `MakeRoomBelow` sucks one stack out of the turtle below first |
+| a dozen drones "lost" for a day | frozen in unloaded chunks 180 blocks out; scan region files for `computercraft:turtle` block entities (`ComputerId`) to find them | `forceload add` their chunk; `SeekHomeward` walks home by reckoning instead of a digging cross search |
+
+Three drones (D31, D35, D40) are in no region file at all: destroyed, cause unknown.
+
+The McWebViewer showed no bricks because its baked asset bundle predated them; it now has an
+`mcwv-baker` service that re-bakes when the world gains a block type. Reload the tab after a bake.
