@@ -272,6 +272,7 @@ function JitterWatch()
     if JitterState.beats < JITTER.beats then return false end
     JitterState.beats = 0
     local s_Steps, s_Turns, s_Cells = pgps.motionWindow()
+    local s_Callers = pgps.motionCallers and pgps.motionCallers() or "?"
     pgps.motionReset()
     if m_Status == "crafting" then return false end
     local s_Bouncing = s_Steps >= JITTER.minSteps and s_Cells <= JITTER.maxCells
@@ -282,9 +283,9 @@ function JitterWatch()
     end
     JitterState.events = JitterState.events + 1
     local jx, jy, jz = pgps.getCachedPosition()
-    trace(("JITTER: %d move(s) and %d turn(s) over only %d cell(s) around %s,%s,%s in %d heartbeats -- %s")
+    trace(("JITTER: %d move(s) and %d turn(s) over only %d cell(s) around %s,%s,%s in %d heartbeats -- %s; moved by %s")
         :format(s_Steps, s_Turns, s_Cells, tostring(jx), tostring(jy), tostring(jz), JITTER.beats,
-                executing and "aborting the job" or "breaking the trip"))
+                executing and "aborting the job" or "breaking the trip", s_Callers))
     if executing then
         AbortJobAndWait(3)
     else

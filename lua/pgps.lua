@@ -269,9 +269,30 @@ local m_Reach = nil          -- horizontal radius from the settlement centre, if
 local m_Centre = nil
 -- Moves, turns and distinct cells since the last motionReset() -- the heartbeat's jitter watch
 -- reads them (DroneLogic.JitterWatch). A drone that made 20 moves over 3 cells is bouncing.
-local m_Motion = {steps = 0, turns = 0, cells = {}, distinct = 0}
+local m_Motion = {steps = 0, turns = 0, cells = {}, distinct = 0, callers = {}}
 function motionWindow() return m_Motion.steps, m_Motion.turns, m_Motion.distinct end
-function motionReset() m_Motion = {steps = 0, turns = 0, cells = {}, distinct = 0} end
+function motionReset() m_Motion = {steps = 0, turns = 0, cells = {}, distinct = 0, callers = {}} end
+-- Who has been moving the drone: the first frame outside this file, tallied per step. Cheap
+-- enough per move, and the only way a "325 moves over 2 cells" report names the loop instead of
+-- leaving it to guesswork.
+local function motionCaller()
+    for lvl = 3, 12 do
+        local info = debug and debug.getinfo and debug.getinfo(lvl, "Sl")
+        if info == nil then return "?" end
+        if not tostring(info.short_src):find("pgps", 1, true) then
+            return tostring(info.short_src):match("[^/]+$") .. ":" .. tostring(info.currentline)
+        end
+    end
+    return "deep"
+end
+function motionCallers()
+    local s_List = {}
+    for site, n in pairs(m_Motion.callers) do s_List[#s_List + 1] = {site = site, n = n} end
+    table.sort(s_List, function(a, b) return a.n > b.n or (a.n == b.n and a.site < b.site) end)
+    local s_Out = {}
+    for i = 1, math.min(3, #s_List) do s_Out[#s_Out + 1] = s_List[i].site .. " x" .. s_List[i].n end
+    return table.concat(s_Out, ", ")
+end
 local function motionStep(p_X, p_Y, p_Z)
     m_Motion.steps = m_Motion.steps + 1
     local k = p_X .. ":" .. p_Y .. ":" .. p_Z
@@ -279,6 +300,8 @@ local function motionStep(p_X, p_Y, p_Z)
         m_Motion.cells[k] = true
         m_Motion.distinct = m_Motion.distinct + 1
     end
+    local s_Site = motionCaller()
+    m_Motion.callers[s_Site] = (m_Motion.callers[s_Site] or 0) + 1
 end
 
 local function withinReach(x, z)
@@ -2868,5 +2891,5 @@ end
 -- HiveMindTest set and reads the motion counters through it. In the world HiveMindTest is nil and
 -- this does nothing.
 if HiveMindTest ~= nil then
-    HiveMindTest.pgps = {motionWindow = motionWindow, motionReset = motionReset}
+    HiveMindTest.pgps = {motionWindow = motionWindow, motionReset = motionReset, motionCallers = motionCallers}
 end
