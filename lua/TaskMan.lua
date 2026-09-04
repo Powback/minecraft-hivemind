@@ -2423,10 +2423,30 @@ end
 -- Takes the drone or nil, so the caller does not have to ask twice: "nobody holds this" and "the
 -- holder is offline" are both just "no reason to release it", and testing them at the call site is
 -- what made this the third-most branchy function in the file.
+-- A DRONE THAT SAYS "BUSY" AND HAS NOT MOVED IN THREE MINUTES IS NOT BUSY. Three drones sat docked
+-- reporting busy with a detail line from a job hours gone ("searching 13 chest(s) for coal"), each
+-- holding a tower patch; this only ever released idle or fuel-less drones, so TaskMan logged
+-- "reclaim? task N held by 58: busy" every 15 s for 44 minutes and dispatched nothing to them
+-- (2026-09-04, 15:10). Position comes from the heartbeat; a working drone moves.
+local m_LastPosKey, m_LastMovedAt = {}, {}
+local RECLAIM_STALL_MS = 3 * 60 * 1000
+local function stalledFor(p_Drone)
+    local k = tostring(p_Drone.id)
+    local s_Pos = p_Drone.pos and (tostring(p_Drone.pos.x) .. ":" .. tostring(p_Drone.pos.y) .. ":" .. tostring(p_Drone.pos.z)) or "?"
+    if m_LastPosKey[k] ~= s_Pos then
+        m_LastPosKey[k], m_LastMovedAt[k] = s_Pos, os.epoch("utc")
+        return 0
+    end
+    return os.epoch("utc") - (m_LastMovedAt[k] or os.epoch("utc"))
+end
 local function heldForNothing(p_Drone)
     if p_Drone == nil or p_Drone.offline then return nil end
     if p_Drone.status == "idle" then return "reports idle" end
     if not hasFuel(p_Drone) then return "has no fuel to finish it" end
+    local s_Still = stalledFor(p_Drone)
+    if s_Still >= RECLAIM_STALL_MS then
+        return ("reports %s but has not moved for %d min"):format(tostring(p_Drone.status), math.floor(s_Still / 60000))
+    end
     return nil
 end
 
@@ -3470,6 +3490,7 @@ if HiveMindTest then
         jobMinFuel = jobMinFuel, workPos = workPos, workCost = workCost, pickDrone = pickDrone,
         noDroneReason = noDroneReason, notPlaceableNow = notPlaceableNow, fleetFuelLow = fleetFuelLow,
         anyoneForBuild = anyoneForBuild,
+        heldForNothing = heldForNothing, stalledFor = stalledFor,
     }
 end
 

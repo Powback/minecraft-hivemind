@@ -133,6 +133,16 @@ test("TaskMan.anyoneForBuild prices the build for the fallback drone too", funct
     eq(d and d.name, "D39", "a scout that can afford it builds")
 end)
 
+test("TaskMan.heldForNothing: a busy drone that has not moved for three minutes is stalled", function()
+    local env, T = taskManWithFleet({})
+    local d = { id = 58, name = "D40", role = "miner", status = "busy", fuel = 1700, pos = { x = -480, y = 64, z = 65 } }
+    eq(T.heldForNothing(d), nil, "first sighting: not stalled")
+    env.__world.clock = env.__world.clock + 200                 -- os.epoch follows the stub clock (ms = s * 1000)
+    truthy(T.heldForNothing(d), "still there 200 s later: stalled")
+    d.pos = { x = -470, y = 64, z = 65 }
+    eq(T.heldForNothing(d), nil, "it moved: not stalled")
+end)
+
 test("TaskMan.pickDrone offers the job to a drone that can afford it", function()
     local _, T = taskManWithFleet({
         { id = 1, name = "D1", role = "miner", status = "idle", fuel = 1000, pos = { x = 0, y = 64, z = 0 } },
