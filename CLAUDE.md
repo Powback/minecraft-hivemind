@@ -738,3 +738,26 @@ for two logs that did not exist anywhere.
 Fix upstream first. Hours went into gather, deposit, fuel and rescue while `storage.stock` reported
 0 items forever — which made every supply decision garbage. When a foundational number looks
 impossible, chase that before anything downstream.
+
+## Why the tower was swiss cheese (2026-09-05)
+
+Two facts multiplied. `PowGPSServer.a_star` charged a dug cell the same single step as open air --
+the "dig weight" was the heuristic inflation, not a cost -- and `TravelToBody` asked for a DIGGING
+plan first on every hop under 32 blocks (a leftover from when digTo went straight there without
+the map). So every deposit, dock and patch trip around the base was planned as the shortest line
+through whatever stood in the way, and the tower's floors and walls were what stood in the way.
+The blind climbs (`ClimbToOpenAir`, `surfaceIfBuried`) cut straight up through floors as well.
+
+Fixed without bans or zones (the user: "base is mutable, drones just shouldn't be careless"):
+- `DIG_STEP_COST = 12` per dug cell in the planner (`STEP_COST` lookup), dig budget 5000 nodes.
+- `TravelToBody`: open route first, ceiling retry, digging plan last.
+- `RouteUpTo(x, y, ceiling, z)`: the map before any blind climb.
+- `repairLowerFloors` (HQ): every 10 min each finished level is re-ordered; `order.tower` skips
+  solid squares so only holes get queued. Patches BELOW the level counter are repairs, only
+  patches above it are stale (`towerWorkFor`).
+- `JitterWatch()` in the heartbeat: 16+ moves over <= 6 cells (or 40+ turns on <= 2) in 8
+  heartbeats aborts the job / breaks the trip; three windows in a row raise a "jitter" distress.
+  Counters come from `pgps.motionWindow()`.
+
+Do not "fix" digging by protecting materials or fencing the footprint. The planner's price and the
+order of asks are the controls.
