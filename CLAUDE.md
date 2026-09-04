@@ -544,6 +544,27 @@ floor leaves 192; a drone below its floor, or one fetching for a relief (`m_Reli
 it needs -- the first ten minutes of the reserve left two drones dead behind "no fuel to deliver:
 all of it reserve".
 
+**THE DIG FLAG NEVER REACHED THE PLANNER (2026-09-04, 02:35).** pgps sends `dig` as `data[9]` of
+GetPath; MapServer read `[7]` and `[8]` and called `a_star` without it, so the planner treated every
+solid cell as a wall and refused any goal inside rock. Every `digTo` in the codebase failed at the
+request, for as long as the flag has existed: a coal ore under five blocks of dirt cost 392 and then
+1,584 fuel to *fail* to reach, every canopy log was "unreachable", and the mine shaft could never
+have been dug. Two minutes after the fix D40 mined the first coal of the settlement's day. When a
+capability "never works", read the handler that receives the request before the code that sends it.
+
+**TIMEOUTS ON THE COMPUTERS ARE GAME TIME.** `rednet.receive`'s timeout is a tick timer, so at
+`/tick rate 200` a six-second reply window is 0.6 real seconds and "pathfinder did not answer" came
+back (36 in ten minutes) while MapServer answered everything it heard in 0-2 ms. `PATH_REPLY_S` is
+20 game seconds. HQ's timers are wall-clock and were halved instead (10 s tick, 30 s cooldown).
+
+**SEVEN DRONES, ONE CHEST.** `pickDeposit` answered "the roomiest of the nearest" identically to
+every asker at once, so the fleet queued over `-476,64,78` (27 "could not reach" in six minutes)
+with five chests two blocks away. The asker's id now spreads the fleet over the roomy near chests.
+
+**A tower patch is 32 bricks, not 8, and a build pre-marks squares the shared map already has
+solid.** A patch pays a shelf trip and a climb whatever its size; at 8 that was ~250 fuel per 8
+bricks, and visiting a square another drone had filled to read "occupied" was a trip per square.
+
 **A tower patch costs 36-910 fuel for eight bricks (avg ~250) -- 30 fuel a block.** That is the
 next number to bring down: each patch fetches its own bricks from the bay and climbs to the floor;
 22 patches in ten minutes cost ~5,000 fuel. Batching bricks for several patches per trip, and
