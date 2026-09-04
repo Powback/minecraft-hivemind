@@ -765,5 +765,16 @@ test("DroneLogic: RefuelAtStorage at zero fuel raises a distress and makes no tr
     truthy(not s_Asked, "StorageMan was not asked for a deposit point")
 end)
 
+
+test("DroneLogic: a crafter shuttling between the bay's chests is work, not jitter", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.pgps.motionWindow = function() return 255, 6, 6 end
+    local s_Broken = 0
+    env.pgps.BreakExec = function() s_Broken = s_Broken + 1 end
+    env.executing = false
+    for _ = 1, 16 do env.JitterWatch() end
+    eq(s_Broken, 0, "six cells of chest-hopping is never a loop")
+end)
+
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))
 os.exit(failed == 0 and 0 or 1)

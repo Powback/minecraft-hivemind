@@ -1346,7 +1346,10 @@ local ASTAR_MARGIN = 24
 -- small and greedy; a normal search that needs more than 6,000 nodes in a 24-block margin box is a
 -- route that does not exist.
 local ASTAR_MAX_NODES = 6000
-local ASTAR_MAX_NODES_DIG = 5000
+-- 20000, not 2500: with a dug cell priced at 13 steps a 45-block dig-out costs ~600, and the search
+-- rightly tries every open cell within that trade first. The old budget gave up before it reached
+-- the rock ("GoTo FAILED: stuck at -505,62,45 -- 51 blocks from target"), stranding rescues.
+local ASTAR_MAX_NODES_DIG = 20000
 local ASTAR_WEIGHT_DIG = 2.0
 
 -- WHERE THE OTHER DRONES ARE, RIGHT NOW.

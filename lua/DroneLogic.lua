@@ -225,7 +225,11 @@ end
 -- that moves without covering ground: many moves (or many turns) over a handful of cells in a
 -- window of heartbeats. It aborts the job so TaskMan reassigns it, and after three windows in a
 -- row raises a distress the panel can show.
-JITTER = {beats = 8, minSteps = 16, maxCells = 6, minTurns = 40}
+-- maxCells is 4, not 6: the crafter's whole working life is shuttling between the bay's chests
+-- and its crafting spot -- 255 moves over 6 cells in one window, all of it work -- and the first
+-- version aborted a 108-run brick craft for it. Crafting is exempt outright; the real loops seen
+-- so far were 2 to 4 cells wide.
+JITTER = {beats = 8, minSteps = 16, maxCells = 4, minTurns = 40}
 JitterState = {beats = 0, events = 0}
 function JitterWatch()
     JitterState.beats = JitterState.beats + 1
@@ -233,6 +237,7 @@ function JitterWatch()
     JitterState.beats = 0
     local s_Steps, s_Turns, s_Cells = pgps.motionWindow()
     pgps.motionReset()
+    if m_Status == "crafting" then return false end
     local s_Bouncing = s_Steps >= JITTER.minSteps and s_Cells <= JITTER.maxCells
     local s_Spinning = s_Turns >= JITTER.minTurns and s_Cells <= 2
     if not (s_Bouncing or s_Spinning) then
