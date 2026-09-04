@@ -6485,6 +6485,22 @@ local function stageBuildMaterials(s_Hand, s_Need)
     end
 end
 
+-- THE MAP ALREADY HAS SOMETHING THERE. Flying to a square another drone filled, to read "occupied
+-- by something else", was a trip per square of a 2,200-block floor. A square the shared map has as
+-- solid is marked done before the loop starts. A global: this file is at Lua's 200-local limit,
+-- and OnBuild is already the most branching function in it.
+function MarkMapSolidDone(p_Memo, p_Blocks, p_Origin)
+    if type(p_Origin) ~= "table" or type(p_Blocks) ~= "table" then return 0 end
+    local s_World = pgps.cachedWorld or {}
+    local n = 0
+    for _, b in ipairs(p_Blocks or {}) do
+        local k = (p_Origin.x + (tonumber(b.dx) or 0)) .. ":" .. (p_Origin.y + (tonumber(b.dy) or 0))
+            .. ":" .. (p_Origin.z + (tonumber(b.dz) or 0))
+        if s_World[k] == 1 and not p_Memo.done(k) then p_Memo.mark(k) n = n + 1 end
+    end
+    if n > 0 then trace(("build: %d square(s) already solid on the map -- not visiting them"):format(n)) end
+    return n
+end
 function OnBuild(p_ID, p_Message)
     return RunJob("Build", p_Message.data, {status = "building", travel = false}, function(d)
         local s_Origin = d.origin
@@ -6496,6 +6512,7 @@ function OnBuild(p_ID, p_Message)
         -- re-walking every block it already placed.
         local s_BuildDone = Resumable(d)
         s_BuildDone.announce("build")
+        MarkMapSolidDone(s_BuildDone, s_Blocks, s_Origin)
 
         -- 1. Collect the materials. Same handover chest crafting uses.
         local s_Need = {}
