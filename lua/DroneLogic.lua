@@ -9078,6 +9078,19 @@ end
 
 -- Idle, under target, fuel available: go and fill up. See the caller for what it cost not to. A
 -- global rather than a `local`: DroneLogic is at Lua's 200-local limit for the main chunk.
+-- A TOP-UP THAT BRINGS NOTHING BACK IS NOT REPEATED EVERY HEARTBEAT. With the shelf held at
+-- exactly its reserve, ShelfAllowance hands out nothing -- and every idle drone under
+-- REFUEL_TARGET flew to the shelf, took nothing, stepped off, and flew again 30 s later. The
+-- jitter watch put it at 200-400 moves over two cells per window for D4, D38, D39 and D37 at once
+-- (2026-09-05, "moved by DroneLogic.lua:2866"), each burning the fuel it went to fetch.
+TOP_UP_BACKOFF_S = 300
+TopUpBackoffUntil = 0
+function NoteTopUpOutcome(p_Before, p_After)
+    if type(p_After) ~= "number" or type(p_Before) ~= "number" or p_After > p_Before then return end
+    TopUpBackoffUntil = os.clock() + TOP_UP_BACKOFF_S
+    trace(("top-up brought nothing back (the shelf is at or under its reserve) -- not flying there again for %ds")
+        :format(TOP_UP_BACKOFF_S))
+end
 function TopUpWhileIdle()
     local s_F = turtle.getFuelLevel()
     -- StorageKnownDry(nil), NOT StorageKnownDry(s_F). With the tank passed in, the predicate
@@ -9086,9 +9099,11 @@ function TopUpWhileIdle()
     -- 482 fuel and flew to the empty shelf every 15 s, 14-34 fuel a time, down to 179 (2026-09-04).
     -- An idle drone is not stranding; it waits for the shelf to report something.
     if s_F == "unlimited" or s_F >= REFUEL_TARGET or StorageKnownDry(nil) then return false end
+    if os.clock() < TopUpBackoffUntil then return false end
     m_Status = "refuelling"        -- not idle: TaskMan must not hand this drone a job mid-flight
     Tried("top up while idle", RefuelAtStorage)
     m_Status = "idle"
+    NoteTopUpOutcome(s_F, turtle.getFuelLevel())
     return true
 end
 

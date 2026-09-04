@@ -856,5 +856,21 @@ test("DroneLogic: a drone with no fix but a known home walks home by reckoning i
     truthy(s_Legs[1].y >= 121, "and did not descend")
 end)
 
+
+test("DroneLogic: an idle top-up that brings nothing back backs off instead of flying every heartbeat", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.StorageKnownDry = function() return false end
+    local s_Trips = 0
+    env.RefuelAtStorage = function() s_Trips = s_Trips + 1; env.turtle.fuel = env.turtle.fuel - 20; return false end
+    truthy(env.TopUpWhileIdle(), "the first trip is made")
+    eq(env.TopUpWhileIdle(), false, "the next heartbeat does not fly again")
+    eq(s_Trips, 1, "one trip")
+    truthy(env.TopUpBackoffUntil > env.os.clock(), "a backoff is set")
+    env.TopUpBackoffUntil = 0
+    env.RefuelAtStorage = function() s_Trips = s_Trips + 1; env.turtle.fuel = env.turtle.fuel + 300; return true end
+    truthy(env.TopUpWhileIdle(), "a trip that gains fuel")
+    eq(env.TopUpBackoffUntil, 0, "sets no backoff")
+end)
+
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))
 os.exit(failed == 0 and 0 or 1)
