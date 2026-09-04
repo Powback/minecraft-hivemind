@@ -21,7 +21,7 @@ HQ="${HQ:-hive-hq}"
 
 read_faults() {
   docker exec "$HQ" node -e "
-    fetch('http://localhost:4400/brief')
+    fetch((process.env.HIVE_URL || 'http://hive.pow') + '/brief')
       .then(r => r.json())
       .then(b => {
         const p = (b.problems || []).filter(x => String(x) !== 'none');
