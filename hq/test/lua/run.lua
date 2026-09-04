@@ -826,5 +826,20 @@ test("DroneLogic: a mid-job deposit that unloads nothing into a full inventory f
     truthy(env.RoomAfterUnload(0), "nothing unloaded but room aboard: the job can go on")
 end)
 
+
+test("DroneLogic: a build that placed nothing fails with its reasons; a walled-in build stops after six unreachable squares", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    local ok, err = pcall(env.FailIfNothingPlaced, 0, 4, { ["short of minecraft:chest"] = 4 })
+    eq(ok, false, "nothing placed is a failure")
+    truthy(tostring(err):find("short of minecraft:chest x4", 1, true) ~= nil, "with the reason: " .. tostring(err))
+    truthy(pcall(env.FailIfNothingPlaced, 1, 4, { ["no route to the square"] = 3 }), "one block placed is progress")
+    local run = 0
+    for _ = 1, 5 do run = env.NoteNoRoute(run) end
+    eq(run, 5, "five unreachable squares are tolerated")
+    local ok2, err2 = pcall(env.NoteNoRoute, run)
+    eq(ok2, false, "the sixth stops the build")
+    truthy(tostring(err2):find("walled in", 1, true) ~= nil, tostring(err2))
+end)
+
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))
 os.exit(failed == 0 and 0 or 1)

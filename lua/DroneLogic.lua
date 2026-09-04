@@ -6584,10 +6584,26 @@ function noteSkip(p_Tally, p_Reason)
 end
 -- A build that reached none of its squares built nothing, and "done" would tell TaskMan the
 -- opposite (D38: 32 squares skipped for "no route" in 0.05s, patch marked complete).
-function FailIfNothingReached(p_Placed, p_Total, p_Why)
+-- A BUILD THAT PLACED NOTHING IS NOT DONE, whatever the reasons. D38's patch was "done" with 32
+-- squares skipped for want of a route; storage-01's chest-row was "done" with 4 squares skipped
+-- for want of chests -- and HQ believed both. Fail with the tally so TaskMan requeues it.
+function FailIfNothingPlaced(p_Placed, p_Total, p_Why)
     if p_Placed > 0 or p_Total == 0 then return end
-    if (p_Why["no route to the square"] or 0) < p_Total then return end
-    error(("could not reach any of the %d squares -- nothing was built"):format(p_Total), 0)
+    local s_Parts = {}
+    for why, n in pairs(p_Why or {}) do s_Parts[#s_Parts + 1] = why .. " x" .. tostring(n) end
+    table.sort(s_Parts)
+    error(("placed none of %d block(s) -- %s"):format(p_Total, table.concat(s_Parts, "; ")), 0)
+end
+-- Six squares in a row with no route means the drone is walled in, not that six squares are odd.
+-- It used to walk the whole patch anyway: 32 attempts, each a short bounce in the same pocket
+-- (D37: 291 moves over 4 cells). Stop early and let the job fail honestly.
+BUILD_NO_ROUTE_RUN_MAX = 6
+function NoteNoRoute(p_Run)
+    local s_Run = (p_Run or 0) + 1
+    if s_Run >= BUILD_NO_ROUTE_RUN_MAX then
+        error(("walled in: %d squares in a row had no route -- stopping before the rest are walked for nothing"):format(s_Run), 0)
+    end
+    return s_Run
 end
 
 function alreadyThatBlock(p_What, p_Item)
@@ -6751,6 +6767,7 @@ function OnBuild(p_ID, p_Message)
         -- the drone can actually guarantee in the blueprint, and leaves the per-block convention with
         -- the blueprint, which is where it can be written down and checked.
         local s_Placed, s_Skipped = 0, 0
+        local s_NoRouteRun = 0
         -- WHY a block was skipped, counted by reason. Two thirds of every patch was being skipped
         -- and the log said only how MANY -- so every theory about the cause (occupied ground, bad
         -- position, no route) stayed a theory, and several were chased at length and were wrong.
@@ -6783,7 +6800,9 @@ function OnBuild(p_ID, p_Message)
             elseif not TravelTo(bx, by + 1, bz, (by or 64) + 4) then
                 s_Skipped = s_Skipped + 1
                 noteSkip(s_Why, "no route to the square")
+                s_NoRouteRun = NoteNoRoute(s_NoRouteRun)
             else
+                s_NoRouteRun = 0
                 -- MARK ONLY WHAT WAS ACTUALLY PLACED. This used to mark here, on arrival, which
                 -- recorded "the drone reached this coordinate" and not "a block stands there". Every
                 -- abort mid-build -- and builds abort routinely, on reassignment and on stand-down --
@@ -6871,7 +6890,7 @@ function OnBuild(p_ID, p_Message)
         -- Throw instead. The patch goes back on the queue and the coordinates already placed are
         -- memoised, so the retry finishes the remainder rather than starting over.
         reportSkips(s_Why)
-        FailIfNothingReached(s_Placed, #s_Blocks, s_Why)
+        FailIfNothingPlaced(s_Placed, #s_Blocks, s_Why)
         return {message = ("built %d of %d blocks (%d skipped)")
                     :format(s_Placed, #s_Blocks, s_Skipped),
                 placed = s_Placed, skipped = s_Skipped, total = #s_Blocks}
