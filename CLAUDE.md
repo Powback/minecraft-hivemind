@@ -797,3 +797,10 @@ Three drones (D31, D35, D40) are in no region file at all: destroyed, cause unkn
 
 The McWebViewer showed no bricks because its baked asset bundle predated them; it now has an
 `mcwv-baker` service that re-bakes when the world gains a block type. Reload the tab after a bake.
+
+## An edit that failed must stop the chain
+
+A one-shot chain `edit; lint; tests; commit; deploy` committed a message describing edits the file
+did not contain (efd6888, 2026-09-05): the edit script hit an anchor assertion and exited non-zero,
+`;` let everything after it run, and the gate passed on the unchanged file. Chain with `&&` from the
+edit step onward, and write the commit message after the edit has been confirmed, never before.
