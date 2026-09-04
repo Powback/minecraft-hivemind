@@ -446,6 +446,21 @@ The mast's radio is 64 at ground level; the two drones lost before were at 82.
 for any "lost" drone present in the dump. D35 is the other kind: `computercraft dump 52` says no
 such computer -- it is in an unloaded chunk somewhere its last heartbeat did not say.
 
+**WHY THE TOWER WAS SLOW (2026-09-04, 23:00), and the rules that came out of it:**
+- **Fuel work outranks building, but not with the whole fleet.** `orderedTasks` puts every lumber
+  and coal job ahead of every patch, and with wood perpetually short one is always queued, so all
+  four miners felled and mined while the tower got one build an hour. Outside an emergency
+  `FUEL_WORKERS_MAX = 2` miners take fuel work; the rest build (`notPlaceableNow`).
+- **Scouts are the tower's fallback hands; caves wait while patches queue.** `surveyCaves` sent
+  them underground instead, where D39 was walled in for an hour.
+- **A cache is not storage.** Caches are where miners drop spoils so they keep mining; haulers bring
+  them home, from anywhere in reach (the shaft is a route now that the dig flag works). A FETCH for
+  materials searches networked chests only (`FetchSkip`); a build's fetch of 32 bricks had swept
+  every deposit point of unknown contents, including the cache at the bottom of the mine shaft, 55
+  blocks down, and nearly stranded. Forgetting caches to stop that was the wrong fix and was undone.
+- **One pickup chest for six drones queues** ("access is occupied 6/6"); StorageMan spreads
+  deposits by asker, so materials spread over chests with time.
+
 **A monitor that prints to a file is not a monitor.** `bin/fleet-watch.sh` logged 79 fault changes
 that night -- `FUEL SPIRAL`, `OUT OF FUEL` for six drones -- into a background task file nobody was
 reading, and the sentinel counted 20,059 "self-resolved" incidents. Neither reached a person. A
