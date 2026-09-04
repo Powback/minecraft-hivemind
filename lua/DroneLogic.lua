@@ -202,8 +202,36 @@ local m_DockingSince = nil
 
 print("I AM ALIVE!")
 
+-- InJob is true only inside RunJobNow; GoTo and Survey set `executing` directly and, if they throw
+-- or return on an early path, leave it set for ever -- the drone then reports "busy" with no job,
+-- refuses every dispatch, and TaskMan cannot reclaim what it holds. Globals: the file is at Lua's
+-- 200-local limit.
+InJob = false
+ExecPosKey, ExecStillSince = nil, nil
 function TaskStart()
     executing = true
+    ExecPosKey, ExecStillSince = nil, nil
+end
+-- EXECUTING WITH NO JOB AND NO MOVEMENT IS A FLAG LEFT BEHIND. Three drones sat docked for 44
+-- minutes reporting busy with a job's detail line from hours before, each holding a tower patch
+-- TaskMan could not reclaim (2026-09-04). A GoTo or Survey that ended on a path without TaskEnd
+-- is the way in; this, called from the heartbeat, is the way out.
+function ClearStuckExecuting()
+    if not executing or InJob then return false end
+    local EXEC_STILL_S = 300
+    local cx, cy, cz = pgps.getCachedPosition()
+    local s_Key = tostring(cx) .. ":" .. tostring(cy) .. ":" .. tostring(cz)
+    if s_Key ~= ExecPosKey then
+        ExecPosKey, ExecStillSince = s_Key, os.clock()
+        return false
+    end
+    if (os.clock() - (ExecStillSince or os.clock())) <= EXEC_STILL_S then return false end
+    trace(("executing flag left behind by a %s that has not moved for %ds and runs no job -- clearing")
+        :format(tostring(m_Status), math.floor(os.clock() - ExecStillSince)))
+    TaskEnd()
+    m_Status = "idle"
+    m_Detail = nil
+    return true
 end
 function TaskEnd()
     executing = false
@@ -449,6 +477,7 @@ function SendHeartBeat()
     elseif m_Status ~= "docking" then
         m_DockingSince = nil
     end
+    ClearStuckExecuting()
 
     -- AN IDLE DRONE IS NOT STILL DOING THE LAST THING.
     --
@@ -4654,7 +4683,9 @@ local function RunJobNow(p_Name, p_Data, p_Opts, p_Body)
     m_Status = o.status or "working"
     TaskStart()
 
+    InJob = true
     local function finish(p_Ok, p_Res)
+        InJob = false
         -- The description dies with the job. Left set, the panel shows a drone sitting idle
         -- "crafting chest x16" for ever, which reads as a stuck job rather than a finished one.
         m_Detail = nil
@@ -9632,6 +9663,7 @@ if HiveMindTest then
         setHome = function(p) m_HomePos = p end,
         setRelieving = function(v) m_Relieving = v end,
         setExecuting = function(v) executing = v end,
+        isExecuting = function() return executing end,
         collectFuel = CollectFuel,
     }
 end

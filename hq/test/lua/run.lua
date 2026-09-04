@@ -550,6 +550,16 @@ test("DroneLogic.CollectFuel: a shelf at or below its reserve gives a working ta
     eq(env.ShelfAllowance(500), nil, "above the reserve nobody is rationed")
 end)
 
+test("DroneLogic: an executing flag with no job and no movement is cleared by the heartbeat", function()
+    local env, D = loadModule("DroneLogic.lua", { fuel = 500 })
+    D.setExecuting(true)                                       -- a GoTo that never reached TaskEnd
+    env.SendHeartBeat()
+    truthy(D.isExecuting(), "first sighting: kept")
+    env.__world.clock = env.__world.clock + 400
+    env.SendHeartBeat()
+    truthy(not D.isExecuting(), "still there 400 s later with no job: cleared")
+end)
+
 test("DroneLogic.FellTargets stops at an abort and when the tank is the trip home", function()
     local env, D = loadModule("DroneLogic.lua", { fuel = 500, pos = { x = 10, y = 64, z = 0 } })
     D.setHome({ x = 0, y = 64, z = 0 })                    -- floor 150 here
