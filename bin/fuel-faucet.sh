@@ -56,6 +56,18 @@ except Exception: print("")' 2>/dev/null)
     [ -z "$slot" ] && continue
     sleep 1; rc "item replace block $pos container.$slot with minecraft:coal 32" >/dev/null; revived="$revived #$id"
   done
-  echo "$(date '+%H:%M:%S') shelf coal was $coal, added $added; revived:${revived:- none}"
+  # A drone the brief calls LOST while its computer is still ON in the dump is hung, not lost: D37 sat
+  # 28 minutes at y=81 with 96 coal aboard and a log that had simply stopped (2026-09-04 20:27).
+  # Power-cycling it is the only remote remedy; DroneBoot brings it back into the fleet.
+  rebooted=""
+  lost=$(curl -s --max-time 8 http://hive.pow/brief | python3 -c 'import sys,json
+try:
+    b=json.load(sys.stdin); print(" ".join(str(x["id"]) for x in b["fleet"]["drones"] if x.get("status") == "lost"))
+except Exception: print("")' 2>/dev/null)
+  for id in $lost; do
+    echo "$dump" | grep -q "^#$id  *| Y" || continue
+    rc "computercraft shutdown $id" >/dev/null; sleep 3; rc "computercraft turn-on $id" >/dev/null; rebooted="$rebooted #$id"
+  done
+  echo "$(date '+%H:%M:%S') shelf coal was $coal, added $added; revived:${revived:- none}; rebooted:${rebooted:- none}"
   sleep "$EVERY"
 done
