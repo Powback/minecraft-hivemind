@@ -1327,7 +1327,16 @@ local ASTAR_WEIGHT = 1.35
 -- the frontier expand in every direction until the node limit, which is slow AND useless -- if the
 -- way through is not roughly between the two ends, it is not a path worth walking.
 local ASTAR_MARGIN = 24
-local ASTAR_MAX_NODES = 20000
+-- 6,000, NOT 20,000, AND 2,500 WHEN DIGGING. A failed search costs its whole budget: at 20,000 nodes
+-- that was 500-600 ms of a computer the entire fleet shares, and once the dig flag reached the
+-- planner (every solid cell passable) requests through rock hit it every time -- 28 requests a minute
+-- of which 14 "gave up after N nodes", uploads refused, HQ's own FindBlocks "no response" (2026-09-04
+-- 03:10). Through rock the straight line is nearly always the answer, so the digging search is
+-- small and greedy; a normal search that needs more than 6,000 nodes in a 24-block margin box is a
+-- route that does not exist.
+local ASTAR_MAX_NODES = 6000
+local ASTAR_MAX_NODES_DIG = 2500
+local ASTAR_WEIGHT_DIG = 2.0
 
 -- WHERE THE OTHER DRONES ARE, RIGHT NOW.
 --
@@ -1366,6 +1375,11 @@ end
 -- at all, so it walked into the same protected blocks for ever no matter how many times the fleet
 -- recorded them. Making it a PASSABILITY MODE of the one pathfinder is the whole fix: one map, one
 -- search, and "we are not allowed through there" is a fact the router already has.
+-- Heuristic weight and node budget for a search: small and greedy through rock, wider in the open.
+local function searchLimits(p_Dig)
+    if p_Dig then return ASTAR_WEIGHT_DIG, ASTAR_MAX_NODES_DIG end
+    return ASTAR_WEIGHT, ASTAR_MAX_NODES
+end
 -- A digging drone may be sent INTO rock: the cell above an ore is dirt, and that is the point.
 local function goalOpen(p_Cell, p_Dig)
     return p_Dig or p_Cell == nil or p_Cell == 0 or p_Cell == 2
@@ -1397,9 +1411,10 @@ function a_star(x1, y1, z1, x2, y2, z2, discover, priority, asker, dig)
     local closedset, cameFrom, g_score = {}, {}, {}
     local heap = {}
     local s_Nodes = 0
+    local s_W, s_MaxNodes = searchLimits(dig)
 
     g_score[idx_start] = 0
-    heapPush(heap, ASTAR_WEIGHT * heuristic_cost_estimate(x1, y1, z1, x2, y2, z2), idx_start, {x1, y1, z1})
+    heapPush(heap, s_W * heuristic_cost_estimate(x1, y1, z1, x2, y2, z2), idx_start, {x1, y1, z1})
 
     while #heap > 0 do
         s_Nodes = s_Nodes + 1
@@ -1422,7 +1437,7 @@ function a_star(x1, y1, z1, x2, y2, z2, discover, priority, asker, dig)
         if s_Nodes % 200 == 0 then
             breathe("astar")
         end
-        if s_Nodes > ASTAR_MAX_NODES then
+        if s_Nodes > s_MaxNodes then
             return false, ("gave up after %d nodes"):format(s_Nodes)
         end
 
@@ -1475,7 +1490,7 @@ function a_star(x1, y1, z1, x2, y2, z2, discover, priority, asker, dig)
                             cameFrom[idx_neighbor] = {dir, idx_current}
                             g_score[idx_neighbor] = tentative
                             heapPush(heap, tentative +
-                                ASTAR_WEIGHT * heuristic_cost_estimate(x4, y4, z4, x2, y2, z2),
+                                s_W * heuristic_cost_estimate(x4, y4, z4, x2, y2, z2),
                                 idx_neighbor, {x4, y4, z4})
                         end
                     end
