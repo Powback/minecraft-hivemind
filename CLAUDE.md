@@ -572,6 +572,24 @@ back (36 in ten minutes) while MapServer answered everything it heard in 0-2 ms.
 every asker at once, so the fleet queued over `-476,64,78` (27 "could not reach" in six minutes)
 with five chests two blocks away. The asker's id now spreads the fleet over the roomy near chests.
 
+**OVERNIGHT 2026-09-04 (03:40-13:55), UNATTENDED, WHAT BROKE:**
+- **The shelf reserve deadlocked the fleet.** Drones at 150-300 fuel were refused the 172 coal on
+  the shelf (below the 256 reserve) and were too low to mine more; the shelf never grew. A reserve
+  must leave a drone a WORKING tank: `ShelfAllowance` hands out enough to reach 600, unlimited
+  above the reserve, unlimited for survival and relief.
+- **Leftover canopy only in an emergency meant no wood at all once the emergency ended.** No planks,
+  no chests, storage could not expand, and 4,394 stone from the coal veins filled every bay chest to
+  27/27. Lumber falls back to leftovers whenever oak_log is below its minimum.
+- **The fuel faucet aimed at one chest.** That chest filled with stone; "added 0" for hours. It now
+  counts and fills coal across the bay row.
+- **Level 1 took 3,014 bricks for a ~2,200-brick floor and never advanced.** Every re-order queued
+  every square; drones flew to squares others had filled to read "occupied"; some patch always
+  consumed a brick, so "placed nothing" never held. `MapServer.BlocksSolid` now answers which squares
+  already hold a block and `order.tower` queues only the rest; a floor with none left queues zero
+  tasks, which is the advance condition.
+- **D35 is LOST at y=27 in an unloaded chunk** (silent 31,000 s): a cave survey took it out of the
+  force-loaded area and the computer stopped. Surveys and gathers must stay inside loaded chunks.
+
 **A tower patch is 32 bricks, not 8, and a build pre-marks squares the shared map already has
 solid.** A patch pays a shelf trip and a climb whatever its size; at 8 that was ~250 fuel per 8
 bricks, and visiting a square another drone had filled to read "occupied" was a trip per square.
