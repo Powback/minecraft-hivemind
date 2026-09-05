@@ -1055,10 +1055,11 @@ test("StorageMan: the pickup point is the chest that already holds the most of t
         { where = "minecraft:chest_0", slot = 1, count = 20 },
         { where = "minecraft:chest_1", slot = 3, count = 60 },
         { where = "minecraft:furnace_2", slot = 1, count = 10 } } } }
-    local p = env.pickupFor("minecraft:stone_bricks")
-    eq(p.peripheral, "minecraft:chest_1", "the chest with 60, not the one with 20, never the furnace")
-    eq(p.pos.x, -480, "at its registered position")
-    eq(env.pickupFor("minecraft:glass"), nil, "nothing holds glass")
+    -- two askers spread across the chests that hold it, never the furnace
+    local seen = {}
+    for asker = 1, 6 do local p = env.pickupFor("minecraft:stone_bricks", asker); truthy(p ~= nil, "a pickup"); truthy(p.peripheral ~= "minecraft:furnace_2", "never the furnace"); seen[p.peripheral] = true end
+    truthy(seen["minecraft:chest_0"] and seen["minecraft:chest_1"], "spread across both chests, not one")
+    eq(env.pickupFor("minecraft:glass", 1), nil, "nothing holds glass")
 end)
 
 

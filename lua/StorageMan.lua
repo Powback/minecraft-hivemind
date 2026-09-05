@@ -175,7 +175,7 @@ function OnProvide(p_ID, p_Message)
     -- handover came back "short", and eleven builds in twenty minutes threw "ran out of
     -- stone_bricks" with 119 bricks on the shelf (2026-09-05 15:19). The chest holding the most of
     -- the first item asked for is the pickup point: no push is needed for the bulk of the order.
-    local s_Point = pickupPointFor(s_Want)
+    local s_Point = pickupPointFor(s_Want, p_ID)
     if s_Point == nil then
         for _, d in ipairs(DATA["deposits"] or {}) do s_Point = d break end
     end
@@ -619,20 +619,28 @@ local function depositPosOf(p_Name)
     end
     return nil
 end
-function pickupFor(p_Name)
+-- SPREAD PICKUPS ACROSS CHESTS, DON'T FUNNEL EVERY BUILDER TO THE FULLEST ONE. Sending all
+-- builders to the single fullest brick chest piled them onto its one access square -- "blocked by
+-- something unidentified", bounce, 0.7 blocks/min with a full larder (2026-09-05 17:40). Every
+-- chest that holds a usable amount is a candidate; the asking drone's id picks which, so two
+-- builders fetching at once go to different chests and different access squares.
+function pickupFor(p_Name, p_Asker)
     local e = m_Index[p_Name]
     if type(e) ~= "table" then return nil end
-    local s_Best, s_BestCount = nil, 0
+    local s_Cand = {}
     for _, at in ipairs(e.at or {}) do
-        local n = tonumber(at.count) or 0
-        if n > s_BestCount and not isFurnace(at.where) and depositPosOf(at.where) then s_Best, s_BestCount = at.where, n end
+        if (tonumber(at.count) or 0) > 0 and not isFurnace(at.where) and depositPosOf(at.where) then
+            s_Cand[#s_Cand + 1] = at.where
+        end
     end
-    if s_Best == nil then return nil end
-    return {pos = depositPosOf(s_Best), peripheral = s_Best}
+    if #s_Cand == 0 then return nil end
+    table.sort(s_Cand)                              -- stable, so the id maps to the same chest each ask
+    local s_Pick = s_Cand[((tonumber(p_Asker) or 0) % #s_Cand) + 1]
+    return {pos = depositPosOf(s_Pick), peripheral = s_Pick}
 end
--- The pickup point for an order: where its first item mostly is, else the configured pickup.
-function pickupPointFor(p_Want)
-    return pickupFor(p_Want[1] and p_Want[1].name) or DATA["pickup"]
+-- The pickup point for an order: where its first item is, spread by asker, else the configured pickup.
+function pickupPointFor(p_Want, p_Asker)
+    return pickupFor(p_Want[1] and p_Want[1].name, p_Asker) or DATA["pickup"]
 end
 
 function OnBringToFront(p_ID, p_Message)
