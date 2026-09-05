@@ -1133,5 +1133,17 @@ test("DroneLogic: a build patch is ordered lowest course first, then nearest-nei
     eq(out[3].dx, 8, "then the far low block, before climbing")
 end)
 
+
+test("DroneLogic: Tried reports a Lua code error to HQ once, but not a plain domain failure", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    local s_Distress = {}
+    env.Distress = function(reason, detail) s_Distress[#s_Distress + 1] = reason .. "|" .. tostring(detail) end
+    env.Tried("reach the chest", function() error("could not reach", 0) end)   -- domain: no file:line
+    env.Tried("top up", function() error("DroneLogic.lua:7304: bad argument (number expected, got nil)", 0) end)
+    env.Tried("top up", function() error("DroneLogic.lua:7304: bad argument (number expected, got nil)", 0) end)
+    eq(#s_Distress, 1, "the code error surfaced once; the domain failure did not, the repeat did not")
+    truthy(s_Distress[1]:find("code error", 1, true), "reported as a code error")
+end)
+
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))
 os.exit(failed == 0 and 0 or 1)

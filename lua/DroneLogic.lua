@@ -180,9 +180,23 @@ local function HEADINGS_() return pgps.HEADINGS end
 -- GLOBAL, not local, and not by preference: this chunk is at 192 of Lua's 200 locals and adding
 -- one more fails the whole file to load with "too many local variables". Same reason DigUp and
 -- PutDown are globals. Assigned at file scope, so it exists before anything calls it.
+-- CAUGHT IS NOT THE SAME AS SEEN. Every risky call goes through here, and a failure used to be a
+-- line in this one drone's log and nothing more -- so a real CODE error (a nil where a number was
+-- expected, a bad index) that recurred every few minutes limped on invisibly until a person spotted
+-- the stuck drone (2026-09-05: D41's "%d on nil" top-up crash, unseen for an hour). A domain failure
+-- ("could not reach the chest") stays a local trace; a Lua error -- recognised by its `file.lua:NN`
+-- stamp -- is reported to HQ ONCE per unique message, so it surfaces on the brief and the monitor.
+local m_CodeErrSeen = {}
 function Tried(p_What, p_Fn, ...)
     local s_Ok, s_Err = pcall(p_Fn, ...)
-    if not s_Ok then trace("FAILED to " .. tostring(p_What) .. " -- " .. tostring(s_Err)) end
+    if not s_Ok then
+        trace("FAILED to " .. tostring(p_What) .. " -- " .. tostring(s_Err))
+        local s_Msg = tostring(s_Err)
+        if s_Msg:find("%.lua:%d") and not m_CodeErrSeen[s_Msg] then
+            m_CodeErrSeen[s_Msg] = true
+            Distress("code error", (p_What or "?") .. ": " .. s_Msg, false)
+        end
+    end
     return s_Ok
 end
 
