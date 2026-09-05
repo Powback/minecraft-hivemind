@@ -6795,6 +6795,46 @@ function MarkMapSolidDone(p_Memo, p_Blocks, p_Origin)
     if n > 0 then trace(("build: %d square(s) already solid on the map -- not visiting them"):format(n)) end
     return n
 end
+-- A SQUARE UNDER A BLOCK CANNOT BE LAID FROM ABOVE. Measured against the world, not the map
+-- (2026-09-05 15:00): of floor 0's 683 missing squares, 231 sit under a stone brick and 160 under
+-- cobblestone from the first build -- the top wall row under the next floor's slab, wall pieces
+-- under older wall pieces, floor squares under something placed before them. From above every one
+-- is "no route to the square" for ever, and six in a row read as "walled in", so the reachable
+-- squares in the same patch never got laid either. Lay a covered square from a neighbour cell at
+-- its own height (turtle.place facing the gap), or a floor square from the cell below
+-- (turtle.placeUp). Stairs keep their heading rule and stay top-laid.
+-- Returns "placed", "already", "occupied" or "no route"; throws when the material ran out.
+function LayCovered(bx, by, bz, p_Block)
+    if p_Block.heading ~= nil then return "no route" end
+    for _, d in ipairs({{1, 0}, {-1, 0}, {0, 1}, {0, -1}}) do
+        if TravelTo(bx + d[1], by, bz + d[2], by + 3) then
+            local h = headingToward(bx + d[1], bz + d[2], bx, bz)
+            if h ~= nil and pgps.turnTo(h) ~= false then
+                return LayAhead(turtle.inspect, turtle.place, p_Block.item)
+            end
+        end
+    end
+    if TravelTo(bx, by - 1, bz, by + 1) then
+        return LayAhead(turtle.inspectUp, turtle.placeUp, p_Block.item)
+    end
+    return "no route"
+end
+function LayAhead(p_Inspect, p_Place, p_Item)
+    local s_Has, s_What = p_Inspect()
+    if s_Has then return alreadyThatBlock(s_What, p_Item) and "already" or "occupied" end
+    if not selectItem(p_Item) then error("ran out of " .. tostring(p_Item) .. " partway through", 0) end
+    return p_Place() and "placed" or "occupied"
+end
+-- The bookkeeping of one covered square, so OnBuild's loop stays one line for it.
+function CountCovered(p_Verdict, p_Done, p_Key, p_Why, p_Run, p_Placed, p_Skipped)
+    if p_Verdict == "placed" or p_Verdict == "already" then
+        p_Done.mark(p_Key)
+        return 0, p_Placed + 1, p_Skipped
+    end
+    noteSkip(p_Why, p_Verdict == "occupied" and "occupied by something else" or "no route to the square")
+    if p_Verdict == "no route" then p_Run = NoteNoRoute(p_Run) end
+    return p_Run, p_Placed, p_Skipped + 1
+end
 function OnBuild(p_ID, p_Message)
     return RunJob("Build", p_Message.data, {status = "building", travel = false}, function(d)
         local s_Origin = d.origin
@@ -6913,9 +6953,8 @@ function OnBuild(p_ID, p_Message)
             if s_BuildDone.done(s_BK) then
                 -- already placed before the last stand-down
             elseif not TravelTo(bx, by + 1, bz, (by or 64) + 4) then
-                s_Skipped = s_Skipped + 1
-                noteSkip(s_Why, "no route to the square")
-                s_NoRouteRun = NoteNoRoute(s_NoRouteRun)
+                s_NoRouteRun, s_Placed, s_Skipped = CountCovered(LayCovered(bx, by, bz, b), s_BuildDone, s_BK,
+                                                                 s_Why, s_NoRouteRun, s_Placed, s_Skipped)
             else
                 s_NoRouteRun = 0
                 -- MARK ONLY WHAT WAS ACTUALLY PLACED. This used to mark here, on arrival, which

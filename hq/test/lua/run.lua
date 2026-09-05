@@ -1009,5 +1009,39 @@ test("StorageMan: furnaces are never deposit points, whatever the registry says"
     for _, p in ipairs(res.points) do truthy(not env.isFurnace(p.peripheral), "no furnace among them") end
 end)
 
+
+test("DroneLogic: a covered square is laid from a neighbour cell, facing the gap", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.turtle.inv[1] = { name = "minecraft:stone_bricks", count = 10 }
+    local s_Trips, s_Faced, s_Placed = {}, nil, 0
+    env.TravelTo = function(x, y, z) s_Trips[#s_Trips + 1] = x .. "," .. y .. "," .. z; env.__world.pos = { x = x, y = y, z = z }; return true end
+    env.pgps.turnTo = function(h) s_Faced = h return true end
+    env.turtle.inspect = function() return false end
+    env.turtle.place = function() s_Placed = s_Placed + 1 return true end
+    eq(env.LayCovered(-480, 63, 70, { item = "minecraft:stone_bricks" }), "placed", "laid sideways")
+    eq(s_Trips[1], "-479,63,70", "from the east neighbour at the square's own height")
+    eq(s_Faced, env.pgps.HEADINGS.west, "facing the gap")
+    eq(s_Placed, 1, "one block")
+    eq(env.LayCovered(-480, 63, 70, { item = "minecraft:stone_brick_stairs", heading = "north" }), "no route", "stairs keep their heading rule")
+end)
+
+test("DroneLogic: when no neighbour is reachable a floor square is laid from below", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.turtle.inv[1] = { name = "minecraft:stone_bricks", count = 10 }
+    local s_Up = 0
+    env.TravelTo = function(x, y, z) return y == 62 end       -- only the cell below is reachable
+    env.turtle.inspectUp = function() return false end
+    env.turtle.placeUp = function() s_Up = s_Up + 1 return true end
+    eq(env.LayCovered(-480, 63, 70, { item = "minecraft:stone_bricks" }), "placed", "laid from below")
+    eq(s_Up, 1, "placeUp once")
+    local marked = {}
+    local memo = { mark = function(k) marked[#marked + 1] = k end }
+    local run, placed, skipped = env.CountCovered("placed", memo, "-480:63:70", {}, 3, 5, 2)
+    eq(run .. "/" .. placed .. "/" .. skipped, "0/6/2", "a placed square resets the no-route run and counts")
+    eq(marked[1], "-480:63:70", "and is remembered as done")
+    run, placed, skipped = env.CountCovered("no route", memo, "k", {}, 0, 0, 0)
+    eq(run .. "/" .. placed .. "/" .. skipped, "1/0/1", "an unreachable one counts toward walled-in")
+end)
+
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))
 os.exit(failed == 0 and 0 or 1)
