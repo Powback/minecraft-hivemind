@@ -18,7 +18,7 @@ describe('the build memo only remembers blocks that were placed', () => {
 
   it('marks exactly where a block went down, and nowhere else', () => {
     const marks = loop.split('\n').filter((l) => l.includes('s_BuildDone.mark('));
-    expect(marks.length).toBe(2);
+    expect(marks.length).toBe(3);   // place-on-air, already-correct, replace-wrong-block
     for (const after of loop.split('s_BuildDone.mark(s_BK)').slice(1)) {
       expect(after.slice(0, 120)).toMatch(/s_Placed = s_Placed \+ 1/);
     }

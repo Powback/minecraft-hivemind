@@ -6818,6 +6818,26 @@ function noteSkip(p_Tally, p_Reason)
 end
 -- A build that reached none of its squares built nothing, and "done" would tell TaskMan the
 -- opposite (D38: 32 squares skipped for "no route" in 0.05s, patch marked complete).
+-- THE WRONG BLOCK IS IN THE WAY: REPLACE IT, DON'T LEAVE IT. A square holding something other than
+-- the design block used to be skipped, so it stayed for ever and walled the drone out of the
+-- squares behind it. Compare; if it is not ours to protect, dig it and place the right one.
+-- DigDown refuses protected blocks (chests, computers, modems), so a machine is skipped, never cut.
+s_ReplaceWhy = nil
+function ReplaceWrongBlock(p_What, p_Block, p_BK)
+    local s_Name = (type(p_What) == "table" and p_What.name) or "?"
+    if p_What == nil or p_What == false then return false end
+    if IsProtected(s_Name) then s_ReplaceWhy = "occupied by protected " .. s_Name return false end
+    if not DigDown() then s_ReplaceWhy = "could not clear " .. s_Name return false end
+    if selectItem(p_Block.item)
+            and (p_Block.heading == nil or pgps.turnTo(HEADINGS_()[p_Block.heading]) ~= false)
+            and turtle.placeDown() then
+        trace(("build: replaced %s with %s"):format(s_Name, tostring(p_Block.item)))
+        pgps.noteObservation(p_BK, 1, {true, {name = p_Block.item}})
+        return true
+    end
+    s_ReplaceWhy = "cleared " .. s_Name .. " but could not place " .. tostring(p_Block.item)
+    return false
+end
 -- A BUILD THAT PLACED NOTHING IS NOT DONE, whatever the reasons. D38's patch was "done" with 32
 -- squares skipped for want of a route; storage-01's chest-row was "done" with 4 squares skipped
 -- for want of chests -- and HQ believed both. Fail with the tally so TaskMan requeues it.
@@ -7164,14 +7184,15 @@ function OnBuild(p_ID, p_Message)
                     goto continueBlock
                 end
                 local s_Occupied, s_What = turtle.inspectDown()
-                if s_Occupied then
-                    if alreadyThatBlock(s_What, b.item) then
-                        s_BuildDone.mark(s_BK)
-                        s_Placed = s_Placed + 1        -- already correct; count it as done
-                    else
-                        s_Skipped = s_Skipped + 1
-                        noteSkip(s_Why, "occupied by something else")
-                    end
+                if s_Occupied and alreadyThatBlock(s_What, b.item) then
+                    s_BuildDone.mark(s_BK)
+                    s_Placed = s_Placed + 1            -- already correct; count it as done
+                elseif ReplaceWrongBlock(s_What, b, s_BK) then
+                    s_BuildDone.mark(s_BK)
+                    s_Placed = s_Placed + 1
+                elseif s_Occupied then
+                    s_Skipped = s_Skipped + 1
+                    noteSkip(s_Why, s_ReplaceWhy or "occupied")
                 elseif not selectItem(b.item) then
                     -- A material the handover came up short on skips its squares; it used to abort
                     -- the whole patch after a handful of bricks (11 aborts in 20 min, 2026-09-05).

@@ -1204,5 +1204,23 @@ test("StorageMan: a reserved chest is excluded from another drone's candidates u
     truthy(not S.reservedByOther("minecraft:chest_1", 9), "reserving a new chest freed the old")
 end)
 
+
+test("DroneLogic: a build replaces a wrong block, keeps a right one, spares a protected one", function()
+    local env, D = loadModule("DroneLogic.lua", { fuel = 1000 })
+    -- right block: alreadyThatBlock true
+    truthy(env.alreadyThatBlock({ name = "minecraft:stone_bricks" }, "minecraft:stone_bricks"), "right block recognised")
+    truthy(not env.alreadyThatBlock({ name = "minecraft:cobblestone" }, "minecraft:stone_bricks"), "wrong block recognised")
+    -- the replace helper digs a wrong, unprotected block and places the design block
+    env.turtle.inv[1] = { name = "minecraft:stone_bricks", count = 64 }
+    local s_Dug, s_Placed, s_Cleared = 0, 0, false
+    env.turtle.detectDown = function() return not s_Cleared end          -- solid until we dig it
+    env.turtle.inspectDown = function() return not s_Cleared, { name = "minecraft:cobblestone" } end
+    env.turtle.digDown = function() s_Dug = s_Dug + 1; s_Cleared = true; return true end
+    env.turtle.placeDown = function() s_Placed = s_Placed + 1 return true end
+    truthy(env.ReplaceWrongBlock({ name = "minecraft:cobblestone" }, { item = "minecraft:stone_bricks" }, "0:0:0"),
+        "a wrong unprotected block is dug and replaced")
+    truthy(s_Dug >= 1 and s_Placed == 1, "dug the old, placed the new")
+end)
+
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))
 os.exit(failed == 0 and 0 or 1)
