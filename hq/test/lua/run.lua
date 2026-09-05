@@ -725,19 +725,22 @@ test("DroneLogic: a drone that moves a lot over a few cells gets its trip broken
     env.pgps.motionWindow = function() return 22, 4, 3 end
     env.pgps.BreakExec = function() s_Broken = s_Broken + 1 end
     env.executing = false
-    -- the module's own start-up already ran one heartbeat, so the window closes within 8 calls
+    -- the module's own start-up already ran one heartbeat, so the window closes within 2 calls
     local s_Fired = false
-    for _ = 1, 8 do if env.JitterWatch() then s_Fired = true end end
+    for _ = 1, 2 do if env.JitterWatch() then s_Fired = true end end
     truthy(s_Fired, "the window closed on jitter")
     eq(s_Broken, 1, "the trip was broken once")
 end)
 
 test("DroneLogic: a drone covering ground is never called jittery", function()
     local env = loadModule("DroneLogic.lua", { fuel = 1000 })
-    env.pgps.motionWindow = function() return 40, 12, 38 end
+    env.pgps.motionWindow = function() return 40, 12, 38, 60 end
     local s_Fired = false
-    for _ = 1, 16 do if env.JitterWatch() then s_Fired = true end end
-    truthy(not s_Fired, "40 moves over 38 cells is travel")
+    for _ = 1, 8 do if env.JitterWatch() then s_Fired = true end end
+    truthy(not s_Fired, "40 moves over 38 cells spanning 60 blocks is travel")
+    env.pgps.motionWindow = function() return 44, 0, 12, 6 end
+    for _ = 1, 4 do if env.JitterWatch() then s_Fired = true end end
+    truthy(s_Fired, "44 moves that never left a 6-block box is a back-and-forth")
 end)
 
 
@@ -768,12 +771,13 @@ end)
 
 test("DroneLogic: a crafter shuttling between the bay's chests is work, not jitter", function()
     local env = loadModule("DroneLogic.lua", { fuel = 1000 })
-    env.pgps.motionWindow = function() return 255, 6, 6 end
+    env.pgps.motionWindow = function() return 255, 6, 6, 8 end
     local s_Broken = 0
     env.pgps.BreakExec = function() s_Broken = s_Broken + 1 end
     env.executing = false
-    for _ = 1, 16 do env.JitterWatch() end
-    eq(s_Broken, 0, "six cells of chest-hopping is never a loop")
+    env.HiveMindTest.DroneLogic.setStatus("crafting")
+    for _ = 1, 8 do env.JitterWatch() end
+    eq(s_Broken, 0, "a crafter's chest-hopping is never a loop")
 end)
 
 
@@ -902,6 +906,13 @@ test("DroneLogic: with no map to ask, a blind leg home rises, faces home and fli
     eq(s_Faced, env.pgps.HEADINGS.east, "home is east")
     eq(s_Fwd, 16, "sixteen blocks forward")
     eq(s_Up, 0, "already above cruise height: no climb")
+end)
+
+
+test("DroneLogic: the blind leg's second axis is the shorter way home", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    eq(env.headingAcross(-657, 62, -480, 64), env.pgps.HEADINGS.south, "x is the long axis, so across is +z: south")
+    eq(env.headingAcross(-480, 20, -480, 64), nil, "no second axis when x already matches")
 end)
 
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))

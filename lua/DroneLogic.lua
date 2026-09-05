@@ -276,19 +276,27 @@ end
 -- and its crafting spot -- 255 moves over 6 cells in one window, all of it work -- and the first
 -- version aborted a 108-run brick craft for it. Crafting is exempt outright; the real loops seen
 -- so far were 2 to 4 cells wide.
-JITTER = {beats = 8, minSteps = 16, maxCells = 4, minTurns = 40}
+-- Two heartbeats (60 game-s, six real seconds at 10x), not eight: the user watches drones walk back
+-- and forth for a minute before anything reacts. Bouncing is 12+ moves over <= 4 cells, or 40+
+-- moves that never left a 10-block box (a longer back-and-forth); spinning is 20+ turns on the spot.
+JITTER = {beats = 2, minSteps = 12, maxCells = 4, minTurns = 20, boxSteps = 40, boxSpan = 10}
 JitterState = {beats = 0, events = 0}
+-- "bouncing", "spinning", or nil for a drone that is getting somewhere.
+function JitterVerdict(p_Steps, p_Turns, p_Cells, p_Span)
+    if p_Steps >= JITTER.minSteps and p_Cells <= JITTER.maxCells then return "bouncing" end
+    if p_Steps >= JITTER.boxSteps and (p_Span or 999) <= JITTER.boxSpan then return "bouncing" end
+    if p_Turns >= JITTER.minTurns and p_Cells <= 2 then return "spinning" end
+    return nil
+end
 function JitterWatch()
     JitterState.beats = JitterState.beats + 1
     if JitterState.beats < JITTER.beats then return false end
     JitterState.beats = 0
-    local s_Steps, s_Turns, s_Cells = pgps.motionWindow()
+    local s_Steps, s_Turns, s_Cells, s_Span = pgps.motionWindow()
     local s_Callers = pgps.motionCallers and pgps.motionCallers() or "?"
     pgps.motionReset()
     if m_Status == "crafting" then return false end
-    local s_Bouncing = s_Steps >= JITTER.minSteps and s_Cells <= JITTER.maxCells
-    local s_Spinning = s_Turns >= JITTER.minTurns and s_Cells <= 2
-    if not (s_Bouncing or s_Spinning) then
+    if JitterVerdict(s_Steps, s_Turns, s_Cells, s_Span) == nil then
         JitterState.events = 0
         return false
     end
@@ -3854,8 +3862,28 @@ function BlindLegHome(p_Hx, p_Hy, p_Hz)
     for _ = 1, math.max(0, s_Cruise - cy) do
         if not pgps.up() then break end
     end
-    local s_H = headingToward(cx, cz, p_Hx, p_Hz)
-    if s_H == nil or pgps.turnTo(s_H) == false then return false end
+    -- The longer axis first; if that way is walled (D2: "0 block(s)" from a hole at -534,69,26),
+    -- the other axis; if both are, one block cut forward -- a stranded drone far from the base
+    -- freeing itself, not a route through anything of ours.
+    local s_Went = BlindRun(headingToward(cx, cz, p_Hx, p_Hz))
+    local s_Across = headingAcross(cx, cz, p_Hx, p_Hz)
+    if s_Went == 0 and s_Across ~= nil then s_Went = BlindRun(s_Across) end
+    if s_Went == 0 and CanDig() and DigForward() then s_Went = BlindRun(nil) end
+    trace(("blind leg home: %d block(s) toward %d,%d,%d with no map to ask"):format(s_Went, p_Hx, p_Hy or 64, p_Hz))
+    return s_Went > 0
+end
+-- The heading along the SHORTER axis toward home (nil when there is none).
+function headingAcross(p_Cx, p_Cz, p_Hx, p_Hz)
+    if math.abs(p_Hx - p_Cx) >= math.abs(p_Hz - p_Cz) then
+        if p_Hz == p_Cz then return nil end
+        return headingToward(p_Cx, p_Cz, p_Cx, p_Hz)
+    end
+    if p_Hx == p_Cx then return nil end
+    return headingToward(p_Cx, p_Cz, p_Hx, p_Cz)
+end
+-- Face p_H (nil = keep facing) and fly up to 16 blocks, stepping up over anything solid ahead.
+function BlindRun(p_H)
+    if p_H ~= nil and pgps.turnTo(p_H) == false then return 0 end
     local s_Went = 0
     for _ = 1, 16 do
         if pgps.forward() then
@@ -3864,8 +3892,7 @@ function BlindLegHome(p_Hx, p_Hy, p_Hz)
             break
         end
     end
-    trace(("blind leg home: %d block(s) toward %d,%d,%d with no map to ask"):format(s_Went, p_Hx, p_Hy or 64, p_Hz))
-    return s_Went > 0
+    return s_Went
 end
 function SeekHomeward()
     local hx, hy, hz = HomeXYZ()
@@ -9914,6 +9941,7 @@ if HiveMindTest then
         setRelieving = function(v) m_Relieving = v end,
         setExecuting = function(v) executing = v end,
         isExecuting = function() return executing end,
+        setStatus = function(v) m_Status = v end,
         collectFuel = CollectFuel,
     }
 end

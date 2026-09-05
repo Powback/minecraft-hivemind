@@ -269,9 +269,14 @@ local m_Reach = nil          -- horizontal radius from the settlement centre, if
 local m_Centre = nil
 -- Moves, turns and distinct cells since the last motionReset() -- the heartbeat's jitter watch
 -- reads them (DroneLogic.JitterWatch). A drone that made 20 moves over 3 cells is bouncing.
-local m_Motion = {steps = 0, turns = 0, cells = {}, distinct = 0, callers = {}}
-function motionWindow() return m_Motion.steps, m_Motion.turns, m_Motion.distinct end
-function motionReset() m_Motion = {steps = 0, turns = 0, cells = {}, distinct = 0, callers = {}} end
+local m_Motion = {steps = 0, turns = 0, cells = {}, distinct = 0, callers = {}, box = nil}
+-- steps, turns, distinct cells, and the span of the box every step fell in (the largest axis)
+function motionWindow()
+    local b = m_Motion.box
+    local s_Span = b and math.max(b.x2 - b.x1, b.y2 - b.y1, b.z2 - b.z1) or 0
+    return m_Motion.steps, m_Motion.turns, m_Motion.distinct, s_Span
+end
+function motionReset() m_Motion = {steps = 0, turns = 0, cells = {}, distinct = 0, callers = {}, box = nil} end
 -- Who has been moving the drone: the first frame outside this file, tallied per step. Cheap
 -- enough per move, and the only way a "325 moves over 2 cells" report names the loop instead of
 -- leaving it to guesswork.
@@ -293,6 +298,10 @@ function motionCallers()
     for i = 1, math.min(3, #s_List) do s_Out[#s_Out + 1] = s_List[i].site .. " x" .. s_List[i].n end
     return table.concat(s_Out, ", ")
 end
+local function widen(p_Box, p_Axis, p_V)
+    if p_V < p_Box[p_Axis .. "1"] then p_Box[p_Axis .. "1"] = p_V end
+    if p_V > p_Box[p_Axis .. "2"] then p_Box[p_Axis .. "2"] = p_V end
+end
 local function motionStep(p_X, p_Y, p_Z)
     m_Motion.steps = m_Motion.steps + 1
     local k = p_X .. ":" .. p_Y .. ":" .. p_Z
@@ -302,6 +311,12 @@ local function motionStep(p_X, p_Y, p_Z)
     end
     local s_Site = motionCaller()
     m_Motion.callers[s_Site] = (m_Motion.callers[s_Site] or 0) + 1
+    local b = m_Motion.box
+    if b == nil then
+        m_Motion.box = {x1 = p_X, x2 = p_X, y1 = p_Y, y2 = p_Y, z1 = p_Z, z2 = p_Z}
+    else
+        widen(b, "x", p_X) widen(b, "y", p_Y) widen(b, "z", p_Z)
+    end
 end
 
 local function withinReach(x, z)
@@ -2478,12 +2493,23 @@ local MOVE_STUCK   = 4       -- legs without progress before giving up
 
 -- THE one implementation of "get from here to there". p_Dig only changes which cells the PLANNER is
 -- allowed to route through; the travelling itself is identical, which is the entire point.
+local function probeSuspectHeading()
+    if not m_HeadingSuspect or cachedDir == nil then return end
+    ptrace("heading is suspect since the last fix -- probing before this trip")
+    ensureHeading(true)
+end
 function moveTo(_targetX, _targetY, _targetZ, _targetDir, changeDir, discover, p_Dig)
     -- A DRY DRONE DOES NOT TRY. Every leg used to plan, turn to face the first step, have the step
     -- refused ("MOVE REFUSED: Out of fuel", 50-90 times a minute), replan and turn again: D31 spent
     -- a window of 42 turns and 0 moves spinning at the bay. Turning is free, so nothing stopped it.
     -- There is no route around an empty tank; say so before the first turn and let relief come.
     if turtle.getFuelLevel() == 0 then return false, "out of fuel" end
+    -- A HEADING THE LAST FIX DOUBTED IS PROBED BEFORE THE NEXT TRIP, NOT WHEN THE DRONE IS NEXT
+    -- IDLE. D4 zig-zagged for minutes -- "wanted -1,0,-2 got 0,0,-3", a fix every few seconds
+    -- mending the position and never the heading -- because the only probe ran from the heartbeat
+    -- and the heartbeat skips it while the drone travels. One probe step here costs less than one
+    -- wrong leg.
+    probeSuspectHeading()
     if cachedX == nil then return false, "no position fix" end
     if _targetX == nil or _targetY == nil or _targetZ == nil then
         return false, "incomplete destination"
