@@ -2838,6 +2838,14 @@ end
 -- The move succeeds each time, so no single step "fails"; what fails is progress. Bail the moment
 -- a step does not reduce the distance, and TravelToBody falls through to moveTo, which prices the
 -- cell honestly ("goal is solid") instead of bouncing on it.
+-- The single cell a straight step from (cx,cy,cz) toward (p_X,p_Y,p_Z) would enter next: vertical
+-- first (a hop closes height before distance), then the one horizontal axis with a gap.
+local function nextStraightCell(cx, cy, cz, p_X, p_Y, p_Z)
+    if cy ~= p_Y then return cx, cy + (p_Y > cy and 1 or -1), cz end
+    if p_X > cx then return cx + 1, cy, cz elseif p_X < cx then return cx - 1, cy, cz end
+    if p_Z > cz then return cx, cy, cz + 1 elseif p_Z < cz then return cx, cy, cz - 1 end
+    return cx, cy, cz
+end
 local function stepStraightTo(p_X, p_Y, p_Z)
     local s_Best = nil
     for _ = 1, 12 do
@@ -2847,6 +2855,13 @@ local function stepStraightTo(p_X, p_Y, p_Z)
         local s_Dist = math.abs(cx - p_X) + math.abs(cy - p_Y) + math.abs(cz - p_Z)
         if s_Best ~= nil and s_Dist >= s_Best then return false end   -- no closer: let the map try
         s_Best = s_Dist
+        -- DO NOT WALK INTO A WALL THE MAP ALREADY KNOWS ABOUT. The straight hop is a blind shortcut
+        -- for short trips; unchecked, it stepped a drone into the tower wall between it and the next
+        -- square, then bounced (the "hugging the wall", 0.8 blocks/min solo, 2026-09-05). The
+        -- pathfinder's own world knows that cell is solid, so peek it: if the next step is into a
+        -- known-solid cell, bail and let TravelToBody use A*, which routes around or over it.
+        local nx, ny, nz = nextStraightCell(cx, cy, cz, p_X, p_Y, p_Z)
+        if (pgps.cachedWorld or {})[nx .. ":" .. ny .. ":" .. nz] == 1 then return false end
         local s_Ok
         if cy ~= p_Y then
             s_Ok = stepVertically(cy, p_Y)

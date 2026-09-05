@@ -1242,5 +1242,26 @@ test("DroneLogic: RequestClearance faces a sideways blocker, marks a wall solid 
     eq(s_Asked, 1, "a drone IS asked to move")
 end)
 
+
+test("DroneLogic: the straight hop bails to the planner instead of stepping into a known wall", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.__world.pos = { x = 0, y = 64, z = 0 }
+    env.pgps.cachedWorld = { ["1:64:0"] = 1 }          -- a wall one block east, target is past it
+    local s_Fwd = 0
+    env.pgps.forward = function() s_Fwd = s_Fwd + 1 return true end
+    -- target east at 3,64,0: first straight step would enter 1,64,0 which is solid
+    local ok = env.TravelToBody and true or false
+    -- call stepStraightTo indirectly is awkward; assert nextStraightCell + the peek via a tiny run:
+    env.pgps.getCachedPosition = function() return 0, 64, 0, env.pgps.HEADINGS and env.pgps.HEADINGS.north or 0 end
+    local moved = env.pgps.moveTo
+    -- if the hop refused to step into the wall, forward is never called for that cell
+    -- (we can only check via TravelToBody falling through to moveTo)
+    local planned = false
+    env.pgps.moveTo = function() planned = true return true end
+    env.TravelToBody(3, 64, 0)
+    truthy(planned, "it used the planner instead of walking into the known wall")
+    eq(s_Fwd, 0, "it never stepped forward into the solid cell")
+end)
+
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))
 os.exit(failed == 0 and 0 or 1)
