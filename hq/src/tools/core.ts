@@ -2510,10 +2510,17 @@ registry.register({
       `Nothing in stock for a ${a.palette} level ${a.level}.`,
       `It needs ${Object.keys(cost).join(', ')}.`);
 
-    // Slab first, then outward and upward -- a turtle places against an adjacent face, so the
-    // ground must exist before anything can stand on it. Same ordering rule as a blueprint.
+    // CONTIGUOUS PATCHES, LOWEST COURSE FIRST. A patch is a slice of this list, and a drone places
+    // it square by square -- so consecutive squares must be PHYSICALLY ADJACENT or the drone flies
+    // ten blocks between each placement (measured: 10 game-s/block even mid-burst, ~2.4 blocks/min
+    // for the fleet, 2026-09-05). Order: lowest y first (a course must exist before the one above,
+    // and a turtle places against an existing face), then walk AROUND the ring by angle so a slice
+    // is a continuous arc, then outward by radius. Now a 32-block patch is 32 neighbours: place,
+    // step one, place.
+    const angle = (b: { dx: number; dz: number }) => Math.atan2(b.dz, b.dx);
     const ordered = [...affordable].sort((x, y) =>
       x.dy - y.dy ||
+      angle(x) - angle(y) ||
       (Math.abs(x.dx) + Math.abs(x.dz)) - (Math.abs(y.dx) + Math.abs(y.dz)) ||
       x.dx - y.dx || x.dz - y.dz);
 
