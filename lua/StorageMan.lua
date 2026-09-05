@@ -624,6 +624,35 @@ end
 -- something unidentified", bounce, 0.7 blocks/min with a full larder (2026-09-05 17:40). Every
 -- chest that holds a usable amount is a candidate; the asking drone's id picks which, so two
 -- builders fetching at once go to different chests and different access squares.
+-- CHEST RESERVATIONS: ONE DRONE PER CHEST AT A TIME. Every picker sent all drones to the same
+-- emptiest/fullest chest, so two builders landed on one access square, collided, and spun there
+-- turning and stepping for minutes (traced 2026-09-05: "42 move 41 turns over 2 cells" at
+-- -476,65,77). A drone that is handed a chest reserves it; another asking at the same moment is
+-- given a DIFFERENT free chest. Reservations expire after RESERVE_TTL so a crashed or rebooted
+-- drone never locks a chest for good, and a drone holds at most one (a new pick frees the old).
+RESERVE_TTL = 20000
+m_Reserve = {}          -- peripheral -> { drone = id, at = epoch }
+local function nowMs() return os.epoch("utc") end
+local function pruneReserves()
+    local t = nowMs()
+    for k, r in pairs(m_Reserve) do if t - (r.at or 0) > RESERVE_TTL then m_Reserve[k] = nil end end
+end
+local function reservedByOther(p_Periph, p_Drone)
+    local r = m_Reserve[p_Periph]
+    return r ~= nil and r.drone ~= p_Drone and (nowMs() - (r.at or 0)) <= RESERVE_TTL
+end
+local function reserveChest(p_Periph, p_Drone)
+    if p_Periph == nil then return end
+    for k, r in pairs(m_Reserve) do if r.drone == p_Drone then m_Reserve[k] = nil end end   -- one per drone
+    m_Reserve[p_Periph] = { drone = p_Drone, at = nowMs() }
+end
+-- The subset of a candidate list not held by another drone (the whole list if that leaves none).
+local function unreserved(p_List, p_Drone, p_KeyOf)
+    pruneReserves()
+    local s_Out = {}
+    for _, c in ipairs(p_List) do if not reservedByOther(p_KeyOf(c), p_Drone) then s_Out[#s_Out + 1] = c end end
+    return (#s_Out > 0) and s_Out or p_List
+end
 function pickupFor(p_Name, p_Asker)
     local e = m_Index[p_Name]
     if type(e) ~= "table" then return nil end
@@ -634,8 +663,10 @@ function pickupFor(p_Name, p_Asker)
         end
     end
     if #s_Cand == 0 then return nil end
+    s_Cand = unreserved(s_Cand, p_Asker, function(w) return w end)
     table.sort(s_Cand)                              -- stable, so the id maps to the same chest each ask
     local s_Pick = s_Cand[((tonumber(p_Asker) or 0) % #s_Cand) + 1]
+    reserveChest(s_Pick, p_Asker)
     return {pos = depositPosOf(s_Pick), peripheral = s_Pick}
 end
 -- The pickup point for an order: where its first item is, spread by asker, else the configured pickup.
@@ -1093,6 +1124,7 @@ function OnDepositPoint(p_ID, p_Message)
     if #s_Usable == 0 then
         return false, "no deposit point with free space -- add one with: p StorageMan deposit -pos x y z"
     end
+    s_Usable = unreserved(s_Usable, p_ID, function(d) return d.peripheral end)   -- prefer chests no other drone holds
 
     -- SEND THEM TO THE EMPTIEST CHEST, NOT TO A FIXED ONE PER DRONE.
     --
@@ -1131,6 +1163,7 @@ function OnDepositPoint(p_ID, p_Message)
     if s_Pick == nil then
         s_Pick = s_Usable[(math.abs(tonumber(p_ID) or 0) % #s_Usable) + 1]
     end
+    reserveChest(s_Pick.peripheral, p_ID)
     return true, {pos = s_Pick.pos, peripheral = s_Pick.peripheral,
                   free = m_Free[s_Pick.peripheral], points = #s_Usable,
                   message = "drop at " .. s_Pick.pos.x .. "," .. s_Pick.pos.y .. "," .. s_Pick.pos.z}
@@ -1720,7 +1753,7 @@ Render()
 if HiveMindTest then
     HiveMindTest.StorageMan = {
         dedupeDeposits = dedupeDeposits, reservedForCrafting = reservedForCrafting,
-        smeltAllowance = smeltAllowance, fillFor = fillFor, pickHolder = pickHolder,
+        smeltAllowance = smeltAllowance, fillFor = fillFor, pickHolder = pickHolder, reservedByOther = reservedByOther, reserveChest = reserveChest,
     }
 end
 

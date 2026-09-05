@@ -1193,5 +1193,16 @@ test("DroneLogic: only bay chests get vertical staging, not deep caches", functi
     eq(env.DescendToAccess(-480, 8, 87, "haul"), false, "no staging for the deep cache -- falls through")
 end)
 
+
+test("StorageMan: a reserved chest is excluded from another drone's candidates until it expires", function()
+    local env, S = loadModule("StorageMan.lua")
+    S.reserveChest("minecraft:chest_1", 7)
+    truthy(S.reservedByOther("minecraft:chest_1", 9), "chest_1 is taken by drone 7, so drone 9 must go elsewhere")
+    truthy(not S.reservedByOther("minecraft:chest_1", 7), "the holder itself is not blocked")
+    truthy(not S.reservedByOther("minecraft:chest_2", 9), "an unreserved chest is free")
+    S.reserveChest("minecraft:chest_2", 7)   -- a drone holds at most one: chest_1 is released
+    truthy(not S.reservedByOther("minecraft:chest_1", 9), "reserving a new chest freed the old")
+end)
+
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))
 os.exit(failed == 0 and 0 or 1)
