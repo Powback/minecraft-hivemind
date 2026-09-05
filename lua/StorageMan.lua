@@ -752,11 +752,19 @@ end
 -- "refusing to dig minecraft:furnace"). Holders rotate per request, and a furnace is never the
 -- answer while a chest holds the item -- its fuel slot is for smelting.
 local m_HolderTurn = 0
+-- FURNACES ARE NOT DEPOSIT POINTS. The registered list carried furnace_2 at -520,63,34 and
+-- furnace_3 at -464,63,30 -- coordinates 50 blocks from the bay -- and every drone with leftovers
+-- was sent there, "arrived, unloading", unloaded nothing into a furnace, and flew back
+-- (2026-09-05 03:40: the far flights the user watched). A furnace is for smelting; drones unload
+-- into chests. Both deposit endpoints and WhereIs ask this.
+function isFurnace(p_Name)
+    return string.find(tostring(p_Name or ""), "furnace", 1, true) ~= nil
+end
 function pickHolder(p_Holders, p_Turn)
     if #p_Holders == 0 then return nil end
     local s_Chests = {}
     for _, h in ipairs(p_Holders) do
-        if not tostring(h.where or ""):find("furnace", 1, true) then s_Chests[#s_Chests + 1] = h end
+        if not isFurnace(h.where) then s_Chests[#s_Chests + 1] = h end
     end
     local s_From = (#s_Chests > 0) and s_Chests or p_Holders
     return s_From[(p_Turn % #s_From) + 1]
@@ -951,9 +959,11 @@ function OnDepositPoints(p_ID, p_Message)
         --
         -- ReportChest still has its purpose -- stock accounting for chests nothing else can see --
         -- it just no longer gets to tell a drone not to bother looking.
-        local seen = liveContents(d.peripheral)
-        s_Out[#s_Out + 1] = {pos = d.pos, peripheral = d.peripheral,
-                             free = m_Free[d.peripheral], items = seen}
+        if not isFurnace(d.peripheral) then          -- a furnace is for smelting, never for unloading
+            local seen = liveContents(d.peripheral)
+            s_Out[#s_Out + 1] = {pos = d.pos, peripheral = d.peripheral,
+                                 free = m_Free[d.peripheral], items = seen}
+        end
     end
     if #s_Out == 0 then return false, "no deposit points configured" end
     return true, {points = s_Out, count = #s_Out}
@@ -1034,6 +1044,7 @@ function OnDepositPoint(p_ID, p_Message)
     local s_Usable, s_Offline = {}, {}
     for _, d in ipairs(DATA["deposits"]) do
         local f = m_Free[d.peripheral]
+        if isFurnace(d.peripheral) then f = -1 end   -- see isFurnace: never an unloading point
         if f == nil then
             s_Offline[#s_Offline + 1] = d
         elseif f > 0 then

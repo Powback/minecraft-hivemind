@@ -995,5 +995,19 @@ test("TaskMan: a craft whose inputs are not on the shelf is held, one that has t
     eq(T.craftShortIn(planks), nil, "unknown stock is not a reason to hold")
 end)
 
+
+test("StorageMan: furnaces are never deposit points, whatever the registry says", function()
+    local env = loadModule("StorageMan.lua")
+    env.DATA.deposits = {
+        { peripheral = "minecraft:chest_0", pos = { x = -476, y = 64, z = 78 } },
+        { peripheral = "minecraft:furnace_2", pos = { x = -520, y = 63, z = 34 } },
+        { pos = { x = -479, y = 63, z = 32 } },
+    }
+    local ok, res = env.OnDepositPoints(1, { data = {} })
+    truthy(ok, "points came back")
+    eq(res.count, 2, "the furnace is gone, the chest and the unnamed cache stay")
+    for _, p in ipairs(res.points) do truthy(not env.isFurnace(p.peripheral), "no furnace among them") end
+end)
+
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))
 os.exit(failed == 0 and 0 or 1)
