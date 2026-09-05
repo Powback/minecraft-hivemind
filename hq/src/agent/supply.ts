@@ -141,6 +141,10 @@ export const DEFAULT_RULES: SupplyRule[] = [
   // Made, not dug. Planks gate every build the settlement will ever do, and chests gate field
   // caches -- so the fleet should keep a working stock of both without being asked.
   { match: 'minecraft:oak_planks', stock: 'minecraft:oak_planks', min: 32, action: 'craft', limit: 32 },
+  // The tower eats bricks faster than order.tower's one-off craft supplies them: builds failed
+  // "ran out of minecraft:stone_bricks partway" with 6,000 stone on the shelf and no craft queued
+  // (2026-09-05 02:45). Keep a working stock the way planks are kept.
+  { match: 'minecraft:stone_bricks', stock: 'minecraft:stone_bricks', min: 128, action: 'craft', limit: 128 },
   { match: 'minecraft:chest', stock: 'minecraft:chest', min: 4, action: 'craft', limit: 4 },
   // THE SETTLEMENT HAD NO RENEWABLE FUEL SOURCE. Every joule came from mining coal_ore, and the
   // fleet burns ~400 coal/hour -- so the energy balance was negative by construction and no supply

@@ -278,7 +278,7 @@ function M.makeEnv(p_Opts)
         isWithinReach = yes, positionVerified = yes, verifyPosition = function() return true, 0 end,
         forward = yes, back = yes, up = yes, down = yes, turnLeft = noop, turnRight = noop, turnTo = noop,
         moveTo = yes, digTo = yes, flyTo = yes, mayStep = yes, boundsReason = function() return nil end,
-        BreakExec = noop, StartExec = noop,
+        BreakExec = noop, StartExec = noop, isDriving = function() return false end,
         motionWindow = function() return 0, 0, 0 end, motionReset = noop, motionCallers = function() return "" end, setRecovering = noop, startGPS = yes,
         noteObservation = noop, noteBlocked = noop, noteCleared = noop, noteExternalStep = noop,
         requeueObservations = noop, takeWorldDelta = function() return {}, {} end,

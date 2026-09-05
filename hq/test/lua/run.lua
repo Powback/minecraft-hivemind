@@ -722,7 +722,7 @@ end)
 test("DroneLogic: a drone that moves a lot over a few cells gets its trip broken after one window", function()
     local env = loadModule("DroneLogic.lua", { fuel = 1000 })
     local s_Broken = 0
-    env.pgps.motionWindow = function() return 22, 4, 3 end
+    env.pgps.motionWindow = function() return 44, 4, 3 end
     env.pgps.BreakExec = function() s_Broken = s_Broken + 1 end
     env.executing = false
     -- the module's own start-up already ran one heartbeat, so the window closes within 2 calls
@@ -738,9 +738,9 @@ test("DroneLogic: a drone covering ground is never called jittery", function()
     local s_Fired = false
     for _ = 1, 8 do if env.JitterWatch() then s_Fired = true end end
     truthy(not s_Fired, "40 moves over 38 cells spanning 60 blocks is travel")
-    env.pgps.motionWindow = function() return 44, 0, 12, 6 end
+    env.pgps.motionWindow = function() return 64, 0, 12, 6 end
     for _ = 1, 4 do if env.JitterWatch() then s_Fired = true end end
-    truthy(s_Fired, "44 moves that never left a 6-block box is a back-and-forth")
+    truthy(s_Fired, "64 moves that never left a 6-block box is a back-and-forth")
 end)
 
 
@@ -913,6 +913,35 @@ test("DroneLogic: the blind leg's second axis is the shorter way home", function
     local env = loadModule("DroneLogic.lua", { fuel = 1000 })
     eq(env.headingAcross(-657, 62, -480, 64), env.pgps.HEADINGS.south, "x is the long axis, so across is +z: south")
     eq(env.headingAcross(-480, 20, -480, 64), nil, "no second axis when x already matches")
+end)
+
+
+test("pgps: one driver at a time -- a second coroutine's turn waits until the first coroutine's move is over", function()
+    local env = loadModule("pgps.lua")
+    env.setLocation(0, 64, 0, "north")
+    env.os.sleep = function() coroutine.yield("waiting") end
+    local s_Log = {}
+    local s_RawForward = env.turtle.forward
+    env.turtle.forward = function() s_Log[#s_Log + 1] = "step"; coroutine.yield("mid-step"); return s_RawForward() end
+    env.turtle.turnLeft = function() s_Log[#s_Log + 1] = "turn"; return true end
+    local A = coroutine.create(function() return env.forward() end)
+    local B = coroutine.create(function() return env.turnLeft() end)
+    coroutine.resume(A)                       -- A takes the drive and yields mid-step
+    truthy(env.isDriving(), "seen from the main coroutine, somebody else is driving")
+    coroutine.resume(B)                       -- B wants to turn: must wait
+    eq(#s_Log, 1, "B did not turn while A was mid-step")
+    coroutine.resume(A)                       -- A finishes its step and releases
+    coroutine.resume(B)                       -- B wakes, drives, turns
+    eq(table.concat(s_Log, ","), "step,turn", "the turn came after the step, never between")
+    truthy(not env.isDriving(), "nobody is driving afterwards")
+end)
+
+test("DroneLogic: travel counts as busy while any coroutine drives through pgps", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.pgps.isDriving = function() return true end
+    truthy(env.TravelIsBusy(), "busy")
+    env.pgps.isDriving = function() return false end
+    truthy(not env.TravelIsBusy(), "free")
 end)
 
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))

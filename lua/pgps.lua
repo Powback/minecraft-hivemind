@@ -318,6 +318,34 @@ local function motionStep(p_X, p_Y, p_Z)
         widen(b, "x", p_X) widen(b, "y", p_Y) widen(b, "z", p_Z)
     end
 end
+-- ONE DRIVER AT A TIME.
+--
+-- D4, 2026-09-05 02:35: "heading re-established: E", then 0.65 s later a fix that said the drone had
+-- moved +1,+1 with ZERO intended moves ("wanted 0,0,0 got 1,0,1"), then "wanted 1,0,-2 got
+-- -2,0,-1", then a heading rotated to W on that evidence -- and the zig-zag the user watched. Two
+-- coroutines were probing and stepping the same turtle at once: the heartbeat's heading probe and
+-- the mover's. Every lost quarter-turn of the "drift" family is this shape: a turn or a step issued
+-- by one coroutine between another coroutine's turn and its step. The turtle has one body. The four
+-- choke points every move and turn passes through -- moveLeg, ensureHeading's probe, timedMove and
+-- turnAndTrack -- take the drive; a second coroutine waits (yielding) until the holder's call is
+-- over; the holder may nest freely; a holder that dies releases it.
+local m_Driver = nil
+local function driverGone()
+    return m_Driver == nil or coroutine.status(m_Driver) == "dead"
+end
+function isDriving()
+    return not driverGone() and m_Driver ~= coroutine.running()
+end
+local function driving(p_Fn, ...)
+    local me = coroutine.running()
+    if m_Driver == me then return p_Fn(...) end
+    while not driverGone() do os.sleep(0.1) end
+    m_Driver = me
+    local s_Ret = table.pack(pcall(p_Fn, ...))
+    m_Driver = nil
+    if not s_Ret[1] then error(s_Ret[2], 0) end
+    return table.unpack(s_Ret, 2, s_Ret.n)
+end
 
 local function withinReach(x, z)
     if m_Reach == nil or m_Centre == nil then return true end
@@ -1008,13 +1036,14 @@ function holdFixes()
     m_Moving = m_Moving + 1
 end
 function releaseFixes() m_Moving = math.max(0, m_Moving - 1) end
-local function timedMove(p_Fn)
+local function timedMoveRaw(p_Fn)
     holdFixes()
     local ok, a, b = pcall(p_Fn)
     releaseFixes()
     if not ok then error(a, 0) end
     return a, b
 end
+local function timedMove(p_Fn) return driving(timedMoveRaw, p_Fn) end
 
 
 function headingSuspect() return m_HeadingSuspect end
@@ -1542,7 +1571,7 @@ end
 -- Re-deriving costs one step out and back and needs a GPS fix to compare against, so callers should
 -- force it just after a confirmed fix. The probe only ever ASSIGNS cachedDir, never clears it, so a
 -- failed re-derivation leaves the old heading in place rather than immobilising the drone.
-function ensureHeading(p_Force)
+function ensureHeadingRaw(p_Force)
     if cachedDir ~= nil and not p_Force then return true end
     if cachedX == nil then return false, "no position, so no way to deduce heading" end
 
@@ -1694,6 +1723,7 @@ function ensureHeading(p_Force)
 
     return false, "could not determine heading"
 end
+function ensureHeading(p_Force) return driving(ensureHeadingRaw, p_Force) end
 
 -- EVERY REASON A STEP CAN BE REFUSED BEFORE IT IS ATTEMPTED, IN ONE PLACE.
 --
@@ -1976,7 +2006,7 @@ end
 -- turnLeft and turnRight were the same eleven lines twice over, differing only in which turtle call
 -- and which delta -- and heading is the ONE quantity that never self-corrects, so a fix landing in
 -- one of them and not the other is the expensive kind of drift. See the note in turnLeft.
-local function turnAndTrack(p_Turn, p_Delta)
+local function turnAndTrackRaw(p_Turn, p_Delta)
     -- A turn with no known heading is arithmetic on nil, and it killed the drone --
     -- miners crash-looped on "attempt to perform arithmetic on upvalue 'cachedDir'".
     -- Turning is still useful without a heading (it is how one is derived), so do the
@@ -1993,6 +2023,7 @@ local function turnAndTrack(p_Turn, p_Delta)
     savePose(true)   -- heading changed: worth writing immediately
     return true
 end
+local function turnAndTrack(p_Turn, p_Delta) return driving(turnAndTrackRaw, p_Turn, p_Delta) end
 
 function turnLeft()
     -- TURN FIRST, THEN BELIEVE IT.
@@ -2226,7 +2257,7 @@ local function tripStalled(p_Trip, p_Dist)
     p_Trip.stalls, p_Trip.best = 0, p_Dist
     return nil
 end
-local function moveLeg(_targetX, _targetY, _targetZ, _targetDir, changeDir, discover, p_Dig)
+local function moveLegRaw(_targetX, _targetY, _targetZ, _targetDir, changeDir, discover, p_Dig)
     changeDir = changeDir or false
     local s_Replans = 0
     local s_Trip = newTrip(_targetX, _targetY, _targetZ)
@@ -2368,6 +2399,7 @@ local function moveLeg(_targetX, _targetY, _targetZ, _targetDir, changeDir, disc
     end
     return true
 end
+local function moveLeg(...) return driving(moveLegRaw, ...) end
 
 ----------------------------------------
 -- setLocation
@@ -2947,5 +2979,5 @@ end
 -- this does nothing.
 if HiveMindTest ~= nil then
     HiveMindTest.pgps = {motionWindow = motionWindow, motionReset = motionReset, motionCallers = motionCallers,
-                         newTrip = newTrip, tripStalled = tripStalled}
+                         newTrip = newTrip, tripStalled = tripStalled, isDriving = isDriving}
 end

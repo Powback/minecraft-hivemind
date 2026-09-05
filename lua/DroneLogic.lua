@@ -279,7 +279,11 @@ end
 -- Two heartbeats (60 game-s, six real seconds at 10x), not eight: the user watches drones walk back
 -- and forth for a minute before anything reacts. Bouncing is 12+ moves over <= 4 cells, or 40+
 -- moves that never left a 10-block box (a longer back-and-forth); spinning is 20+ turns on the spot.
-JITTER = {beats = 2, minSteps = 12, maxCells = 4, minTurns = 20, boxSteps = 40, boxSpan = 10}
+-- Thresholds are per 60 game-seconds, in which a turtle can make up to 150 moves. A drone working
+-- a chest legitimately makes 12-20 moves over 3-4 cells in that time (down, take, step aside, back),
+-- and the first tuning aborted those. 40 moves over <= 4 cells, or 60 moves inside a 10-block box,
+-- is nothing but bouncing.
+JITTER = {beats = 2, minSteps = 40, maxCells = 4, minTurns = 30, boxSteps = 60, boxSpan = 10}
 JitterState = {beats = 0, events = 0}
 -- "bouncing", "spinning", or nil for a drone that is getting somewhere.
 function JitterVerdict(p_Steps, p_Turns, p_Cells, p_Span)
@@ -2924,6 +2928,9 @@ local TRAVEL_LOCK_MAX_S = 240
 -- terrain, and treating it as terrain is how D40 went 235 -> 56 fuel forcing a route to a chest
 -- while another routine was already flying it there.
 function TravelIsBusy()
+    -- pgps knows who is driving even when the trip did not come through TravelTo (ReachSite,
+    -- resumeAtFace, RouteUpTo and the deposit fallbacks call the movers directly).
+    if pgps.isDriving and pgps.isDriving() then return true end
     if TravelOwner == nil or TravelOwner == coroutine.running() then return false end
     if coroutine.status(TravelOwner) == "dead" then TravelOwner = nil return false end
     if TravelSince and (os.clock() - TravelSince) > TRAVEL_LOCK_MAX_S then
