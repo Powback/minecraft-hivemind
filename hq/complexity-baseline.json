@@ -91,10 +91,22 @@
         "activeBox"
       ]
     },
+    "lua/PowGPSServer.lua": {
+      "cc": [
+        35,
+        24,
+        16
+      ],
+      "names": [
+        "a_star",
+        "load",
+        "explore"
+      ]
+    },
     "lua/pgps.lua": {
       "cc": [
-        38,
-        29,
+        35,
+        30,
         23,
         23,
         19,
@@ -107,18 +119,6 @@
         "setLocationFromGPS",
         "forward",
         "ensureHeading"
-      ]
-    },
-    "lua/PowGPSServer.lua": {
-      "cc": [
-        35,
-        24,
-        16
-      ],
-      "names": [
-        "a_star",
-        "load",
-        "explore"
       ]
     },
     "hq/src/tools/core.ts": {

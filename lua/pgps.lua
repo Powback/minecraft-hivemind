@@ -2175,9 +2175,46 @@ end
 -- MapServer answered every request it heard in 0-2 ms. Twenty game seconds is two real seconds at
 -- 10x and twenty at 1x -- long enough either way, and a drone waiting is a drone not burning fuel.
 local PATH_REPLY_S = 20
+-- A TRIP HAS A STEP BUDGET. The stall counter resets whenever the distance improves, so a drone
+-- boxed in near its target could approach, be blocked, back off, approach from another side
+-- (progress!) and repeat: 240 silent moves for one unreachable square, 359 per jitter window,
+-- the travel lock held 565 s (D37, 2026-09-05 02:00). Four steps per block of the trip plus a
+-- margin is generous for any real route; past it the trip is a bounce, and the caller must hear
+-- "no progress" now rather than after the tank is spent.
+local MOVE_STEP_MARGIN = 32
+local function newTrip(p_Tx, p_Ty, p_Tz)
+    local s_Budget = nil
+    if cachedX ~= nil then
+        s_Budget = 4 * (math.abs(cachedX - p_Tx) + math.abs(cachedY - p_Ty) + math.abs(cachedZ - p_Tz)) + MOVE_STEP_MARGIN
+    end
+    return {steps0 = m_Motion.steps, budget = s_Budget, stalls = 0, best = nil, tx = p_Tx, ty = p_Ty, tz = p_Tz}
+end
+-- The trip's progress accounting: the step budget above, and the stall counter against the best
+-- distance so far (the same bounce is four stalls and a fast, honest "no progress"). Returns the
+-- reason when the trip is over, nil while it may go on.
+local function tripStalled(p_Trip, p_Dist)
+    if m_Motion.steps < p_Trip.steps0 then p_Trip.steps0 = m_Motion.steps end     -- the window was reset
+    local s_Walked = m_Motion.steps - p_Trip.steps0
+    if p_Trip.budget and s_Walked > p_Trip.budget then
+        ptrace(("moveTo: walked %d steps for a trip budgeted %d -- no progress toward %d,%d,%d")
+            :format(s_Walked, p_Trip.budget, p_Trip.tx, p_Trip.ty, p_Trip.tz))
+        return "no progress"
+    end
+    if p_Trip.best ~= nil and p_Dist >= p_Trip.best then
+        p_Trip.stalls = p_Trip.stalls + 1
+        if p_Trip.stalls >= MOVE_MAX_STALLS then
+            ptrace("moveTo: no progress toward " .. p_Trip.tx .. "," .. p_Trip.ty .. "," .. p_Trip.tz)
+            return "no progress"
+        end
+        return nil
+    end
+    p_Trip.stalls, p_Trip.best = 0, p_Dist
+    return nil
+end
 local function moveLeg(_targetX, _targetY, _targetZ, _targetDir, changeDir, discover, p_Dig)
     changeDir = changeDir or false
-    local s_Replans, s_Stalls, s_BestDist = 0, 0, nil
+    local s_Replans = 0
+    local s_Trip = newTrip(_targetX, _targetY, _targetZ)
     while cachedX ~= _targetX or cachedY ~= _targetY or cachedZ ~= _targetZ do
         if cachedX == nil then return false, "lost the position fix part-way" end
         s_Replans = s_Replans + 1
@@ -2199,16 +2236,8 @@ local function moveLeg(_targetX, _targetY, _targetZ, _targetDir, changeDir, disc
         -- it is where the "twenty fuel every thirty seconds, going nowhere" of every distressed
         -- drone went. Against the best distance so far the same bounce is four stalls and a fast,
         -- honest "no progress" -- the caller then widens or gives up instead of spending a tank here.
-        if s_BestDist ~= nil and s_Dist >= s_BestDist then
-            s_Stalls = s_Stalls + 1
-            if s_Stalls >= MOVE_MAX_STALLS then
-                ptrace("moveTo: no progress toward " .. _targetX .. "," .. _targetY .. "," .. _targetZ)
-                return false, "no progress"
-            end
-        else
-            s_Stalls = 0
-            s_BestDist = s_Dist
-        end
+        local s_Over = tripStalled(s_Trip, s_Dist)
+        if s_Over then return false, s_Over end
         -- DO NOT ASK A SERVER HOW TO TAKE A STEP YOU CAN SEE.
         --
         -- Every iteration of this loop was a GetPath round trip to MapServer, and MapServer is one
@@ -2891,5 +2920,6 @@ end
 -- HiveMindTest set and reads the motion counters through it. In the world HiveMindTest is nil and
 -- this does nothing.
 if HiveMindTest ~= nil then
-    HiveMindTest.pgps = {motionWindow = motionWindow, motionReset = motionReset, motionCallers = motionCallers}
+    HiveMindTest.pgps = {motionWindow = motionWindow, motionReset = motionReset, motionCallers = motionCallers,
+                         newTrip = newTrip, tripStalled = tripStalled}
 end

@@ -872,5 +872,23 @@ test("DroneLogic: an idle top-up that brings nothing back backs off instead of f
     eq(env.TopUpBackoffUntil, 0, "sets no backoff")
 end)
 
+
+test("pgps: a trip stalls against the best distance so far, not the last step, and has a step budget", function()
+    local env, P = loadModule("pgps.lua")
+    env.setLocation(0, 64, 0, "north")
+    local t = P.newTrip(10, 64, 0)
+    eq(t.budget, 4 * 10 + 32, "budget: four steps per block plus the margin")
+    eq(P.tripStalled(t, 10), nil, "first look sets the best")
+    eq(P.tripStalled(t, 8), nil, "closer: progress")
+    eq(P.tripStalled(t, 9), nil, "further than the best: stall 1")
+    eq(P.tripStalled(t, 8), nil, "back to the best, not beyond it: stall 2 -- the last step improved but the best did not")
+    eq(P.tripStalled(t, 9), nil, "stall 3")
+    eq(P.tripStalled(t, 8), "no progress", "stall 4: over")
+    local t2 = P.newTrip(3, 64, 0)
+    for _ = 1, 40 do env.__world.pos.x = env.__world.pos.x + 1 end
+    -- forty real steps recorded by the motion counter blow a 44-step budget only when they exceed it
+    truthy(P.tripStalled(t2, 3) == nil, "under budget")
+end)
+
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))
 os.exit(failed == 0 and 0 or 1)

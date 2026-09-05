@@ -33,11 +33,9 @@ describe('fuel-economy invariants that are about shape', () => {
 
   // moveLeg is a local inside pgps with no seam yet. A two-cell bounce ran all forty replans because
   // progress was measured against the LAST step.
-  it('moveLeg measures progress against the best distance so far, not the last step', () => {
-    expect(pgps).not.toMatch(/s_LastDist/);
-    expect(pgps).toMatch(/if s_BestDist ~= nil and s_Dist >= s_BestDist then/);
-    expect(pgps).toMatch(/s_Stalls = 0\s*\n\s*s_BestDist = s_Dist/);
-  });
+  // "moveLeg measures progress against the best distance so far, not the last step" is now a
+  // behavioural test in hq/test/lua/run.lua ("pgps: a trip stalls against the best distance so far"),
+  // executed against tripStalled() through the pgps test seam.
 
   // The fuel watchdog used to be the coroutine that flies to storage, so it never looked aboard while
   // flying. The coroutine that burns what is aboard must contain no travel at all -- a property of
