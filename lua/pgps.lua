@@ -2210,7 +2210,9 @@ local PATH_LOCAL_STEPS  = 48
 -- is the single most expensive mistake in this codebase.
 local function localHop(p_X, p_Y, p_Z, p_Dist)
     if p_Dist > PATH_LOCAL_RADIUS then return false end
-    return flyTo(p_X, p_Y, p_Z, PATH_LOCAL_STEPS) ~= false
+    -- _noClimb: a blocked straight line hands the leg to the shared pathfinder instead of climbing
+    -- the obstacle blind. Without it this shortcut becomes the wall-rubber -- see flyTo.
+    return flyTo(p_X, p_Y, p_Z, PATH_LOCAL_STEPS, true) ~= false
 end
 
 -- Path ONE short hop. Renamed from moveTo: this asks MapServer to plan the entire route in a
@@ -2420,7 +2422,7 @@ local function moveLeg(...) return driving(moveLegRaw, ...) end
 --
 -- Greedy and dumb on purpose. Altitude first, because open sky is the cheap axis and getting to
 -- the target height usually removes the horizontal obstacles too.
-function flyTo(_tx, _ty, _tz, _maxSteps)
+function flyTo(_tx, _ty, _tz, _maxSteps, _noClimb)
     -- Same guard digTo carries. An omitted axis means "stay where you are on it", not "fly to nil":
     -- unguarded, the first comparison is `cachedY < nil` and the drone dies with "attempt to compare
     -- nil with number". The survey passes a nil Y deliberately, so this is a normal call shape.
@@ -2450,9 +2452,22 @@ function flyTo(_tx, _ty, _tz, _maxSteps)
             s_Moved = forward()
         end
 
-        -- Every useful axis is blocked: go over it. If we cannot even rise, we are genuinely
-        -- wedged and saying so beats grinding against a wall until the step budget runs out.
+        -- Every useful axis toward the target is blocked. There are two answers, and which one is
+        -- right depends entirely on who is asking.
+        --
+        -- FlyHome and other long greedy flights WANT to go over it: above the treeline there is
+        -- nothing to route around, and climbing is how they clear it.
+        --
+        -- localHop does NOT. It is the short-hop shortcut that spares MapServer a trivial request,
+        -- and it is only ever right while the straight line is OPEN. The moment it is blocked, the
+        -- honest move is to hand the leg to the shared pathfinder, which reads the whole fleet's map
+        -- and routes AROUND the wall. Climbing over it here is exactly the wall-rubbing we chased for
+        -- days: within PATH_LOCAL_RADIUS of a build square set against the tower, flyTo would hit the
+        -- wall, climb, drop, rub the next face, and repeat for the whole 48-step budget -- burning the
+        -- window blind while a correct route around sat one GetPath away. So _noClimb bails at once
+        -- and lets moveLegRaw ask the server. NAVIGATE WITH THE MAP, NOT BY FEEL.
         if not s_Moved then
+            if _noClimb then return false, "blocked -- defer to the router" end
             if not up() then return false, "flyTo is wedged at " .. cachedX .. "," .. cachedY .. "," .. cachedZ end
         end
     end
