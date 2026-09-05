@@ -7294,7 +7294,7 @@ local function CollectFuel()
     -- indexes every networked chest for every other question; one network call answers this one
     -- for nothing, and a "no" marks the shelf dry so nobody else asks with their tank for a while.
     -- A failed call falls through to the old path: no answer is not "no fuel".
-    local s_Burnable = ShelfBurnable()
+    local s_Burnable = ShelfBurnable() or 0    -- a malformed/absent network reply is not fuel, and must not %d-crash below
     if s_Burnable == 0 then
         m_StorageDryAt = os.clock()
         return 0, "storage had nothing burnable (asked over the network, did not fly)"
