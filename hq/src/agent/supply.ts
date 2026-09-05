@@ -62,6 +62,10 @@ export interface SupplyRule {
 }
 
 /** Sensible starting policy. Tune with the supply.policy tool rather than editing this. */
+/** A crafted stock kept between min and limit, the way planks and chests are. */
+function keepCrafted(item: string, min: number, limit: number): SupplyRule {
+  return { match: item, stock: item, min, action: 'craft', limit };
+}
 export const DEFAULT_RULES: SupplyRule[] = [
   // EVERY ORE THE FLEET CAN USE, not just the two it started with.
   //
@@ -159,6 +163,9 @@ export const DEFAULT_RULES: SupplyRule[] = [
   // downstream of it. Note a furnace still has to be PLACED on the wired network to be serviced;
   // crafting it is the prerequisite, not the whole job.
   { match: 'minecraft:furnace', stock: 'minecraft:furnace', min: 2, action: 'craft', limit: 4 },
+  // The brick palette's patches mix bricks with stairs and walls; a patch short of 6 stairs threw
+  // "ran out of minecraft:stone_brick_stairs partway" as readily as one short of bricks.
+  ...['minecraft:stone_brick_stairs', 'minecraft:stone_brick_wall'].map((it) => keepCrafted(it, 32, 64)),
 ];
 
 /**
