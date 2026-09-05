@@ -825,3 +825,17 @@ interrupted, 4 reliefs failed. Causes, in order of damage:
    pgps has a drive lock at moveLeg/ensureHeading/timedMove/turnAndTrack (`driving`, `isDriving`).
 
 Measure completions, not deploys: `grep -o 'JOB [A-Za-z]* \(done\|FAILED\|THREW\)' */drone.log`.
+
+## Crafting facts that cost a night (2026-09-05)
+
+- `turtle.craft()` refuses ("No matching recipes") when ANY slot outside the 3x3 grid (4, 8, 12-16)
+  holds an item. Surplus cannot be parked aboard; it must go into a container. `StowCargoForCraft`
+  deposits the crafter's cargo before it fetches inputs; `ClearGridForCraft` puts surplus below.
+- A crafter that also hauls arrives at the craft with twelve stacks of stone. TaskMan gives hauls
+  to the crafter only when no craft waits (`crafterFreeOfCrafts`).
+- A craft whose inputs are not on the shelf is held by TaskMan (`craftShortIn`, from the GetStock
+  reply cached in `m_StockCounts`) instead of flown thirty times to find nothing.
+- StorageMan's WhereIs rotates across holders and never names a furnace while a chest holds the
+  item (`pickHolder`): five drones were queuing over one access cell.
+- A full shelf never gates the storage chain (logs, planks, chests) -- HQ `makesStorage`, TaskMan
+  `storageRank` -- because that chain is the only way out of a full shelf.
