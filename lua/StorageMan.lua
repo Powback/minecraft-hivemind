@@ -1741,6 +1741,63 @@ local function tickPass(p_Name, p_Fn)
     end)
 end
 
+-- SORTED STORAGE: ONE ITEM PER CHEST.
+--
+-- turtle.suck takes a chest's first occupied slot and cannot choose, so a chest of many kinds hands
+-- a drone whatever is in front -- the "911 stone_bricks in storage, drone pulls 1 per trip" failure
+-- that stalled building for a session. A chest holding ONE item class is deterministic: suck it and
+-- get a full load. assignHomes gives each item a HOME chest -- its majority chest, resolved greedily
+-- (items biggest first, each claims its highest-count unclaimed chest) so no chest is home to two
+-- items -- and ServiceSort pushes any stack sitting outside its home back to it over the wired
+-- network. Over a few ticks every chest converges to a single item class. A furnace is never a home;
+-- its slots are for smelting.
+local function assignHomes()
+    local s_Items = {}
+    for name, e in pairs(m_Index) do
+        if (e.total or 0) > 0 then s_Items[#s_Items + 1] = { name = name, total = e.total, at = e.at } end
+    end
+    table.sort(s_Items, function(a, b) return a.total > b.total end)
+    local s_Claimed, s_Home = {}, {}
+    for _, it in ipairs(s_Items) do
+        local s_Cands = {}
+        for _, at in ipairs(it.at or {}) do
+            if not isFurnace(at.where) and depositPosOf(at.where) then s_Cands[#s_Cands + 1] = at end
+        end
+        table.sort(s_Cands, function(a, b) return (a.count or 0) > (b.count or 0) end)
+        for _, at in ipairs(s_Cands) do
+            if s_Claimed[at.where] == nil then
+                s_Home[it.name] = at.where
+                s_Claimed[at.where] = it.name
+                break
+            end
+        end
+    end
+    return s_Home
+end
+
+local function ServiceSort()
+    Rescan()
+    local s_Home = assignHomes()
+    local s_Moved = 0
+    for name, e in pairs(m_Index) do
+        local s_Dest = s_Home[name]
+        if s_Dest then
+            for _, at in ipairs(e.at or {}) do
+                breathe("sort")
+                if at.where ~= s_Dest and not isFurnace(at.where) then
+                    local src = peripheral.wrap(at.where)
+                    if src and src.pushItems then
+                        local ok, n = pcall(src.pushItems, s_Dest, at.slot)
+                        if ok and type(n) == "number" then s_Moved = s_Moved + n end
+                    end
+                end
+            end
+        end
+    end
+    if s_Moved > 0 then Log(("sort: consolidated %d item(s) toward home chests"):format(s_Moved)) end
+    return s_Moved, s_Home
+end
+
 -- Keep the index warm and run the furnaces. Nothing else ticks here: a query rescans anyway, so
 -- this exists for smelting and for the display being right when nobody has asked recently.
 local function Tick()
@@ -1751,6 +1808,9 @@ local function Tick()
         -- Routes ride the same tick as smelting: both are just moving items between things on the
         -- wired network, and neither needs a drone to do it.
         tickPass("ServiceRoutes", ServiceRoutes)
+        -- Sorting rides it too: consolidating each item toward its home chest is the same pushItems
+        -- over the wire, and it is what keeps every fetch a full clean load of one thing.
+        tickPass("ServiceSort", ServiceSort)
         tickPass("Render", Render)
     end
 end
@@ -1766,6 +1826,7 @@ if HiveMindTest then
     HiveMindTest.StorageMan = {
         dedupeDeposits = dedupeDeposits, reservedForCrafting = reservedForCrafting,
         smeltAllowance = smeltAllowance, fillFor = fillFor, pickHolder = pickHolder, reservedByOther = reservedByOther, reserveChest = reserveChest,
+        ServiceSort = ServiceSort, assignHomes = assignHomes,
     }
 end
 

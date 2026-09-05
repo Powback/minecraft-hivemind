@@ -282,6 +282,37 @@ test("StorageMan.OnWhereIs lists every holder, most-held first, so the drone nee
     truthy(r.places[1].count >= r.places[2].count, "descending by count")
 end)
 
+test("StorageMan.ServiceSort consolidates each item into one home chest -- one item per chest", function()
+    local env, S = storageWithChests()
+    -- chest_0 holds the bulk of the bricks; chest_1 has a few bricks IN FRONT of its coal -- exactly
+    -- the buried-item shape that made a fetch return one stack.
+    env.__world.peripherals["minecraft:chest_0"].api.__inv.items = {
+        [1] = { name = "minecraft:stone_bricks", count = 64 } }
+    env.__world.peripherals["minecraft:chest_1"].api.__inv.items = {
+        [1] = { name = "minecraft:stone_bricks", count = 20 }, [2] = { name = "minecraft:coal", count = 64 } }
+    env.Rescan()
+    S.ServiceSort()
+    local kinds = function(l) local k = {} for _, it in pairs(l) do k[it.name] = (k[it.name] or 0) + it.count end return k end
+    local k0 = kinds(env.__world.peripherals["minecraft:chest_0"].api.list())
+    local k1 = kinds(env.__world.peripherals["minecraft:chest_1"].api.list())
+    truthy(k0["minecraft:coal"] == nil, "no coal in the brick chest")
+    truthy(k1["minecraft:stone_bricks"] == nil, "no bricks in the coal chest")
+    eq(k0["minecraft:stone_bricks"], 84, "all bricks consolidated into their home chest")
+    eq(k1["minecraft:coal"], 64, "coal alone in its own chest")
+end)
+
+test("StorageMan.assignHomes gives each item its own chest -- the bigger item keeps a contested one", function()
+    local env, S = storageWithChests()
+    -- Both items have their majority in chest_0; only the larger may keep it.
+    env.m_Index = {
+        ["minecraft:stone_bricks"] = { total = 100, at = { { where = "minecraft:chest_0", slot = 1, count = 100 } } },
+        ["minecraft:coal"]         = { total = 40,  at = { { where = "minecraft:chest_0", slot = 2, count = 40 } } },
+    }
+    local home = S.assignHomes()
+    eq(home["minecraft:stone_bricks"], "minecraft:chest_0", "the bigger item keeps the contested chest")
+    truthy(home["minecraft:coal"] ~= "minecraft:chest_0", "the smaller item does not share it")
+end)
+
 test("StorageMan: fuel before furniture -- wood smelts while fuel is short", function()
     local env, S = storageWithChests()
     env.Rescan()
