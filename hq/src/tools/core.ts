@@ -19,7 +19,7 @@ import { bridge } from '../bridge/ws.js';
 import { expand, craftable, RECIPES } from '../world/recipes.js';
 import { allocate, checkOrder, SPEC, type Purpose } from '../world/plots.js';
 import { city, saveCity, factories } from '../world/city.js';
-import { chain, unmetInputs, buildOrder, inputsOf, type Factory } from '../world/factories.js';
+import { chain, unmetInputs, buildOrder, inputsOf, transportPlan, type Factory } from '../world/factories.js';
 import { BLUEPRINTS, blueprint, materials, placementOrder, footprint } from '../world/blueprints.js';
 import { PALETTES, towerFloor, floorCost, specForLevel, LEVELS, TOWER_TOP, bayIsFlightPath } from '../world/tower.js';
 import { outfitBay } from '../world/bay.js';
@@ -3117,6 +3117,9 @@ registry.register({
       count: factories.length,
       factories: factories.map((f) => ({ ...f, consumes: inputsOf(f.produces) })),
       links: chain(factories),
+      // Pipes first, droids when not: each link's transport is 'route' once both ends are wired,
+      // else 'haul' -- so this doubles as the plant's construction status.
+      transport: transportPlan(factories),
       buildOrder: order,
       cycles,
       unmet: unmetInputs(factories),

@@ -72,6 +72,29 @@ export function chain(factories: Factory[]): Link[] {
   return links;
 }
 
+export type Transport = 'route' | 'haul';
+
+/**
+ * How a link moves its item, PIPES FIRST AND DROIDS WHEN NOT.
+ *
+ * A wired route costs nothing to run and needs no fuel, but it does not exist until both ends are on
+ * the network -- and a factory has its input/output chest network names only once its bay is built
+ * AND its modems are commissioned (a drone can place a modem but not switch it on). So while a plant
+ * is being built, or while the fleet still cannot make and commission the wiring the route needs,
+ * the link moves on DRONE HAUL, and upgrades itself to a route the moment both ends come online.
+ * Nothing has to choose per link: the transport follows from whether the chests are wired yet.
+ */
+export function transportFor(link: Link, factories: Factory[]): Transport {
+  const from = factories.find((f) => f.name === link.from);
+  const to = factories.find((f) => f.name === link.to);
+  return from?.output && to?.input ? 'route' : 'haul';
+}
+
+/** The live wiring plan: every implied link with the transport it will use right now. */
+export function transportPlan(factories: Factory[]): Array<Link & { via: Transport }> {
+  return chain(factories).map((l) => ({ ...l, via: transportFor(l, factories) }));
+}
+
 /**
  * Inputs a factory needs that NOTHING in the plant produces.
  *
