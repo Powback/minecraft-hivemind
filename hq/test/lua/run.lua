@@ -1113,5 +1113,25 @@ test("StorageMan: a chest name recorded at several positions collapses to its la
     eq(byName["?"], 1, "the cache stays")
 end)
 
+
+test("DroneLogic: a build patch is ordered lowest course first, then nearest-neighbour", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.__world.pos = { x = 0, y = 64, z = 0 }
+    local o = { x = 0, y = 64, z = 0 }
+    -- scattered, mixed heights: a top block near, a bottom block far, a bottom block near
+    local blocks = {
+        { dx = 10, dy = 2, dz = 0, item = "b" },   -- high, near-ish
+        { dx = 8,  dy = 0, dz = 0, item = "b" },    -- low, far
+        { dx = 1,  dy = 0, dz = 0, item = "b" },    -- low, near
+        { dx = 2,  dy = 0, dz = 0, item = "b" },    -- low, near+1
+    }
+    local out = env.OrderBuildBlocks(blocks, o)
+    eq(out[1].dy, 0, "a lowest-course block first")
+    eq(out[#out].dy, 2, "the high block last")
+    eq(out[1].dx, 1, "nearest low block first")
+    eq(out[2].dx, 2, "then the next-nearest low block")
+    eq(out[3].dx, 8, "then the far low block, before climbing")
+end)
+
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))
 os.exit(failed == 0 and 0 or 1)

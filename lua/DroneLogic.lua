@@ -6881,12 +6881,49 @@ function CountCovered(p_Verdict, p_Done, p_Key, p_Why, p_Run, p_Placed, p_Skippe
     if p_Verdict == "no route" then p_Run = NoteNoRoute(p_Run) end
     return p_Run, p_Placed, p_Skipped + 1
 end
+-- BUILD IN A SENSIBLE ORDER, NOT THE ORDER HQ LISTED. order.tower slices 32 squares straight out
+-- of the floor generator, so a patch mixes heights and is scattered across the whole ring; the
+-- drone then flew corner to corner and up and down, placing almost nothing (the user watched it,
+-- 2026-09-05 16:40). Reorder each patch here: LOWEST y first, so a course exists before the one
+-- above it (a wall square is reachable only while the course over it is still open), and within a
+-- height, nearest-neighbour from where the drone stands so it walks a short continuous path
+-- instead of zig-zagging. n <= ~32, so the greedy O(n^2) walk is nothing.
+function OrderBuildBlocks(p_Blocks, p_Origin)
+    local cx, cy, cz = pgps.getCachedPosition()
+    local s_Ax = cx or p_Origin.x
+    local s_Az = cz or p_Origin.z
+    local s_Rest = {}
+    for _, b in ipairs(p_Blocks) do s_Rest[#s_Rest + 1] = b end
+    -- lowest course first
+    table.sort(s_Rest, function(a, b) return (tonumber(a.dy) or 0) < (tonumber(b.dy) or 0) end)
+    local s_Out = {}
+    local s_Cx, s_Cz = s_Ax, s_Az
+    while #s_Rest > 0 do
+        -- among the blocks on the lowest remaining course, take the nearest to where we are
+        local s_MinY = tonumber(s_Rest[1].dy) or 0
+        local s_BestI, s_BestD = nil, nil
+        for i, b in ipairs(s_Rest) do
+            if (tonumber(b.dy) or 0) == s_MinY then
+                local bx = p_Origin.x + (tonumber(b.dx) or 0)
+                local bz = p_Origin.z + (tonumber(b.dz) or 0)
+                local dd = math.abs(bx - s_Cx) + math.abs(bz - s_Cz)
+                if s_BestD == nil or dd < s_BestD then s_BestI, s_BestD = i, dd end
+            end
+        end
+        local b = table.remove(s_Rest, s_BestI)
+        s_Out[#s_Out + 1] = b
+        s_Cx = p_Origin.x + (tonumber(b.dx) or 0)
+        s_Cz = p_Origin.z + (tonumber(b.dz) or 0)
+    end
+    return s_Out
+end
 function OnBuild(p_ID, p_Message)
     return RunJob("Build", p_Message.data, {status = "building", travel = false}, function(d)
         local s_Origin = d.origin
         local s_Blocks = d.blocks
         if type(s_Origin) ~= "table" or s_Origin.x == nil then error("no origin", 0) end
         if type(s_Blocks) ~= "table" or #s_Blocks == 0 then error("nothing to build", 0) end
+        s_Blocks = OrderBuildBlocks(s_Blocks, s_Origin)
 
         -- Two lines. A build interrupted by a fleet stand-down resumes where it stopped instead of
         -- re-walking every block it already placed.
