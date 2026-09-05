@@ -40,7 +40,14 @@ rc() { docker compose exec -T mc rcon-cli "$1" 2>&1 | tr -d '\r' | sed 's/\x1b\[
 # Restarts are verified against the dump rather than assumed: `computercraft turn-on` is a silent
 # no-op when it lands while the machine is still shutting down, and the failure mode is a module
 # that reads as ON while sitting at a shell prompt running nothing.
-state() { rc "computercraft dump" | grep -E "^#$1 " | awk -F'|' '{gsub(/ /,"",$2);print $2}'; }
+# STRIP THE ANSI FIRST. `computercraft dump` colours the On column and emits a reset escape at the
+# START of every row, so the piped line is "\e[0m#47   | Y | ...". `grep -E "^#47 "` anchors at the
+# escape, never matches, and state() returns empty -- so a running drone reads as OFF and is never
+# cycled. That is the "seventeen of twenty on stale code" bug at the top of this file: the fixes were
+# deployed to disk and never loaded, and every measurement described yesterday's binary. Strip the
+# escapes (perl, always present on macOS; BSD sed will not do \x1b) and match the id as a field.
+stripansi() { perl -pe 's/\e\[[0-9;]*m//g'; }
+state() { rc "computercraft dump" | stripansi | grep -E "^#$1[[:space:]]" | awk -F'|' '{gsub(/ /,"",$2);print $2}'; }
 
 cycle() {
   local id=$1 t
@@ -126,6 +133,11 @@ done
 # modules, so this keeps working across scratchpad wipes and restored saves.
 deploy_drones() {
   local d id n=0 cycled=0 stale=0
+  # ONE dump for the whole fleet, not one rcon round trip per drive. Twenty `computercraft dump`
+  # calls back to back contend on rcon and some come back empty -- another way a running drone reads
+  # as OFF and misses its cycle. Snapshot once (ANSI stripped) and read the On column from memory.
+  local DRONE_DUMP; DRONE_DUMP=$(rc "computercraft dump" | stripansi)
+  on_now() { printf '%s\n' "$DRONE_DUMP" | grep -E "^#$1[[:space:]]" | awk -F'|' '{gsub(/ /,"",$2);print $2}'; }
   for d in "$WORLD"/computercraft/computer/*/; do
     [ -f "$d/DroneLogic.lua" ] || continue
     id=$(basename "$d")
@@ -148,7 +160,7 @@ deploy_drones() {
     n=$((n+1))
     # Only cycle what is actually running. A drone that is off picks the new code up when it boots,
     # and turn-on here would strand it wherever it happens to be sitting.
-    if [ "$(state $id)" = "Y" ]; then cycle $id; cycled=$((cycled+1)); fi
+    if [ "$(on_now $id)" = "Y" ]; then cycle $id; cycled=$((cycled+1)); fi
   done
   # VERIFY AT THE EFFECT, NOT AT THE COPY. A drone that was mid-write, read-only or simply missed
   # must be named -- a redeploy that silently skips one is how this whole class of bug survives.
