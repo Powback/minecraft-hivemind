@@ -29,7 +29,7 @@
 
 import type { BlueprintBlock } from './blueprints.js';
 import type { TowerSpec } from './tower.js';
-import { bayCells } from './tower.js';
+import { bayCells, LEVELS } from './tower.js';
 
 const CHEST = 'minecraft:chest';
 const MODEM = 'computercraft:wired_modem_full';
@@ -109,4 +109,42 @@ export function factoryBayInterior(spec: TowerSpec, sector: number, machine = FU
     else machines.push({ dx: c.dx, dy: CHEST_DY, dz: c.dz });
   });
   return { blocks, chests, machines, modems };
+}
+
+/**
+ * WHAT A BAY IS FOR, DECIDED BY THE FLOOR IT IS ON.
+ *
+ * This is the generative brain: `LEVELS` already says what each floor does, so the bay's contents
+ * follow from its level rather than from a human choosing per bay. The storage floors get sorted
+ * single-item racks; the smelt floor gets a furnace bank; the mine head and the cap hold no bays;
+ * and the floors whose machines the recipe vocabulary cannot place yet (wash/alloy/press/assemble/
+ * logic -- crushers, mixers, presses, mechanical crafters, AE2) are left as shells, honestly marked
+ * 'pending', to be outfitted when their Station type and Create placement exist. Nothing here guesses
+ * a machine that cannot be built.
+ */
+export type BayRole = 'storage' | 'factory' | 'shaft' | 'cap' | 'pending';
+
+export interface BayPlan { role: BayRole; interior: BayInterior; }
+
+const EMPTY: BayInterior = { blocks: [], chests: [], machines: [], modems: [] };
+
+export function outfitBay(spec: TowerSpec, level: number, sector: number): BayPlan {
+  const name = LEVELS.find((l) => l.index === level)?.name;
+  switch (name) {
+    case 'bulk':
+    case 'buffer':
+    case 'ingest':
+      // Storage and ingest are racks of single-item chests: bulk holds ore/stone, buffer sorts one
+      // class per chest feeding upward, ingest buffers what drones drop before it is sorted down.
+      return { role: 'storage', interior: storageBayInterior(spec, sector) };
+    case 'smelt':
+      return { role: 'factory', interior: factoryBayInterior(spec, sector, FURNACE) };
+    case 'shaft':
+      return { role: 'shaft', interior: EMPTY };   // the mine head: an open shaft, no bays
+    case 'cap':
+      return { role: 'cap', interior: EMPTY };      // mast base, no bays
+    default:
+      // wash / alloy / press / assemble / logic -- machines not yet placeable. Shell only, for now.
+      return { role: 'pending', interior: EMPTY };
+  }
 }

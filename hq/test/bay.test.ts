@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { storageBayInterior, factoryBayInterior } from '../src/world/bay.js';
+import { storageBayInterior, factoryBayInterior, outfitBay } from '../src/world/bay.js';
 import { specForLevel, bayCells } from '../src/world/tower.js';
 
 const CHEST = 'minecraft:chest';
@@ -49,5 +49,32 @@ describe('bay interiors are generated from the bay geometry', () => {
     const sorted = [...cells].sort((a, b) => angle(a) - angle(b));
     const ends = new Set([`${sorted[0]!.dx},${sorted[0]!.dz}`, `${sorted[sorted.length - 1]!.dx},${sorted[sorted.length - 1]!.dz}`]);
     for (const ch of bay.chests) expect(ends.has(`${ch.dx},${ch.dz}`)).toBe(true);
+  });
+});
+
+describe('outfitBay decides a bay from the floor it is on', () => {
+  const sector = 3;
+  it('storage floors get sorted single-item racks', () => {
+    for (const lv of [-2, -1, 0]) {
+      const plan = outfitBay(specForLevel(lv), lv, sector);
+      expect(plan.role).toBe('storage');
+      expect(plan.interior.chests.length).toBeGreaterThan(0);
+      expect(plan.interior.machines.length).toBe(0);
+    }
+  });
+  it('the smelt floor gets a furnace bank', () => {
+    const plan = outfitBay(specForLevel(2), 2, sector);
+    expect(plan.role).toBe('factory');
+    expect(plan.interior.machines.length).toBeGreaterThan(0);
+    expect(plan.interior.chests.length).toBe(2);
+  });
+  it('the mine head and the cap hold no bays', () => {
+    expect(outfitBay(specForLevel(-3), -3, sector).role).toBe('shaft');
+    expect(outfitBay(specForLevel(7), 7, sector).role).toBe('cap');
+  });
+  it('a floor whose machine cannot be placed yet is left a shell, marked pending', () => {
+    const plan = outfitBay(specForLevel(3), 3, sector);   // alloy: mixer not placeable yet
+    expect(plan.role).toBe('pending');
+    expect(plan.interior.blocks.length).toBe(0);
   });
 });
