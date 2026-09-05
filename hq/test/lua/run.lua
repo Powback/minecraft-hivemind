@@ -1222,5 +1222,25 @@ test("DroneLogic: a build replaces a wrong block, keeps a right one, spares a pr
     truthy(s_Dug >= 1 and s_Placed == 1, "dug the old, placed the new")
 end)
 
+
+test("DroneLogic: RequestClearance faces a sideways blocker, marks a wall solid and routes round, asks only a real drone to move", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.__world.pos = { x = -467, y = 71, z = 78 }
+    -- a stone_bricks wall one block west
+    local s_Marked, s_Asked = nil, 0
+    env.pgps.getCachedPosition = function() return -467, 71, 78, env.pgps.HEADINGS.north end
+    env.pgps.turnTo = function() return true end
+    env.pgps.noteObservation = function(idx, solid) s_Marked = idx .. "=" .. tostring(solid) end
+    env.turtle.inspect = function() return true, { name = "minecraft:stone_bricks" } end
+    env.AskToMakeWay = function() s_Asked = s_Asked + 1 end
+    env.RequestClearance(-468, 71, 78)
+    eq(s_Marked, "-468:71:78=1", "the wall was faced, identified, and marked solid for the planner")
+    eq(s_Asked, 0, "a wall is not asked to move")
+    -- now a real drone beside it
+    env.turtle.inspect = function() return true, { name = "computercraft:turtle_normal" } end
+    env.RequestClearance(-468, 71, 78)
+    eq(s_Asked, 1, "a drone IS asked to move")
+end)
+
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))
 os.exit(failed == 0 and 0 or 1)

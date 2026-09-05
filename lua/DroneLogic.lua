@@ -2712,96 +2712,50 @@ function CanDig()
 end
 
 function RequestClearance(p_X, p_Y, p_Z)
-    local s_What = "something"
+    -- TEST WHAT IS IN THE WAY BEFORE ASSUMING IT IS A DRONE. This used to inspect only up and down,
+    -- so a blocker BESIDE the drone stayed the literal string "something" and was treated as a
+    -- drone to ask aside -- which, alone at the tower, meant asking the wall it is building to step
+    -- aside, and hugging that wall for ever (0.8 blocks/min solo, 2026-09-05). Turn to face a
+    -- sideways blocker and look. A turtle is asked to move; anything else is a BLOCK -- terrain or
+    -- our own build -- so mark it solid on the map and let the planner route around or over it.
+    -- Never dig it: for the tower that means cutting the thing we are here to raise.
     local cx, cy, cz = pgps.getCachedPosition()
-    if cx ~= nil and cx == p_X and cz == p_Z then
-        local ok, blk = (p_Y > cy) and turtle.inspectUp() or turtle.inspectDown()
-        if ok and type(blk) == "table" and blk.name then s_What = blk.name end
-    end
-
-    -- A DRONE IS NOT A BLOCK. DO NOT SEND A MINER TO DIG ONE.
-    --
-    -- This queued a clear- task for whatever was in the way, and "whatever" is very often another
-    -- drone -- the bay is the most congested airspace in the settlement and a crafter has no
-    -- pickaxe, so it asks for help constantly. The miner then arrives and correctly refuses:
-    -- "refusing to dig computercraft:turtle_normal". The task cannot complete, cannot fail, and
-    -- sits at PRIORITY 1 for ever.
-    --
-    -- Eighteen of them accumulated at once -- more than every other kind of task combined -- all
-    -- unresolvable, all outranking the tower build they were starving. The queue looked busy and
-    -- the fleet was clearing each other out of the way instead of working.
-    --
-    -- The right answer for a drone in the way already exists and costs one message: ask it to move.
-    -- Ask, do not queue a dig. Written out twice below as well; the only difference was the reason.
-    local function askInstead(p_Why)
-        trace(("blocked by %s at %d,%d,%d -- asking it to move, not queuing a dig")
-            :format(p_Why, p_X, p_Y, p_Z))
-        if type(AskToMakeWay) == "function" then AskToMakeWay(p_X, p_Y, p_Z) end
+    local s_What = "something"
+    if cx ~= nil then
+        if cx == p_X and cz == p_Z then
+            local ok, blk = (p_Y > cy) and turtle.inspectUp() or turtle.inspectDown()
+            if ok and type(blk) == "table" and blk.name then s_What = blk.name end
+        elseif cy == p_Y then
+            local s_H = nil
+            local H = HEADINGS_()
+            if p_X > cx then s_H = H.east elseif p_X < cx then s_H = H.west
+            elseif p_Z > cz then s_H = H.south elseif p_Z < cz then s_H = H.north end
+            if s_H ~= nil and pgps.turnTo(s_H) ~= false then
+                local ok, blk = turtle.inspect()
+                if ok and type(blk) == "table" and blk.name then s_What = blk.name end
+            end
+        end
     end
 
     if s_What:find("turtle", 1, true) or s_What:find("drone", 1, true) then
-        askInstead("a DRONE")
+        -- a real drone in the way: one message, and travel retries
+        trace(("blocked by a DRONE at %d,%d,%d -- asking it to move"):format(p_X, p_Y, p_Z))
+        if type(AskToMakeWay) == "function" then AskToMakeWay(p_X, p_Y, p_Z) end
         return
     end
 
-    -- DO NOT SEND A MINER TO DIG SOMETHING YOU CANNOT NAME.
-    --
-    -- s_What is only ever identified when the obstruction is directly above or below us -- that is
-    -- the only case turtle.inspectUp/Down can see. Every other time it stays the literal string
-    -- "something", which is not in the protected list, so an unknown blocker got a PRIORITY-1 dig
-    -- task queued against it.
-    --
-    -- Measured: eight of them at once, all at -474..-480, 65, 78 -- the airspace directly above the
-    -- chest row. That is where drones queue to deposit, so the "obstruction" was invariably another
-    -- drone, the dig could never succeed, and eight unresolvable priority-1 tasks sat ahead of
-    -- gather:coal_ore while the settlement ran out of fuel.
-    --
-    -- An unidentified blocker in a busy bay is a drone until proven otherwise. Ask it to move --
-    -- that costs one message and works -- and let travel retry. A dig is for something we have
-    -- looked at and know to be diggable.
-    if s_What == "something" then
-        askInstead("something unidentified")
+    if s_What ~= "something" then
+        -- an identified block: terrain or our own build. Record it solid so a_star routes around
+        -- it, and let the mover replan. NEVER a dig -- this is exactly the tower we are building.
+        pgps.noteObservation(p_X .. ":" .. p_Y .. ":" .. p_Z, 1, {true, {name = s_What}})
+        trace(("blocked by %s at %d,%d,%d -- a block, not a drone; marked solid, routing round"):format(s_What, p_X, p_Y, p_Z))
         return
     end
 
-    -- NEVER ASK ANYONE TO DIG THE SETTLEMENT.
-    --
-    -- The turtle case above was only half of it. IsProtected is the list of things no drone may
-    -- ever dig -- chests, computers, modems, the machines this fleet is built out of -- and a clear-
-    -- task for one of those is unresolvable by construction: the miner arrives, correctly refuses,
-    -- and the task sits at PRIORITY 1 for ever, outranking real work.
-    --
-    -- Found live: clear--472:64:76 was a standing request to DIG THE BRIDGE COMPUTER. Eighteen such
-    -- tasks were queued at once, ahead of the tower build they were starving, and the queue looked
-    -- fully occupied the entire time.
-    --
-    -- Reusing IsProtected rather than listing names here, because that list is the one place this
-    -- rule belongs -- every component that must not dig something asks it, and a second copy would
-    -- be wrong the first time somebody added a machine to one and not the other.
-    if IsProtected(s_What) then
-        trace(("blocked by %s at %d,%d,%d -- protected, so no dig will ever clear it; routing round")
-            :format(s_What, p_X, p_Y, p_Z))
-        Distress("blocked by protected infrastructure",
-                 ("%s at %d,%d,%d"):format(s_What, p_X, p_Y, p_Z))
-        return
-    end
-
-    trace(("blocked by %s at %d,%d,%d and I have no pickaxe -- asking for a miner")
-        :format(s_What, p_X, p_Y, p_Z))
-    Distress("blocked, needs a miner", ("%s at %d,%d,%d"):format(s_What, p_X, p_Y, p_Z))
-
-    -- The Distress above says the drone is stuck; THIS is the thing that actually gets a miner
-    -- sent. Lost silently, the drone waits for help nobody was ever asked for, and for a crafter a
-    -- blocked route is permanent.
-    Tried("ask TaskMan for a miner to clear the way", function()
-        PowNet.SendToServer("TaskMan", PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Add", {
-            name = ("clear-%d:%d:%d"):format(p_X, p_Y, p_Z),
-            -- Above every ordinary job: something is STOPPED until this is done, and the whole
-            -- point is that the drone waiting cannot fix it itself.
-            priority = 1,
-            work = {dig = {start = {x = p_X, y = p_Y + 1, z = p_Z}, w = 1, l = 1, depth = 1}},
-        }))
-    end)
+    -- Could not face or name it (rare -- no heading, or an odd geometry). Assume a drone we could
+    -- not look at and ask it to move; travel retries. A guess, but a cheap and safe one.
+    trace(("blocked by something unidentified at %d,%d,%d -- asking it to move"):format(p_X, p_Y, p_Z))
+    if type(AskToMakeWay) == "function" then AskToMakeWay(p_X, p_Y, p_Z) end
 end
 
 local function hardStop(p_What)
