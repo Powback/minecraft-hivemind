@@ -928,6 +928,12 @@ local function economyWaiting()
     end
     return false
 end
+-- The crafter hauls only when nothing waits to be crafted: it arrived at a craft with twelve
+-- stacks of hauled stone aboard and could not clear its grid (2026-09-05).
+local function crafterFreeOfCrafts(p_Where, p_Task, p_MinFuel)
+    if craftIsWaiting() then return nil end
+    return pickDrone("crafter", p_Where, p_Task.lastFailedBy, p_MinFuel)
+end
 local function pickForTask(p_Task, p_Role, p_Where, p_MinFuel)
     if p_Task.work and p_Task.work.build and p_Role == "miner" and economyWaiting() then
         local s_Other = pickDrone("scout", p_Where, p_Task.lastFailedBy, p_MinFuel)
@@ -942,7 +948,7 @@ local function pickForTask(p_Task, p_Role, p_Where, p_MinFuel)
             s_Hauler = pickDrone("miner", p_Where, p_Task.lastFailedBy, p_MinFuel)
         else
             s_Hauler = pickDrone("scout", p_Where, p_Task.lastFailedBy, p_MinFuel)
-                    or pickDrone("crafter", p_Where, p_Task.lastFailedBy, p_MinFuel)
+                    or crafterFreeOfCrafts(p_Where, p_Task, p_MinFuel)
         end
         if s_Hauler then return s_Hauler end
         if s_Deep then return nil, nil, nil, nil end
@@ -1377,6 +1383,21 @@ local m_FuelStock, m_FuelBest, m_FuelStockAt = nil, nil, -1000
 -- (the user, 2026-09-05: "if we have no storage that needs prio over crafting shit we cant store").
 local STORAGE_FULL_SLOTS = 6
 local m_FreeSlots = nil
+local m_StockCounts = nil
+-- A CRAFT WITH NO INPUTS ON THE SHELF IS NOT DISPATCHED. The crafter flew to the bay for
+-- craft-oak_planks thirty times in twenty minutes (2026-09-05 02:48-03:09) to find zero logs each
+-- time -- "short of minecraft:oak_log x32" -- and threw. The stock reply already says so.
+local function craftShortIn(p_Task)
+    local w = p_Task and p_Task.work and p_Task.work.craft
+    if type(w) ~= "table" or type(w.inputs) ~= "table" or m_StockCounts == nil then return nil end
+    local s_Runs = math.max(1, tonumber(w.runs) or 1)
+    for name, per in pairs(w.inputs) do
+        local s_Need = (tonumber(per) or 0) * s_Runs
+        local s_Have = m_StockCounts[tostring(name)] or 0
+        if s_Have < math.min(s_Need, tonumber(per) or 0) then return tostring(name) end   -- not even one run
+    end
+    return nil
+end
 local function makesStorage(p_Name)
     local n = tostring(p_Name or "")
     return n:find("^lumber:") ~= nil or n:find("oak_planks", 1, true) ~= nil
@@ -1394,8 +1415,10 @@ local function readFuelStock()
         PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "GetStock", {}), PowNet.SERVER_PROTOCOL, 5)
     if type(s_Res) ~= "table" or type(s_Res.detail) ~= "table" then return nil, nil end
     m_FreeSlots = tonumber(s_Res.free)          -- the shelf's room, read on the same reply
+    m_StockCounts = {}
     local s_Total, s_Best = 0, 0
     for _, e in ipairs(s_Res.detail) do
+        m_StockCounts[tostring(e.name)] = (m_StockCounts[tostring(e.name)] or 0) + (tonumber(e.count) or 0)
         if taskProducesFuel(e.name) then
             local n = tonumber(e.count) or 0
             s_Total = s_Total + n
@@ -2551,6 +2574,11 @@ local function fuelWorkersBusy()
     return n
 end
 local function notPlaceableNow(p_Task, p_Role, p_NoDrone)
+    local s_ShortOf = craftShortIn(p_Task)
+    if s_ShortOf then
+        Log(("holding %s: storage has none of %s"):format(tostring(p_Task.name), s_ShortOf))
+        return true
+    end
     if not fleetFuelLow() and taskProducesFuel(p_Task.name) and fuelWorkersBusy() >= FUEL_WORKERS_MAX then
         return true
     end
@@ -3566,6 +3594,7 @@ Render()
 if HiveMindTest then
     HiveMindTest.TaskMan = {
         setFreeSlots = function(n) m_FreeSlots = n end, storageRank = storageRank,
+        setStock = function(t) m_StockCounts = t end, craftShortIn = craftShortIn,
         jobMinFuel = jobMinFuel, workPos = workPos, workCost = workCost, pickDrone = pickDrone,
         noDroneReason = noDroneReason, notPlaceableNow = notPlaceableNow, fleetFuelLow = fleetFuelLow,
         anyoneForBuild = anyoneForBuild,

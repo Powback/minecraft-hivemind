@@ -958,18 +958,6 @@ test("TaskMan: a build does not take a miner while lumber or a gather is waiting
     eq(env.DATA.tasks[8].assignedTo, 2, "on the scout, though the miner was nearer: wood is waiting")
 end)
 
-test("DroneLogic: a craft keeps surplus in the non-grid slots when no container will take it", function()
-    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
-    truthy(env.IsCraftSlot(1) and env.IsCraftSlot(11) and not env.IsCraftSlot(4) and not env.IsCraftSlot(16), "the 3x3 grid")
-    env.turtle.inv = env.turtle.inv or {}
-    local s_Moved = nil
-    env.turtle.getItemCount = function(i) return (i == 1) and 12 or 0 end
-    env.turtle.transferTo = function(to, n) s_Moved = { to = to, n = n } return true end
-    env.turtle.select = function() return true end
-    truthy(env.ParkSurplus(1, 12), "parked")
-    eq(s_Moved.to, 4, "into the first free non-grid slot")
-    eq(s_Moved.n, 12, "all of the surplus")
-end)
 
 
 test("TaskMan: with the shelf full, the storage chain outranks other work of the same priority", function()
@@ -982,6 +970,29 @@ test("TaskMan: with the shelf full, the storage chain outranks other work of the
     eq(T.storageRank("tower-L0-p04"), 0, "a tower patch does not")
     T.setFreeSlots(40)
     eq(T.storageRank("lumber:oak_log"), 0, "with room on the shelf nothing is special")
+end)
+
+
+test("StorageMan: holders rotate per request and a furnace is never the answer while a chest holds it", function()
+    local _, S = loadModule("StorageMan.lua")
+    local holders = { { where = "minecraft:furnace_3" }, { where = "minecraft:chest_1" }, { where = "minecraft:chest_2" } }
+    eq(S.pickHolder(holders, 1).where, "minecraft:chest_2", "turn 1")
+    eq(S.pickHolder(holders, 2).where, "minecraft:chest_1", "turn 2 -- a different chest")
+    eq(S.pickHolder(holders, 3).where, "minecraft:chest_2", "and round again, never the furnace")
+    eq(S.pickHolder({ { where = "minecraft:furnace_3" } }, 7).where, "minecraft:furnace_3", "a furnace only when nothing else holds it")
+    eq(S.pickHolder({}, 1), nil, "nothing")
+end)
+
+
+test("TaskMan: a craft whose inputs are not on the shelf is held, one that has them is not", function()
+    local _, T = loadModule("TaskMan.lua")
+    T.setStock({ ["minecraft:stone"] = 500 })
+    local planks = { name = "craft-oak_planks", work = { craft = { item = "minecraft:oak_planks", runs = 8, inputs = { ["minecraft:oak_log"] = 1 } } } }
+    local bricks = { name = "craft-stone_bricks", work = { craft = { item = "minecraft:stone_bricks", runs = 32, inputs = { ["minecraft:stone"] = 4 } } } }
+    eq(T.craftShortIn(planks), "minecraft:oak_log", "no logs: held")
+    eq(T.craftShortIn(bricks), nil, "stone is there: goes")
+    T.setStock(nil)
+    eq(T.craftShortIn(planks), nil, "unknown stock is not a reason to hold")
 end)
 
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))

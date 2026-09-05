@@ -746,14 +746,32 @@ end
 
 -- Which networked chest holds something matching, and where a drone flies to reach it. Reads the
 -- peripherals rather than any memory of them -- OnWhereIs says what the memory cost.
+-- EVERY ASKER WAS SENT TO THE SAME CONTAINER. pairs() order made one chest the answer for coal
+-- for every drone at once, and once it was a furnace's fuel slot: five drones queued over one
+-- access cell at the bay and bounced (2026-09-05 03:20, "no progress toward -479,65,77" with
+-- "refusing to dig minecraft:furnace"). Holders rotate per request, and a furnace is never the
+-- answer while a chest holds the item -- its fuel slot is for smelting.
+local m_HolderTurn = 0
+function pickHolder(p_Holders, p_Turn)
+    if #p_Holders == 0 then return nil end
+    local s_Chests = {}
+    for _, h in ipairs(p_Holders) do
+        if not tostring(h.where or ""):find("furnace", 1, true) then s_Chests[#s_Chests + 1] = h end
+    end
+    local s_From = (#s_Chests > 0) and s_Chests or p_Holders
+    return s_From[(p_Turn % #s_From) + 1]
+end
 local function networkedHolderOf(p_Match)
     Rescan()
     for name, e in pairs(m_Index) do
         if e.total > 0 and name:find(p_Match, 1, true) then
+            local s_Holders = {}
             for _, at in ipairs(e.at) do
-                local s_Pos = depositPosOf(at.where)
-                if s_Pos then return s_Pos, name, e.total end
+                if depositPosOf(at.where) then s_Holders[#s_Holders + 1] = at end
             end
+            m_HolderTurn = m_HolderTurn + 1
+            local s_Pick = pickHolder(s_Holders, m_HolderTurn)
+            if s_Pick then return depositPosOf(s_Pick.where), name, e.total end
         end
     end
     return nil, "no networked chest holds " .. p_Match
@@ -1653,7 +1671,7 @@ Render()
 if HiveMindTest then
     HiveMindTest.StorageMan = {
         dedupeDeposits = dedupeDeposits, reservedForCrafting = reservedForCrafting,
-        smeltAllowance = smeltAllowance, fillFor = fillFor,
+        smeltAllowance = smeltAllowance, fillFor = fillFor, pickHolder = pickHolder,
     }
 end
 

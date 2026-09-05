@@ -309,7 +309,10 @@ function JitterWatch()
     trace(("JITTER: %d move(s) and %d turn(s) over only %d cell(s) around %s,%s,%s in %d heartbeats -- %s; moved by %s")
         :format(s_Steps, s_Turns, s_Cells, tostring(jx), tostring(jy), tostring(jz), JITTER.beats,
                 executing and "aborting the job" or "breaking the trip", s_Callers))
-    if executing then
+    -- The first window only breaks the current trip -- the mover replans and usually gets through
+    -- (a bay queue clears, a drone steps aside). Only a second window in a row aborts the job: the
+    -- first tuning aborted builds on their approach to the bay and every one ended "placed none".
+    if executing and JitterState.events >= 2 then
         AbortJobAndWait(3)
     else
         pgps.BreakExec()
@@ -5694,33 +5697,33 @@ end
 -- The 3x3 grid maps onto a 4x4 inventory, so it is NOT slots 1-9: the fourth column is outside the
 -- grid and anything left there makes the craft fail with no explanation.
 local CRAFT_SLOTS = {1, 2, 3, 5, 6, 7, 9, 10, 11}
-function IsCraftSlot(p_Slot)
-    for _, c in ipairs(CRAFT_SLOTS) do if c == p_Slot then return true end end
-    return false
+-- A crafter arrives with whatever it carried last -- twelve stacks of hauled stone once -- and
+-- turtle.craft needs every non-grid slot empty. Put the cargo away first, or say so before flying
+-- anywhere for inputs.
+function StowCargoForCraft()
+    if CarriedCount() == 0 then return end
+    Deposit()
+    local s_Left = CarriedCount()
+    if s_Left > 0 then
+        error(("holding %d item(s) with nowhere to put them -- the shelf is full"):format(s_Left), 0)
+    end
 end
--- Leave the 3x3 grid holding exactly the recipe. Surplus goes into the container below, or into a
--- free non-grid slot when nothing will take it; only a slot that can do neither fails the craft.
+-- Leave the inventory holding exactly the recipe. turtle.craft() refuses ("No matching recipes")
+-- when ANY slot outside the 3x3 grid holds an item, so every surplus must go into the container
+-- below -- parking it in slots 4/8/12-16 (tried 2026-09-05 03:10) broke every craft. The surplus
+-- fits when the craft fetched only what it needs (see the fetch above); a full chest that just
+-- gave up the inputs has room for the same item back.
 function ClearGridForCraft(p_Need)
     for i = 1, 16 do
         local have = turtle.getItemCount(i)
         local want = p_Need[i] or 0
-        if have > want and (IsCraftSlot(i) or FreeSlots() == 0) then
+        if have > want then
             turtle.select(i)
-            if not PutDown(have - want) and not ParkSurplus(i, have - want) then
-                error(("cannot clear slot %d for the craft -- no container below and no free slot"):format(i), 0)
+            if not PutDown(have - want) then
+                error(("cannot clear slot %d for the craft -- no container below"):format(i), 0)
             end
         end
     end
-end
--- Move surplus out of a grid slot into a free non-grid slot when no container will take it.
-function ParkSurplus(p_From, p_Count)
-    for i = 1, 16 do
-        if not IsCraftSlot(i) and i ~= p_From and turtle.getItemCount(i) == 0 then
-            turtle.select(p_From)
-            return turtle.transferTo(i, p_Count)
-        end
-    end
-    return false
 end
 
 function IsCrafter()
@@ -5951,6 +5954,7 @@ function OnCraft(p_ID, p_Message)
         local s_Grid  = d.grid                       -- may be nil for shapeless recipes
         local s_Inputs= d.inputs or {}
         if s_Item == nil then error("no item to craft", 0) end
+        StowCargoForCraft()
 
         -- 1. Ask storage to put the ingredients somewhere we can reach.
         local s_Req = {}
