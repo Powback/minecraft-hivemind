@@ -6846,8 +6846,12 @@ local function stageBuildMaterials(s_Hand, s_Need)
     else
         trace("pickup: that chest is unreachable -- collecting the materials the ordinary way")
     end
-    local s_Stage, s_StageErr = stageFromChest(s_Need)
-    if s_Stage == nil and s_Got then error(s_StageErr, 0) end
+    -- AN EMPTY PICKUP IS NOT A DEAD END. All builders are handed the same fullest chest, so the
+    -- first to arrive drains it and the next reads "the pickup chest gave up nothing" -- and this
+    -- used to ERROR (build failed, no block placed) whenever the drone had ARRIVED, even though the
+    -- bay holds the bricks in other chests. FetchItems sweeps them. Fall back to the sweep whether
+    -- the pickup was unreachable OR merely empty; only truly finding none anywhere fails the build.
+    local s_Stage = stageFromChest(s_Need)
     if s_Stage == nil then
         FetchItems(s_Need, s_Need)
         s_Stage = true
