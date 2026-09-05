@@ -15,7 +15,9 @@ services:
       # 60, not 56: the nearest real forest (a 27-log trunk column at -525,29 among others) sits 57
       # blocks from the base, and every tree inside 56 is gone. The mast's radio reaches 64 at ground
       # level; the two drones lost before were at 82. Wood is what chests, and therefore storage, wait on.
-      - HIVE_REACH=60
+      # 72, not 60 (2026-09-05): the settlement's only standing oak is at z=1, 63 blocks out. Chunk
+      # rows z -16..15 are force-loaded to match; anything HQ orders inside the reach must be loaded.
+      - HIVE_REACH=72
     volumes:
       # The Lua tree HQ publishes at /lua/manifest and /lua/file/:path, which Sync.lua
       # pulls onto MainFrame's disk. Read-only: nothing in-game may write back.
