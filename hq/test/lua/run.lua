@@ -1094,5 +1094,24 @@ test("DroneLogic: a straight hop that stops closing the distance bails to the pl
     truthy(s_Moves <= 3, "it did not bounce: at most a couple of moves before bailing, got " .. s_Moves)
 end)
 
+
+test("StorageMan: a chest name recorded at several positions collapses to its last one", function()
+    local env, S = loadModule("StorageMan.lua")
+    env.DATA.deposits = {
+        { peripheral = "minecraft:chest_6", pos = { x = -477, y = 64, z = 78 } },
+        { peripheral = "minecraft:chest_0", pos = { x = -476, y = 64, z = 78 } },
+        { peripheral = "minecraft:chest_6", pos = { x = -476, y = 64, z = 79 } },   -- newer position of chest_6
+        { pos = { x = -479, y = 63, z = 32 } },                                     -- a cache, unnamed, kept
+    }
+    S.dedupeDeposits()
+    local byName = {}
+    for _, d in ipairs(env.DATA.deposits) do byName[d.peripheral or "?"] = (byName[d.peripheral or "?"] or 0) + 1 end
+    eq(byName["minecraft:chest_6"], 1, "chest_6 appears once")
+    for _, d in ipairs(env.DATA.deposits) do
+        if d.peripheral == "minecraft:chest_6" then eq(d.pos.z, 79, "kept the last position") end
+    end
+    eq(byName["?"], 1, "the cache stays")
+end)
+
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))
 os.exit(failed == 0 and 0 or 1)

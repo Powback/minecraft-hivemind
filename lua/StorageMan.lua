@@ -579,14 +579,26 @@ end
 -- original unbound entry behind, so the registry held -480,64,78 twice: once as chest_1 and once as
 -- an anonymous chest that looked exactly like a field cache. HQ's haul loop, which collects from
 -- unwired points, then hauled from a base chest into a base chest, one task at a time, for an hour.
+-- ONE PERIPHERAL, ONE POSITION. A networked chest is learned from wherever a drone last deposited,
+-- so a chest re-scanned at a new network slot left its NAME recorded at two, three positions
+-- (chest_6 at -477,64,78, -476,64,79, ...). depositPosOf returns the first, which may be a cell
+-- with no chest under it -- D37 flew there, "unloaded nothing", and thrashed (2026-09-05 16:30).
+-- The current network scan (m_Free is keyed by the live peripheral name) is the authority on which
+-- name is real; keep the LAST-recorded position for each name and drop the earlier ones, and drop
+-- an unnamed point that duplicates a bound cell as before.
 local function dedupeDeposits()
-    local s_Bound, s_Kept, s_Dropped = {}, {}, 0
+    local s_Bound, s_Kept, s_Dropped, s_SeenName = {}, {}, 0, {}
     for _, d in ipairs(DATA["deposits"]) do
         if d.pos and d.peripheral then s_Bound[("%d:%d:%d"):format(d.pos.x, d.pos.y, d.pos.z)] = true end
     end
-    for _, d in ipairs(DATA["deposits"]) do
+    -- last position wins for a repeated name: record each name's last index
+    local s_LastAt = {}
+    for i, d in ipairs(DATA["deposits"]) do if d.peripheral then s_LastAt[d.peripheral] = i end end
+    for i, d in ipairs(DATA["deposits"]) do
         local k = d.pos and ("%d:%d:%d"):format(d.pos.x, d.pos.y, d.pos.z)
-        if d.peripheral or not (k and s_Bound[k]) then
+        if d.peripheral and s_LastAt[d.peripheral] ~= i then
+            s_Dropped = s_Dropped + 1                       -- an older position of a name kept later
+        elseif d.peripheral or not (k and s_Bound[k]) then
             s_Kept[#s_Kept + 1] = d
         else
             s_Dropped = s_Dropped + 1
@@ -595,7 +607,7 @@ local function dedupeDeposits()
     if s_Dropped > 0 then
         DATA["deposits"] = s_Kept
         PowNet.MarkDirty()
-        Log(("dropped %d unbound duplicate(s) of chests already bound to the network"):format(s_Dropped))
+        Log(("dropped %d stale/duplicate deposit point(s)"):format(s_Dropped))
     end
 end
 
