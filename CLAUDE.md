@@ -839,3 +839,18 @@ Measure completions, not deploys: `grep -o 'JOB [A-Za-z]* \(done\|FAILED\|THREW\
   item (`pickHolder`): five drones were queuing over one access cell.
 - A full shelf never gates the storage chain (logs, planks, chests) -- HQ `makesStorage`, TaskMan
   `storageRank` -- because that chain is the only way out of a full shelf.
+
+## Floor 0's holes, measured against the world (2026-09-05 15:00)
+
+Compare the design (`towerFloor(specForLevel(l), l, PALETTES.brick)` at base -480,63,64) with the
+region files, not the map (scratchpad scripts dump-l0.ts / check-map.ts, using McWebViewer's
+region reader). Floor 0: 1677 of 2360 built; of the 683 missing, 254 have air above (plain
+buildable), 231 sit under a stone brick, 160 under cobblestone from the first cobble-palette
+build, and 7 under the GPS-host computers. Floors 1 and 2: 333 and 221 of their missing squares are
+under a brick. A square under a block was "no route to the square" for ever from above, and six in a
+row tripped "walled in", so the reachable squares in the same patch were never laid either.
+`LayCovered` lays such squares from a neighbour cell at their own height (`turtle.place` facing the
+gap) or from below (`turtle.placeUp`); stairs keep their heading rule.
+
+HQ's "already built" filter (`squaresAlreadySolid`) agreed with the world within 1% -- the map is
+not the problem; reachability was.
