@@ -281,11 +281,14 @@ function motionReset() m_Motion = {steps = 0, turns = 0, cells = {}, distinct = 
 -- enough per move, and the only way a "325 moves over 2 cells" report names the loop instead of
 -- leaving it to guesswork.
 local function motionCaller()
-    for lvl = 3, 12 do
+    -- skip this file and C frames (the drive lock's pcall shows as "[C]:-1"); the first Lua frame
+    -- outside pgps is the routine that asked for the move
+    for lvl = 3, 16 do
         local info = debug and debug.getinfo and debug.getinfo(lvl, "Sl")
         if info == nil then return "?" end
-        if not tostring(info.short_src):find("pgps", 1, true) then
-            return tostring(info.short_src):match("[^/]+$") .. ":" .. tostring(info.currentline)
+        local src = tostring(info.short_src)
+        if not src:find("pgps", 1, true) and src ~= "[C]" and (info.currentline or -1) >= 0 then
+            return src:match("[^/]+$") .. ":" .. tostring(info.currentline)
         end
     end
     return "deep"
