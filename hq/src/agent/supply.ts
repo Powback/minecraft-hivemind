@@ -1669,10 +1669,14 @@ async function orderFloor(p_Level: number): Promise<{ res: unknown } | { failed:
   };
   try {
     return { res: await registry.invoke('order.tower',
-      // 32, not 8: a patch pays a trip to the shelf and a climb to the floor whatever its size, and
-      // at 8 blocks that overhead was ~250 fuel for 8 bricks -- 30 fuel a block, 250 trips a floor.
-      // Eight was chosen when relief preemptions kept cutting jobs short; the shelf is stocked now.
-      { level: p_Level, palette: 'brick', blocksPerTask: 32 }, ctx) };
+      // 96, not 32: a patch pays a FIXED cost -- fly from the shelf to the floor, and the gap back to
+      // it before the next patch -- whatever its size. Measured on D4 (2026-09-05): a build's first 8
+      // squares took ~220 game-s (the fly-out) while a mid-build run of 8 took ~55; between builds sat
+      // a ~490 game-s gap returning and refetching. Over a 295s window that overhead held the builder
+      // to 21 blocks/min while its best contiguous stretch ran at 31. A turtle carries ~700 items, so
+      // 96 bricks is two slots -- amortising the fly-out over 3x the blocks, not straining the load.
+      // (Was 8 when relief preemptions cut jobs short; 32 once the shelf was stocked.)
+      { level: p_Level, palette: 'brick', blocksPerTask: 96 }, ctx) };
   } catch (err) {
     return { failed: (err as Error)?.message ?? String(err) };
   }
