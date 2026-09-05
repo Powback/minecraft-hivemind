@@ -133,22 +133,6 @@ test("TaskMan.anyoneForBuild prices the build for the fallback drone too", funct
     eq(d and d.name, "D39", "a scout that can afford it builds")
 end)
 
-test("TaskMan: a lower-priority craft does not hold the crafter off a build; a higher-priority one does", function()
-    local env, T = taskManWithFleet({
-        { id = 5, name = "D4", role = "crafter", status = "idle", fuel = 2000, fuelFloor = 120, pos = { x = 0, y = 64, z = 0 } },
-    })
-    local build = { id = 9, name = "tower-L0-p1", work = { build = { origin = { x = 2, y = 64, z = 0 } } }, priority = 2 }
-    -- A prio-3 furnace craft is waiting (no inputs field -> not short -> counts as a live craft).
-    -- It must NOT keep the sole crafter off a prio-2 tower build -- the inversion that left 22 build
-    -- tasks unbuilt while D4 chased a furnace it was gated to and the walls stood full of holes.
-    env.DATA.tasks = { [5] = { id = 5, name = "craft-furnace", work = { craft = {} }, priority = 3 } }
-    local d = T.anyoneForBuild(build, { x = 2, y = 64, z = 0 }, 100)
-    eq(d and d.name, "D4", "the crafter builds -- a prio-3 craft does not outrank a prio-2 build")
-    -- A craft that genuinely outranks the build still holds the crafter for it.
-    env.DATA.tasks = { [6] = { id = 6, name = "craft-urgent", work = { craft = {} }, priority = 1 } }
-    eq(T.anyoneForBuild(build, { x = 2, y = 64, z = 0 }, 100), nil, "a prio-1 craft keeps the crafter crafting")
-end)
-
 test("TaskMan.heldForNothing: a busy drone that has not moved for three minutes is stalled", function()
     local env, T = taskManWithFleet({})
     local d = { id = 58, name = "D40", role = "miner", status = "busy", fuel = 1700, pos = { x = -480, y = 64, z = 65 } }

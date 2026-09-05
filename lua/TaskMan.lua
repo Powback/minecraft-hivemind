@@ -657,20 +657,14 @@ local function storageRank(p_Name)
     if m_FreeSlots ~= nil and m_FreeSlots <= STORAGE_FULL_SLOTS and makesStorage(p_Name) then return 1 end
     return 0
 end
--- p_MoreUrgentThan: when given (a build's priority), ONLY a craft strictly more urgent than that
--- build counts. Without it a prio-3 furnace craft held the sole crafter off a prio-2 tower backlog
--- -- 22 build tasks unbuilt while D4 idled next to a furnace it was gated to but the tower did not
--- need. A crafter falling back to a build (anyoneForBuild) should keep crafting only for work that
--- actually outranks the build. Lower number = higher priority (order.issue: "1 is the top").
-local function craftIsWaiting(p_MoreUrgentThan)
+local function craftIsWaiting()
     for _, t in pairs(DATA["tasks"] or {}) do
         -- A craft that has already FAILED is not waiting for the crafter, it is waiting for materials
         -- -- craft-oak_planks with no log in the settlement held the crafter out of building for a
         -- whole fuel emergency (2026-09-04) while it was the only drone with fuel to lay bricks.
         -- and a craft held for missing inputs cannot run, so it must not keep the crafter idle either
         if type(t) == "table" and t.work and t.work.craft and t.assignedTo == nil and taskLive(t)
-           and (tonumber(t.attempts) or 0) == 0 and craftShortIn(t) == nil
-           and (p_MoreUrgentThan == nil or (tonumber(t.priority) or 9) < p_MoreUrgentThan) then
+           and (tonumber(t.attempts) or 0) == 0 and craftShortIn(t) == nil then
             return true
         end
     end
@@ -698,8 +692,7 @@ end
 local function anyoneForBuild(p_Task, p_Where, p_MinFuel)
     if p_Task.work == nil or p_Task.work.build == nil then return nil end
     for _, alt in ipairs({"loader", "scout", "crafter"}) do
-        -- A crafter falling back to this build keeps crafting only for work that OUTRANKS the build.
-        if alt ~= "crafter" or not craftIsWaiting(tonumber(p_Task.priority) or 9) then
+        if alt ~= "crafter" or not craftIsWaiting() then
             -- THE FALLBACK PRICES THE JOB LIKE THE FIRST CHOICE DID. Without p_MinFuel this offered a
             -- 384-fuel build to scouts holding 290 and 270; both burned to the watchdog's floor and
             -- were pulled off the tower with the patch unfinished (2026-09-04, 173 and 149 fuel).
