@@ -2844,11 +2844,22 @@ local function arrivedAt(p_Cx, p_Cy, p_Cz, p_X, p_Y, p_Z)
     return p_Cx == p_X and p_Cy == p_Y and p_Cz == p_Z
 end
 
+-- A STRAIGHT HOP THAT STOPS GETTING CLOSER GIVES UP TO THE PLANNER. Without this, a build
+-- approach to a cell the drone cannot land on (the target sits under a placed block, or the
+-- square above a stacked wall course) had the drone step up, fail to enter, drop back, and step
+-- up again -- 92 moves over two cells in a window, for D4/D37/D38/D39 at once (2026-09-05 16:00).
+-- The move succeeds each time, so no single step "fails"; what fails is progress. Bail the moment
+-- a step does not reduce the distance, and TravelToBody falls through to moveTo, which prices the
+-- cell honestly ("goal is solid") instead of bouncing on it.
 local function stepStraightTo(p_X, p_Y, p_Z)
+    local s_Best = nil
     for _ = 1, 12 do
         local cx, cy, cz = pgps.getCachedPosition()
         if cx == nil then return false end
         if arrivedAt(cx, cy, cz, p_X, p_Y, p_Z) then return true end
+        local s_Dist = math.abs(cx - p_X) + math.abs(cy - p_Y) + math.abs(cz - p_Z)
+        if s_Best ~= nil and s_Dist >= s_Best then return false end   -- no closer: let the map try
+        s_Best = s_Dist
         local s_Ok
         if cy ~= p_Y then
             s_Ok = stepVertically(cy, p_Y)

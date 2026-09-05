@@ -1074,5 +1074,25 @@ test("DroneLogic: a fetched stack is kept only up to the cap, the rest goes back
     eq(k .. "/" .. b, "0/30", "nothing more wanted: all back")
 end)
 
+
+test("DroneLogic: a straight hop that stops closing the distance bails to the planner", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.__world.pos = { x = -476, y = 66, z = 47 }
+    -- up() works, but the target y=67 cell "moves" -- simulate arrival never matching by making
+    -- the drone oscillate: up goes to 67, but the target is 68 and 68 is blocked so up fails there;
+    -- here we just prove it bails rather than looping 12 times when distance does not fall.
+    local s_Moves = 0
+    env.pgps.up = function() s_Moves = s_Moves + 1; env.__world.pos.y = 67; return true end   -- lands at 67, never 68
+    env.pgps.down = function() s_Moves = s_Moves + 1; env.__world.pos.y = 66; return true end
+    -- target 68: from 66 dist 2, step up -> 67 dist 1 (progress), step up again stays 67 dist 1 (no progress) -> bail
+    env.pgps.moveTo = function() return false end
+    env.riseToCeiling = function() return false end
+    env.CanDig = function() return false end
+    env.hardStop = function() return true end
+    local ok = env.TravelToBody(-476, 68, 47)
+    -- TravelToBody will then try moveTo; stub it to fail so the whole call returns false quickly
+    truthy(s_Moves <= 3, "it did not bounce: at most a couple of moves before bailing, got " .. s_Moves)
+end)
+
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))
 os.exit(failed == 0 and 0 or 1)
