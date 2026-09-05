@@ -1061,5 +1061,18 @@ test("StorageMan: the pickup point is the chest that already holds the most of t
     eq(env.pickupFor("minecraft:glass"), nil, "nothing holds glass")
 end)
 
+
+test("DroneLogic: a fetched stack is kept only up to the cap, the rest goes back", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    local k, b = env.KeepUpTo(64, 4)
+    eq(k .. "/" .. b, "4/60", "four kept, sixty back")
+    k, b = env.KeepUpTo(30, nil)
+    eq(k .. "/" .. b, "30/0", "no cap: keep it all")
+    k, b = env.KeepUpTo(30, 100)
+    eq(k .. "/" .. b, "30/0", "cap above the stack: keep it all")
+    k, b = env.KeepUpTo(30, 0)
+    eq(k .. "/" .. b, "0/30", "nothing more wanted: all back")
+end)
+
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))
 os.exit(failed == 0 and 0 or 1)

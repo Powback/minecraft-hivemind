@@ -3239,7 +3239,17 @@ function SurfaceDeepSlot(p_Chest, p_WantName, p_Want, p_Slot)
     return {list = s_List, ahead = s_Ahead, slot = s_Slot}, s_Elsewhere
 end
 
-function TakeFromChest(p_Want)
+-- How much of a matching stack to keep against a cap: returns keep, put-back.
+function KeepUpTo(p_Have, p_Cap)
+    if p_Cap == nil or p_Cap >= p_Have then return p_Have, 0 end
+    local s_Keep = math.max(0, p_Cap)
+    return s_Keep, p_Have - s_Keep
+end
+-- p_Cap(name) -> how many more of that item the caller wants (nil = no cap). The excess of a
+-- matching stack goes straight back below, while we still stand over the chest it came from:
+-- a 4-log plank craft withdrew 200 logs, could not clear its grid, and flew them to the
+-- shaft-bottom cache 50 blocks down (2026-09-05 15:50).
+function TakeFromChest(p_Want, p_Cap)
     local s_Before = {}
     for i = 1, 16 do
         local d = turtle.getItemDetail(i)
@@ -3350,7 +3360,9 @@ function TakeFromChest(p_Want)
         local d = turtle.getItemDetail(i)
         local nm = d and d.name
         if nm and p_Want(nm, i) then
-            s_Kept[nm] = (s_Kept[nm] or 0) + n
+            local s_Keep, s_Back = KeepUpTo(n, p_Cap and p_Cap(nm, s_Kept[nm] or 0))
+            if s_Back > 0 then PutDown(s_Back) end
+            s_Kept[nm] = (s_Kept[nm] or 0) + s_Keep
         else
             PutDown()
         end
@@ -3499,6 +3511,13 @@ function FetchItems(p_Want, p_Min)
         for w in pairs(p_Want) do if SameItem(w, nm) then return true end end
         return false
     end
+    -- how many more of nm this order still needs, counting what is already aboard from this chest
+    local s_StillWanted = function(nm, p_KeptHere)
+        for w, n in pairs(p_Want) do
+            if SameItem(w, nm) then return math.max(0, n - (CarriedTally(p_Want)[w] or 0) + (p_KeptHere or 0)) end
+        end
+        return nil
+    end
     local function tally() return CarriedTally(p_Want) end
     local function short(got)
         for w, n in pairs(p_Want) do if (got[w] or 0) < n then return w end end
@@ -3556,7 +3575,7 @@ function FetchItems(p_Want, p_Min)
             if s_Tried[k] then break end
             s_Tried[k] = true
             if not ArriveAt(pos.x, pos.y + 1, pos.z, (pos.y or 64) + 4) then return s_Hops > 0 end
-            local _, _, s_MovedTo = TakeFromChest(s_Match)   -- reports its contents, repairing the index
+            local _, _, s_MovedTo = TakeFromChest(s_Match, s_StillWanted)   -- reports its contents, repairing the index
             s_Hops = s_Hops + 1
             pos = s_MovedTo
         end
@@ -3565,7 +3584,7 @@ function FetchItems(p_Want, p_Min)
 
     if ContainerBelow() then
         Doing(("looking for %s in the chest below"):format(tostring(s_First):gsub("^minecraft:", "")))
-        local _, _, s_MovedTo = TakeFromChest(s_Match)
+        local _, _, s_MovedTo = TakeFromChest(s_Match, s_StillWanted)
         s_Got = tally()
         if short(s_Got) == nil then
             trace("fetch: it was in the chest we were already standing on")
