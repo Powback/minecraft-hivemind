@@ -5694,6 +5694,34 @@ end
 -- The 3x3 grid maps onto a 4x4 inventory, so it is NOT slots 1-9: the fourth column is outside the
 -- grid and anything left there makes the craft fail with no explanation.
 local CRAFT_SLOTS = {1, 2, 3, 5, 6, 7, 9, 10, 11}
+function IsCraftSlot(p_Slot)
+    for _, c in ipairs(CRAFT_SLOTS) do if c == p_Slot then return true end end
+    return false
+end
+-- Leave the 3x3 grid holding exactly the recipe. Surplus goes into the container below, or into a
+-- free non-grid slot when nothing will take it; only a slot that can do neither fails the craft.
+function ClearGridForCraft(p_Need)
+    for i = 1, 16 do
+        local have = turtle.getItemCount(i)
+        local want = p_Need[i] or 0
+        if have > want and (IsCraftSlot(i) or FreeSlots() == 0) then
+            turtle.select(i)
+            if not PutDown(have - want) and not ParkSurplus(i, have - want) then
+                error(("cannot clear slot %d for the craft -- no container below and no free slot"):format(i), 0)
+            end
+        end
+    end
+end
+-- Move surplus out of a grid slot into a free non-grid slot when no container will take it.
+function ParkSurplus(p_From, p_Count)
+    for i = 1, 16 do
+        if not IsCraftSlot(i) and i ~= p_From and turtle.getItemCount(i) == 0 then
+            turtle.select(p_From)
+            return turtle.transferTo(i, p_Count)
+        end
+    end
+    return false
+end
 
 function IsCrafter()
     return type(turtle.craft) == "function"
@@ -6145,16 +6173,11 @@ function OnCraft(p_ID, p_Message)
         --
         -- The surplus is not discarded: the drone is standing on the chest it fetched from, so it
         -- goes back where it came from and stays available for the next run.
-        for i = 1, 16 do
-            local have = turtle.getItemCount(i)
-            local want = s_Need[i] or 0
-            if have > want then
-                turtle.select(i)
-                if not PutDown(have - want) then
-                    error(("cannot clear slot %d for the craft -- no container below"):format(i), 0)
-                end
-            end
-        end
+        -- Only the 3x3 grid must be exact. Surplus in the other seven slots does not touch the
+        -- recipe, and demanding a container for it stopped every craft the moment the shelf was
+        -- full: "cannot clear slot 12 for the craft -- no container" while 5,000 stone waited to
+        -- become the bricks every build was failing for (2026-09-05 02:55).
+        ClearGridForCraft(s_Need)
         turtle.select(1)
         ReportChest()          -- the surplus went back into that chest; say so (see emptyInventory)
 

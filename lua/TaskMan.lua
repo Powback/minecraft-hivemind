@@ -914,7 +914,27 @@ end
 -- y=8 it was walled in at -503,17,41 with a full tank (D38, 2026-09-04 23:35). Below HAUL_SURFACE_Y
 -- the haul is a miner's.
 local HAUL_SURFACE_Y = 56
+-- WOOD AND ORE BEFORE BRICKS. With both miners laying tower patches, lumber:oak_log sat queued
+-- "no miner free" for an hour while the shelf had no room, no chests could be crafted, no bricks
+-- could be crafted (the crafter had nowhere to clear a slot), and every patch failed "ran out of
+-- stone_bricks" (2026-09-05). A build goes to a miner only when nothing a miner alone can do --
+-- lumber, gather -- is waiting; scouts and the crafter still build.
+local function economyWaiting()
+    for _, t in pairs(DATA["tasks"] or {}) do
+        if type(t) == "table" and t.work and (t.work.lumber or t.work.gather) and t.assignedTo == nil
+           and taskLive(t) then
+            return true
+        end
+    end
+    return false
+end
 local function pickForTask(p_Task, p_Role, p_Where, p_MinFuel)
+    if p_Task.work and p_Task.work.build and p_Role == "miner" and economyWaiting() then
+        local s_Other = pickDrone("scout", p_Where, p_Task.lastFailedBy, p_MinFuel)
+                     or pickDrone("loader", p_Where, p_Task.lastFailedBy, p_MinFuel)
+        if s_Other then return s_Other end
+        return nil, "miners are wanted for wood and ore first"
+    end
     if p_Task.work and p_Task.work.haul then
         local s_Deep = p_Where ~= nil and tonumber(p_Where.y) ~= nil and p_Where.y < HAUL_SURFACE_Y
         local s_Hauler

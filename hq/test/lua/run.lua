@@ -944,5 +944,32 @@ test("DroneLogic: travel counts as busy while any coroutine drives through pgps"
     truthy(not env.TravelIsBusy(), "free")
 end)
 
+
+test("TaskMan: a build does not take a miner while lumber or a gather is waiting; a scout takes it", function()
+    local env, T = taskManWithFleet({
+        { id = 1, name = "D1", role = "miner", status = "idle", fuel = 1500, pos = { x = -480, y = 64, z = 80 } },
+        { id = 2, name = "D9", role = "scout", status = "idle", fuel = 1500, pos = { x = -480, y = 64, z = 90 } },
+    })
+    env.DATA.tasks = {
+        [8] = { id = 8, name = "tower-L0-p01", work = { build = { origin = { x = -480, y = 63, z = 80 }, blocks = {} } }, progress = 0, priority = 1 },
+        [9] = { id = 9, name = "lumber:oak_log", work = { lumber = { w = 8, l = 8 } }, progress = 0, priority = 1 },
+    }
+    truthy(env.OnStartTask(0, { data = { id = 8 } }), "the build was placed")
+    eq(env.DATA.tasks[8].assignedTo, 2, "on the scout, though the miner was nearer: wood is waiting")
+end)
+
+test("DroneLogic: a craft keeps surplus in the non-grid slots when no container will take it", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    truthy(env.IsCraftSlot(1) and env.IsCraftSlot(11) and not env.IsCraftSlot(4) and not env.IsCraftSlot(16), "the 3x3 grid")
+    env.turtle.inv = env.turtle.inv or {}
+    local s_Moved = nil
+    env.turtle.getItemCount = function(i) return (i == 1) and 12 or 0 end
+    env.turtle.transferTo = function(to, n) s_Moved = { to = to, n = n } return true end
+    env.turtle.select = function() return true end
+    truthy(env.ParkSurplus(1, 12), "parked")
+    eq(s_Moved.to, 4, "into the first free non-grid slot")
+    eq(s_Moved.n, 12, "all of the surplus")
+end)
+
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))
 os.exit(failed == 0 and 0 or 1)

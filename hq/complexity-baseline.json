@@ -5,7 +5,7 @@
   "files": {
     "lua/DroneLogic.lua": {
       "cc": [
-        66,
+        62,
         57,
         51,
         45,
@@ -113,12 +113,12 @@
         17
       ],
       "names": [
-        "moveLeg",
+        "moveLegRaw",
         "moveTo",
         "flyTo",
         "setLocationFromGPS",
         "forward",
-        "ensureHeading"
+        "ensureHeadingRaw"
       ]
     },
     "hq/src/tools/core.ts": {
