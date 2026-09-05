@@ -2654,7 +2654,14 @@ end
 -- Statuses that are NOT a drone holding a job nobody gave it. Idle and docking are waiting;
 -- refuelling is the idle top-up (DroneLogic.TopUpWhileIdle), which was being aborted mid-fetch
 -- every sixty seconds as "refuelling with no task" -- the one thing that makes it useful next.
-local NOT_AN_ORPHAN = { idle = true, offline = true, docking = true, refuelling = true }
+-- A drone reporting an active-work status HAS work, whatever the assignment record lost track of.
+-- Reaping it destroys live building: a patch takes 200-260s to lay, and the 60s window aborted
+-- builders every minute ("Aborting (was executing: true)", the build-then-bounce, 2026-09-05 16:30).
+local NOT_AN_ORPHAN = {
+    idle = true, offline = true, docking = true, refuelling = true,
+    building = true, mining = true, logging = true, gathering = true, scanning = true, moving = true,
+}
+local ORPHAN_GRACE_MS = 300 * 1000
 
 local function freeOrphanedDrones()
     local s_Held = {}
@@ -2697,7 +2704,7 @@ local function freeOrphanedDrones()
             m_OrphanSince[s_Key] = m_OrphanSince[s_Key] or os.epoch("utc")
             -- Sustained, not momentary: there is a real window between a drone accepting work and
             -- the assignment being recorded, and aborting inside it would cancel live work.
-            if (os.epoch("utc") - m_OrphanSince[s_Key]) > 60000 then
+            if (os.epoch("utc") - m_OrphanSince[s_Key]) > ORPHAN_GRACE_MS then
                 Log(("%s is %s with no task -- aborting so it can be given work")
                     :format(tostring(d.name), tostring(d.status)))
                 abortDrone(d.id)
