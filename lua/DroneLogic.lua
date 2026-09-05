@@ -7075,8 +7075,13 @@ function OnBuild(p_ID, p_Message)
     end)
 end
 
+-- travel = false: the sweep start HQ sends is the densest trunk, so the cell above it is wood or
+-- leaves and ReachSite failed "goal is solid" -- "cannot reach site -485,65,15" -- before a single
+-- tree was felled, while the shelf sat at 0 free slots waiting for logs (2026-09-05). FellTargets
+-- approaches each trunk itself, from the side, digging leaves as it goes.
 function OnLumber(p_ID, p_Message)
-    return RunJob("Lumber", p_Message.data, {status = "logging"}, function(d)
+    local s_Opts = {status = "logging", travel = false}
+    return RunJob("Lumber", p_Message.data, s_Opts, function(d)
         local s_W = tonumber(d.w) or 8
         local s_L = tonumber(d.l) or 8
         local s_Logs, s_Trees = 0, 0
