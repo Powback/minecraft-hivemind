@@ -3474,6 +3474,11 @@ local function storageHasAnyOf(p_Want, p_Min)
     local s_Res = PowNet.sendAndWaitForResponse("StorageMan",
         PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "GetStock", {}), PowNet.SERVER_PROTOCOL, 5)
     if type(s_Res) ~= "table" or type(s_Res.detail) ~= "table" then return true end
+    -- AN EMPTY READ IS NOT AN EMPTY WAREHOUSE. StorageMan mid-rescan answers GetStock with a detail
+    -- of zero entries; treating that as "storage has none" made builds throw "ran out of
+    -- stone_bricks" and give up while 344 bricks sat on the shelf (the next fetch a moment later
+    -- logged "found it at -475,64,78"). No entries at all means we could not read it -- go and look.
+    if #s_Res.detail == 0 then return true end
     for s_Name in pairs(p_Want or {}) do
         local s_Floor = (p_Min and tonumber(p_Min[s_Name])) or 1
         for _, e in ipairs(s_Res.detail) do
@@ -3509,9 +3514,10 @@ local function sweepPointless(p_HasAny, p_Count)
         trace("fetch: out of fuel, so the chest sweep is a list of places we cannot go")
         return "out of fuel -- cannot reach any chest, waiting for relief"
     end
-    if not p_HasAny then
-        trace(("fetch: storage holds none of it -- not flying %d chest(s) to confirm that")
-              :format(p_Count))
+    -- A HANDFUL OF CHESTS IS CHEAP TO CONFIRM. The aggregate can be a stale or mid-scan read, so
+    -- when only a few candidates remain, fly them rather than trust "none" and abandon the job.
+    if not p_HasAny and p_Count > 4 then
+        trace(("fetch: storage holds none of it -- not flying %d chest(s) to confirm that"):format(p_Count))
         return "storage does not have it"
     end
     return nil
