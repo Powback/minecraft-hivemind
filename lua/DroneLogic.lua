@@ -6837,6 +6837,10 @@ function LayAhead(p_Inspect, p_Place, p_Item)
     if not selectItem(p_Item) then error("ran out of " .. tostring(p_Item) .. " partway through", 0) end
     return p_Place() and "placed" or "occupied"
 end
+-- A memo entry counts only when the map agrees that a block stands there (see the note in OnBuild).
+function DoneAndSolid(p_Memo, p_Key)
+    return p_Memo.done(p_Key) and (pgps.cachedWorld or {})[p_Key] == 1
+end
 -- The bookkeeping of one covered square, so OnBuild's loop stays one line for it.
 function CountCovered(p_Verdict, p_Done, p_Key, p_Why, p_Run, p_Placed, p_Skipped)
     if p_Verdict == "placed" or p_Verdict == "already" then
@@ -6962,8 +6966,12 @@ function OnBuild(p_ID, p_Message)
             -- build came out full of holes and still reported success.
             -- Same two lines as every other job: already-placed blocks are not placed twice.
             local s_BK = bx .. ":" .. by .. ":" .. bz
-            if s_BuildDone.done(s_BK) then
-                -- already placed before the last stand-down
+            -- THE MEMO IS NOT THE WORLD. A square the memo calls done but the map calls air is a
+            -- block that landed somewhere else (a wrong pose at placement) or was dug out since.
+            -- HQ only orders air squares, so trusting the memo alone skipped every square of a
+            -- re-ordered patch and threw "placed none of 32" (2026-09-05 15:30, twice in 4 min).
+            if DoneAndSolid(s_BuildDone, s_BK) then
+                -- already placed before the last stand-down, and the map agrees
             elseif not TravelTo(bx, by + 1, bz, (by or 64) + 4) then
                 s_NoRouteRun, s_Placed, s_Skipped = CountCovered(LayCovered(bx, by, bz, b), s_BuildDone, s_BK,
                                                                  s_Why, s_NoRouteRun, s_Placed, s_Skipped)
