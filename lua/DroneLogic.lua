@@ -222,13 +222,25 @@ end
 -- moving the drone", all 32 were skipped in 0.05s, and the patch was reported DONE with nothing
 -- placed. Wait for the lock; if it is still held after TRAVEL_WAIT_S the job fails honestly and
 -- TaskMan requeues it.
-TRAVEL_WAIT_S = 60
+-- 240 s, the travel lock's own ceiling, not 60: the idle errands that hold the lock -- a deposit
+-- to a far cache, a fuel top-up -- routinely run longer than a minute, and five crafts in a row
+-- died at the sixty-second mark (2026-09-05 15:10) while bricks ran out on every patch. And a job
+-- outranks an errand: after five seconds the errand's trip is broken so the drone is free.
+TRAVEL_WAIT_S = 240
+TRAVEL_PREEMPT_S = 5
 function RunBodyWhenFree(p_Body, p_Data)
-    local s_Began = os.clock()
+    local s_Began, s_Broke = os.clock(), false
     while TravelIsBusy() do
         if os.clock() - s_Began >= TRAVEL_WAIT_S then
             error(("another routine kept the drone moving for %ds -- taken at %s"):format(
                 TRAVEL_WAIT_S, tostring(TravelTakenAt or "?")), 0)
+        end
+        if not s_Broke and os.clock() - s_Began >= TRAVEL_PREEMPT_S then
+            trace("a job is waiting on an idle errand's trip -- breaking that trip")
+            pgps.BreakExec()
+            os.sleep(1)
+            pgps.StartExec()
+            s_Broke = true
         end
         os.sleep(1)
     end
