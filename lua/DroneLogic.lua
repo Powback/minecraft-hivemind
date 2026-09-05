@@ -6914,17 +6914,28 @@ end
 -- its own height (turtle.place facing the gap), or a floor square from the cell below
 -- (turtle.placeUp). Stairs keep their heading rule and stay top-laid.
 -- Returns "placed", "already", "occupied" or "no route"; throws when the material ran out.
+-- DO NOT PATH INTO A CELL THE MAP CALLS SOLID. Worth trying a cell the map does not know (it may be
+-- air); never one it already records as a wall. Same rule stepStraightTo and localHop now follow.
+function ApproachOpen(p_X, p_Y, p_Z)
+    return (pgps.cachedWorld or {})[p_X .. ":" .. p_Y .. ":" .. p_Z] ~= 1
+end
 function LayCovered(bx, by, bz, p_Block)
     if p_Block.heading ~= nil then return "no route" end
+    -- A covered floor square's neighbours are usually other floor blocks, and the cell below it is
+    -- the foundation. Sending TravelTo -- and its blind fallback -- at an enclosed cell is exactly
+    -- where the y63 thrash came from: 48 "unidentified blocker" events under one floor in a single
+    -- window, 80 moves for 5 cells. Peek the map and skip an approach it already calls a wall, so an
+    -- unreachable covered square returns "no route" at once instead of grinding under the floor.
     for _, d in ipairs({{1, 0}, {-1, 0}, {0, 1}, {0, -1}}) do
-        if TravelTo(bx + d[1], by, bz + d[2], by + 3) then
-            local h = headingToward(bx + d[1], bz + d[2], bx, bz)
+        local ax, az = bx + d[1], bz + d[2]
+        if ApproachOpen(ax, by, az) and TravelTo(ax, by, az, by + 3) then
+            local h = headingToward(ax, az, bx, bz)
             if h ~= nil and pgps.turnTo(h) ~= false then
                 return LayAhead(turtle.inspect, turtle.place, p_Block.item)
             end
         end
     end
-    if TravelTo(bx, by - 1, bz, by + 1) then
+    if ApproachOpen(bx, by - 1, bz) and TravelTo(bx, by - 1, bz, by + 1) then
         return LayAhead(turtle.inspectUp, turtle.placeUp, p_Block.item)
     end
     return "no route"

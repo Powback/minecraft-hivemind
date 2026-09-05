@@ -1082,6 +1082,21 @@ test("DroneLogic: when no neighbour is reachable a floor square is laid from bel
     eq(run .. "/" .. placed .. "/" .. skipped, "1/0/1", "an unreachable one counts toward walled-in")
 end)
 
+test("DroneLogic: a covered square walled in on the map returns no route without pathing into a wall", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.turtle.inv[1] = { name = "minecraft:stone_bricks", count = 10 }
+    -- Every neighbour at the square's height and the cell directly below are recorded solid: the
+    -- covered floor square the y63 thrash was grinding under. No approach is open.
+    env.pgps.cachedWorld = {
+        ["-479:63:70"] = 1, ["-481:63:70"] = 1, ["-480:63:71"] = 1, ["-480:63:69"] = 1,
+        ["-480:62:70"] = 1,
+    }
+    local s_Trips = 0
+    env.TravelTo = function() s_Trips = s_Trips + 1 return true end
+    eq(env.LayCovered(-480, 63, 70, { item = "minecraft:stone_bricks" }), "no route", "no open approach")
+    eq(s_Trips, 0, "never pathed into a cell the map already calls a wall")
+end)
+
 
 test("StorageMan: the pickup point is the chest that already holds the most of the first item", function()
     local env = loadModule("StorageMan.lua")
