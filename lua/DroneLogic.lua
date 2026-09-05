@@ -6955,7 +6955,12 @@ end
 function LayAhead(p_Inspect, p_Place, p_Item)
     local s_Has, s_What = p_Inspect()
     if s_Has then return alreadyThatBlock(s_What, p_Item) and "already" or "occupied" end
-    if not selectItem(p_Item) then error("ran out of " .. tostring(p_Item) .. " partway through", 0) end
+    -- SHORT IS A SKIP, NOT A CRASH. This used to error("ran out of X partway"), which aborted the
+    -- WHOLE patch the moment one covered square wanted a material the load was short on -- so a build
+    -- that had placed twenty squares threw them all away as a failure and re-walked them next pass.
+    -- The main placement branch already treats "short" as a skip (OnBuild ~7188); the covered path
+    -- must match, so a build always completes to what it actually carries and re-issues the rest.
+    if not selectItem(p_Item) then return "short" end
     return p_Place() and "placed" or "occupied"
 end
 -- A memo entry counts only when the map agrees that a block stands there (see the note in OnBuild).
@@ -6968,7 +6973,12 @@ function CountCovered(p_Verdict, p_Done, p_Key, p_Why, p_Run, p_Placed, p_Skippe
         p_Done.mark(p_Key)
         return 0, p_Placed + 1, p_Skipped
     end
-    noteSkip(p_Why, p_Verdict == "occupied" and "occupied by something else" or "no route to the square")
+    local s_Reason = "no route to the square"
+    if p_Verdict == "occupied" then s_Reason = "occupied by something else"
+    elseif p_Verdict == "short" then s_Reason = "short of material" end
+    noteSkip(p_Why, s_Reason)
+    -- Only a genuine route failure counts toward "walled in". A material shortage is not the floor
+    -- being unreachable; letting it trip the walled-in cutoff would abandon reachable squares too.
     if p_Verdict == "no route" then p_Run = NoteNoRoute(p_Run) end
     return p_Run, p_Placed, p_Skipped + 1
 end

@@ -1110,6 +1110,21 @@ test("DroneLogic: a covered square walled in on the map returns no route without
     eq(s_Trips, 0, "never pathed into a cell the map already calls a wall")
 end)
 
+test("DroneLogic: a covered square short of material skips cleanly -- it does not throw the whole build", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.turtle.inspect = function() return false end            -- the gap is open
+    env.turtle.place = function() return true end
+    -- Inventory holds none of the item, so selectItem fails. This used to error("ran out ... partway")
+    -- and abort the whole patch; it must now report "short" and let the loop carry on.
+    local ok, verdict = pcall(env.LayAhead, env.turtle.inspect, env.turtle.place, "minecraft:stone_bricks")
+    truthy(ok, "LayAhead did not throw")
+    eq(verdict, "short", "it reports short of material")
+    -- A shortage is a skip, and NOT a step toward the walled-in cutoff (which is about routes).
+    local run, placed, skipped = env.CountCovered("short", { mark = function() end }, "k", {}, 3, 5, 2)
+    eq(run, 3, "the walled-in run is untouched by a material shortage")
+    eq(placed .. "/" .. skipped, "5/3", "no placement, counted as one skip")
+end)
+
 
 test("StorageMan: the pickup point is the chest that already holds the most of the first item", function()
     local env = loadModule("StorageMan.lua")
