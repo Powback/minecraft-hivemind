@@ -874,3 +874,13 @@ square (now `LayCovered`), and `RunJobNow`'s `ReachSite(pos)` for Lumber, whose 
 densest trunk itself -- the cell above it is wood or leaves. Lumber runs with `travel = false`
 now and `FellTargets` approaches each trunk from the side. When a job dies "cannot reach site",
 check what the site cell holds before blaming the planner.
+
+## Afternoon of 2026-09-05: what moved floor 0 at last
+
+Measured 15:19 -> 15:44: floor 0 +43 squares, floor 1 +18 -- the first movement all day -- after
+`LayCovered` (side/below placement) and `pickupFor` (handover from the chest that holds the item).
+Then two more blockers fell: the build resume memo trusted over the map (`DoneAndSolid`), and a
+fetch keeping whole stacks (a 4-log craft withdrew 200 logs: `TakeFromChest(p_Want, p_Cap)`,
+`KeepUpTo`). The user authorised wood: 256 oak logs and 8 chests were put on the shelf in place of
+stone so the chest row could exist at all. HIVE_REACH is 72 because the nearest standing oak is 63
+blocks out.
