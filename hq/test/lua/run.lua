@@ -482,6 +482,45 @@ test("pgps.verifyPosition discards a fix taken while something else moved the tu
     truthy(env.positionVerified(), "and counts")
 end)
 
+test("pgps.flyTo defers a blocked line to the router when told not to climb -- the wall-rubbing fix", function()
+    local env, T = loadModule("pgps.lua")
+    -- A wall on every horizontal face: forward never advances. Vertical is open.
+    local ups
+    env.turtle.forward = function() return false end
+    env.turtle.up = function() ups = ups + 1 return true end
+    env.turtle.down = function() return true end
+
+    -- Without _noClimb, flyTo climbs over the wall and bounces up/down until the step budget runs
+    -- out -- the behaviour that rubbed the tower for a whole replan.
+    env.setLocation(0, 64, 0, "north")
+    ups = 0
+    local ok1 = T.flyTo(5, 64, 0, 12, false)
+    eq(ok1, false, "cannot reach through a wall")
+    truthy(ups >= 5, "climbing flyTo went up the wall many times (" .. ups .. ")")
+
+    -- With _noClimb (what localHop passes), the first blocked step bails at once, so moveLegRaw asks
+    -- the shared pathfinder for a route AROUND the wall instead of grinding against it.
+    env.setLocation(0, 64, 0, "north")
+    ups = 0
+    local ok2, why2 = T.flyTo(5, 64, 0, 12, true)
+    eq(ok2, false, "still cannot walk through the wall")
+    eq(ups, 0, "but it never climbed -- it deferred to the router")
+    truthy(tostring(why2):find("router"), "and says why: " .. tostring(why2))
+end)
+
+test("pgps.localHop hands a blocked short hop to the router rather than climbing blind", function()
+    local env, T = loadModule("pgps.lua")
+    local ups = 0
+    env.turtle.forward = function() return false end
+    env.turtle.up = function() ups = ups + 1 return true end
+    env.setLocation(0, 64, 0, "north")
+    -- Within PATH_LOCAL_RADIUS but blocked: localHop must NOT climb (that is the wall-rubber). It
+    -- returns false so moveLegRaw falls through to the GetPath request.
+    local ok = T.localHop(3, 64, 0, 3)
+    eq(ok, false, "a blocked local hop fails instead of climbing")
+    eq(ups, 0, "and never climbed the wall")
+end)
+
 test("pgps.verifyPosition refuses a fix while a move is in flight, whoever asks", function()
     local env = loadModule("pgps.lua")
     env.setLocation(0, 64, 0, "north")

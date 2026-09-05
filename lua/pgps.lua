@@ -2997,5 +2997,6 @@ end
 -- this does nothing.
 if HiveMindTest ~= nil then
     HiveMindTest.pgps = {motionWindow = motionWindow, motionReset = motionReset, motionCallers = motionCallers,
-                         newTrip = newTrip, tripStalled = tripStalled, isDriving = isDriving}
+                         newTrip = newTrip, tripStalled = tripStalled, isDriving = isDriving,
+                         flyTo = flyTo, localHop = localHop}
 end
