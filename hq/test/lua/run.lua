@@ -269,6 +269,19 @@ test("StorageMan.OnWhereIs answers from the wire before any memory", function()
     eq(r.pos.x, -476, "the networked chest holding the coal")
 end)
 
+test("StorageMan.OnWhereIs lists every holder, most-held first, so the drone need not sweep the bay", function()
+    local env = storageWithChests()
+    -- Bricks smeared across two chests -- one order's worth split, more in chest_1 than chest_0.
+    env.__world.peripherals["minecraft:chest_0"].api.__inv.items[1] = { name = "minecraft:stone_bricks", count = 20 }
+    env.__world.peripherals["minecraft:chest_1"].api.__inv.items[1] = { name = "minecraft:stone_bricks", count = 51 }
+    env.Rescan()
+    local ok, r = env.OnWhereIs(1, { data = { match = "stone_bricks" } })
+    truthy(ok, "found")
+    truthy(type(r.places) == "table" and #r.places >= 2, "lists both holders, not just one (" .. #(r.places or {}) .. ")")
+    eq(r.places[1].count, 51, "most-held chest first so the order fills in the fewest stops")
+    truthy(r.places[1].count >= r.places[2].count, "descending by count")
+end)
+
 test("StorageMan: fuel before furniture -- wood smelts while fuel is short", function()
     local env, S = storageWithChests()
     env.Rescan()

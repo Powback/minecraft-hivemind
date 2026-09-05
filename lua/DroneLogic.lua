@@ -3525,6 +3525,10 @@ function FetchSkip(p_Point, p_Match)
     end
     return true
 end
+-- How many of the chests StorageMan named to visit before giving up on the index and sweeping. The
+-- list is most-held first, so the whole order is usually in the first one or two; the cap bounds the
+-- pathological case of an item smeared one-per-chest across the bay. A global: 200-local main chunk.
+FETCH_KNOWN_MAX = 6
 function FetchItems(p_Want, p_Min)
     local s_Match = function(nm)
         for w in pairs(p_Want) do if SameItem(w, nm) then return true end end
@@ -3625,11 +3629,19 @@ function FetchItems(p_Want, p_Min)
         PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "WhereIs", {match = tostring(s_First or "")}),
         PowNet.SERVER_PROTOCOL)
     if type(s_Where) == "table" and s_Where.pos then
-        tryChest(s_Where.pos)
-        s_Got = tally()
-        if short(s_Got) == nil then return s_Got, nil end
-        trace(("fetch: not at %d,%d,%d after all -- sweeping the bay")
-            :format(s_Where.pos.x, s_Where.pos.y, s_Where.pos.z))
+        -- TOLD WHERE IT IS, GO STRAIGHT THERE. StorageMan hands back every networked chest that holds
+        -- the item, most-held first; visit them in turn until the order is filled. One chest holds a
+        -- fraction, so a single position came up short and dropped the drone into the bay sweep -- the
+        -- "searching N chests, skipping them" the user watched. The sweep below is now the fallback for
+        -- an index that is wrong or silent, not the ordinary way to collect a load.
+        local s_Places = s_Where.places or { {pos = s_Where.pos} }
+        for i = 1, math.min(#s_Places, FETCH_KNOWN_MAX) do
+            tryChest(s_Places[i].pos)
+            s_Got = tally()
+            if short(s_Got) == nil then return s_Got, nil end
+        end
+        trace(("fetch: visited %d known chest(s) and still short -- sweeping the bay")
+            :format(math.min(#s_Places, FETCH_KNOWN_MAX)))
     end
 
     -- The index was wrong or silent. Look, and record what is actually there.

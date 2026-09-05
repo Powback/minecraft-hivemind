@@ -842,13 +842,25 @@ local function networkedHolderOf(p_Match)
     Rescan()
     for name, e in pairs(m_Index) do
         if e.total > 0 and name:find(p_Match, 1, true) then
-            local s_Holders = {}
+            -- EVERY chest that holds it, not just one. A builder needs the whole order and one chest
+            -- holds a fraction of it, so handing back a single position is what made the drone visit
+            -- it, come up short, and fall to sweeping the bay chest by chest -- the "searching N
+            -- chests" the fleet spends its life on. Return the full list, most-held first, so the
+            -- drone is TOLD where the item is and walks straight to it.
+            local s_Holders, s_Places = {}, {}
             for _, at in ipairs(e.at) do
-                if depositPosOf(at.where) then s_Holders[#s_Holders + 1] = at end
+                local p = depositPosOf(at.where)
+                if p then
+                    s_Holders[#s_Holders + 1] = at
+                    s_Places[#s_Places + 1] = {pos = p, count = at.count}
+                end
             end
             m_HolderTurn = m_HolderTurn + 1
             local s_Pick = pickHolder(s_Holders, m_HolderTurn)
-            if s_Pick then return depositPosOf(s_Pick.where), name, e.total end
+            if s_Pick then
+                table.sort(s_Places, function(x, y) return (x.count or 0) > (y.count or 0) end)
+                return depositPosOf(s_Pick.where), name, e.total, s_Places
+            end
         end
     end
     return nil, "no networked chest holds " .. p_Match
@@ -880,8 +892,8 @@ function OnWhereIs(p_ID, p_Message)
     -- -520,63,34 after all -- sweeping the bay", and D38 ran dry in the sweep. Same rule as
     -- OnBringToFront's "SEARCH THE NETWORK, NOT THE REGISTRY": the observation is for chests that
     -- have no peripheral, and it comes after.
-    local s_Pos, s_Name, s_Total = networkedHolderOf(s_Match)
-    if s_Pos then return true, {pos = s_Pos, item = s_Name, count = s_Total, source = "peripheral"} end
+    local s_Pos, s_Name, s_Total, s_Places = networkedHolderOf(s_Match)
+    if s_Pos then return true, {pos = s_Pos, item = s_Name, count = s_Total, places = s_Places, source = "peripheral"} end
     -- Observed chests next: a reading beats a running total that may have missed an event.
     s_Pos, s_Name, s_Total = observedHolderOf(s_Match)
     if s_Pos then return true, {pos = s_Pos, item = s_Name, count = s_Total, source = "observed"} end
