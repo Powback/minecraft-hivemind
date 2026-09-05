@@ -865,3 +865,12 @@ holds the most of the first item the pickup point (no push for the bulk), and a 
 material skips those squares (`noteSkip "short of X"`) instead of aborting the patch.
 
 Measure floors from the region files, not the map: scratchpad `dump-l0.ts` + `check-map.ts`.
+
+## "goal is solid" was the only pathfinder failure left (2026-09-05 15:40)
+
+MapServer's per-minute tally showed 7-9 failures a minute, all "goal is solid": the mover was
+being asked for cells that hold a block. Two senders: builds aiming at the cell above a covered
+square (now `LayCovered`), and `RunJobNow`'s `ReachSite(pos)` for Lumber, whose `pos` is the
+densest trunk itself -- the cell above it is wood or leaves. Lumber runs with `travel = false`
+now and `FellTargets` approaches each trunk from the side. When a job dies "cannot reach site",
+check what the site cell holds before blaming the planner.
