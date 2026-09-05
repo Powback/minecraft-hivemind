@@ -2794,6 +2794,25 @@ function loadPose()
     return true
 end
 
+-- Just the heading from the saved pose, WITHOUT touching a position we already have from GPS.
+--
+-- At boot the GPS fix gives us where we are but not which way we face, so setLocationFromGPS clears
+-- the heading and steps to re-derive it. A drone boxed in against a wall cannot take that step, and
+-- came out of boot with heading nil -- unable to turn toward anything, walking into the wall and
+-- reporting cells that are plainly air as "blocked by something unidentified" (measured on D4 alone
+-- in the world, 2026-09-05: cached==gps exactly, h=nil, wedged at the tower). The pose file is where
+-- "which way" was last written down; it is a far better prior than nil, and correct unless the drone
+-- was physically turned while off.
+function savedHeading()
+    if not fs.exists(POSE_FILE) then return nil end
+    local h = fs.open(POSE_FILE, "r")
+    if not h then return nil end
+    local s_Line = h.readLine()
+    h.close()
+    local d = type(s_Line) == "string" and s_Line:match("%-?%d+ %-?%d+ %-?%d+ (%d+)")
+    return d and tonumber(d) or nil
+end
+
 function setLocationFromGPS()
     if startGPS() then
         -- get the current position
@@ -2833,6 +2852,12 @@ function setLocationFromGPS()
         --
         -- Keep the old value and put it back if the derivation fails. Deriving is an improvement,
         -- not a prerequisite, and pgps tracks heading through every turn anyway.
+        -- SEED THE PRIOR FROM DISK. At boot cachedDir is nil (GPS gave position, not facing), so
+        -- without this s_PrevDir is nil and the "keep the one we had" fallback below has nothing to
+        -- keep -- which is how a boxed-in drone ended boot with no heading at all. The saved pose
+        -- holds the last known facing; use it as the prior so a failed re-derivation falls back to it
+        -- rather than to nil.
+        if cachedDir == nil then cachedDir = savedHeading() end
         local s_PrevDir = cachedDir
         local d = cachedDir or nil
         cachedDir = nil
@@ -2848,7 +2873,11 @@ function setLocationFromGPS()
             if not s_Fwd and classifyMove(s_FwdErr) == "hard" then
                 -- Same lesson as ensureHeading: a refusal that applies everywhere must be named,
                 -- not retried in the other three directions and then reported as "boxed in".
+                -- KEEP THE HEADING. A wall in front is not a reason to forget which way we face -- this
+                -- early return skips the fallback below, so restore the prior here or a boxed-in drone
+                -- boots with heading nil and cannot turn toward anything.
                 moveFailed(s_FwdErr)
+                cachedDir = cachedDir or s_PrevDir
                 return cachedX, cachedY, cachedZ
             end
             if s_Fwd then

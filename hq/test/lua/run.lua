@@ -488,6 +488,29 @@ test("pgps loads under the stub world", function()
     truthy(env.moveTo, "moveTo defined")
 end)
 
+test("pgps.savedHeading reads the last facing off the pose file", function()
+    local env = loadModule("pgps.lua")
+    local h = env.fs.open("/pgps-pose.txt", "w") h.write("10 64 20 2") h.close()
+    eq(env.savedHeading(), 2, "heading read back from disk")
+    env.fs.delete("/pgps-pose.txt")
+    eq(env.savedHeading(), nil, "no file -> nil")
+end)
+
+test("pgps.setLocationFromGPS keeps the saved heading when boxed in -- it must not boot with heading nil", function()
+    local env = loadModule("pgps.lua")
+    -- A GPS fix gives position, but the drone is walled in on every side so it cannot step out to
+    -- re-derive its facing. Without the saved-pose fallback it came out of boot with heading nil,
+    -- unable to turn toward anything -- the "blocked by something unidentified" wedge on D4 alone.
+    env.__world.gps = { x = 10, y = 64, z = 20 }
+    env.turtle.forward = function() return false end
+    local h = env.fs.open("/pgps-pose.txt", "w") h.write("10 64 20 2") h.close()
+    env.setLocationFromGPS()
+    local x, _, _, d = env.getCachedPosition()
+    eq(x, 10, "position came from the GPS fix")
+    truthy(d ~= nil, "heading is NOT nil -- it was kept from the saved pose")
+    eq(d, 2, "and it is the facing we last wrote down")
+end)
+
 test("pgps.setLocation with no heading keeps the heading it has", function()
     local env = loadModule("pgps.lua")
     env.setLocation(1, 2, 3, "north")
