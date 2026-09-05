@@ -170,9 +170,12 @@ function OnProvide(p_ID, p_Message)
     local s_Want = p_Message.data and p_Message.data.items
     if type(s_Want) ~= "table" or #s_Want == 0 then return false, "Missing items" end
 
-    -- The pickup chest. Deliberately the SAME chest drones already unload into: one physical
-    -- rendezvous point, one thing to keep clear, one place to look when something goes missing.
-    local s_Point = DATA["pickup"]
+    -- THE PICKUP IS WHERE THE BRICKS ALREADY ARE. This used to be one fixed pickup chest that
+    -- everything was pushed into; with the shelf at 0 free slots every push moved nothing, the
+    -- handover came back "short", and eleven builds in twenty minutes threw "ran out of
+    -- stone_bricks" with 119 bricks on the shelf (2026-09-05 15:19). The chest holding the most of
+    -- the first item asked for is the pickup point: no push is needed for the bulk of the order.
+    local s_Point = pickupPointFor(s_Want)
     if s_Point == nil then
         for _, d in ipairs(DATA["deposits"] or {}) do s_Point = d break end
     end
@@ -603,6 +606,21 @@ local function depositPosOf(p_Name)
         if dep.peripheral == p_Name then return dep.pos end
     end
     return nil
+end
+function pickupFor(p_Name)
+    local e = m_Index[p_Name]
+    if type(e) ~= "table" then return nil end
+    local s_Best, s_BestCount = nil, 0
+    for _, at in ipairs(e.at or {}) do
+        local n = tonumber(at.count) or 0
+        if n > s_BestCount and not isFurnace(at.where) and depositPosOf(at.where) then s_Best, s_BestCount = at.where, n end
+    end
+    if s_Best == nil then return nil end
+    return {pos = depositPosOf(s_Best), peripheral = s_Best}
+end
+-- The pickup point for an order: where its first item mostly is, else the configured pickup.
+function pickupPointFor(p_Want)
+    return pickupFor(p_Want[1] and p_Want[1].name) or DATA["pickup"]
 end
 
 function OnBringToFront(p_ID, p_Message)

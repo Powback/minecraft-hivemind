@@ -1043,5 +1043,23 @@ test("DroneLogic: when no neighbour is reachable a floor square is laid from bel
     eq(run .. "/" .. placed .. "/" .. skipped, "1/0/1", "an unreachable one counts toward walled-in")
 end)
 
+
+test("StorageMan: the pickup point is the chest that already holds the most of the first item", function()
+    local env = loadModule("StorageMan.lua")
+    env.DATA.deposits = {
+        { peripheral = "minecraft:chest_0", pos = { x = -476, y = 64, z = 78 } },
+        { peripheral = "minecraft:chest_1", pos = { x = -480, y = 64, z = 78 } },
+        { peripheral = "minecraft:furnace_2", pos = { x = -479, y = 65, z = 77 } },
+    }
+    env.m_Index = { ["minecraft:stone_bricks"] = { total = 90, at = {
+        { where = "minecraft:chest_0", slot = 1, count = 20 },
+        { where = "minecraft:chest_1", slot = 3, count = 60 },
+        { where = "minecraft:furnace_2", slot = 1, count = 10 } } } }
+    local p = env.pickupFor("minecraft:stone_bricks")
+    eq(p.peripheral, "minecraft:chest_1", "the chest with 60, not the one with 20, never the furnace")
+    eq(p.pos.x, -480, "at its registered position")
+    eq(env.pickupFor("minecraft:glass"), nil, "nothing holds glass")
+end)
+
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))
 os.exit(failed == 0 and 0 or 1)

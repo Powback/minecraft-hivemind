@@ -7019,7 +7019,11 @@ function OnBuild(p_ID, p_Message)
                         noteSkip(s_Why, "occupied by something else")
                     end
                 elseif not selectItem(b.item) then
-                    error("ran out of " .. tostring(b.item) .. " partway through", 0)
+                    -- A material the handover came up short on skips its squares; it used to abort
+                    -- the whole patch after a handful of bricks (11 aborts in 20 min, 2026-09-05).
+                    -- The squares stay unbuilt on the map and the repair pass re-orders them.
+                    s_Skipped = s_Skipped + 1
+                    noteSkip(s_Why, "short of " .. tostring(b.item))
                 elseif (b.heading == nil or pgps.turnTo(HEADINGS_()[b.heading]) ~= false)
                         and turtle.placeDown() then
                     s_BuildDone.mark(s_BK)
