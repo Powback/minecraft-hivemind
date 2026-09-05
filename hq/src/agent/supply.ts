@@ -682,7 +682,10 @@ async function dispatchLumber(rule: SupplyRule, have: number, ctx: SupplyCtx): P
   // session elsewhere: the tick prints its fuel-emergency line, the wood rule is skipped, and there
   // is nothing anywhere connecting the two. "No miner free" and "no trees known" need completely
   // different fixes and looked identical from outside.
-  if (!ctx.minerFree) {
+  // Wood is the storage chain (logs -> planks -> chests -> a row). It is queued even with no miner
+  // free, like coal: TaskMan serves it to the next miner that frees up and dedupes the repeat.
+  // Waiting for a free miner first left the chest row without logs for a night (2026-09-05).
+  if (!ctx.minerFree && !makesStorage(rule.match)) {
     ctx.waiting.push(`lumber ${rule.match}: no miner free`);
     return false;
   }
