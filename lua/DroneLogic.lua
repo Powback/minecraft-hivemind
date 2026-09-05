@@ -6846,16 +6846,14 @@ local function stageBuildMaterials(s_Hand, s_Need)
     else
         trace("pickup: that chest is unreachable -- collecting the materials the ordinary way")
     end
-    -- AN EMPTY PICKUP IS NOT A DEAD END. All builders are handed the same fullest chest, so the
-    -- first to arrive drains it and the next reads "the pickup chest gave up nothing" -- and this
-    -- used to ERROR (build failed, no block placed) whenever the drone had ARRIVED, even though the
-    -- bay holds the bricks in other chests. FetchItems sweeps them. Fall back to the sweep whether
-    -- the pickup was unreachable OR merely empty; only truly finding none anywhere fails the build.
-    local s_Stage = stageFromChest(s_Need)
-    if s_Stage == nil then
-        FetchItems(s_Need, s_Need)
-        s_Stage = true
-    end
+    -- FILL THE WHOLE PATCH, NOT WHATEVER THE PICKUP CHEST HAPPENED TO HOLD. The pickup chest holds
+    -- only a fraction of the fleet's bricks, so staging from it alone left a drone with ~4 of the 32
+    -- a patch needs -- it placed those, flew back, and repeated ("short of stone_bricks x28", the
+    -- place-one-go-back the user watched). stageFromChest is a best-effort first grab from the chest
+    -- below; FetchItems then ALWAYS tops up to the full need from the rest of the bay (it counts what
+    -- is already aboard, so it fetches only the shortfall). Only finding none anywhere leaves it short.
+    stageFromChest(s_Need)
+    FetchItems(s_Need, s_Need)
 end
 
 -- THE MAP ALREADY HAS SOMETHING THERE. Flying to a square another drone filled, to read "occupied
