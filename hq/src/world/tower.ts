@@ -69,12 +69,12 @@ export interface TowerSpec {
  * to every floor.
  */
 export const TOWER: TowerSpec = {
-  radius: 14,
+  radius: 15,
   sectors: 8,
   floorHeight: 6,
   atriumRadius: 4,
   walkRadius: 6,
-  serviceDepth: 2,
+  serviceDepth: 3,
 };
 
 /**
@@ -275,23 +275,27 @@ export interface TowerBand {
 }
 
 /**
- * r=14 IS THE FLOOR, AND IT IS ARITHMETIC RATHER THAN TASTE.
+ * r=15 IS THE FLOOR, AND IT IS ARITHMETIC RATHER THAN TASTE.
  *
  * A bay needs the atrium (4) plus both gallery lanes (2) plus its own depth (5) plus the service
- * cavity (2) plus the wall. That is fourteen. Taper below it and the bays are the first thing
+ * cavity (3) plus the wall. That is fifteen. Taper below it and the bays are the first thing
  * squeezed -- a first attempt at r=11 produced 15-cell bays against 41 at the base, which is exactly
  * the "every module needs a variant per band" failure the round plan exists to prevent.
  *
- * So the working floors step 20 -> 17 -> 14 and stop. The cap above them is genuinely narrow because
+ * The service cavity is THREE deep, not two: two skins with a two-block gap between them, room for a
+ * chute AND a power shaft (or a wider item lane) to run the full rise without fouling each other.
+ * Widening it stepped every working band out by one to keep bay depth constant.
+ *
+ * So the working floors step 21 -> 18 -> 15 and stop. The cap above them is genuinely narrow because
  * it holds no bays at all: it is the mast base and an observation deck, and the ring of roof each
  * step-in leaves exposed below it is a terrace.
  */
 export const BANDS: TowerBand[] = [
-  { name: 'plinth', from: -3, to: -1, radius: 20, sectors: 12 },
-  { name: 'base',   from:  0, to:  1, radius: 20, sectors: 12 },
-  { name: 'mid',    from:  2, to:  3, radius: 17, sectors: 10 },
-  { name: 'upper',  from:  4, to:  6, radius: 14, sectors:  8 },
-  { name: 'cap',    from:  7, to:  7, radius: 11, sectors:  0 },
+  { name: 'plinth', from: -3, to: -1, radius: 21, sectors: 12 },
+  { name: 'base',   from:  0, to:  1, radius: 21, sectors: 12 },
+  { name: 'mid',    from:  2, to:  3, radius: 18, sectors: 10 },
+  { name: 'upper',  from:  4, to:  6, radius: 15, sectors:  8 },
+  { name: 'cap',    from:  7, to:  7, radius: 12, sectors:  0 },
 ];
 
 export function bandFor(level: number): TowerBand {
