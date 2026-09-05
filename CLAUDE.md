@@ -804,3 +804,24 @@ A one-shot chain `edit; lint; tests; commit; deploy` committed a message describ
 did not contain (efd6888, 2026-09-05): the edit script hit an anchor assertion and exited non-zero,
 `;` let everything after it run, and the gate passed on the unchanged file. Chain with `&&` from the
 edit step onward, and write the commit message after the edit has been confirmed, never before.
+
+## Nothing completed for two hours (2026-09-05 01:00-03:00), and why
+
+Measured from the drone logs: zero "JOB ... done" in two hours; 15 builds threw, 3 were
+interrupted, 4 reliefs failed. Causes, in order of damage:
+
+1. **Deploy cadence.** `redeploy.sh Drones` reboots the fleet and kills every job in flight. It
+   ran ~15 times in two hours. Batch fixes; deploy drones at most once an hour while measuring.
+2. **A full shelf starves everything.** Builds fetched partial bricks and threw "ran out partway";
+   the crafter could not craft ("cannot clear slot -- no container"); lumber sat "no miner free"
+   while both miners laid bricks; no logs -> no planks -> no chests -> no new row -> shelf still
+   full. Fixes: crafts keep surplus in non-grid slots (`ClearGridForCraft`), miners take builds
+   only when no lumber/gather waits (`economyWaiting`), the storage chain is exempt from the
+   full-shelf gate (`makesStorage`) and TaskMan serves it first (`storageRank`) when free slots
+   <= 6, HQ keeps 128 stone bricks in stock.
+3. **The jitter watch tuned too tight** (12 moves/4 cells per game-minute) aborted normal chest
+   work. Now 40 moves/4 cells or 60 moves in a 10-block box; crafting exempt.
+4. **Two coroutines driving one turtle** (heading probe vs mover) lost quarter-turns -> zig-zags.
+   pgps has a drive lock at moveLeg/ensureHeading/timedMove/turnAndTrack (`driving`, `isDriving`).
+
+Measure completions, not deploys: `grep -o 'JOB [A-Za-z]* \(done\|FAILED\|THREW\)' */drone.log`.
