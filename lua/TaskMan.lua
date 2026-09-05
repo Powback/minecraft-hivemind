@@ -627,13 +627,44 @@ end
 -- Its own function so it reads as the sibling of anyoneForRescue below, which is what it is: both
 -- are "prefer that role, but do not make it a requirement".
 -- Is there crafting queued that nobody has picked up?
+-- STORAGE FIRST WHEN THERE IS NONE. With the shelf full, every task that makes more shelf --
+-- lumber for planks, planks for chests, chests, the chest-row build -- is served before anything
+-- else of the same priority. Crafting or mining things there is no room to store is wasted work
+-- (the user, 2026-09-05: "if we have no storage that needs prio over crafting shit we cant store").
+local STORAGE_FULL_SLOTS = 6
+local m_FreeSlots = nil
+local m_StockCounts = nil
+-- A CRAFT WITH NO INPUTS ON THE SHELF IS NOT DISPATCHED. The crafter flew to the bay for
+-- craft-oak_planks thirty times in twenty minutes (2026-09-05 02:48-03:09) to find zero logs each
+-- time -- "short of minecraft:oak_log x32" -- and threw. The stock reply already says so.
+local function craftShortIn(p_Task)
+    local w = p_Task and p_Task.work and p_Task.work.craft
+    if type(w) ~= "table" or type(w.inputs) ~= "table" or m_StockCounts == nil then return nil end
+    local s_Runs = math.max(1, tonumber(w.runs) or 1)
+    for name, per in pairs(w.inputs) do
+        local s_Need = (tonumber(per) or 0) * s_Runs
+        local s_Have = m_StockCounts[tostring(name)] or 0
+        if s_Have < math.min(s_Need, tonumber(per) or 0) then return tostring(name) end   -- not even one run
+    end
+    return nil
+end
+local function makesStorage(p_Name)
+    local n = tostring(p_Name or "")
+    return n:find("^lumber:") ~= nil or n:find("oak_planks", 1, true) ~= nil
+        or n:find("craft%-chest") ~= nil or n:find("chest%-row") ~= nil
+end
+local function storageRank(p_Name)
+    if m_FreeSlots ~= nil and m_FreeSlots <= STORAGE_FULL_SLOTS and makesStorage(p_Name) then return 1 end
+    return 0
+end
 local function craftIsWaiting()
     for _, t in pairs(DATA["tasks"] or {}) do
         -- A craft that has already FAILED is not waiting for the crafter, it is waiting for materials
         -- -- craft-oak_planks with no log in the settlement held the crafter out of building for a
         -- whole fuel emergency (2026-09-04) while it was the only drone with fuel to lay bricks.
+        -- and a craft held for missing inputs cannot run, so it must not keep the crafter idle either
         if type(t) == "table" and t.work and t.work.craft and t.assignedTo == nil and taskLive(t)
-           and (tonumber(t.attempts) or 0) == 0 then
+           and (tonumber(t.attempts) or 0) == 0 and craftShortIn(t) == nil then
             return true
         end
     end
@@ -934,8 +965,14 @@ local function crafterFreeOfCrafts(p_Where, p_Task, p_MinFuel)
     if craftIsWaiting() then return nil end
     return pickDrone("crafter", p_Where, p_Task.lastFailedBy, p_MinFuel)
 end
+-- A miner is held back from a build while wood or ore waits -- unless the build is the storage
+-- row, which is itself the economy.
+local function minerHeldForEconomy(p_Task, p_Role)
+    if p_Role ~= "miner" or not (p_Task.work and p_Task.work.build) then return false end
+    return economyWaiting() and not makesStorage(p_Task.name)
+end
 local function pickForTask(p_Task, p_Role, p_Where, p_MinFuel)
-    if p_Task.work and p_Task.work.build and p_Role == "miner" and economyWaiting() then
+    if minerHeldForEconomy(p_Task, p_Role) then
         local s_Other = pickDrone("scout", p_Where, p_Task.lastFailedBy, p_MinFuel)
                      or pickDrone("loader", p_Where, p_Task.lastFailedBy, p_MinFuel)
         if s_Other then return s_Other end
@@ -1377,36 +1414,6 @@ local FUEL_STOCK_TTL = 30
 local m_FuelStock, m_FuelBest, m_FuelStockAt = nil, nil, -1000
 
 -- One read, two numbers, because two different questions are asked of it.
--- STORAGE FIRST WHEN THERE IS NONE. With the shelf full, every task that makes more shelf --
--- lumber for planks, planks for chests, chests, the chest-row build -- is served before anything
--- else of the same priority. Crafting or mining things there is no room to store is wasted work
--- (the user, 2026-09-05: "if we have no storage that needs prio over crafting shit we cant store").
-local STORAGE_FULL_SLOTS = 6
-local m_FreeSlots = nil
-local m_StockCounts = nil
--- A CRAFT WITH NO INPUTS ON THE SHELF IS NOT DISPATCHED. The crafter flew to the bay for
--- craft-oak_planks thirty times in twenty minutes (2026-09-05 02:48-03:09) to find zero logs each
--- time -- "short of minecraft:oak_log x32" -- and threw. The stock reply already says so.
-local function craftShortIn(p_Task)
-    local w = p_Task and p_Task.work and p_Task.work.craft
-    if type(w) ~= "table" or type(w.inputs) ~= "table" or m_StockCounts == nil then return nil end
-    local s_Runs = math.max(1, tonumber(w.runs) or 1)
-    for name, per in pairs(w.inputs) do
-        local s_Need = (tonumber(per) or 0) * s_Runs
-        local s_Have = m_StockCounts[tostring(name)] or 0
-        if s_Have < math.min(s_Need, tonumber(per) or 0) then return tostring(name) end   -- not even one run
-    end
-    return nil
-end
-local function makesStorage(p_Name)
-    local n = tostring(p_Name or "")
-    return n:find("^lumber:") ~= nil or n:find("oak_planks", 1, true) ~= nil
-        or n:find("craft%-chest") ~= nil or n:find("chest%-row") ~= nil
-end
-local function storageRank(p_Name)
-    if m_FreeSlots ~= nil and m_FreeSlots <= STORAGE_FULL_SLOTS and makesStorage(p_Name) then return 1 end
-    return 0
-end
 local function readFuelStock()
     if m_FuelStock ~= nil and (os.clock() - m_FuelStockAt) < FUEL_STOCK_TTL then
         return m_FuelStock, m_FuelBest
