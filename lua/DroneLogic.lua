@@ -3841,6 +3841,32 @@ end
 -- pose and the region centre are on disk; a drone that knows roughly where it is and where home is
 -- walks home, high (wireless and GPS both reach further with altitude), and takes a fix as soon as
 -- one appears.
+-- WHEN THE MAP CANNOT ANSWER, FLY STRAIGHT. Out of wireless range there is no MapServer, so every
+-- planned leg fails before its first step -- which is why six woken drones "heading home by
+-- reckoning" never moved a block (2026-09-05 02:15: D2 said it for an hour from -534,69,26). A blind
+-- leg: rise to cruise height without digging, face the axis with the longer way home, fly forward
+-- up to 16 blocks stepping up over anything solid. Sixteen blocks closer is sixteen blocks nearer
+-- the range where the planner answers again.
+function BlindLegHome(p_Hx, p_Hy, p_Hz)
+    local cx, cy, cz = pgps.getCachedPosition()
+    if cx == nil then return false end
+    local s_Cruise = (p_Hy or 64) + 12
+    for _ = 1, math.max(0, s_Cruise - cy) do
+        if not pgps.up() then break end
+    end
+    local s_H = headingToward(cx, cz, p_Hx, p_Hz)
+    if s_H == nil or pgps.turnTo(s_H) == false then return false end
+    local s_Went = 0
+    for _ = 1, 16 do
+        if pgps.forward() then
+            s_Went = s_Went + 1
+        elseif not pgps.up() then
+            break
+        end
+    end
+    trace(("blind leg home: %d block(s) toward %d,%d,%d with no map to ask"):format(s_Went, p_Hx, p_Hy or 64, p_Hz))
+    return s_Went > 0
+end
 function SeekHomeward()
     local hx, hy, hz = HomeXYZ()
     local cx, cy, cz = pgps.getCachedPosition()
@@ -3848,7 +3874,7 @@ function SeekHomeward()
     trace(("no fix and no peers -- heading home toward %d,%d,%d by reckoning to find the GPS"):format(hx, hy, hz))
     for _ = 1, 12 do
         local tx, tz = HomewardLeg(cx, cz, hx, hz)
-        pgps.flyTo(tx, math.max(cy, (hy or 64) + 12), tz, 64)
+        if pgps.flyTo(tx, math.max(cy, (hy or 64) + 12), tz, 64) == false then BlindLegHome(hx, hy, hz) end
         if pgps.verifyPosition(true) then
             trace("found GPS on the way home -- we are placed again")
             return true
@@ -9077,7 +9103,9 @@ local function goHomeIfOutside()
     -- the subject was "heading home", which is not what happened.
     -- Two above the centre, not the centre: the centre is the floor block itself, and D2 spent an
     -- hour "blocked by something unidentified at -480,63,64" trying to fly into it.
-    Tried("fly home from outside the region", TravelTo, hx, hy + 2, hz)
+    local s_Ok, s_Arrived = pcall(TravelTo, hx, hy + 2, hz)
+    if not s_Ok then trace("FAILED to fly home from outside the region -- " .. tostring(s_Arrived)) end
+    if not (s_Ok and s_Arrived) then BlindLegHome(hx, hy, hz) end
 end
 
 -- Idle, under target, fuel available: go and fill up. See the caller for what it cost not to. A

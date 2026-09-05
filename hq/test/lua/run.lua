@@ -890,5 +890,19 @@ test("pgps: a trip stalls against the best distance so far, not the last step, a
     truthy(P.tripStalled(t2, 3) == nil, "under budget")
 end)
 
+
+test("DroneLogic: with no map to ask, a blind leg home rises, faces home and flies sixteen blocks", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.__world.pos = { x = -657, y = 121, z = 62 }
+    local s_Faced, s_Fwd, s_Up = nil, 0, 0
+    env.pgps.turnTo = function(h) s_Faced = h return true end
+    env.pgps.forward = function() s_Fwd = s_Fwd + 1 return true end
+    env.pgps.up = function() s_Up = s_Up + 1 return true end
+    truthy(env.BlindLegHome(-480, 63, 64), "moved")
+    eq(s_Faced, env.pgps.HEADINGS.east, "home is east")
+    eq(s_Fwd, 16, "sixteen blocks forward")
+    eq(s_Up, 0, "already above cruise height: no climb")
+end)
+
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))
 os.exit(failed == 0 and 0 or 1)
