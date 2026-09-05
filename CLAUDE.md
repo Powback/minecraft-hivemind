@@ -854,3 +854,14 @@ gap) or from below (`turtle.placeUp`); stairs keep their heading rule.
 
 HQ's "already built" filter (`squaresAlreadySolid`) agreed with the world within 1% -- the map is
 not the problem; reachability was.
+
+## Builds get materials by handover, and the handover needs room (2026-09-05 15:20)
+
+`OnBuild` asks StorageMan `Provide`; StorageMan pushes items from every chest into ONE pickup
+chest and the drone collects there. With the shelf at 0 free slots every push moved nothing, the
+reply came back `short`, the build "placed what arrived" and threw "ran out of stone_bricks" -- 11
+times in 20 minutes with 119 bricks on the shelf. Now `pickupFor` makes the chest that already
+holds the most of the first item the pickup point (no push for the bulk), and a build short of one
+material skips those squares (`noteSkip "short of X"`) instead of aborting the patch.
+
+Measure floors from the region files, not the map: scratchpad `dump-l0.ts` + `check-map.ts`.
