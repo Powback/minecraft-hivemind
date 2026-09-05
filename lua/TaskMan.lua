@@ -1371,6 +1371,21 @@ local FUEL_STOCK_TTL = 30
 local m_FuelStock, m_FuelBest, m_FuelStockAt = nil, nil, -1000
 
 -- One read, two numbers, because two different questions are asked of it.
+-- STORAGE FIRST WHEN THERE IS NONE. With the shelf full, every task that makes more shelf --
+-- lumber for planks, planks for chests, chests, the chest-row build -- is served before anything
+-- else of the same priority. Crafting or mining things there is no room to store is wasted work
+-- (the user, 2026-09-05: "if we have no storage that needs prio over crafting shit we cant store").
+local STORAGE_FULL_SLOTS = 6
+local m_FreeSlots = nil
+local function makesStorage(p_Name)
+    local n = tostring(p_Name or "")
+    return n:find("^lumber:") ~= nil or n:find("oak_planks", 1, true) ~= nil
+        or n:find("craft%-chest") ~= nil or n:find("chest%-row") ~= nil
+end
+local function storageRank(p_Name)
+    if m_FreeSlots ~= nil and m_FreeSlots <= STORAGE_FULL_SLOTS and makesStorage(p_Name) then return 1 end
+    return 0
+end
 local function readFuelStock()
     if m_FuelStock ~= nil and (os.clock() - m_FuelStockAt) < FUEL_STOCK_TTL then
         return m_FuelStock, m_FuelBest
@@ -1378,6 +1393,7 @@ local function readFuelStock()
     local s_Res = PowNet.sendAndWaitForResponse("StorageMan",
         PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "GetStock", {}), PowNet.SERVER_PROTOCOL, 5)
     if type(s_Res) ~= "table" or type(s_Res.detail) ~= "table" then return nil, nil end
+    m_FreeSlots = tonumber(s_Res.free)          -- the shelf's room, read on the same reply
     local s_Total, s_Best = 0, 0
     for _, e in ipairs(s_Res.detail) do
         if taskProducesFuel(e.name) then
@@ -2703,6 +2719,8 @@ local function orderedTasks()
         local pa = priorityOf(a.task)
         local pb = priorityOf(b.task)
         if pa ~= pb then return pa < pb end
+        local sa, sb = storageRank(a.task.name), storageRank(b.task.name)
+        if sa ~= sb then return sa > sb end
         local fa = fuelRank(a.task.name)
         local fb = fuelRank(b.task.name)
         if fa ~= fb then return fa > fb end
@@ -3547,6 +3565,7 @@ Render()
 -- that greps this file for a line. In the world HiveMindTest is nil and this does nothing.
 if HiveMindTest then
     HiveMindTest.TaskMan = {
+        setFreeSlots = function(n) m_FreeSlots = n end, storageRank = storageRank,
         jobMinFuel = jobMinFuel, workPos = workPos, workCost = workCost, pickDrone = pickDrone,
         noDroneReason = noDroneReason, notPlaceableNow = notPlaceableNow, fleetFuelLow = fleetFuelLow,
         anyoneForBuild = anyoneForBuild,

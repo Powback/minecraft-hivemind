@@ -971,5 +971,18 @@ test("DroneLogic: a craft keeps surplus in the non-grid slots when no container 
     eq(s_Moved.n, 12, "all of the surplus")
 end)
 
+
+test("TaskMan: with the shelf full, the storage chain outranks other work of the same priority", function()
+    local _, T = loadModule("TaskMan.lua")
+    T.setFreeSlots(2)
+    eq(T.storageRank("lumber:oak_log"), 1, "lumber")
+    eq(T.storageRank("craft-oak_planks"), 1, "planks")
+    eq(T.storageRank("craft-chest"), 1, "chests")
+    eq(T.storageRank("build-chest-row-storage-01"), 1, "the row")
+    eq(T.storageRank("tower-L0-p04"), 0, "a tower patch does not")
+    T.setFreeSlots(40)
+    eq(T.storageRank("lumber:oak_log"), 0, "with room on the shelf nothing is special")
+end)
+
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))
 os.exit(failed == 0 and 0 or 1)

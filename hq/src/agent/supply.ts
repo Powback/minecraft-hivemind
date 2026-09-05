@@ -550,6 +550,10 @@ export function producesFuel(match: string): boolean {
  * a test shaped exactly like the bug it was written for, checking a duplicate of the code instead
  * of the code. It now imports this function.
  */
+/** The storage chain: what a full shelf must still be allowed to make. */
+export function makesStorage(match: string): boolean {
+  return /oak_log|oak_planks|:chest$|^chest$/.test(match);
+}
 export function ruleSkipReason(
   rule: SupplyRule,
   gate: { fuelCritical: boolean; have: number; cooldownUntil: number; now: number; storageFull?: boolean },
@@ -570,7 +574,10 @@ export function ruleSkipReason(
   //
   // Fuel is exempt: coal is burned, not shelved, so it is worth fetching with every slot full --
   // and it is what a drone needs to reach a chest at all. Everything else waits for room.
-  if (gate.storageFull && !/coal/.test(rule.match)) {
+  // A full shelf stops everything EXCEPT fuel and the chain that makes more shelf: logs -> planks
+  // -> chests -> a chest row. Gating those too (2026-09-05) was the deadlock: no logs, so no
+  // planks, so no chests, so no new row, so the shelf stayed full and nothing else could run.
+  if (gate.storageFull && !/coal/.test(rule.match) && !makesStorage(rule.match)) {
     return { kind: 'full', message: `${rule.match} (storage has no free slot)` };
   }
   if (gate.have >= rule.min) return { kind: 'satisfied' };

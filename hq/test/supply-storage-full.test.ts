@@ -36,6 +36,13 @@ describe('a full warehouse stops the digging', () => {
    * warehouse is no reason to stop fetching it -- and stopping would strand the fleet exactly when
    * it needs to be able to move to fix the problem.
    */
+  it('never stops the chain that makes more shelf: logs, planks, chests', () => {
+    expect(skip('oak_log', { storageFull: true })).toBeNull();
+    expect(skip('minecraft:oak_planks', { storageFull: true })).toBeNull();
+    expect(skip('minecraft:chest', { storageFull: true })).toBeNull();
+    expect(skip('minecraft:stone_bricks', { storageFull: true })?.kind).toBe('full');
+  });
+
   it('never stops fetching fuel, however full the warehouse', () => {
     expect(skip('coal_ore', { storageFull: true })).toBe(null);
     expect(skip('charcoal', { storageFull: true })).toBe(null);
