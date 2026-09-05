@@ -1161,5 +1161,37 @@ test("DroneLogic: a Tried action that keeps failing surfaces once; a success cle
     eq(#s_D, 1, "the count reset on the success, so four more are quiet again")
 end)
 
+
+test("DroneLogic: DescendToAccess enters a chest from a staging height straight down its own column", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.HomeXYZ = function() return -480, 64, 64 end
+    env.__world.pos = { x = 0, y = 64, z = 0 }
+    local s_Legs, s_Downs = {}, 0
+    env.TravelTo = function(x, y, z) s_Legs[#s_Legs + 1] = y; env.__world.pos = { x = x, y = y, z = z }; return true end
+    env.pgps.down = function() env.__world.pos.y = env.__world.pos.y - 1; s_Downs = s_Downs + 1; return true end
+    truthy(env.DescendToAccess(-476, 65, 78, "pickup"), "arrived on the access square")
+    truthy(s_Legs[1] >= 74, "went to a staging height above the base first (got " .. tostring(s_Legs[1]) .. ")")
+    truthy(s_Downs >= 1, "descended straight down its column")
+end)
+
+test("DroneLogic: DescendToAccess holds (fails) when the access square below is occupied", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.HomeXYZ = function() return -480, 64, 64 end
+    env.__world.pos = { x = 0, y = 64, z = 0 }
+    env.TravelTo = function(x, y, z) env.__world.pos = { x = x, y = y, z = z }; return true end
+    env.pgps.down = function() return false end          -- something on the square below
+    eq(env.DescendToAccess(-476, 65, 78, "pickup"), false, "did not force in; holds high for a retry")
+end)
+
+
+test("DroneLogic: only bay chests get vertical staging, not deep caches", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.HomeXYZ = function() return -480, 64, 64 end
+    truthy(env.IsBayChest(-476, 65, 78), "a bay chest near home at working height")
+    truthy(not env.IsBayChest(-480, 8, 87), "a deep cache is not a bay chest")
+    truthy(not env.IsBayChest(-540, 64, 52), "a far chest is not a bay chest")
+    eq(env.DescendToAccess(-480, 8, 87, "haul"), false, "no staging for the deep cache -- falls through")
+end)
+
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))
 os.exit(failed == 0 and 0 or 1)

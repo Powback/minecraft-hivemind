@@ -4308,7 +4308,45 @@ end
 -- drones cycling deposits produced a continuous stream of requests that every drone had to receive
 -- and evaluate, almost all about squares nobody was standing on. A guess dressed up as an
 -- optimisation.
+-- BAY TRAFFIC CONTROL: EACH CHEST IS A VERTICAL LANE, ENTERED FROM ABOVE, HELD FOR OUTSIDE.
+--
+-- The six bay chests sit in one row against a wall, so every drone threaded the same north
+-- corridor (z77) to reach them, queued there, jostled, and the position bookkeeping thrashed in
+-- the crowd -- most of a build cycle spent "stepping aside" while nothing was placed (traced
+-- 2026-09-05 17:45). Deposits and pickups already SPREAD across the six chests by drone id; this
+-- gives each chest its own approach: climb to a staging height directly ABOVE the target, then
+-- descend straight down its own column onto the access square. If the square is occupied, hold at
+-- the staging height -- out of everyone's way -- and try the descent again, instead of circling in
+-- the shared corridor. The horizontal move happens up high where there is room, not at chest level.
+BAY_STAGE_UP = 10
+-- Only the bay chests get the vertical-lane treatment: near home, at working height. A deep field
+-- cache (y8, 60 blocks out) must NOT be approached by climbing to y74 and dropping 66 blocks.
+function IsBayChest(p_X, p_Y, p_Z)
+    local hx, hy, hz = HomeXYZ()
+    if hx == nil then return false end
+    return math.abs(p_X - hx) <= 24 and math.abs(p_Z - hz) <= 24 and math.abs(p_Y - (hy or 64)) <= 4
+end
+function DescendToAccess(p_X, p_Y, p_Z, p_What)
+    if not IsBayChest(p_X, p_Y, p_Z) then return false end
+    local _, hy = HomeXYZ()
+    local s_Stage = math.max((hy or 64) + BAY_STAGE_UP, p_Y + 3)
+    if not TravelTo(p_X, s_Stage, p_Z, s_Stage + 2) then return false end   -- to the top of our own column
+    for _ = 1, (s_Stage - p_Y) + 2 do
+        local cx, cy, cz = pgps.getCachedPosition()
+        if cx == p_X and cy == p_Y and cz == p_Z then return true end
+        if cx ~= p_X or cz ~= p_Z then                                     -- drifted off the column: recentre high
+            if not TravelTo(p_X, s_Stage, p_Z, s_Stage + 2) then return false end
+        elseif not pgps.down() then
+            return false                                                   -- square below is occupied: hold here, caller retries
+        end
+    end
+    local fx, fy, fz = pgps.getCachedPosition()
+    return fx == p_X and fy == p_Y and fz == p_Z
+end
 function ArriveOrAskToMove(p_X, p_Y, p_Z, p_Ceiling, p_What)
+    -- A bay chest (its access is one cell above a chest at working height) is reached from directly
+    -- above, down its own lane. Fall through to the old corridor arrival only if the lane fails.
+    if DescendToAccess(p_X, p_Y, p_Z, p_What) then return true end
     local s_Arrived = ArriveAt(p_X, p_Y, p_Z, p_Ceiling)
     if s_Arrived then return true end
 
