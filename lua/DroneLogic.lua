@@ -186,18 +186,37 @@ local function HEADINGS_() return pgps.HEADINGS end
 -- the stuck drone (2026-09-05: D41's "%d on nil" top-up crash, unseen for an hour). A domain failure
 -- ("could not reach the chest") stays a local trace; a Lua error -- recognised by its `file.lua:NN`
 -- stamp -- is reported to HQ ONCE per unique message, so it surfaces on the brief and the monitor.
-local m_CodeErrSeen = {}
+-- CAUGHT IS NOT THE SAME AS SEEN. A failure here used to be a line in this one drone's log and
+-- nothing more: a real CODE error (nil where a number was expected) limped on invisibly, and a
+-- DOMAIN failure that never stopped happening ("could not reach the chest", every few seconds for
+-- ten minutes) was equally silent to HQ. Now nothing loops in silence:
+--   * a Lua error (its `file.lua:NN` stamp) surfaces to HQ once per unique message;
+--   * any action that fails REPEATEDLY -- the same p_What, TRIED_ESCALATE times without a success
+--     in between -- surfaces once, because a retry that never succeeds is a stuck drone.
+-- A success clears the count, so a one-off retry stays quiet, which is the whole point of Tried.
+-- globals, not locals: the main chunk is at Lua's 200-local ceiling (see other helpers here)
+m_CodeErrSeen = {}
+m_TriedFails = {}
+TRIED_ESCALATE = 5
 function Tried(p_What, p_Fn, ...)
     local s_Ok, s_Err = pcall(p_Fn, ...)
-    if not s_Ok then
-        trace("FAILED to " .. tostring(p_What) .. " -- " .. tostring(s_Err))
-        local s_Msg = tostring(s_Err)
-        if s_Msg:find("%.lua:%d") and not m_CodeErrSeen[s_Msg] then
-            m_CodeErrSeen[s_Msg] = true
-            Distress("code error", (p_What or "?") .. ": " .. s_Msg, false)
-        end
+    local s_Key = tostring(p_What)
+    if s_Ok then
+        m_TriedFails[s_Key] = nil
+        return true
     end
-    return s_Ok
+    trace("FAILED to " .. s_Key .. " -- " .. tostring(s_Err))
+    local s_Msg = tostring(s_Err)
+    if s_Msg:find("%.lua:%d") and not m_CodeErrSeen[s_Msg] then
+        m_CodeErrSeen[s_Msg] = true
+        Distress("code error", s_Key .. ": " .. s_Msg, false)
+    end
+    local s_N = (m_TriedFails[s_Key] or 0) + 1
+    m_TriedFails[s_Key] = s_N
+    if s_N == TRIED_ESCALATE then
+        Distress("stuck retrying", ("%s has failed %d times running -- %s"):format(s_Key, s_N, s_Msg), false)
+    end
+    return false
 end
 
 -- A DOCK IS BORROWED, NOT OWNED.

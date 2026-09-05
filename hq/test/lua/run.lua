@@ -1145,5 +1145,20 @@ test("DroneLogic: Tried reports a Lua code error to HQ once, but not a plain dom
     truthy(s_Distress[1]:find("code error", 1, true), "reported as a code error")
 end)
 
+
+test("DroneLogic: a Tried action that keeps failing surfaces once; a success clears the count", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    local s_D = {}
+    env.Distress = function(reason, detail) s_D[#s_D + 1] = reason end
+    for _ = 1, 4 do env.Tried("reach the chest", function() error("no route", 0) end) end
+    eq(#s_D, 0, "four failures are still quiet")
+    env.Tried("reach the chest", function() error("no route", 0) end)          -- the fifth
+    eq(#s_D, 1, "the fifth in a row surfaces as stuck retrying")
+    eq(s_D[1], "stuck retrying", "reported so")
+    truthy(env.Tried("reach the chest", function() return true end), "a success")
+    for _ = 1, 4 do env.Tried("reach the chest", function() error("no route", 0) end) end
+    eq(#s_D, 1, "the count reset on the success, so four more are quiet again")
+end)
+
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))
 os.exit(failed == 0 and 0 or 1)
