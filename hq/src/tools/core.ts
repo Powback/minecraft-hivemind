@@ -21,7 +21,8 @@ import { allocate, checkOrder, SPEC, type Purpose } from '../world/plots.js';
 import { city, saveCity, factories } from '../world/city.js';
 import { chain, unmetInputs, buildOrder, inputsOf, type Factory } from '../world/factories.js';
 import { BLUEPRINTS, blueprint, materials, placementOrder, footprint } from '../world/blueprints.js';
-import { PALETTES, towerFloor, floorCost, specForLevel, LEVELS, TOWER_TOP } from '../world/tower.js';
+import { PALETTES, towerFloor, floorCost, specForLevel, LEVELS, TOWER_TOP, bayIsFlightPath } from '../world/tower.js';
+import { outfitBay } from '../world/bay.js';
 import { supply, runSupplyTick, saveSupply, stockKey, type SupplyRule } from '../agent/supply.js';
 import { luaList, field, numField } from '../lua-table.js';
 import { readStockMap } from '../world/stock.js';
@@ -2644,6 +2645,81 @@ registry.register({
       note: skipped
         ? `${skipped} block(s) skipped -- no stock for them yet; reface when the smelters run`
         : 'everything affordable',
+    };
+  },
+});
+
+
+// ── order.bay ──────────────────────────────────────────────────────────────
+// The other half of order.tower. order.tower builds the SHELL; this outfits the bays inside it --
+// the chests, machines and wiring a floor needs to actually do its job -- generated from the design
+// (outfitBay reads what the level is FOR) rather than placed by hand. A storage floor's bays become
+// sorted single-item racks; the smelt floor's become furnace banks; floors whose machines cannot be
+// built yet are skipped, honestly, as 'pending'. Returns the world coordinates of every chest,
+// machine and modem it queued, so a commissioning step can activate the modems (a drone can place
+// one but not switch it on) and register the chests as deposit points once they are built.
+registry.register({
+  name: 'order.bay',
+  summary: 'Outfit a floor\'s bays from the design: build their generated interiors against each bay address.',
+  description:
+    'order.tower lays the shell; this fills the bays. Reads the floor\'s purpose to decide each bay ' +
+    '(storage floors -> sorted single-item chest racks; smelt -> furnace bank; others left as shells ' +
+    'until their machines are buildable) and dispatches one build per bay, skipping the flight-notch ' +
+    'bay. Returns the placed chests/machines/modems in world coordinates for the commissioning and ' +
+    'deposit-registration steps that follow.',
+  params: z.object({
+    level: z.number().int().min(-3).max(7),
+    sector: z.number().int().min(0).optional()
+      .describe('One bay; omit to outfit every buildable bay on the level.'),
+  }).strict(),
+  returns: 'Per-bay role and build task id, plus chest/machine/modem world positions.',
+  danger: 'mutate',
+  handler: async (a, ctx) => {
+    // verify-at-effect: the effect of order.bay is DISPATCH, not placement -- the drones place the
+    // blocks asynchronously later, so there is nothing to re-read at call time. What it CAN confirm
+    // it does: each TaskMan.Add returns the created task's id, and a string return is a refusal that
+    // is surfaced as `refused` rather than reported as success. The placement itself is verified by
+    // the build tasks (OnBuild re-reads and only marks a square done when the map agrees).
+    const spec = specForLevel(a.level);
+    const base = settlement.base;
+    const origin = { x: base.x, y: base.y + a.level * spec.floorHeight, z: base.z };
+    const toWorld = (c: { dx: number; dy: number; dz: number }) =>
+      ({ x: origin.x + c.dx, y: origin.y + c.dy, z: origin.z + c.dz });
+    // Bottom-up within a bay: a chest must exist before the modem that caps it can be placed.
+    const bottomUp = (blocks: any[]) => [...blocks].sort((p, q) =>
+      p.dy - q.dy || (Math.abs(p.dx) + Math.abs(p.dz)) - (Math.abs(q.dx) + Math.abs(q.dz)));
+
+    const sectors = a.sector !== undefined
+      ? [a.sector]
+      : Array.from({ length: spec.sectors }, (_, i) => i);
+
+    const bays: any[] = [];
+    let refused: string | undefined;
+    for (const sector of sectors) {
+      // The notch is a vertical flight channel, not a room -- never furnish it.
+      if (bayIsFlightPath(spec, sector)) { bays.push({ sector, role: 'notch', task: null }); continue; }
+      const plan = outfitBay(spec, a.level, sector);
+      if (plan.interior.blocks.length === 0) { bays.push({ sector, role: plan.role, task: null }); continue; }
+      const res: any = await bridge.call('TaskMan', 'Add', {
+        name: `bay-L${a.level}-s${sector}`,
+        // After the shell (2) and fuel (1): a bay interior needs its floor slab already standing.
+        priority: 3,
+        work: { build: { origin, blocks: bottomUp(plan.interior.blocks) } },
+      }, { timeoutMs: 12000 });
+      if (typeof res === 'string') { refused = res; break; }
+      bays.push({
+        sector, role: plan.role, task: res?.id,
+        chests: plan.interior.chests.map(toWorld),
+        machines: plan.interior.machines.map(toWorld),
+        modems: plan.interior.modems.map(toWorld),
+      });
+    }
+
+    ctx.log('order.bay', { level: a.level, bays: bays.filter((b) => b.task).length, refused });
+    return {
+      level: a.level, name: LEVELS.find((l) => l.index === a.level)?.name ?? String(a.level),
+      origin, bays, refused,
+      note: 'modems are inert until commissioned; chests register as deposits once built',
     };
   },
 });
