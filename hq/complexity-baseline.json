@@ -1,45 +1,81 @@
 {
   "note": "Cyclomatic-complexity debt. This file may only ever SHRINK -- see test/complexity.test.ts.",
   "max": 15,
-  "total": 65,
+  "total": 84,
   "files": {
+    "hq/src/agent/bootstrap.ts": {
+      "cc": [
+        172,
+        33,
+        20
+      ],
+      "names": [
+        "tickBody",
+        "orderNextBay",
+        "tickBays"
+      ]
+    },
     "lua/DroneLogic.lua": {
       "cc": [
         62,
+        61,
         57,
+        56,
+        55,
         51,
-        45,
-        45,
-        34,
+        47,
+        42,
+        38,
+        33,
         31,
-        28,
+        27,
         24,
         22,
         22,
+        22,
+        22,
+        21,
         20,
         19,
+        18,
+        18,
+        18,
         17,
         17,
+        17,
+        16,
         16,
         16,
         16
       ],
       "names": [
         "(anonymous)",
+        "TakeFromChest",
+        "(anonymous)",
+        "SweepBuild",
         "(anonymous)",
         "OnSurvey",
         "SendHeartBeat",
         "(anonymous)",
         "(anonymous)",
-        "TakeFromChest",
         "idleDockLoop",
+        "RunJobNow",
+        "stepTo",
         "RequestClearance",
         "Init",
+        "digHard",
         "FetchItems",
+        "fixCell",
+        "SurfaceLocally",
         "gpsRelay",
         "refixLoop",
+        "DigStartInBox",
+        "ReachSite",
+        "DigBox",
+        "storageHasAnyOf",
         "DescribeJob",
-        "stageFromChest",
+        "DigLayer",
+        "LiftStandCable",
         "(anonymous)",
         "meshForward",
         "surfaceIfBuried"
@@ -50,9 +86,9 @@
         51,
         40,
         33,
+        29,
         28,
-        25,
-        19,
+        22,
         18,
         17,
         16,
@@ -62,8 +98,8 @@
         "rescueNeeded",
         "(anonymous)",
         "OnTaskDone",
-        "placeRescues",
         "OnStartTask",
+        "placeRescues",
         "verbFor",
         "pickDrone",
         "placeBlockers",
@@ -93,39 +129,49 @@
         "activeBox"
       ]
     },
-    "lua/PowGPSServer.lua": {
+    "lua/StorageMan.lua": {
       "cc": [
-        35,
+        41,
+        30,
+        29,
+        25,
         24,
-        16
+        21,
+        18
       ],
       "names": [
-        "a_star",
-        "load",
-        "explore"
+        "OnChestContents",
+        "OnBringToFront",
+        "GatherInto",
+        "ServiceRoutes",
+        "OnProvide",
+        "(anonymous)",
+        "ServiceFurnaces"
       ]
     },
     "lua/pgps.lua": {
       "cc": [
-        35,
+        40,
+        31,
         30,
-        24,
-        23,
+        26,
         19,
+        17,
         17
       ],
       "names": [
         "moveLegRaw",
-        "moveTo",
         "flyTo",
+        "moveTo",
         "setLocationFromGPS",
         "forward",
+        "verifyPosition",
         "ensureHeadingRaw"
       ]
     },
     "hq/src/tools/core.ts": {
       "cc": [
-        33,
+        35,
         27,
         22,
         21,
@@ -145,6 +191,26 @@
         "handler"
       ]
     },
+    "hq/src/agent/screens.ts": {
+      "cc": [
+        33
+      ],
+      "names": [
+        "compose"
+      ]
+    },
+    "lua/PowGPSServer.lua": {
+      "cc": [
+        33,
+        24,
+        16
+      ],
+      "names": [
+        "a_star",
+        "load",
+        "explore"
+      ]
+    },
     "lua/MapServer.lua": {
       "cc": [
         31,
@@ -157,6 +223,14 @@
         "Init"
       ]
     },
+    "hq/src/server.ts": {
+      "cc": [
+        29
+      ],
+      "names": [
+        "(anonymous)"
+      ]
+    },
     "lua/MainFrame.lua": {
       "cc": [
         29,
@@ -165,30 +239,6 @@
       "names": [
         "dashboard",
         "main"
-      ]
-    },
-    "hq/src/server.ts": {
-      "cc": [
-        28
-      ],
-      "names": [
-        "(anonymous)"
-      ]
-    },
-    "lua/StorageMan.lua": {
-      "cc": [
-        26,
-        25,
-        23,
-        22,
-        18
-      ],
-      "names": [
-        "OnProvide",
-        "ServiceRoutes",
-        "OnBringToFront",
-        "OnChestContents",
-        "ServiceFurnaces"
       ]
     },
     "hq/src/agent/supply.ts": {

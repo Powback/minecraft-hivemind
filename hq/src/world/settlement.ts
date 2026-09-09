@@ -25,44 +25,74 @@ export interface Settlement {
   base: { x: number; y: number; z: number };
   /** How far from base the fleet may operate. Must stay inside the force-loaded chunks. */
   reach: number;
+  /** The rednet repeater and how far it is heard: the fleet's radio horizon. */
+  radio: Array<{ x: number; y: number; z: number; range: number }>;
   /** GPS hosts, as placed by bootstrap/gps.sh. */
   gpsHosts: Array<{ x: number; y: number; z: number }>;
 }
 
-export const settlement: Settlement = {
-  base: {
-    x: Number(process.env.HIVE_BASE_X ?? -480),
-    y: Number(process.env.HIVE_BASE_Y ?? 63),
-    z: Number(process.env.HIVE_BASE_Z ?? 64),
-  },
-  // MEASURED, NOT CHOSEN. The bounds were 96 while four-host GPS coverage was 32 -- so the fleet was
-  // authorised to work in an area NINE TIMES larger than it could navigate in, and every drone sent
-  // to the edge stranded with "outside coverage: no gps coverage" while nothing had actually failed.
-  // Two limits, and the tighter one wins. GPS coverage allows 68. RADIO does not: every module sits
-  // in the tower, a drone must reach the mast repeater to be heard at all, and 56 is the radius at
-  // which both a ground drone and one cruising at y=110 stay inside modem range of it. A drone
-  // beyond that is not lost -- it is working perfectly and cannot tell anyone, which reads as lost
-  // and is worse.
-  reach: Number(process.env.HIVE_REACH ?? 56),
-  gpsHosts: [
-    { x: -546, y: 70, z: -2 },
-    { x: -546, y: 83, z: 42 },
-    { x: -546, y: 96, z: 86 },
-    { x: -546, y: 78, z: 130 },
-    { x: -502, y: 91, z: -2 },
-    { x: -502, y: 73, z: 42 },
-    { x: -502, y: 86, z: 86 },
-    { x: -502, y: 99, z: 130 },
-    { x: -458, y: 81, z: -2 },
-    { x: -458, y: 94, z: 42 },
-    { x: -458, y: 76, z: 86 },
-    { x: -458, y: 89, z: 130 },
-    { x: -414, y: 71, z: -2 },
-    { x: -414, y: 84, z: 42 },
-    { x: -414, y: 97, z: 86 },
-    { x: -414, y: 79, z: 130 },
-  ],
-};
+export const settlement: Settlement = (() => {
+  // ONE SOURCE OF TRUTH: the tower centre. Everything else is COMPUTED from it, so relocating the
+  // settlement is a three-number change and never a hunt through hardcoded coordinate lists again
+  // (the -480 world baked its 16 GPS hosts, its base and its bounds as literals in five places).
+  const base = {
+    x: Number(process.env.HIVE_BASE_X ?? 64),
+    y: Number(process.env.HIVE_BASE_Y ?? 66),
+    z: Number(process.env.HIVE_BASE_Z ?? 32),
+  };
+  // GPS: FOUR hosts in a plus on the tower roof, and nothing else. Two at the roof height, two four
+  // blocks lower, so the four are never coplanar (an all-same-y set leaves altitude undetermined).
+  // The roof is the cap level's ceiling: ground + (levels 0..7) * floorHeight. Hosts stay clear of
+  // the centre column, which is the docking / shaft axis. A 22-host ring was the previous answer and
+  // was pure overreach: two drones and one tower need four hosts within earshot, not twenty-two.
+  const FLOORS_ABOVE_GROUND = 8, FLOOR_HEIGHT = 6, ARM = 2, DROP = 4;
+  const roof = base.y + FLOORS_ABOVE_GROUND * FLOOR_HEIGHT;
+  const gpsHosts = [
+    { x: base.x,           y: roof,        z: base.z - ARM     },
+    { x: base.x,           y: roof,        z: base.z + ARM + 1 },
+    { x: base.x - ARM,     y: roof - DROP, z: base.z           },
+    { x: base.x + ARM + 1, y: roof - DROP, z: base.z           },
+    // Basement ring (#23-26, y61/63) -- near-coplanar, so alone it never fixed a drone underground.
+    { x: base.x,      y: base.y - 3,  z: base.z + 16 },
+    { x: base.x + 16, y: base.y - 5,  z: base.z      },
+    { x: base.x - 16, y: base.y - 5,  z: base.z      },
+    { x: base.x,      y: base.y - 3,  z: base.z - 16 },
+    // Deep hosts (#37-39, y26) placed 2026-09-08 after D1 ran two hours without a fix and ended 25
+    // blocks off its dead-reckoned pose. With these the basement geometry is three-dimensional.
+    { x: base.x + 15, y: base.y - 40, z: base.z + 8  },
+    { x: base.x - 15, y: base.y - 40, z: base.z - 8  },
+    { x: base.x,      y: base.y - 40, z: base.z + 18 },
+    { x: base.x,      y: base.y - 40, z: base.z - 18 },   // #41, 2026-09-09: below y0 only three deep hosts were in range
+  ];
+  // The rednet repeater on the GPS mast (bootstrap/repeater.sh): modem range grows with altitude
+  // and CC:T uses the larger of the two ranges, so this is the one radio every drone must stay
+  // within. ~93 blocks at y=116; 88 leaves a margin for the drone's own step. Without it, drones at
+  // the 72-block reach were 79 blocks from MapServer and deaf (2026-09-08).
+  // Two stations: the mast repeater (heard ~93 blocks at y=116) and the module row itself (64 at
+  // ground level), which is what a drone at the bottom of the basement actually talks to.
+  const radio = [
+    { x: base.x, y: base.y + 50, z: base.z, range: Number(process.env.HIVE_RADIO_RANGE ?? 88) },
+    { x: base.x, y: base.y + 2, z: base.z - 4, range: 60 },
+    // Basement repeater (computer #35) outside the level -7 wall: MapServer's own modem reaches
+    // ~y10 straight down and the deep basements' diggers went deaf below it (2026-09-08 18:33).
+    { x: base.x + 13, y: base.y - 40, z: base.z, range: 60 },
+  ];
+  return { base, reach: Number(process.env.HIVE_REACH ?? 56), gpsHosts, radio };
+})();
+
+/** Inside the repeater's radio range in three dimensions -- the reach circle is horizontal only,
+ *  and an ore seam fifty blocks down at the edge of it is out of earshot. */
+export function withinRadio(p: { x: number; y: number; z: number }): boolean {
+  return settlement.radio.some((r) => {
+    const dx = p.x - r.x, dy = p.y - r.y, dz = p.z - r.z;
+    return dx * dx + dy * dy + dz * dz <= r.range * r.range;
+  });
+}
+
+/** The stations as one scalar for the bounds push: MapServer's param validator rejects nested tables. */
+export function radioParam(): string {
+  return settlement.radio.map((r) => `${r.x},${r.y},${r.z},${r.range}`).join(';');
+}
 
 /**
  * Is this position inside the circle the fleet may work in?
@@ -110,7 +140,8 @@ export async function pushSettlement(
     // drone could legally walk into and then never be heard from again. Two drones died in them.
     await call('MapServer', 'bounds',
       { ...bounds(), reach: settlement.reach,
-        cx: settlement.base.x, cy: settlement.base.y, cz: settlement.base.z },
+        cx: settlement.base.x, cy: settlement.base.y, cz: settlement.base.z,
+        radio: radioParam() },
       { timeoutMs: 8000 });
     ok = true;
   } catch (err) {
@@ -147,4 +178,39 @@ export async function pushSettlement(
     } catch { failed.push(`${h.x},${h.y},${h.z}`); }
   }
   return { bounds: ok, boundsError, hosts, expected: settlement.gpsHosts.length, failed };
+}
+
+/**
+ * THE MODULE STATIONS, derived from the base exactly as bootstrap placed them (scratchpad
+ * stations.sh, 2026-09-08): a square ring of radius 7 around the centre at ground level, each
+ * station a 3-wide x 4-tall advanced monitor (y base+1..base+4) with its computer beside it at
+ * base+2 and a wireless modem on top. "Left" is as seen by someone in the room facing the wall.
+ * `origin` is the monitor block at the panel's top-left as seen from the front (monitor-space
+ * xIndex 0 / yIndex 0), which is what a renderer needs to lay text on it.
+ */
+export interface Station {
+  label: string;
+  facing: 'north' | 'south' | 'east' | 'west';
+  computer: { x: number; y: number; z: number };
+  origin: { x: number; y: number; z: number };
+  width: number;
+  height: number;
+}
+export function stations(): Station[] {
+  const b = settlement.base, R = 7, top = b.y + 4, cy = b.y + 2;
+  const N = b.z - R, E = b.x + R, W = b.x - R;
+  const st = (label: string, facing: Station['facing'], cx: number, cz: number, ox: number, oz: number): Station =>
+    ({ label, facing, computer: { x: cx, y: cy, z: cz }, origin: { x: ox, y: top, z: oz }, width: 3, height: 4 });
+  return [
+    // North wall faces south: viewer-left is west, so the panel's left edge is its lowest x.
+    st('MainFrame', 'south', b.x + 1, N, b.x - 2, N),
+    st('DroneMan',  'south', b.x - 3, N, b.x - 6, N),
+    st('TaskMan',   'south', b.x + 5, N, b.x + 2, N),
+    // East wall faces west: viewer-left is north, the panel's left edge is its lowest z.
+    st('MapServer',  'west', E, b.z - 2, E, b.z - 5),
+    st('DockingMan', 'west', E, b.z + 4, E, b.z + 1),
+    // West wall faces east: viewer-left is south, the panel's left edge is its HIGHEST z.
+    st('StorageMan', 'east', W, b.z - 5, W, b.z - 2),
+    st('Bridge',     'east', W, b.z + 1, W, b.z + 4),
+  ];
 }

@@ -9,7 +9,11 @@ services:
   hq:
     build: .
     container_name: hive-hq
+    # RCON (password from .env, gitignored): only to flip the peripheral state on wired modems the
+    # drones placed -- the one act a turtle cannot perform. Never to place or remove blocks.
+    env_file: .env
     environment:
+      - RCON_HOST=mc-create121
       - PORT=4400
       - LUA_DIR=/lua
       # 60, not 56: the nearest real forest (a 27-log trunk column at -525,29 among others) sits 57
@@ -44,6 +48,7 @@ services:
     networks:
       - default
       - traefik
+      - minecraft
 
   # The fault monitor, as a service: it outlives terminal sessions, which the bin/ script does not.
   # RCON_PASSWORD comes from .env (gitignored); the game server's network is joined for tellraw.

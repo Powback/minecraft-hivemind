@@ -50,41 +50,87 @@ function _G.Log(p_Message, p_Color)
             h.close()
         end
     end)
-    if(peripheral.getType("left") == "monitor" ) then
-        monitor = peripheral.wrap("left")
+    -- THE STATION SCREEN IS THIS MODULE'S OWN LOG, NATIVELY. Whatever monitor is attached on any
+    -- side (peripheral.find; "left" only matched two of the seven stations) shows the last lines
+    -- of this log at text scale 0.5, and the same lines go to /screen.json in this computer's folder
+    -- of the world save, where the world viewer reads them -- no HQ in the loop (the user,
+    -- 2026-09-08). Rate-limited: a module that logs in bursts repaints at most every 2 game-seconds.
+    _G.LOG_RING = _G.LOG_RING or {}
+    LOG_RING[#LOG_RING + 1] = ("%s %s"):format(tostring(math.floor(os.clock())), tostring(p_Message))
+    if #LOG_RING > 40 then table.remove(LOG_RING, 1) end
+    if _G.SCREEN_MON == nil then
+        local ok, m = pcall(peripheral.find, "monitor")
+        _G.SCREEN_MON = (ok and m) or false
     end
-    if(monitor ~= nil) then
-
-        monitor.clear()
-        monitor.setCursorPos(1,1)
-        monitor.setTextScale(1.5)
-        if(p_Color == nil) then
-            p_Color = colors.white
-        end
-        monitor.setTextColor(p_Color)
-        monitor.write(p_Message)
-        monitor.setTextColor(colors.white)
-
+    local s_Now = os.clock()
+    if SCREEN_MON and (_G.SCREEN_AT == nil or s_Now - _G.SCREEN_AT >= 2) then
+        _G.SCREEN_AT = s_Now
+        pcall(function()
+            local m = SCREEN_MON
+            m.setTextScale(0.5)
+            local w, h = m.getSize()
+            m.setBackgroundColour(colors.black) m.clear()
+            m.setCursorPos(1, 1) m.setTextColour(colors.yellow)
+            m.write((tostring(os.getComputerLabel() or "module") .. "  #" .. os.getComputerID()):sub(1, w))
+            m.setTextColour(p_Color or colors.white)
+            local s_First = math.max(1, #LOG_RING - (h - 1) + 1)
+            local row = 2
+            for i = s_First, #LOG_RING do
+                m.setCursorPos(1, row) m.write(LOG_RING[i]:sub(1, w)) row = row + 1
+            end
+            m.setTextColour(colors.white)
+        end)
+        pcall(function()
+            local h = fs.open("/screen.json", "w")
+            if h then
+                h.write(textutils.serialiseJSON({label = os.getComputerLabel(), id = os.getComputerID(),
+                    lines = LOG_RING, updated = os.epoch("utc")}))
+                h.close()
+            end
+        end)
     end
 end
 
 function _G.SetStatus(p_Message, p_Color)
     print(p_Message)
-    if(peripheral.getType("left") == "monitor" ) then
-        monitor = peripheral.wrap("left")
+    -- THE STATION SCREEN IS THIS MODULE'S OWN LOG, NATIVELY. Whatever monitor is attached on any
+    -- side (peripheral.find; "left" only matched two of the seven stations) shows the last lines
+    -- of this log at text scale 0.5, and the same lines go to /screen.json in this computer's folder
+    -- of the world save, where the world viewer reads them -- no HQ in the loop (the user,
+    -- 2026-09-08). Rate-limited: a module that logs in bursts repaints at most every 2 game-seconds.
+    _G.LOG_RING = _G.LOG_RING or {}
+    LOG_RING[#LOG_RING + 1] = ("%s %s"):format(tostring(math.floor(os.clock())), tostring(p_Message))
+    if #LOG_RING > 40 then table.remove(LOG_RING, 1) end
+    if _G.SCREEN_MON == nil then
+        local ok, m = pcall(peripheral.find, "monitor")
+        _G.SCREEN_MON = (ok and m) or false
     end
-    if(monitor ~= nil) then
-
-        monitor.clear()
-        monitor.setCursorPos(1,1)
-        monitor.setTextScale(1.5)
-        if(p_Color == nil) then
-            p_Color = colors.white
-        end
-        monitor.setTextColor(p_Color)
-        monitor.write(p_Message)
-        monitor.setTextColor(colors.white)
-
+    local s_Now = os.clock()
+    if SCREEN_MON and (_G.SCREEN_AT == nil or s_Now - _G.SCREEN_AT >= 2) then
+        _G.SCREEN_AT = s_Now
+        pcall(function()
+            local m = SCREEN_MON
+            m.setTextScale(0.5)
+            local w, h = m.getSize()
+            m.setBackgroundColour(colors.black) m.clear()
+            m.setCursorPos(1, 1) m.setTextColour(colors.yellow)
+            m.write((tostring(os.getComputerLabel() or "module") .. "  #" .. os.getComputerID()):sub(1, w))
+            m.setTextColour(p_Color or colors.white)
+            local s_First = math.max(1, #LOG_RING - (h - 1) + 1)
+            local row = 2
+            for i = s_First, #LOG_RING do
+                m.setCursorPos(1, row) m.write(LOG_RING[i]:sub(1, w)) row = row + 1
+            end
+            m.setTextColour(colors.white)
+        end)
+        pcall(function()
+            local h = fs.open("/screen.json", "w")
+            if h then
+                h.write(textutils.serialiseJSON({label = os.getComputerLabel(), id = os.getComputerID(),
+                    lines = LOG_RING, updated = os.epoch("utc")}))
+                h.close()
+            end
+        end)
     end
 end
 

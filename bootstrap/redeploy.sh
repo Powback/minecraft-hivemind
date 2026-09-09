@@ -59,9 +59,12 @@ IDMAP="$REPO/bootstrap/module-ids.txt"
 
 lookup() {
   local n=$1 id d
-  for d in "$WORLD"/computercraft/computer/*/; do
-    if [ -f "$d$n.lua" ]; then id=$(basename "$d"); break; fi
-  done
+  # The label is authoritative: module.sh writes `os.setComputerLabel("<Label>")` into every module's
+  # startup, so the world itself says which id is which. Matching on "<Label>.lua" missed MainFrame
+  # (it has disk/, not a module file) and fell through to a recorded id from a previous world -- and
+  # deployed there (2026-09-08: chmod on computer/17, a computer this world never allocated).
+  id=$(grep -l "setComputerLabel(\"$n\")" "$WORLD"/computercraft/computer/*/startup 2>/dev/null \
+       | head -1 | sed -E 's|.*/computer/([0-9]+)/startup|\1|')
   [ -z "$id" ] && id=$(awk -v n="$n" '$1==n {print $2}' "$IDMAP" 2>/dev/null)
   [ -z "$id" ] && id=$(cat "$IDS/id-$n.txt" 2>/dev/null || echo "")
   echo "$id"

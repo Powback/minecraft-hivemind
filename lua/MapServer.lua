@@ -203,12 +203,18 @@ function OnSaveWorld(p_ID, p_Message)
     if(p_Message.data == nil) then
         return false, "no data"
     end
+    -- Phase clocks: a save that holds the handler is logged with WHERE the time went, so the next
+    -- "slow handler SaveWorld" is a measurement and not a guess (2026-09-08).
+    local s_T0 = os.clock()
+    local s_Phase = {}
+    local function lap(name) local t = os.clock() s_Phase[#s_Phase + 1] = name .. "=" .. string.format("%.1f", t - s_T0) s_T0 = t end
     if(p_Message.data.cachedWorld) then
         PowGPSServer.UpdateCachedWorld(p_Message.data.cachedWorld, p_ID)
     end
     if(p_Message.data.cachedWorldDetail) then
         PowGPSServer.UpdateCachedWorldDetail(p_Message.data.cachedWorldDetail, p_ID)
     end
+    lap("update")
     -- Index the names as they ARRIVE, rather than scanning the detail map on demand.
     --
     -- That map is now 1.2MB and 1000+ entries. blockData (96KB) still loads, which is why
@@ -216,9 +222,11 @@ function OnSaveWorld(p_ID, p_Message)
     -- in memory to search. Indexing incrementally keeps the answer small and costs nothing at
     -- query time; it also survives the detail map growing without bound.
     IndexNames(p_Message.data.cachedWorldDetail)
+    lap("names")
     -- ...and index the OCCUPANCY too. A mined block reports itself only here, as a 0; it never
     -- appears in the detail map again. Reading names alone is what made the index append-only.
     IndexOccupancy(p_Message.data.cachedWorld)
+    lap("occupancy")
     -- THROTTLED. Persisting the whole map on every upload is what made MapServer stop answering.
     --
     -- Six drones uploading scans every few seconds each triggered a full rewrite of every cell the
@@ -263,12 +271,16 @@ function OnSaveWorld(p_ID, p_Message)
     -- old minute. Each pass is still bounded, so the ten-second limit is respected either way.
     m_LastSave = m_LastSave or 0
     local s_Backlog = PowGPSServer.dirtyChunks and PowGPSServer.dirtyChunks() or 0
-    local s_Every = (s_Backlog > 24) and 0 or 60
+    local s_Every = (s_Backlog > 6) and 0 or 60   -- matches CHUNKS_PER_SAVE: never let a backlog sit
     if os.clock() - m_LastSave > s_Every then
         m_LastSave = os.clock()
         PowGPSServer.saveAll()
+        lap("save")
     end
     MapRender.invalidate()
+    local s_Total = 0
+    for _, ph in ipairs(s_Phase) do s_Total = s_Total + (tonumber(ph:match("=(.*)")) or 0) end
+    if s_Total > 2 and _G.Log then _G.Log("SaveWorld phases: " .. table.concat(s_Phase, " ")) end
     return true, true
 end
 
@@ -541,7 +553,7 @@ end
 function OnGetBounds(p_ID, p_Message)
     local s_Chunks, s_Gps = Coverage()
     return true, {bounds = {chunks = s_Chunks, gps = s_Gps,
-                            reach = DATA["reach"], centre = DATA["centre"]},
+                            reach = DATA["reach"], centre = DATA["centre"], radio = DATA["radio"]},
                   message = #s_Chunks .. " chunk region(s), " .. #s_Gps .. " gps region(s)"}
 end
 
@@ -584,6 +596,16 @@ function OnAddGpsHost(p_ID, p_Message)
     return true, {message = #DATA["gpsHosts"] .. " gps hosts registered"}
 end
 
+-- "x,y,z,range;..." -> list of stations. Malformed entries are dropped rather than trusted.
+function ParseRadio(p_Text)
+    local s_Out = {}
+    for s_Entry in tostring(p_Text):gmatch("[^;]+") do
+        local x, y, z, r = s_Entry:match("^(-?%d+),(-?%d+),(-?%d+),(%d+)$")
+        if x then s_Out[#s_Out + 1] = {x = tonumber(x), y = tonumber(y), z = tonumber(z), range = tonumber(r)} end
+    end
+    return s_Out
+end
+
 function OnSetBounds(p_ID, p_Message)
     local d = p_Message.data or {}
     if d.minx == nil then return false, "need minx maxx miny maxy minz maxz" end
@@ -598,6 +620,9 @@ function OnSetBounds(p_ID, p_Message)
     if d.cx ~= nil then
         DATA["centre"] = {x = tonumber(d.cx), y = tonumber(d.cy), z = tonumber(d.cz)}
     end
+    -- The repeater and its range: the 3D horizon a drone must stay inside to be heard at all.
+    -- Sent as "x,y,z,range;x,y,z,range" -- the validator rejects nested tables (see `centre`).
+    if type(d.radio) == "string" then DATA["radio"] = ParseRadio(d.radio) end
     PowNet.MarkDirty()
     return true, {message = "bounds set", bounds = DATA["bounds"]}
 end
@@ -958,11 +983,20 @@ local BLOCKAT_PAGE = 400
 -- 3,014 bricks for a floor of ~2,200 and still had not advanced (2026-09-04, overnight). The shared
 -- map knows. Positions in, 1-based indices of the solid ones out -- indices, so `false` never has
 -- to survive serialisation.
+-- THE LIVE TABLE, NOT THE FIELD. `PowGPSServer.cachedWorld` is the table the API started with; the
+-- map is loaded and merged into the table `getCachedWorld()` returns. Reading the field, KnownAir
+-- answered nothing for any cell and BlocksSolid saw only the name index -- every inspection's verdict
+-- was uploaded, stored, and invisible to the repair pass (2026-09-08, found with CellValues: nil for
+-- cells world.query counted as known).
+local function liveWorld()
+    if PowGPSServer.getCachedWorld then return PowGPSServer.getCachedWorld() or {} end
+    return PowGPSServer.cachedWorld or {}
+end
 function OnBlocksSolid(p_ID, p_Message)
     local d = p_Message.data or {}
     local s_Positions = d.positions or {}
     local s_Solid, s_Known = {}, 0
-    local s_World = PowGPSServer.cachedWorld or {}
+    local s_World = liveWorld()
     for i, p in ipairs(s_Positions) do
         local k = p.x .. ":" .. p.y .. ":" .. p.z
         local s_Cell = s_World[k]
@@ -971,6 +1005,45 @@ function OnBlocksSolid(p_ID, p_Message)
         if i % 200 == 0 then breathe("blocks_solid") end   -- a floor is ~2,200 squares
     end
     return true, {solid = s_Solid, known = s_Known, asked = #s_Positions}
+end
+-- Which of these cells does the fleet already KNOW to be air (observed, 0)? Unknown cells are not
+-- reported: a cell nobody has looked at may well be rock, and a digger that skipped it on that
+-- basis would leave the box unfinished. Digs ask this per layer to sweep only rows that still hold
+-- something (the user, 2026-09-08: "use the map to ignore air and move to where they should mine").
+-- The raw stored value per position (0 air, 1 solid, 2 turtle, 3 forbidden, nil unknown), for
+-- diagnosing why a cell reads as neither air nor solid (2026-09-08).
+function OnCellValues(p_ID, p_Message)
+    local d = p_Message.data or {}
+    local s_World = liveWorld()
+    local s_Out = {}
+    for i, p in ipairs(d.positions or {}) do
+        local v = s_World[p.x .. ":" .. p.y .. ":" .. p.z]
+        s_Out[tostring(i)] = {value = v, type = type(v)}
+    end
+    return true, {cells = s_Out}
+end
+function OnKnownAir(p_ID, p_Message)
+    local d = p_Message.data or {}
+    local s_Positions = d.positions or {}
+    local s_Air = {}
+    local s_World = liveWorld()
+    for i, p in ipairs(s_Positions) do
+        if s_World[p.x .. ":" .. p.y .. ":" .. p.z] == 0 then s_Air[#s_Air + 1] = i end
+        if i % 200 == 0 then breathe("known_air") end
+    end
+    return true, {air = s_Air, asked = #s_Positions}
+end
+-- The block NAME the map has for each position (from identified observations), or nothing. A repair
+-- pass uses it to tell a wall cell holding a log from one holding cobble; both are "solid".
+function OnNamesAt(p_ID, p_Message)
+    local d = p_Message.data or {}
+    local s_Names = {}
+    for i, p in ipairs(d.positions or {}) do
+        local n = m_BlockAt and m_BlockAt[p.x .. ":" .. p.y .. ":" .. p.z]
+        if n then s_Names[tostring(i)] = n end
+        if i % 200 == 0 then breathe("names_at") end
+    end
+    return true, {names = s_Names}
 end
 function OnBlockAt(p_ID, p_Message)
     local d = p_Message.data or {}
@@ -1250,6 +1323,9 @@ local m_ServerEvents = {
     RegionKnown = { func = OnRegionKnown },
     BlockAt    = { func = OnBlockAt },
     BlocksSolid = { func = OnBlocksSolid },
+    KnownAir = { func = OnKnownAir },
+    CellValues = { func = OnCellValues },
+    NamesAt = { func = OnNamesAt },
     forget = {
         func = OnForget, callable = true,
         params = { match = {} }
@@ -1281,7 +1357,7 @@ local m_ServerEvents = {
         -- {x,y,z} table for `centre` failed it silently -- the whole bounds push was rejected and
         -- the log said only "bounds=false".
         params = { minx={}, maxx={}, miny={}, maxy={}, minz={}, maxz={},
-                   reach = {optional = true},
+                   reach = {optional = true}, radio = {optional = true},
                    cx = {optional = true}, cy = {optional = true}, cz = {optional = true} }
     },
     map = {

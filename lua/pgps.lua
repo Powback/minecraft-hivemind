@@ -267,6 +267,18 @@ local m_Chunks, m_Gps
 -- A radius costs a fifth of the area and removes the trap entirely.
 local m_Reach = nil          -- horizontal radius from the settlement centre, if one was given
 local m_Centre = nil
+local m_Radio = nil          -- radio stations {{x,y,z,range},...}: the 3D horizon a drone is heard inside
+
+-- Inside at least one station's range, or no stations known. Kept apart from withinReach so the
+-- reach check stays under the complexity gate.
+local function inEarshot(x, y, z)
+    if type(m_Radio) ~= "table" or #m_Radio == 0 then return true end
+    for _, r in ipairs(m_Radio) do
+        local rx, ry, rz = x - r.x, y - r.y, z - r.z
+        if (rx * rx + ry * ry + rz * rz) <= (r.range * r.range) then return true end
+    end
+    return false
+end
 -- Moves, turns and distinct cells since the last motionReset() -- the heartbeat's jitter watch
 -- reads them (DroneLogic.JitterWatch). A drone that made 20 moves over 3 cells is bouncing.
 local m_Motion = {steps = 0, turns = 0, cells = {}, distinct = 0, callers = {}, box = nil}
@@ -277,6 +289,34 @@ function motionWindow()
     return m_Motion.steps, m_Motion.turns, m_Motion.distinct, s_Span
 end
 function motionReset() m_Motion = {steps = 0, turns = 0, cells = {}, distinct = 0, callers = {}, box = nil} end
+-- MOVE TRACE -- a heartbeat-INDEPENDENT record of what one trip actually did, for debugging the
+-- up/down jitter. motionWindow above is zeroed every 2 heartbeats by JitterWatch, so it cannot
+-- measure a whole moveTo -- a 20-block trip reads as "6 steps" because the window reset mid-move.
+-- This ring buffer is cleared only when tracing is (re)armed, so it captures the exact
+-- "planned N, blocked at step K, replanned, stepped back" sequence a bounce is made of. Off by
+-- default -- no cost -- ; pgps.setMoveDebug(true) arms it, pgps.dumpMoveTrace() reads it.
+MOVE_DEBUG = false
+local m_MTrace = {}
+local function mtrace(p_S)
+    if not MOVE_DEBUG then return end
+    m_MTrace[#m_MTrace + 1] = p_S
+    if #m_MTrace > 140 then table.remove(m_MTrace, 1) end
+end
+function setMoveDebug(p_On) MOVE_DEBUG = p_On and true or false; if p_On then m_MTrace = {} end; return MOVE_DEBUG end
+function dumpMoveTrace() return table.concat(m_MTrace, " | ") end
+-- FUEL BUDGET FOR A JOB -- the system's OWN estimate, so budget-vs-result can be measured, not guessed.
+-- Each moveTo's FIRST a* plan is what the trip should cost (one fuel per planned step: air walked or
+-- rock cut). Summed across a job's legs, that is the job's fuel budget. The drone's actual spend is
+-- fuel burned. A clean run (no re-plans, no bounce) makes them equal; every hiccup shows up as spend
+-- OVER budget. RunJob resets this at the start of a job and logs both at the end -- so accuracy is a
+-- number in the log, reproducible, not a probe that races the scheduler.
+M_PLAN_BUDGET = 0
+function resetPlanBudget() M_PLAN_BUDGET = 0 end
+function planBudget() return M_PLAN_BUDGET end
+-- A job that does DETERMINISTIC work off the a* router (a mine sinking a shaft, driving branches)
+-- adds its own predicted move count here, so its budget reflects the whole task and not just the
+-- travel legs a* planned. Stochastic work (hauls sized by spoil volume) is left to the actual spend.
+function addPlanBudget(p_N) M_PLAN_BUDGET = M_PLAN_BUDGET + (tonumber(p_N) or 0) end
 -- Who has been moving the drone: the first frame outside this file, tallied per step. Cheap
 -- enough per move, and the only way a "325 moves over 2 cells" report names the loop instead of
 -- leaving it to guesswork.
@@ -305,8 +345,14 @@ local function widen(p_Box, p_Axis, p_V)
     if p_V < p_Box[p_Axis .. "1"] then p_Box[p_Axis .. "1"] = p_V end
     if p_V > p_Box[p_Axis .. "2"] then p_Box[p_Axis .. "2"] = p_V end
 end
+-- Job-scoped counters for the efficiency line RunJob logs: steps and turns since jobMotionReset(),
+-- untouched by the jitter watch's window resets.
+local m_JobSteps, m_JobTurns = 0, 0
+function jobMotionReset() m_JobSteps, m_JobTurns = 0, 0 end
+function jobMotion() return m_JobSteps, m_JobTurns end
 local function motionStep(p_X, p_Y, p_Z)
     m_Motion.steps = m_Motion.steps + 1
+    m_JobSteps = m_JobSteps + 1
     local k = p_X .. ":" .. p_Y .. ":" .. p_Z
     if not m_Motion.cells[k] then
         m_Motion.cells[k] = true
@@ -350,16 +396,28 @@ local function driving(p_Fn, ...)
     return table.unpack(s_Ret, 2, s_Ret.n)
 end
 
-local function withinReach(x, z)
+-- The suspended driver's stack, for a watchdog outside pgps: a move that never returns can only be
+-- read from another coroutine, and this is the coroutine that holds it (2026-09-08).
+function driverTraceback()
+    if m_Driver == nil or m_Driver == coroutine.running() then return nil end
+    local ok, tb = pcall(debug.traceback, m_Driver, "", 0)
+    if not ok then return nil end
+    return (tostring(tb):gsub("%s+", " "))
+end
+
+local function withinReach(x, z, y)
     if m_Reach == nil or m_Centre == nil then return true end
     local dx, dz = x - m_Centre.x, z - m_Centre.z
-    return (dx * dx + dz * dz) <= (m_Reach * m_Reach)
+    if (dx * dx + dz * dz) > (m_Reach * m_Reach) then return false end
+    -- With a height given, the radio horizon applies too: the reach circle is flat, and a vein
+    -- fifty blocks down at its edge is out of earshot of the repeater (D5, 2026-09-08).
+    return y == nil or inEarshot(x, y, z)
 end
 
 -- Exposed because the gather's vein-following needs it: seeds are filtered by the caller, but
 -- following a seam outward is a decision made ON the drone, one block at a time, and it is exactly
 -- how drones walk out of radio coverage without any single step looking wrong.
-function isWithinReach(x, z) return withinReach(x, z) end
+function isWithinReach(x, z, y) return withinReach(x, z, y) end
 
 -- Where the settlement is. Exposed because the mesh routes messages TOWARD it: each hop picks the
 -- neighbour closer to base, so every node needs the same reference point. It comes from the region
@@ -393,7 +451,7 @@ local REGION_FILE = "/pgps-region.txt"
 local function saveRegion()
     local h = fs.open(REGION_FILE, "w")
     if not h then return end
-    h.write(textutils.serialize({reach = m_Reach, centre = m_Centre, chunks = m_Chunks}))
+    h.write(textutils.serialize({reach = m_Reach, centre = m_Centre, chunks = m_Chunks, radio = m_Radio}))
     h.close()
 end
 
@@ -406,9 +464,14 @@ function loadRegion()
     h.close()
     local ok, r = pcall(textutils.unserialize, s_Text)
     if not ok or type(r) ~= "table" then return false end
-    m_Chunks, m_Reach, m_Centre = r.chunks, r.reach, r.centre
+    m_Chunks, m_Reach, m_Centre, m_Radio = r.chunks, r.reach, r.centre, r.radio
     ptrace(("restored region from disk: reach %s"):format(tostring(m_Reach)))
     return true
+end
+
+-- Stations arrive with the bounds when MapServer knows them; a push without keeps the last list.
+local function takeRadio(p_B)
+    if type(p_B.radio) == "table" then m_Radio = p_B.radio end
 end
 
 function setBounds(p_B)
@@ -422,6 +485,7 @@ function setBounds(p_B)
     end
     m_Reach  = tonumber(p_B.reach)
     m_Centre = p_B.centre
+    takeRadio(p_B)
     -- m_Gps is now hosts+radius rather than a list of boxes, so describe whichever arrived.
     local s_Gps = "none"
     if m_Gps and m_Gps.hosts then
@@ -727,13 +791,18 @@ local m_Suppressed = 0
 -- burned its last fuel with every job completing normally.
 --
 -- The same mechanism starves ore -- `gather: 1/768 checked, 0 taken` is this, one resource over.
-function noteObservation(idx, solid, detail)
+-- THE PRIORITY LANE. A scout's scanner leaves thousands of cells pending and the upload ships 256 a
+-- time, so an inspection's verdict on a wall square waited behind them for ages -- 79 holes found
+-- and none in the map when the repair pass asked (2026-09-08). Observations marked urgent go first.
+local pendingUrgent = {}
+function noteObservation(idx, solid, detail, urgent)
     if not positionVerified() and solid ~= 0 then
         m_Suppressed = m_Suppressed + 1
         return false
     end
     pendingWorld[idx] = solid
     if detail ~= nil then pendingDetail[idx] = detail end
+    if urgent then pendingUrgent[idx] = true end
     return true
 end
 
@@ -743,10 +812,34 @@ end
 -- noteObservation would now silently DROP it -- the fix may have lapsed in the seconds since, and
 -- the gate cannot tell a stale reading from a fresh one. These coordinates were checked at the
 -- moment they were recorded; a failed upload is a network problem, not a position problem.
+-- What the LAST batch carried as urgent, so a refused upload puts it back in the fast lane instead
+-- of dropping it into a six-figure scanner backlog (measured: 125,426 pending on one scout, 2026-09-08).
+local lastUrgent = {}
 function requeueObservations(p_World, p_Detail)
     for k, v in pairs(p_World or {}) do
         pendingWorld[k] = v
         if p_Detail and p_Detail[k] ~= nil then pendingDetail[k] = p_Detail[k] end
+        if lastUrgent[k] then pendingUrgent[k] = true end
+    end
+end
+function pendingUrgentCount()
+    local n = 0
+    for _ in pairs(pendingUrgent) do n = n + 1 end
+    return n
+end
+-- THE BACKLOG IS CAPPED. A scanner produces far more than 256 cells per upload interval; beyond this
+-- many pending, the oldest ordinary observations are the least valuable and are dropped (the scanner
+-- will see those cells again). Urgent ones are never dropped.
+local PENDING_MAX = 20000
+local function trimPending()
+    local n = 0
+    for _ in pairs(pendingWorld) do n = n + 1 end
+    if n <= PENDING_MAX then return end
+    local drop = n - PENDING_MAX
+    for k in pairs(pendingWorld) do
+        if drop <= 0 then break end
+        -- lua-hygiene: allow (this DELETES stale scanner cells from the queue; it records nothing, so the fix gate is not bypassed)
+        if not pendingUrgent[k] then pendingWorld[k] = nil pendingDetail[k] = nil drop = drop - 1 end
     end
 end
 
@@ -775,9 +868,22 @@ local UPLOAD_MAX_BATCH = 256
 
 function takeWorldDelta()
     local w, d, n = {}, {}, 0
+    lastUrgent = {}
+    trimPending()
     -- Partial drain. Keys are copied out one at a time and REMOVED from pending, so the next call
     -- continues where this one stopped; there is no cursor to keep in sync and no risk of sending
     -- the same cell twice.
+    for k in pairs(pendingUrgent) do
+        if n >= UPLOAD_MAX_BATCH then break end
+        if pendingWorld[k] ~= nil then
+            w[k] = pendingWorld[k]
+            if pendingDetail[k] ~= nil then d[k] = pendingDetail[k] end
+            pendingWorld[k], pendingDetail[k] = nil, nil
+            n = n + 1
+            lastUrgent[k] = true
+        end
+        pendingUrgent[k] = nil
+    end
     for k, v in pairs(pendingWorld) do
         if n >= UPLOAD_MAX_BATCH then break end
         w[k] = v
@@ -1057,7 +1163,7 @@ function notePlannedStep(dx, dy, dz, p_Straight)
     m_IntDX, m_IntDY, m_IntDZ = m_IntDX + dx, m_IntDY + dy, m_IntDZ + dz
     if p_Straight then m_StraightFwd = m_StraightFwd + 1 else m_StraightFwd = -1 end
 end
-function noteTurn() m_TurnsSinceFix = m_TurnsSinceFix + 1 m_StraightFwd = -1 m_Motion.turns = m_Motion.turns + 1 end
+function noteTurn() m_TurnsSinceFix = m_TurnsSinceFix + 1 m_StraightFwd = -1 m_Motion.turns = m_Motion.turns + 1 m_JobTurns = m_JobTurns + 1 end
 
 local function resetAudit(x, y, z)
     m_FixAtX, m_FixAtY, m_FixAtZ = x, y, z
@@ -1188,6 +1294,14 @@ function verifyPosition(p_Force)
     end
     if x == nil then
         m_FixFailedAt = os.clock()
+        -- GPS-HEALTH LOG. A failed fix is where drift begins -- the drone flies blind on dead
+        -- reckoning until the next one, and every "position corrected by N" downstream is that blind
+        -- stretch being paid back. So record WHERE and how DEEP the fix failed and how long we have
+        -- been without one: that is the coverage-gap map that says where the next satellite goes.
+        -- Rate-limited by the GPS_RETRY_AFTER back-off at the top of this function, so it cannot spam.
+        local s_Since = m_LastFix and (math.floor(os.clock() - m_LastFix) .. "s") or "never"
+        ptrace(("gps-health: MISS near %s,%s,%s -- %s since a good fix")
+            :format(tostring(cachedX), tostring(cachedY), tostring(cachedZ), s_Since))
         return nil, "no gps fix"
     end
     m_FixFailedAt = nil
@@ -1211,8 +1325,14 @@ function verifyPosition(p_Force)
         -- hysteresis here were taken on a drone that was STEPPING for a heading probe. What looked
         -- like sensor noise was the race guarded against above, and the hysteresis only hid it.
         if m_Drift > 0 then
-            ptrace(("position corrected by %d: %d,%d,%d -> %d,%d,%d")
-                :format(m_Drift, cachedX, cachedY, cachedZ, x, y, z))
+            -- The time since the last good fix is the tell: a large correction after a long blind
+            -- stretch is DEAD-RECKONING drift being paid back (expected, and an argument for a
+            -- closer satellite), while a large one seconds after a fresh fix is a RACE or a bad host
+            -- (a real bug). Logging both numbers together is what lets those two be told apart
+            -- instead of every correction reading the same.
+            local s_Since = m_LastFix and math.floor(os.clock() - m_LastFix) or -1
+            ptrace(("position corrected by %d: %d,%d,%d -> %d,%d,%d (y=%d, %ds since last fix)")
+                :format(m_Drift, cachedX, cachedY, cachedZ, x, y, z, y, s_Since))
         end
     end
     -- BEFORE overwriting the cache: the audit needs the position GPS just reported, compared
@@ -1444,6 +1564,16 @@ function noteBlocked(p_Which, p_Name)
     return idx
 end
 
+-- The cell a dig aimed at, for the caller's own bookkeeping (nil if the heading is unknown).
+function cellAt(p_Which)
+    local d
+    if p_Which == "up"        then d = deltas[Up]
+    elseif p_Which == "down"  then d = deltas[Down]
+    else                           d = cachedDir and deltas[cachedDir] or nil end
+    if d == nil or cachedX == nil then return nil end
+    return cachedX + d[1], cachedY + d[2], cachedZ + d[3]
+end
+
 function noteCleared(p_Which)
     local d
     if p_Which == "up"        then d = deltas[Up]
@@ -1538,9 +1668,27 @@ end
 
 function protectedCell(idx) return m_ProtectedCells[idx] == true end
 
+-- WHAT A TRAVEL DIG MAY BREAK, beyond the protected list. nil = anything unprotected (a dig job at its
+-- own site); a function name -> boolean narrows it -- a build lets its mover through leaves, logs and
+-- dirt but never through a placed block. Set by DroneLogic per job (setDigFilter).
+local m_DigFilter = nil
+function setDigFilter(p_Fn) m_DigFilter = p_Fn end
 local function digGuarded(p_Dig, p_Detect, p_Inspect, p_Idx)
     if not p_Detect() then return true end
     local s_Ok, s_Blk = p_Inspect()
+    if s_Ok and s_Blk and m_DigFilter ~= nil and not isProtectedBlock(s_Blk.name) and not m_DigFilter(s_Blk.name) then
+        -- Refused, AND REMEMBERED AS A WALL, or the planner hands back the same one-step path through
+        -- it on every replan: D1 stood over its own wall asking to step down into it 57 times a
+        -- minute (2026-09-08). Same bookkeeping as a protected block: forbidden locally and on the
+        -- shared map, so the next plan goes round.
+        ptrace("not digging " .. tostring(s_Blk.name) .. " on the way -- not a natural block; routing round it")
+        if p_Idx then
+            m_ProtectedCells[p_Idx] = true
+            cachedWorld[p_Idx] = 3
+            if positionVerified() then noteObservation(p_Idx, 3, {true, {name = s_Blk.name}}) end
+        end
+        return false, s_Blk.name
+    end
     if s_Ok and s_Blk and isProtectedBlock(s_Blk.name) then
         ptrace("refusing to dig " .. tostring(s_Blk.name))
         if p_Idx then
@@ -2163,6 +2311,7 @@ end
 function SavePath()
     local s_World, s_Detail, s_Count = takeWorldDelta()
     if s_Count == 0 then return true end
+    mtrace(("BLK @%s,%s,%s +%d newsolid"):format(tostring(cachedX), tostring(cachedY), tostring(cachedZ), s_Count))
 
     local s_Request = PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "UpdatePath",
         {id = os.getComputerID(), cachedWorld = s_World, cachedWorldDetail = s_Detail})
@@ -2308,7 +2457,9 @@ local function moveLegRaw(_targetX, _targetY, _targetZ, _targetDir, changeDir, d
         -- drone could walk blind: flyTo is greedy, local, and asks nobody. So try that first for
         -- anything close, and keep MapServer for the routes that actually need routing. On failure
         -- we fall through to the request exactly as before, so nothing that used to work stops.
-        if localHop(_targetX, _targetY, _targetZ, s_Dist) then return true end
+        local s_LH = localHop(_targetX, _targetY, _targetZ, s_Dist)
+        mtrace(("lh %d,%d,%d->%d,%d,%d d=%d %s"):format(cachedX, cachedY, cachedZ, _targetX, _targetY, _targetZ, s_Dist, s_LH and "OK" or "no"))
+        if s_LH then return true end
 
         --TODO: NETWORK
         -- Slot 8 is `priority`, which this caller does not use; slot 9 is the dig mode. Positional
@@ -2338,9 +2489,23 @@ local function moveLegRaw(_targetX, _targetY, _targetZ, _targetDir, changeDir, d
             return false, "pathfinder unavailable"
         end
         if(type(s_Response) == "table" and s_Response.message ~= nil) then
+            mtrace(("GP %d,%d,%d->%d,%d,%d ERR:%s"):format(cachedX, cachedY, cachedZ, _targetX, _targetY, _targetZ, tostring(s_Response.message)))
+            -- THE SHARED MAP IS STALE, AND WE KNOW BETTER. "goal is solid" was 21 of 38 refusals a minute
+            -- inside the finished base (2026-09-08): cells pre-marked solid when the courses were laid
+            -- and cleared since. If OUR cache says the goal is air, tell the map so (urgent lane) so the
+            -- caller's next attempt is planned against the truth.
+            local s_GoalKey = _targetX .. ":" .. _targetY .. ":" .. _targetZ
+            if tostring(s_Response.message):find("goal is solid", 1, true) and cachedWorld[s_GoalKey] == 0 then
+                noteObservation(s_GoalKey, 0, {false}, true)
+                ptrace("planner calls the goal solid; our own cache says air -- correcting the shared map")
+            end
             return false, "no path: " .. tostring(s_Response.message)
         end
         local path = s_Response.path
+        mtrace(("GP#%d %d,%d,%d->%d,%d,%d path#%d"):format(s_Replans, cachedX, cachedY, cachedZ, _targetX, _targetY, _targetZ, #path))
+        -- The FIRST plan of a leg is the budget for that leg; re-plans are hiccup cost, counted only
+        -- in the actual spend. Summing first-plans across a job gives the job's fuel budget.
+        if s_Replans == 1 then M_PLAN_BUDGET = M_PLAN_BUDGET + #path end
 
         --[[
         local path = a_star(cachedX, cachedY, cachedZ, _targetX, _targetY, _targetZ, discover)
@@ -2430,6 +2595,12 @@ function flyTo(_tx, _ty, _tz, _maxSteps, _noClimb)
     _tx, _ty, _tz = _tx or cachedX, _ty or cachedY, _tz or cachedZ
     local s_Max = _maxSteps or 512
     local s_Steps = 0
+    -- KEEP THE HEIGHT YOU CLIMBED FOR UNTIL YOU HAVE USED IT. The climb-over at the bottom of the
+    -- loop gains a block to clear a blocker; the descent at the top then gave that block straight
+    -- back, the blocker was still there, and the drone climbed again -- up, down, up, down, 81
+    -- moves over two cells until the jitter watch aborted the job (D2 beside the base hillside,
+    -- 2026-09-08). Altitude gained to get round something is held until a sideways step succeeds.
+    local s_Hold = nil
     while cachedX ~= _tx or cachedY ~= _ty or cachedZ ~= _tz do
         s_Steps = s_Steps + 1
         if s_Steps > s_Max then return false, "flyTo gave up after " .. s_Max .. " steps" end
@@ -2441,15 +2612,24 @@ function flyTo(_tx, _ty, _tz, _maxSteps, _noClimb)
 
         local s_Moved = false
         if cachedY < _ty then s_Moved = up()
-        elseif cachedY > _ty then s_Moved = down() end
+        elseif cachedY > _ty and (s_Hold == nil or cachedY > s_Hold) then
+            s_Moved = down()
+            -- Over the target column with rock beneath: no climb-over can help. Say so and stop,
+            -- instead of climbing to the step budget one block at a time.
+            if not s_Moved and cachedX == _tx and cachedZ == _tz then
+                return false, "flyTo: the target is buried under " .. cachedX .. "," .. cachedY .. "," .. cachedZ
+            end
+        end
 
         if not s_Moved and cachedX ~= _tx then
             turnTo(cachedX < _tx and East or West)
             s_Moved = forward()
+            if s_Moved then s_Hold = nil end
         end
         if not s_Moved and cachedZ ~= _tz then
             turnTo(cachedZ < _tz and South or North)
             s_Moved = forward()
+            if s_Moved then s_Hold = nil end
         end
 
         -- Every useful axis toward the target is blocked. There are two answers, and which one is
@@ -2469,6 +2649,7 @@ function flyTo(_tx, _ty, _tz, _maxSteps, _noClimb)
         if not s_Moved then
             if _noClimb then return false, "blocked -- defer to the router" end
             if not up() then return false, "flyTo is wedged at " .. cachedX .. "," .. cachedY .. "," .. cachedZ end
+            s_Hold = cachedY
         end
     end
     return true
@@ -2722,10 +2903,12 @@ end
 function startGPS()
     local netOpen, modemSide = false, nil
 
+    -- WIRELESS FIRST: under a bay slab the wired modem block above the turtle is a "modem" too, and
+    -- opening only that one put the drone on the chest network with no radio (2026-09-08).
     for _, side in pairs(rs.getSides()) do    -- for all sides
-        if peripheral.getType(side) == "modem" then  -- find the modem
+        if peripheral.getType(side) == "modem" and (modemSide == nil or modemWireless(side)) then
             modemSide = side
-            if rednet.isOpen(side) then  -- check its status
+            if rednet.isOpen(side) and modemWireless(side) then  -- check its status
                 netOpen = true
                 break
             end
@@ -2813,7 +2996,31 @@ function savedHeading()
     return d and tonumber(d) or nil
 end
 
+-- Is a WIRED modem attached to this turtle (a bay's wired_modem_full above or beside it)? With one
+-- attached, gps.locate never returned -- its timer never fired -- and every drone that booted under a
+-- bay slab hung at Init (2026-09-08). Position comes from the saved pose instead, and the drone steps
+-- off the wire before it asks again (DroneLogic.GetOffTheWire).
+-- Is the modem on this side wireless? nil when the side holds no modem.
+function modemWireless(side)
+    if peripheral.getType(side) ~= "modem" then return nil end
+    local ok, w = pcall(peripheral.call, side, "isWireless")
+    return ok and w == true
+end
+function wiredModemAttached()
+    for _, side in ipairs(rs.getSides()) do
+        if modemWireless(side) == false then return true end
+    end
+    return false
+end
+-- The saved pose stands in for GPS while a wired modem is attached (see wiredModemAttached).
+local function poseWithoutRadio()
+    if not (wiredModemAttached() and loadPose()) then return false end
+    ptrace("a wired modem is attached -- skipping GPS, resuming from the saved pose")
+    return true
+end
+
 function setLocationFromGPS()
+    if poseWithoutRadio() then return cachedX, cachedY, cachedZ, cachedDir end
     if startGPS() then
         -- get the current position
         cachedX, cachedY, cachedZ  = gps.locate(4, false)
@@ -3026,6 +3233,6 @@ end
 -- this does nothing.
 if HiveMindTest ~= nil then
     HiveMindTest.pgps = {motionWindow = motionWindow, motionReset = motionReset, motionCallers = motionCallers,
-                         newTrip = newTrip, tripStalled = tripStalled, isDriving = isDriving,
+                         newTrip = newTrip, tripStalled = tripStalled, isDriving = isDriving, driverTraceback = driverTraceback, wiredModemAttached = wiredModemAttached,
                          flyTo = flyTo, localHop = localHop}
 end

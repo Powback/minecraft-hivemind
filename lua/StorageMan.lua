@@ -57,13 +57,18 @@ local function wrapped(p_Name)
     return nil
 end
 
+-- WHICH NAMES ARE CHESTS AND WHICH ARE FURNACES CHANGES ONLY WHEN THE WIRE DOES. Classifying 400
+-- names cost a getType round trip and a yield each, per index rebuild -- 8.5 game-seconds of every
+-- ChestContents handler at 170 chests (2026-09-08). Cached until the peripheral count changes.
+-- SIDE_NAMES (the modem's own sides) are never inventories; a "furnace" type is a machine, anything
+-- with list() and size() is a chest.
+local m_InvCache = nil   -- {n = names count, chests = {...}, furnaces = {...}}
 local function inventories()
+    local s_Names = peripheral.getNames()
+    if m_InvCache and m_InvCache.n == #s_Names then return m_InvCache.chests, m_InvCache.furnaces end
     local s_Chests, s_Furnaces = {}, {}
-    for _, name in ipairs(peripheral.getNames()) do
-        -- The other half of the scan, and it runs BEFORE the chest loop -- getType plus a wrap for
-        -- every peripheral on the wired network, each one a crossing into Java. Together these two
-        -- loops are what ran computer #14 over its budget by 22 seconds and left it powered off.
-        breathe("scan")
+    for i, name in ipairs(s_Names) do
+        if i % 16 == 0 then breathe("scan") end
         if not SIDE_NAMES[name] then
             local s_Type = peripheral.getType(name)
             if s_Type and string.find(s_Type, "furnace") then
@@ -76,57 +81,86 @@ local function inventories()
             end
         end
     end
+    m_InvCache = {n = #s_Names, chests = s_Chests, furnaces = s_Furnaces}
     return s_Chests, s_Furnaces
 end
 
 -- item name -> {total, {where = peripheral, slot = n, count = n}, ...}
+-- One chest's listing, for the parallel scan below. Writes into p_Lists[name] / m_SizeOf.
+local function readChest(name, p_Lists)
+    local inv = wrapped(name)
+    if not inv then return end
+    local ok2, items = pcall(inv.list)
+    -- A chest's size never changes: one network call per chest, ever.
+    if m_SizeOf[name] == nil then local ok3, size = pcall(inv.size) if ok3 and size then m_SizeOf[name] = size end end
+    if ok2 and items then p_Lists[name] = items end
+end
+
+-- Every chest's listing, thirty-two in flight at a time. Returns name -> list().
+local function listChests(p_Chests)
+    local s_Lists = {}
+    for i = 1, #p_Chests, 32 do
+        local s_Fns = {}
+        for j = i, math.min(i + 31, #p_Chests) do
+            local name = p_Chests[j]
+            s_Fns[#s_Fns + 1] = function() readChest(name, s_Lists) end
+        end
+        if #s_Fns > 0 then parallel.waitForAll(table.unpack(s_Fns)) end
+    end
+    return s_Lists
+end
+
 function BuildIndex()
     local s_Index, s_Free = {}, {}
-    -- Once, not twice: this walks every peripheral on the network and is the expensive part.
     local s_Chests, s_Furnaces = inventories()
-    for _, name in ipairs(s_Chests) do
-        -- BREATHE BETWEEN CHESTS, OR THE HEART OF THE SETTLEMENT GETS KILLED MID-BEAT.
-        --
-        -- Every chest costs a peripheral.wrap plus a list() and a size(), and each of those crosses
-        -- into Java. Rescan runs on every tick AND on every query, so this loop is the single
-        -- hottest thing StorageMan does -- and it had no yield in it at all.
-        --
-        -- CC:T terminates a coroutine that runs ~10s without yielding, uncatchably. Measured in the
-        -- server log: "Terminating computer #14 due to timeout (ran over by 22.328 seconds)"
-        -- followed by InterruptedException. StorageMan died mid-scan, its bootloader never reached
-        -- os.reboot(), and the computer sat POWERED OFF -- taking stock, smelting and every
-        -- storage query in the settlement with it, while last-run.txt still read ok=true.
-        --
-        -- queueEvent/pullEvent rather than sleep(0): it satisfies the watchdog and resumes in the
-        -- SAME tick, so a full rescan still costs no wall clock.
-        breathe("rescan")
-        local inv = wrapped(name)
-        if inv then
-            local ok2, items = pcall(inv.list)
-            local ok3, size  = pcall(inv.size)
-            if ok2 and items then
-                local used = 0
-                for slot, it in pairs(items) do
-                    used = used + 1
-                    local e = s_Index[it.name]
-                    if e == nil then e = {total = 0, at = {}} s_Index[it.name] = e end
-                    e.total = e.total + it.count
-                    e.at[#e.at + 1] = {where = name, slot = slot, count = it.count}
-                end
-                if ok3 and size then s_Free[name] = size - used end
+    -- IN PARALLEL, IN BATCHES. One chest after another cost a scheduler round trip per chest: 8.5
+    -- game-seconds for 170 chests, growing with every bay (2026-09-08). Thirty-two listings in flight
+    -- at once come back together within a couple of ticks.
+    local s_Lists = listChests(s_Chests)
+    for i, name in ipairs(s_Chests) do
+        -- 257 chests after level -2 joined: yield on the way through, or the CC monitor terminates
+        -- the computer for running too long ("Terminating computer #33 due to timeout", 2026-09-08).
+        if i % 16 == 0 then breathe("index") end
+        local items = s_Lists[name]
+        if items then
+            local used = 0
+            for slot, it in pairs(items) do
+                used = used + 1
+                local e = s_Index[it.name]
+                if e == nil then e = {total = 0, at = {}} s_Index[it.name] = e end
+                e.total = e.total + it.count
+                e.at[#e.at + 1] = {where = name, slot = slot, count = it.count}
             end
+            local size = m_SizeOf[name]
+            if size then s_Free[name] = size - used end
         end
     end
     return s_Index, s_Free, s_Chests, s_Furnaces
 end
 
 m_Index, m_Free, m_Chests, m_Furnaces = {}, {}, {}, {}
+m_SizeOf = {}   -- chest name -> slot count, learned once
 m_WarnedSided = {}   -- furnace name -> already warned about sided access
 
-function Rescan()
+-- A FULL RESCAN PER REQUEST DOES NOT SCALE. Every Provide, Find, Stock and DepositPoints rebuilt the
+-- index -- two peripheral calls per chest, each a yield -- and at 69 chests the callers' reply windows
+-- ran out ("no response from StorageMan.stock", 2026-09-08) with the module answering every request it
+-- heard. A scan younger than RESCAN_MIN_S game-seconds is reused; a write path passes p_Force.
+-- GAME seconds (tick rate 200: 10 = one real second). At 257 chests a rescan every real second is
+-- 257 main-thread inventory reads a second, and the server's main-thread budget (40 ms/tick) starved
+-- turtle moves for minutes -- the "native move hang" epidemic began the minute level -2's chests
+-- joined (2026-09-08 19:17). Deposits still force a rescan; the idle cadence is ten real seconds.
+RESCAN_MIN_S = 100
+m_LastScan, m_LastNames = nil, -1
+function Rescan(p_Force)
+    -- One getNames call decides: a peripheral appearing or vanishing (a chest bound, a bay coming
+    -- onto the network) always rescans, whatever the age of the last scan.
+    local s_Names = #peripheral.getNames()
+    if not p_Force and m_LastScan and s_Names == m_LastNames and (os.clock() - m_LastScan) < RESCAN_MIN_S then return true end
     local ok, a, b, c, d = pcall(BuildIndex)
     if ok then
         m_Index, m_Free, m_Chests, m_Furnaces = a, b, c, d
+        m_LastScan, m_LastNames = os.clock(), s_Names
         return true
     end
     print("rescan failed: " .. tostring(a))
@@ -165,6 +199,44 @@ end
 -- network inventory unless it is wired to the modem network, and these drones are mobile. The
 -- deposit chest is somewhere a drone can already fly to and reach, so this reuses infrastructure
 -- that is known to work rather than inventing a second delivery mechanism.
+-- The registered chest (position and network name) holding the most of p_Name, other than p_Except.
+-- Nil when no holder has a registered position: a chest with no position cannot be flown to.
+function holderPointFor(p_Name, p_Except)
+    local e = m_Index[p_Name]
+    if not e then return nil end
+    local s_ByChest = {}
+    for _, at in ipairs(e.at or {}) do
+        if at.where and at.where ~= p_Except then s_ByChest[at.where] = (s_ByChest[at.where] or 0) + (at.count or 0) end
+    end
+    local s_Best, s_Count = nil, 0
+    for where, n in pairs(s_ByChest) do
+        if n > s_Count then
+            for _, dep in ipairs(DATA["deposits"] or {}) do
+                if dep.peripheral == where and dep.pos then s_Best, s_Count = {pos = dep.pos, peripheral = where, count = n}, n break end
+            end
+        end
+    end
+    return s_Best
+end
+
+function notePoint(p_Points, p_Name, p_Except)
+    local s_Pt = holderPointFor(p_Name, p_Except)
+    if s_Pt then p_Points[#p_Points + 1] = {name = p_Name, count = s_Pt.count, pos = s_Pt.pos, peripheral = s_Pt.peripheral} end
+end
+
+-- A NAMED CHEST WITH ROOM, NOT THE FIRST REGISTRY ENTRY. deposits[1] was 62,68,32, a position-only
+-- point from the first hour; every order whose items sat in chests without a registered position
+-- (80 furnaces, 2026-09-08) fell through to it and the whole Provide failed with "has no peripheral
+-- name" -- the smeltery went out "short of furnace x36" pass after pass.
+function roomiestNamedDeposit()
+    local s_Best, s_Room = nil, -1
+    for _, d in ipairs(DATA["deposits"] or {}) do
+        local free = d.peripheral and m_Free[d.peripheral]
+        if free and free > s_Room then s_Best, s_Room = d, free end
+    end
+    return s_Best
+end
+
 function OnProvide(p_ID, p_Message)
     Rescan()
     local s_Want = p_Message.data and p_Message.data.items
@@ -176,9 +248,7 @@ function OnProvide(p_ID, p_Message)
     -- stone_bricks" with 119 bricks on the shelf (2026-09-05 15:19). The chest holding the most of
     -- the first item asked for is the pickup point: no push is needed for the bulk of the order.
     local s_Point = pickupPointFor(s_Want, p_ID)
-    if s_Point == nil then
-        for _, d in ipairs(DATA["deposits"] or {}) do s_Point = d break end
-    end
+    if s_Point == nil then s_Point = roomiestNamedDeposit() end
     if s_Point == nil then
         return false, "no pickup point -- set one with StorageMan.SetPickup {pos, peripheral}"
     end
@@ -198,7 +268,7 @@ function OnProvide(p_ID, p_Message)
         end
     end
 
-    local s_Given, s_Short = {}, {}
+    local s_Given, s_Short, s_Points = {}, {}, {}
     for _, req in ipairs(s_Want) do
         -- A Provide can walk the whole index and push from several chests per requested item.
         breathe("provide")
@@ -235,12 +305,17 @@ function OnProvide(p_ID, p_Message)
         if s_Moved > 0 then s_Given[#s_Given + 1] = {name = s_Name, count = s_Moved} end
         if s_Moved < s_Need then
             s_Short[#s_Short + 1] = {name = s_Name, count = s_Need - s_Moved}
+            -- A PUSH THAT MOVED NOTHING IS NOT "THE SHELF HAS NONE". With 26 free slots across 28
+            -- chests every push into the pickup failed and the bay builds went out "short of chest
+            -- x20, modem x20, cable x21" while 54 chests, 40 modems and 170 cable sat on the shelf
+            -- (2026-09-08). Name the chest that holds the most of it: the drone collects there itself.
+            notePoint(s_Points, s_Name, s_Dest)
         end
     end
 
-    Rescan()
+    Rescan(true)
     return true, {
-        pos = s_Point.pos, peripheral = s_Dest,
+        pos = s_Point.pos, peripheral = s_Dest, points = s_Points,
         provided = s_Given, short = s_Short,
         complete = (#s_Short == 0),
         message = ("handed over %d kinds at %d,%d,%d"):format(#s_Given, s_Point.pos.x, s_Point.pos.y, s_Point.pos.z),
@@ -484,27 +559,57 @@ function OnChestContents(p_ID, p_Message)
         return n1 == n2
     end
     if DATA["chestName"] == nil then DATA["chestName"] = {} end
-    if DATA["chestName"][s_Key] == nil then
-        for _, name in ipairs(peripheral.getNames()) do
-            breathe("scan")
-            local inv = wrapped(name)
-            if inv and inv.list then
-                local ok2, l = pcall(inv.list)
-                if ok2 and sameContents(l, d.items) then
-                    DATA["chestName"][s_Key] = name
-                    -- Register it as a deposit point too, if nobody had.
-                    local known = false
-                    for _, dep in ipairs(DATA["deposits"] or {}) do
-                        if dep.pos and dep.pos.x == d.at.x and dep.pos.y == d.at.y
-                           and dep.pos.z == d.at.z then known = true dep.peripheral = name break end
-                    end
-                    if not known then
-                        DATA["deposits"][#DATA["deposits"] + 1] = {pos = d.at, peripheral = name}
-                        Log(("learned chest %s at %d,%d,%d"):format(name, d.at.x, d.at.y, d.at.z))
-                    end
-                    break
-                end
+    -- An empty chest identifies nothing: every empty networked chest matches, and binding a position
+    -- to the wrong empty name routes a later push into a chest the drone never flies to. Bind on
+    -- content only.
+    if DATA["chestName"][s_Key] == nil and next(d.items) ~= nil then
+        -- Find the networked name holding what the drone just read. Exact contents first (types AND
+        -- counts -- unambiguous, the original behaviour); then, if that drifted, the SAME TYPE SET
+        -- when exactly one networked chest carries it. ServiceSort shuffles stacks between chests
+        -- every few ticks, so a one-item brick chest read as {bricks=100} never equalled the live
+        -- {bricks=164}: binding stalled at one chest while every build threw "storage would not hand
+        -- over materials". The type set survives the count drift; "exactly one, not already bound"
+        -- keeps it unambiguous -- two brick chests mid-merge match nobody until the sort has finished
+        -- making them one.
+        local s_Want, s_Bound = {}, {}
+        for k in pairs(d.items) do s_Want[k] = true end
+        for _, nm in pairs(DATA["chestName"]) do s_Bound[nm] = true end
+        local s_Exact, s_Hits = nil, {}
+        -- FROM THE INDEX, NOT THE WIRE. This re-listed every chest on the network per drone report --
+        -- 8.3 game-seconds each with 170 chests, one report per deposit, all day (2026-09-08). The
+        -- index StorageMan already keeps (refreshed within RESCAN_MIN_S) answers the same question.
+        Rescan()
+        local s_ByChest = {}
+        for kind, e in pairs(m_Index) do
+            for _, at in ipairs(e.at or {}) do
+                local c = s_ByChest[at.where]; if c == nil then c = {} s_ByChest[at.where] = c end
+                c[#c + 1] = {name = kind, count = at.count}
             end
+        end
+        for _, name in ipairs(m_Chests) do
+            local l = s_ByChest[name] or {}
+            if sameContents(l, d.items) then s_Exact = name break end
+            if not s_Bound[name] then
+                local s_Set, s_Same = {}, true
+                for _, it in pairs(l) do if it and it.name then s_Set[it.name] = true end end
+                for k in pairs(s_Set)  do if not s_Want[k] then s_Same = false break end end
+                if s_Same then for k in pairs(s_Want) do if not s_Set[k] then s_Same = false break end end end
+                if s_Same then s_Hits[#s_Hits + 1] = name end
+            end
+        end
+        local s_Name = s_Exact or (#s_Hits == 1 and s_Hits[1] or nil)
+        if s_Name then
+            DATA["chestName"][s_Key] = s_Name
+            -- Register it as a deposit point too, if nobody had.
+            local known = false
+            for _, dep in ipairs(DATA["deposits"] or {}) do
+                if dep.pos and dep.pos.x == d.at.x and dep.pos.y == d.at.y
+                   and dep.pos.z == d.at.z then known = true dep.peripheral = s_Name break end
+            end
+            if not known then
+                DATA["deposits"][#DATA["deposits"] + 1] = {pos = d.at, peripheral = s_Name}
+            end
+            Log(("learned chest %s at %d,%d,%d"):format(s_Name, d.at.x, d.at.y, d.at.z))
         end
     end
     local s_N = 0
@@ -656,161 +761,207 @@ end
 function pickupFor(p_Name, p_Asker)
     local e = m_Index[p_Name]
     if type(e) ~= "table" then return nil end
+    -- ANY registered chest may be the pickup, not only a holder of the first item: the holders of the
+    -- cable were both full, so every other kind of the order had nowhere to be pushed and came back
+    -- "short" while the shelf held plenty (2026-09-08). The holders still sort first when they have
+    -- room (nothing to push for the bulk); a full holder loses to an empty stranger.
     local s_Cand = {}
-    for _, at in ipairs(e.at or {}) do
-        if (tonumber(at.count) or 0) > 0 and not isFurnace(at.where) and depositPosOf(at.where) then
-            s_Cand[#s_Cand + 1] = at.where
-        end
+    for _, name in ipairs(m_Chests) do
+        if not isFurnace(name) and depositPosOf(name) then s_Cand[#s_Cand + 1] = name end
     end
     if #s_Cand == 0 then return nil end
     s_Cand = unreserved(s_Cand, p_Asker, function(w) return w end)
-    table.sort(s_Cand)                              -- stable, so the id maps to the same chest each ask
-    local s_Pick = s_Cand[((tonumber(p_Asker) or 0) % #s_Cand) + 1]
+    -- THE CHESTS THAT HOLD THE MOST, spread among the top three by asker. Any holder would do when
+    -- the rest can be pushed in; with every spoils chest full the push moved nothing, and a builder
+    -- was handed a chest with 14 cobblestone for a 78-square course (2026-09-08).
+    local s_Count = {}
+    for _, at in ipairs(e.at or {}) do s_Count[at.where] = (s_Count[at.where] or 0) + (tonumber(at.count) or 0) end
+    -- ...but a pickup with no free slot cannot take the OTHER items of the order (Provide pushes them
+    -- in), so the drone arrives for cable at a chest that only ever held the modems: "nothing matching
+    -- is in there" at a full spoils chest, six times in an hour (2026-09-08). Room first, then count.
+    -- MOST ROOM FIRST. The other kinds of the order are pushed INTO the pickup chest, one slot per
+    -- stack; a chest with one free slot took the chests and refused the cable, and the build went out
+    -- "short of cable x21" with 64 on the shelf (2026-09-08). Room, then how much it already holds.
+    table.sort(s_Cand, function(a, b)
+        -- AN EMPTY CHEST FIRST. Everything the order needs is pushed into it and the drone sucks it out
+        -- front to back; nothing is buried behind twenty stacks of spoil. A holder with room comes next
+        -- (the bulk needs no push); a full holder loses to any stranger with room. Measured before this:
+        -- the cable sat in slot 26 of a full chest, the drone had no spare slot to lift the front stack,
+        -- and the bay went out "short of cable x22" for the fifth time (2026-09-08).
+        local ea, eb = (m_Free[a] or 0) >= 27, (m_Free[b] or 0) >= 27
+        if ea ~= eb then return ea end
+        local ha, hb = (s_Count[a] or 0) > 0 and (m_Free[a] or 0) >= 3, (s_Count[b] or 0) > 0 and (m_Free[b] or 0) >= 3
+        if ha ~= hb then return ha end
+        if (m_Free[a] or 0) ~= (m_Free[b] or 0) then return (m_Free[a] or 0) > (m_Free[b] or 0) end
+        if (s_Count[a] or 0) ~= (s_Count[b] or 0) then return (s_Count[a] or 0) > (s_Count[b] or 0) end
+        return a < b
+    end)
+    local s_Top = math.min(3, #s_Cand)
+    local s_Pick = s_Cand[((tonumber(p_Asker) or 0) % s_Top) + 1]
     reserveChest(s_Pick, p_Asker)
     return {pos = depositPosOf(s_Pick), peripheral = s_Pick}
 end
 -- The pickup point for an order: where its first item is, spread by asker, else the configured pickup.
 function pickupPointFor(p_Want, p_Asker)
-    return pickupFor(p_Want[1] and p_Want[1].name, p_Asker) or DATA["pickup"]
+    -- Any item of the order that storage holds names the pickup; the FIRST item alone sent every bay
+    -- order to the configured fallback point when chests were out of stock, and the cable pushes into
+    -- that full chest all failed -- "short of cable x21" with 64 on the shelf (2026-09-08).
+    for _, req in ipairs(p_Want) do
+        local p = pickupFor(req.name, p_Asker)
+        if p then return p end
+    end
+    return DATA["pickup"]
 end
 
-function OnBringToFront(p_ID, p_Message)
-    local d = p_Message.data or {}
-    local s_Match = tostring(d.match or "")
-    if #s_Match < 2 then return false, "need something to look for" end
-    Rescan()
-
-    -- SEARCH THE NETWORK, NOT THE REGISTRY.
-    --
-    -- This walked DATA["deposits"] and wrapped dep.peripheral -- and those entries were written when
-    -- the modems were unattached, so their peripheral field is nil and the loop matched nothing. It
-    -- answered "no chest holds: minecraft:oak_log" to a turtle that was standing on the chest and
-    -- had just read the logs out of slot 20 itself. The network is the authority on what exists;
-    -- the registry only records where a drone should fly to.
+-- Every chest on the network that is not a furnace.
+local function chestNames()
     local s_Names = {}
-    for _, name in ipairs(peripheral.getNames()) do
+    for i, name in ipairs(peripheral.getNames()) do
+        if i % 16 == 0 then breathe("names") end   -- yield now and then: 250+ names on the wire
         local ok, t = pcall(peripheral.getType, name)
         if ok and t and (t == "minecraft:chest" or tostring(t):find("chest", 1, true)
                          or tostring(t):find("barrel", 1, true)) then
             s_Names[#s_Names + 1] = name
         end
     end
+    return s_Names
+end
 
-    for _, s_PName in ipairs(s_Names) do
-        breathe("scan")
-        do
-            local dep = {peripheral = s_PName, pos = depositPosOf(s_PName)}
-            local inv = wrapped(dep.peripheral)
-            if inv and inv.list then
-                local ok2, l = pcall(inv.list)
-                if ok2 and type(l) == "table" then
-                    local s_Slot, s_Name
-                    for slot, it in pairs(l) do
-                        if it and it.name and it.name:find(s_Match, 1, true) then
-                            s_Slot, s_Name = slot, it.name break
-                        end
-                    end
-                    if s_Slot then
-                        -- Already within reach of sixteen sucks: nothing to do.
-                        if s_Slot <= 16 then
-                            return true, {pos = dep.pos, slot = s_Slot, item = s_Name, moved = false}
-                        end
-                        -- Find a free low slot to bring it to.
-                        local s_Free
-                        for i = 1, 16 do if l[i] == nil then s_Free = i break end end
-                        if s_Free == nil then
-                            -- Every low slot is occupied: shove one to the back to make room.
-                            local s_Tail
-                            local s_Size = (inv.size and select(2, pcall(inv.size))) or 27
-                            for i = 17, (tonumber(s_Size) or 27) do if l[i] == nil then s_Tail = i break end end
-                            if s_Tail then
-                                -- CHECK THE SHUFFLE, THE WAY EVERY OTHER pushItems HERE IS CHECKED.
-                                --
-                                -- This discarded both the pcall AND the moved count and then
-                                -- declared `s_Free = 1` regardless -- so a push that moved nothing
-                                -- left the code certain slot 1 was empty when it still held the
-                                -- old stack. The final push then moved 0 and the caller was told
-                                -- "could not move %s from slot %d", which points at the wrong
-                                -- chest, the wrong slot and the wrong cause: the failure was the
-                                -- shuffle, three branches earlier.
-                                --
-                                -- Worse, it skipped the recovery that exists for exactly this. If
-                                -- the back of this chest will not take it, the other-chests path
-                                -- below can still surface the stack -- there were 29 free slots
-                                -- across six chests the day this was written, and asserting a free
-                                -- slot that is not free is what stopped any of them being tried.
-                                local s_Moved, s_Why = pushed(inv, dep.peripheral, 1, 64, s_Tail)
-                                if s_Moved > 0 then
-                                    s_Free = 1
-                                else
-                                    Log(("could not shuffle %s slot 1 to the back (%s) -- trying the other chests")
-                                        :format(tostring(dep.peripheral), tostring(s_Why or "moved nothing")))
-                                end
-                            elseif evictLowSlot(inv, s_Names, dep.peripheral) then
-                                -- THE BACK OF THIS CHEST IS FULL TOO. USE SOMEBODY ELSE'S.
-                                --
-                                -- The shuffle above needs a free slot at the BACK of this chest, and
-                                -- with every chest in the bay packed there is not one. So the stack
-                                -- the drone came for sits in slot 23 for ever, unreachable, and the
-                                -- drone reports "charcoal is stuck in slot 23 -- storage could not
-                                -- surface it" -- which is exactly what happened while two drones sat
-                                -- at zero fuel waiting for that charcoal.
-                                --
-                                -- The wired network is the whole point: a low slot can be cleared by
-                                -- pushing its contents into ANY inventory with room, not only into
-                                -- the back of this one. There were 29 free slots across six chests
-                                -- at the time, and none of them were reachable to this code.
-                                s_Free = 1
-                            end
-                        end
+-- The chest registered at a position, or nil. A double chest is two positions and one peripheral,
+-- so a neighbour of the registered square counts too.
+local function chestAtPos(p_Pos)
+    if type(p_Pos) ~= "table" or p_Pos.x == nil then return nil end
+    local s_Near = nil
+    for _, dep in ipairs(DATA["deposits"]) do
+        if dep.peripheral and dep.pos and dep.pos.y == p_Pos.y then
+            local dx, dz = math.abs(dep.pos.x - p_Pos.x), math.abs(dep.pos.z - p_Pos.z)
+            if dx == 0 and dz == 0 then return dep.peripheral end
+            if dx + dz == 1 and s_Near == nil then s_Near = dep.peripheral end
+        end
+    end
+    return s_Near
+end
 
-                        -- A FULL CHEST IS NOT A DEAD END -- THERE ARE OTHER CHESTS.
-                        --
-                        -- With 27 of 27 slots occupied there is nowhere to shuffle WITHIN the chest,
-                        -- and this gave up: "chest is full -- nowhere to move it", leaving the logs
-                        -- permanently unreachable in slot 20 and the crafter circling the bay. But
-                        -- pushItems moves between inventories, which is the whole point of the wired
-                        -- network -- so send the stack somewhere with room and point the drone there.
-                        if s_Free == nil then
-                            for _, other in ipairs(s_Names) do
-                                breathe("scan")
-                                if other ~= dep.peripheral then
-                                    local oinv = wrapped(other)
-                                    if oinv and oinv.list then
-                                        local ok5, ol = pcall(oinv.list)
-                                        local osize = 27
-                                        if oinv.size then local o6, sz = pcall(oinv.size) if o6 then osize = tonumber(sz) or 27 end end
-                                        local ofree
-                                        if ok5 and type(ol) == "table" then
-                                            for i = 1, math.min(16, osize) do if ol[i] == nil then ofree = i break end end
-                                        end
-                                        if ofree then
-                                            if pushed(inv, other, s_Slot, 64, ofree) > 0 then
-                                                Log(("brought %s forward into %s slot %d (from a full chest)")
-                                                    :format(tostring(s_Name), other, ofree))
-                                                return true, {pos = depositPosOf(other), slot = ofree,
-                                                              item = s_Name, moved = true,
-                                                              from = s_Slot, chest = other}
-                                            end
-                                        end
-                                    end
-                                end
-                            end
-                            return false, "every chest is full -- cannot surface " .. tostring(s_Name)
-                        end
-                        local s_Got, s_Why2 = pushed(inv, dep.peripheral, s_Slot, 64, s_Free)
-                        if s_Got == 0 then
-                            return false, ("could not move %s from slot %d: %s")
-                                :format(tostring(s_Name), s_Slot, tostring(s_Why2 or "moved nothing"))
-                        end
-                        return true, {pos = dep.pos, slot = s_Free, item = s_Name,
-                                      moved = true, from = s_Slot}
+-- GATHER THE ITEM INTO THE CHEST THE DRONE IS STANDING ON, AND PUT EVERYTHING ELSE OUT OF IT.
+--
+-- A turtle only ever sucks a chest's FIRST occupied slot. Every earlier version of this moved ONE
+-- wanted stack one slot forward per request, and the drone asked again per stack: with cobble
+-- scattered in eight chests behind 3,213 dirt, a 256-block fetch was forty round trips of
+-- "slot 23 is out of reach -- asking storage", "moved it to slot 6", "it is in another chest now",
+-- and the build threw "storage handed over none" with 475 cobblestone on the shelf (2026-09-08
+-- 05:05). StorageMan is on the wired network: it can move stacks between chests directly. So:
+-- evict every non-matching stack from the drone's chest into any chest with room, then pull every
+-- matching stack from every other chest into it. Afterwards every suck yields the item, and the
+-- drone takes as many stacks as it wants with no further asking. Bounded per call so a rescan-heavy
+-- pass cannot hog the module; the drone asks again if the chest is not yet pure.
+GATHER_MOVES_MAX = 60
+function GatherInto(p_Chest, p_Match)
+    local s_Names = chestNames()
+    local inv = wrapped(p_Chest)
+    if inv == nil or inv.list == nil then return 0, "no such chest" end
+    local s_Moves = 0
+    local function spaceIn(other)
+        local o = wrapped(other)
+        if o == nil then return 0 end
+        local ok1, sz = pcall(o.size)
+        local ok2, l = pcall(o.list)
+        if not (ok1 and ok2 and type(l) == "table") then return 0 end
+        local used = 0
+        for _ in pairs(l) do used = used + 1 end
+        return (tonumber(sz) or 0) - used
+    end
+    -- 1. evict what does not match
+    local ok, l = pcall(inv.list)
+    if not (ok and type(l) == "table") then return 0, "could not read the chest" end
+    local s_Others = {}
+    for _, other in ipairs(s_Names) do
+        if other ~= p_Chest then s_Others[#s_Others + 1] = {name = other, free = spaceIn(other)} end
+    end
+    table.sort(s_Others, function(a, b) return a.free > b.free end)
+    for slot, it in pairs(l) do
+        if s_Moves >= GATHER_MOVES_MAX then break end
+        if it and it.name and not it.name:find(p_Match, 1, true) then
+            breathe("gather")
+            for _, o in ipairs(s_Others) do
+                if o.free > 0 and pushed(inv, o.name, slot, 64) > 0 then
+                    o.free = o.free - 1
+                    s_Moves = s_Moves + 1
+                    break
+                end
+            end
+        end
+    end
+    -- 2. pull every matching stack from the other chests
+    local s_Room = spaceIn(p_Chest)
+    for _, o in ipairs(s_Others) do
+        if s_Room <= 0 or s_Moves >= GATHER_MOVES_MAX then break end
+        local src = wrapped(o.name)
+        local ok2, l2 = false, nil
+        if src and src.list then ok2, l2 = pcall(src.list) end
+        if ok2 and type(l2) == "table" then
+            for slot, it in pairs(l2) do
+                if s_Room <= 0 or s_Moves >= GATHER_MOVES_MAX then break end
+                if it and it.name and it.name:find(p_Match, 1, true) then
+                    breathe("gather")
+                    local n = pushed(src, p_Chest, slot, 64)
+                    if n > 0 then
+                        s_Moves = s_Moves + 1
+                        -- a stack that merged into a partial stack takes no new slot; over-counting
+                        -- room downward only makes this pass stop early, which is safe
+                        s_Room = spaceIn(p_Chest)
                     end
                 end
             end
         end
     end
-    return false, "no chest holds: " .. s_Match
+    return s_Moves, nil
+end
+
+-- Bring an item to the front of a chest so a turtle can suck it. `pos` is where the asking drone
+-- stands (the chest beneath it); without it, or when that square is no registered chest, the chest
+-- holding the most of the item is gathered into instead and its position is the answer.
+function OnBringToFront(p_ID, p_Message)
+    local d = p_Message.data or {}
+    local s_Match = tostring(d.match or "")
+    if #s_Match < 2 then return false, "need something to look for" end
+    Rescan()
+    local s_Chest = chestAtPos(d.pos)
+    if s_Chest == nil then
+        local s_Best, s_BestN = nil, 0
+        for name, e in pairs(m_Index) do
+            if name:find(s_Match, 1, true) then
+                local s_Per = {}
+                for _, at in ipairs(e.at or {}) do s_Per[at.where] = (s_Per[at.where] or 0) + (at.count or 0) end
+                for where, n in pairs(s_Per) do
+                    if n > s_BestN and not isFurnace(where) then s_Best, s_BestN = where, n end
+                end
+            end
+        end
+        s_Chest = s_Best
+    end
+    if s_Chest == nil then return false, "no chest holds: " .. s_Match end
+    local s_Moves, s_Err = GatherInto(s_Chest, s_Match)
+    if s_Err then return false, s_Err end
+    local inv = wrapped(s_Chest)
+    local ok, l = false, nil
+    if inv and inv.list then ok, l = pcall(inv.list) end
+    if not (ok and type(l) == "table") then return false, "could not read " .. s_Chest end
+    local s_First, s_Slot, s_Name, s_Count = nil, nil, nil, 0
+    for slot, it in pairs(l) do
+        if it and it.name then
+            if s_First == nil or slot < s_First then s_First = slot end
+            if it.name:find(s_Match, 1, true) then
+                s_Count = s_Count + (it.count or 0)
+                if s_Slot == nil or slot < s_Slot then s_Slot, s_Name = slot, it.name end
+            end
+        end
+    end
+    if s_Slot == nil then return false, "no " .. s_Match .. " reached " .. s_Chest end
+    Log(("gathered %s into %s: %d move(s), %d in the chest, front slot %d (first occupied %d)")
+        :format(s_Match, s_Chest, s_Moves, s_Count, s_Slot, s_First))
+    Rescan(true)   -- stacks were just moved
+    return true, {pos = depositPosOf(s_Chest), slot = s_Slot, item = s_Name, moved = s_Moves > 0,
+                  count = s_Count, pure = (s_Slot == s_First)}
 end
 
 -- Which networked chest holds something matching, and where a drone flies to reach it. Reads the
@@ -914,6 +1065,10 @@ function OnWithdrawn(p_ID, p_Message)
     end)
 end
 
+function OnChestNames(p_ID, p_Message)
+    return true, {names = chestNames()}
+end
+
 function OnStock(p_ID, p_Message)
     Rescan()
     local s_Kinds, s_Items, s_Slots = 0, 0, 0
@@ -950,10 +1105,30 @@ function OnStock(p_ID, p_Message)
         sortByCount(s_Detail)
     end
 
+    -- OBSERVED deposit chests, as a SUPPLEMENT the fetch consults -- not folded into the census.
+    --
+    -- The wired detail above is authoritative and is what planners read. But this world's
+    -- network-name->position bindings went stale, so half the bay's chests are invisible to the
+    -- wired rescan while still physically holding items a drone dropped in. Without this, a fetch
+    -- for something that lives only in such a chest asks GetStock, hears "none", and gives up before
+    -- it ever flies out to look -- even though a drone standing on the chest could suck it. Reported
+    -- as `observed` (from what drones last saw), separate from `detail`, so a planner still gets the
+    -- census and only the fetch's "is it worth going to look" gate is made permissive.
+    local s_Obs = {}
+    for _, rec in pairs(DATA["chestAt"] or {}) do
+        for nm, c in pairs((rec and rec.items) or {}) do
+            s_Obs[nm] = (s_Obs[nm] or 0) + (tonumber(c) or 0)
+        end
+    end
+    local s_ObsDetail = {}
+    for nm, c in pairs(s_Obs) do
+        if c > 0 then s_ObsDetail[#s_ObsDetail + 1] = {name = nm, count = c} end
+    end
+
     return true, {chests = s_Chests, source = s_Source,
         message = string.format("%d kinds, %d items, %d chests, %d free slots, %d furnaces (%s)",
         s_Kinds, s_Items, #m_Chests, s_Slots, #m_Furnaces, s_Source),
-        kinds = s_Kinds, items = s_Items, free = s_Slots, detail = s_Detail}
+        kinds = s_Kinds, items = s_Items, free = s_Slots, detail = s_Detail, observed = s_ObsDetail}
 end
 
 -- Where a full drone should fly to unload. Deposit points are physical positions a drone can
@@ -1661,6 +1836,10 @@ local m_ServerEvents = {
         params = { item = { optional = false } }
     },
     stock = { func = OnStock, callable = true, params = {} },
+    -- Names only, no rescan: bay activation toggles modems and asks "what is on the wire" twenty times a
+    -- bay; through `stock` each ask rebuilt the index behind a changed peripheral count and timed out
+    -- ("no response from StorageMan.stock", 2026-09-08).
+    chestNames = { func = OnChestNames, callable = true, params = {} },
     forgetDeposit = {
         func = OnForgetDeposit, callable = true,
         params = { pos = { length = 3 } },
@@ -1752,6 +1931,13 @@ end
 -- network. Over a few ticks every chest converges to a single item class. A furnace is never a home;
 -- its slots are for smelting.
 local function assignHomes()
+    -- The handover/pickup chest is a RESERVED buffer, never a home. OnProvide pushes an order's
+    -- materials into it for the drone to collect; if the sort treats it as ordinary storage it
+    -- hands that chest out as some item's home and drags the just-pushed materials back to their
+    -- home before the drone arrives. Measured 2026-09-07: every build threw "short of cobblestone"
+    -- with 4,658 in storage while ServiceSort moved 700-800 items a pass -- sort and Provide were
+    -- fighting over the same chest. Excluded here and in ServiceSort.
+    local s_Pickup = DATA["pickup"] and DATA["pickup"].peripheral
     local s_Items = {}
     for name, e in pairs(m_Index) do
         if (e.total or 0) > 0 then s_Items[#s_Items + 1] = { name = name, total = e.total, at = e.at } end
@@ -1761,7 +1947,7 @@ local function assignHomes()
     for _, it in ipairs(s_Items) do
         local s_Cands = {}
         for _, at in ipairs(it.at or {}) do
-            if not isFurnace(at.where) and depositPosOf(at.where) then s_Cands[#s_Cands + 1] = at end
+            if not isFurnace(at.where) and at.where ~= s_Pickup and depositPosOf(at.where) then s_Cands[#s_Cands + 1] = at end
         end
         table.sort(s_Cands, function(a, b) return (a.count or 0) > (b.count or 0) end)
         for _, at in ipairs(s_Cands) do
@@ -1775,16 +1961,23 @@ local function assignHomes()
     return s_Home
 end
 
+-- OFF FOR THE BOOTSTRAP. With three mixed spoils chests the sorter moved 64-128 items a pass toward
+-- "home" chests -- the stack a drone was flying to fetch kept turning up "in another chest now"
+-- (2026-09-08). Sorting is the sorted-storage design's job once there are chests to sort into.
+SORT_ENABLED = false
 local function ServiceSort()
+    if not SORT_ENABLED then return end
     Rescan()
     local s_Home = assignHomes()
+    local s_Pickup = DATA["pickup"] and DATA["pickup"].peripheral
     local s_Moved = 0
     for name, e in pairs(m_Index) do
         local s_Dest = s_Home[name]
         if s_Dest then
             for _, at in ipairs(e.at or {}) do
                 breathe("sort")
-                if at.where ~= s_Dest and not isFurnace(at.where) then
+                -- Never pull from the handover chest: OnProvide fills it for a waiting drone.
+                if at.where ~= s_Dest and at.where ~= s_Pickup and not isFurnace(at.where) then
                     local src = peripheral.wrap(at.where)
                     if src and src.pushItems then
                         local ok, n = pcall(src.pushItems, s_Dest, at.slot)

@@ -176,7 +176,10 @@ local function fleet(p_Force)
     -- who exists. It then assigns nothing, reclaims nothing, and the queue fills with work while
     -- idle drones sit in front of it. That is exactly what "lots of tasks and nothing executing"
     -- looked like from outside.
-    local s_Res = PowNet.sendAndWaitForResponse("DroneMan", s_Msg, PowNet.SERVER_PROTOCOL, 5)
+    -- GAME seconds: at tick rate 200 a "5" is half a real second, and a miss silently kept the previous
+    -- snapshot -- TaskMan reclaimed by a fleet picture minutes old ("held by 27: building" while the
+    -- drone sat idle on a dock for 100 minutes, 2026-09-08). Twenty, and say so when it still fails.
+    local s_Res = PowNet.sendAndWaitForResponse("DroneMan", s_Msg, PowNet.SERVER_PROTOCOL, 20)
     if type(s_Res) == "table" and s_Res.drones then
         m_Fleet, m_FleetAt = s_Res.drones, s_Now
     elseif m_Fleet == nil then
@@ -185,6 +188,9 @@ local function fleet(p_Force)
         -- Log, not print. THIS is the message that explains an idle fleet with a full queue, and
         -- it was being written to a screen nobody can read.
         Log("TaskMan cannot reach DroneMan -- no fleet to assign work to")
+    end
+    if type(s_Res) ~= "table" and m_Fleet ~= nil and (s_Now - m_FleetAt) > 60 then
+        Log(("TaskMan: DroneMan did not answer GetDrones -- working from a fleet snapshot %d s old"):format(math.floor(s_Now - m_FleetAt)))
     end
     return m_Fleet or {}
 end
@@ -264,6 +270,8 @@ function RoleForWork(p_Work)
     -- casualties, and the task, and could not put the three together.
     if p_Work["rescue"] then return rescueRole(p_Work["rescue"]) end
     if p_Work["survey"] or p_Work["scan"] then return "scout" end
+    -- An inspection sweep places nothing: it is the scout looking at a finished course for the map.
+    if p_Work["build"] and p_Work["build"].inspect == true then return "scout" end
     -- Crafting needs a crafting-table upgrade, which is a different turtle entirely: turtle.craft
     -- simply does not exist on a miner, so routing a craft to one wastes the trip and fails at the
     -- last step rather than the first.
@@ -461,6 +469,21 @@ end
 -- The phrase the tick loop recognises as "this task is too big", as opposed to "no drone". One
 -- constant so the two cannot drift apart.
 UNAFFORDABLE = "can afford it"
+-- The tail of a dispatch: offer, and record the assignment only once the drone has answered.
+local function commitDispatch(p_Task, p_Drone, p_Verb, p_Payload, p_Id, p_Role)
+    -- Fire-and-forget again: waiting on the drone's answer inside Tick stopped every dispatch
+    -- (TaskMan logged nothing after the first reclaim while nine drones idled, 2026-09-08 19:24).
+    -- A blocking receive inside the tick coroutine is not safe here; ack needs another design.
+    PowNet.SendToDrone(p_Drone.id, PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, p_Verb, p_Payload))
+    p_Task.assigned = p_Drone.name
+    p_Task.assignedTo = p_Drone.id
+    p_Task.assignedAt = os.epoch("utc")
+    p_Task.paused = false
+    PowNet.MarkDirty()
+    return true, {message = "task " .. tostring(p_Id) .. " -> " .. tostring(p_Drone.name) ..
+                  " (" .. p_Role .. ")", drone = p_Drone.name}
+end
+
 local function noDroneReason(p_Role, p_Busy, p_Poor, p_PoorNeed)
     if p_Poor then
         -- %d REFUSES A FRACTION. The need is a floor plus fuel-per-block times a distance, and the
@@ -691,8 +714,14 @@ end
 -- is empty -- a crafter with nothing to craft should absolutely be laying blocks.
 local function anyoneForBuild(p_Task, p_Where, p_MinFuel)
     if p_Task.work == nil or p_Task.work.build == nil then return nil end
+    -- THE SCOUT IS THE FLEET'S EYES. With two or more miners a build never falls to the scout: it
+    -- was never idle long enough to inspect a single course (2026-09-08, "d2 can scan").
+    local s_Miners = 0
+    for _, d in ipairs(fleet()) do if (d.role or "miner") == "miner" and not d.offline then s_Miners = s_Miners + 1 end end
     for _, alt in ipairs({"loader", "scout", "crafter"}) do
-        if alt ~= "crafter" or not craftIsWaiting() then
+        -- With two or more miners the specialists keep their jobs: the crafter took a roof batch while
+        -- planks waited (2026-09-08).
+        if (alt ~= "crafter" or not craftIsWaiting()) and (s_Miners < 2 or alt == "loader") then
             -- THE FALLBACK PRICES THE JOB LIKE THE FIRST CHOICE DID. Without p_MinFuel this offered a
             -- 384-fuel build to scouts holding 290 and 270; both burned to the watchdog's floor and
             -- were pulled off the tower with the patch unfinished (2026-09-04, 173 and 149 fuel).
@@ -784,8 +813,20 @@ end
 local m_MissedStarts = {}
 local MAX_MISSED_STARTS = 3
 
+-- The strike count EXPIRES. It was cleared only when the drone finished a task -- and a drone that is
+-- offered nothing cannot finish anything, so three missed starts (two of them TaskMan's own crash on
+-- a dig payload, 2026-09-08) locked the only miner out for good: "every miner is busy (D1)" with D1
+-- idle on its dock. Ten real minutes without a strike forgives the lot.
+local MISSED_START_FORGIVE_MS = 600000
+local m_MissedStartAt = {}
 local function tooManyMissedStarts(p_Drone)
-    return (m_MissedStarts[tostring(p_Drone.id)] or 0) >= MAX_MISSED_STARTS
+    local k = tostring(p_Drone.id)
+    local s_At = m_MissedStartAt[k]
+    if s_At ~= nil and (os.epoch("utc") - s_At) > MISSED_START_FORGIVE_MS then
+        m_MissedStarts[k] = nil
+        m_MissedStartAt[k] = nil
+    end
+    return (m_MissedStarts[k] or 0) >= MAX_MISSED_STARTS
 end
 
 local function pickDrones(p_Role)
@@ -806,8 +847,12 @@ local function pickDrones(p_Role)
             -- heartbeats, so `offline` already answers the question the ping was asking, for free
             -- and without blocking anything. The worst case is dispatching to a drone that died in
             -- the last ninety seconds -- and that task is reclaimed on the next sweep anyway.
+            -- NOT ONE THAT STILL HOLDS A LIVE TASK. pickDrone checked committed(); this path did not,
+            -- so a miner whose TaskDone was lost at the shaft bottom (it reported idle, TaskMan had
+            -- it on task 255) was handed task 366 as well, and stopping 255 later aborted 366
+            -- (2026-09-08). One drone, one task; the stale one is reclaimed by heldForNothing.
             if FREE_STATES[d.status] and not d.offline and hasFuel(d)
-               and not tooManyMissedStarts(d) then
+               and not tooManyMissedStarts(d) and not committed(d.id) then
                 s_Free[#s_Free + 1] = d
             else
                 s_Busy = s_Busy or d
@@ -830,7 +875,10 @@ local function verbFor(s_Task, s_Role)
 -- Dig, not GoTo. GoTo only moves a drone to a coordinate -- dispatching mining work with it
 -- sent a miner to stand next to the ore and do nothing.
 local s_Verb, s_Payload
-if s_Role == "scout" then
+-- THE VERB FOLLOWS THE WORK, NOT THE ROLE. A build handed to a scout (an inspection sweep) went out as
+-- "Survey" with a build payload, the scout never started it, and TaskMan reclaimed and re-sent it
+-- for ever ("reclaiming task 426 -- never started", 2026-09-08).
+if s_Role == "scout" and s_Task.work.build == nil then
     local w = s_Task.work.survey or {}
     local s_Pos, s_W, s_H = w.pos, w.w, w.h
     local s_R = tonumber(w.radius) or 8
@@ -870,7 +918,7 @@ elseif s_Task.work.build then
     -- The layout arrives as data. HQ costed it, checked it against the plot registry and
     -- ordered it bottom-up before any of this was dispatched.
     local w = s_Task.work.build
-    s_Verb, s_Payload = "Build", {origin = w.origin, blocks = w.blocks, taskId = s_Task.id}
+    s_Verb, s_Payload = "Build", {origin = w.origin, blocks = w.blocks, taskId = s_Task.id, sweep = w.sweep == true or nil, inspect = w.inspect == true or nil}
 elseif s_Task.work.mine then
     -- Prospecting: sink a shaft and drive branches, inspecting what gets exposed. The only job
     -- that can find ore the map has never seen.
@@ -1000,10 +1048,12 @@ function OnStartTask(p_ID, p_Message)
 
     local s_Role = RoleForWork(s_Task.work)
 
-    -- A dig is the one job that splits cleanly across workers, so give it everyone who is free.
-    -- dig.SplitRegion cuts the box into disjoint slabs oriented to minimise TURNS (a turn costs a
-    -- full step), and disjoint is what stops miners digging each other -- D1 mined D2 out of the
-    -- world because its box contained D2's parking spot.
+    -- ONE MINER PER DIG (was: every free miner). The operator wants a single drone excavating the
+    -- base + basement methodically, layer by layer, from the central shaft -- not the whole fleet
+    -- fanned across disjoint slabs, which reads as (and congests into) "mining random shit" with six
+    -- drones fighting the one dock and the storage row. dig.SplitRegion still cuts the box, but with
+    -- DIG_WORKERS = 1 it returns a single slab = the whole box, and OnDig walks it top-down on its
+    -- own. Raise DIG_WORKERS to bring the fleet back onto a dig once the congestion is solved.
     if s_Role == "miner" and s_Task.work and s_Task.work.dig
        and s_Task.work.dig.start and s_Task.work.dig.stop then
         local s_Free, s_Busy2 = pickDrones(s_Role)
@@ -1017,13 +1067,27 @@ function OnStartTask(p_ID, p_Message)
         -- digs around an obstacle. The rule belongs at the block being broken -- see IsProtected
         -- in DroneLogic, which every dig funnels through.
         local s_Depth = tonumber(w.depth) or (math.abs((w.stop.y or 0) - (w.start.y or 0)) + 1)
-        local s_Slabs = dig.SplitRegion(w.start, w.stop, #s_Free, s_Depth)
+        local DIG_WORKERS = 1
+        local s_Slabs = dig.SplitRegion(w.start, w.stop, math.min(#s_Free, DIG_WORKERS), s_Depth)
 
         local s_Names = {}
         for i, slab in ipairs(s_Slabs) do
             local d = s_Free[i]
-            PowNet.SendToDrone(d.id, PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Dig",
-                {w = slab.w, l = slab.l, depth = slab.depth, pos = slab.pos}))
+            -- A round footprint arrives as w.boxes (one per row of the disc); the drone works them in
+            -- order and start/stop are only its bounding box. A plain dig is the single slab.
+            -- taskId travels with the job: the drone reports TaskDone by it, and without it the
+            -- report matched no task -- a fully dug box sat at 0%, was "reclaimed -- never started",
+            -- re-dispatched and re-dug as air, for as long as anyone let it (2026-09-08).
+            local s_Payload = {w = slab.w, l = slab.l, depth = slab.depth, pos = slab.pos, taskId = s_Task.id, unbuild = w.unbuild == true or nil}
+            if type(w.boxes) == "table" and #w.boxes > 0 then
+                local b1 = w.boxes[1]
+                -- A COPY of the first box's position, not a reference: the payload is serialised for the
+                -- wire and textutils refuses a table that appears twice ("Cannot serialize table with
+                -- repeated entries" crashed the miner's worker on the first row dig, 2026-09-08).
+                s_Payload = {boxes = w.boxes, w = b1.w, l = b1.l, depth = b1.depth,
+                             pos = {x = b1.pos.x, y = b1.pos.y, z = b1.pos.z}, taskId = s_Task.id, unbuild = w.unbuild == true or nil}
+            end
+            PowNet.SendToDrone(d.id, PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Dig", s_Payload))
             s_Names[#s_Names + 1] = tostring(d.name) .. "(" .. slab.cost .. ")"
         end
 
@@ -1075,15 +1139,11 @@ function OnStartTask(p_ID, p_Message)
     -- dispatch that did not arrive, and it says nothing about which verb went where.
     Log(("dispatch %s -> %s (task %s)"):format(tostring(s_Verb), tostring(s_Drone.name or s_Drone.id),
         tostring(s_Task.id)))
-    PowNet.SendToDrone(s_Drone.id, PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, s_Verb, s_Payload))
-
-    s_Task.assigned = s_Drone.name
-    s_Task.assignedTo = s_Drone.id
-    s_Task.assignedAt = os.epoch("utc")
-    s_Task.paused = false
-    PowNet.MarkDirty()
-    return true, {message = "task " .. tostring(s_Id) .. " -> " .. tostring(s_Drone.name) ..
-                  " (" .. s_Role .. ")", drone = s_Drone.name}
+    -- WAIT FOR THE ANSWER. Fire-and-forget marked the task assigned whether or not the drone ever
+    -- heard it, and a lost dispatch cost 90 s of idle per reclaim: D14 and D8 sat docked holding
+    -- tasks their logs never mention while TaskMan said "every crafter is busy" (2026-09-08 19:16).
+    -- The drone answers at once -- {accepted} or "busy" -- so no answer means the message is gone.
+    return commitDispatch(s_Task, s_Drone, s_Verb, s_Payload, s_Id, s_Role)
 end
 
 function OnPauseTask(p_ID, p_Message)
@@ -1097,6 +1157,14 @@ function OnPauseTask(p_ID, p_Message)
     end
     PowNet.MarkDirty()
     return true, {message = "paused " .. tostring(s_Id)}
+end
+
+-- Is a task still live? A rebooted drone asks before resuming the job on its disk.
+function OnTaskAlive(p_ID, p_Message)
+    local s_Id = p_Message.data and p_Message.data.id
+    local s_Task = s_Id and (DATA["tasks"][s_Id] or DATA["tasks"][tostring(s_Id)] or DATA["tasks"][tonumber(s_Id) or -1])
+    local s_Alive = s_Task ~= nil and (tonumber(s_Task.progress) or 0) < 100 and s_Task.enabled ~= false
+    return true, {id = s_Id, alive = s_Alive == true}
 end
 
 function OnAbortTask(p_ID, p_Message)
@@ -2530,8 +2598,15 @@ local function stalledFor(p_Drone)
     end
     return os.epoch("utc") - (m_LastMovedAt[k] or os.epoch("utc"))
 end
+-- A heartbeat older than this says nothing about what the drone is doing NOW: a miner 60 blocks down
+-- a shaft is out of radio range and DroneMan still shows the "idle" it sent from the dock. TaskMan
+-- read that as "holding a task and idle", reclaimed the dig twice and re-dispatched it, and the miner
+-- swept the same shaft three times (2026-09-08). Stale means unknown, and unknown is not reclaimed.
+local STALE_BEAT_MS = 20000
 local function heldForNothing(p_Drone)
     if p_Drone == nil or p_Drone.offline then return nil end
+    local s_Seen = tonumber(p_Drone.lastSeen)
+    if s_Seen ~= nil and (os.epoch("utc") - s_Seen) > STALE_BEAT_MS then return nil end
     if p_Drone.status == "idle" then return "reports idle" end
     if not hasFuel(p_Drone) then return "has no fuel to finish it" end
     local s_Still = stalledFor(p_Drone)
@@ -2633,6 +2708,7 @@ local function releaseStalledAssignments()
                 -- whoever reads the log, and one message for both hid the fuel case entirely.
                 local dk = tostring(v.assignedTo)
                 m_MissedStarts[dk] = (m_MissedStarts[dk] or 0) + 1
+                m_MissedStartAt[dk] = os.epoch("utc")
                 if m_MissedStarts[dk] == MAX_MISSED_STARTS then
                     Log(("%s has failed to start %d assignments in a row -- not offering it more "
                          .. "until it finishes something"):format(tostring(d.name or d.id), MAX_MISSED_STARTS))
@@ -3479,6 +3555,7 @@ local m_ServerEvents = { -- Runs on a different thread so that we can interrupt 
     StartTask = { func = OnStartTask },
     PauseTask = { func = OnPauseTask },
     AbortTask = { func = OnAbortTask },
+    TaskAlive = { func = OnTaskAlive, params = { id = { optional = false } } },
     Abort = {
         callable = true,
         params = {

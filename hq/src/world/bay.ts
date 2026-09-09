@@ -29,11 +29,14 @@
 
 import type { BlueprintBlock } from './blueprints.js';
 import type { TowerSpec } from './tower.js';
-import { bayCells, LEVELS } from './tower.js';
+import { bayCells, discCells, BAY_DEPTH, LEVELS } from './tower.js';
 
 const CHEST = 'minecraft:chest';
 const MODEM = 'computercraft:wired_modem_full';
 const FURNACE = 'minecraft:furnace';
+// Between the modems the wire is plain networking cable: a full modem is only needed where a
+// peripheral attaches (the user, 2026-09-08: "do we need to use modems as wires all the time?").
+const CABLE = 'computercraft:cable';
 
 /** A relative cell inside a bay, addressed from the floor origin like every BlueprintBlock. */
 export interface Cell { dx: number; dy: number; dz: number; }
@@ -56,19 +59,32 @@ export interface BayInterior {
  * a single connected run. Drones do not suck these -- StorageMan routes through the modems -- so a
  * modem on top does not block anything.
  */
+// THE MODEM GOES UNDER THE CHEST, IN THE SLAB LAYER. A turtle loads and unloads a chest from ABOVE
+// (suckDown/dropDown), so nothing may sit on top of it -- the first bay was built with modems capping
+// the chests and no drone could ever have used it (the user, 2026-09-08: "the chests must be connected
+// from their bottom, they can't have stuff on top"). The modem replaces the floor slab cell; full modems
+// touching each other form the network, so the wired run travels inside the floor.
 const CHEST_DY = 1;
-const MODEM_DY = 2;
+const MODEM_DY = 0;
 
 /**
  * A basement bay as sorted storage: one single-item chest on every footprint cell, each capped with
  * a modem. Capacity is the cell count; StorageMan assigns one item class per chest as items arrive.
  */
 export function storageBayInterior(spec: TowerSpec, sector: number): BayInterior {
+  // CHECKERBOARD. Two chests that touch merge into one double chest, and a third beside them starts
+  // another pair -- so a packed row is not "one item per chest", it is a few 54-slot boxes StorageMan
+  // cannot tell apart from the plan ("max 2 next to each other" -- the user, 2026-09-08). Every other
+  // cell holds a chest; the cells between stay open floor to stand on. Modems run under all of them.
   const floor = bayCells(spec, sector);
   const blocks: BlueprintBlock[] = [];
   const chests: Cell[] = [];
   const modems: Cell[] = [];
   for (const c of floor) {
+    if ((c.dx + c.dz) % 2 !== 0) {
+      blocks.push({ dx: c.dx, dy: MODEM_DY, dz: c.dz, item: CABLE });   // wire between the chest modems
+      continue;
+    }
     const chest: Cell = { dx: c.dx, dy: CHEST_DY, dz: c.dz };
     const modem: Cell = { dx: c.dx, dy: MODEM_DY, dz: c.dz };
     blocks.push({ ...chest, item: CHEST });
@@ -106,7 +122,15 @@ export function factoryBayInterior(spec: TowerSpec, sector: number, machine = FU
     blocks.push({ dx: c.dx, dy: MODEM_DY, dz: c.dz, item: MODEM });
     modems.push({ dx: c.dx, dy: MODEM_DY, dz: c.dz });
     if (isEnd) chests.push({ dx: c.dx, dy: CHEST_DY, dz: c.dz });
-    else machines.push({ dx: c.dx, dy: CHEST_DY, dz: c.dz });
+    else {
+      machines.push({ dx: c.dx, dy: CHEST_DY, dz: c.dz });
+      // A FURNACE HAS FACES. Seen from below it exposes fuel and output (size 2); its INPUT face is
+      // the top. With only the modem underneath, StorageMan's service loaded coal into 35 furnaces
+      // and never a single ore (2026-09-08). Chests keep nothing on top (the user); furnaces get a
+      // second modem above, which the service reads as the input face (size 1).
+      blocks.push({ dx: c.dx, dy: CHEST_DY + 1, dz: c.dz, item: MODEM });
+      modems.push({ dx: c.dx, dy: CHEST_DY + 1, dz: c.dz });
+    }
   });
   return { blocks, chests, machines, modems };
 }
@@ -147,4 +171,55 @@ export function outfitBay(spec: TowerSpec, level: number, sector: number): BayPl
       // wash / alloy / press / assemble / logic -- machines not yet placeable. Shell only, for now.
       return { role: 'pending', interior: EMPTY };
   }
+}
+
+/**
+ * THE TRUNK. One ring of cable in the slab layer, just inside the bays' inner edge, so every bay mesh
+ * on the level is one network with StorageMan's. It has to be 4-CONNECTED: a discretised circle steps
+ * diagonally and cable does not connect across a diagonal -- the ring HQ ordered on 2026-09-08 was 16
+ * fragments of 5-7 cells, and sectors 7-9 stayed an island from the wired sector 11 with every cell
+ * "laid". Consecutive cells round the ring that only touch at a corner get a bridging cell between them.
+ */
+export function trunkCells(spec: TowerSpec): Cell[] {
+  const outer = spec.radius - spec.serviceDepth - 1;
+  const inner = Math.max(spec.walkRadius, outer - BAY_DEPTH);
+  const band = discCells(inner).filter((c) => Math.hypot(c.dx, c.dz) > inner - 1);
+  band.sort((a, b) => Math.atan2(a.dz, a.dx) - Math.atan2(b.dz, b.dx));
+  const seen = new Set(band.map((c) => `${c.dx}:${c.dz}`));
+  const out: Cell[] = [];
+  for (let i = 0; i < band.length; i++) {
+    const a = band[i]!, b = band[(i + 1) % band.length]!;
+    out.push({ dx: a.dx, dy: MODEM_DY, dz: a.dz });
+    if (Math.abs(a.dx - b.dx) === 1 && Math.abs(a.dz - b.dz) === 1) {
+      // a corner step: bridge through the INNER elbow -- the outer one can lie in the bay band
+      const e1 = { dx: a.dx, dz: b.dz }, e2 = { dx: b.dx, dz: a.dz };
+      const pick = Math.hypot(e1.dx, e1.dz) <= Math.hypot(e2.dx, e2.dz) ? e1 : e2;
+      const k = `${pick.dx}:${pick.dz}`;
+      if (!seen.has(k)) { seen.add(k); out.push({ dx: pick.dx, dy: MODEM_DY, dz: pick.dz }); }
+    }
+  }
+  return out;
+}
+
+/** The trunk as blueprint blocks (cable). */
+export function trunkBlocks(spec: TowerSpec): BlueprintBlock[] {
+  return trunkCells(spec).map((c) => ({ ...c, item: CABLE }));
+}
+
+/**
+ * The cable column that joins one level's trunk to the next level's: a wired network is one
+ * ring per floor until something climbs between them, and a ring nobody reaches is a bay whose
+ * chests StorageMan never sees. The column stands on a cell both rings share (tapers permitting)
+ * and fills every cell strictly between the two trunk heights, floor slab included -- cable is
+ * infrastructure the shell check tolerates.
+ */
+export function riserBlocks(a: TowerSpec, b: TowerSpec, dyA: number, dyB: number): BlueprintBlock[] {
+  const key = (c: Cell) => `${c.dx}:${c.dz}`;
+  const other = new Set(trunkCells(b).map(key));
+  const cell = trunkCells(a).find((c) => other.has(key(c)));
+  if (!cell) return [];
+  const lo = Math.min(dyA, dyB), hi = Math.max(dyA, dyB);
+  const out: BlueprintBlock[] = [];
+  for (let dy = lo + 1; dy < hi; dy++) out.push({ dx: cell.dx, dy, dz: cell.dz, item: CABLE });
+  return out;
 }

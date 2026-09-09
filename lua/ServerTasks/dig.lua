@@ -27,21 +27,14 @@ function round(x)
 	return x-0.5
 end
 
+-- Returns the sorted corners as NEW tables. Upstream aliased s_Min/s_Max to the arguments (so the
+-- "swap" assigned p_Max.x into p_Min.x and then read the already-overwritten p_Min.x back) and
+-- returned nothing at all -- PrepareTask's `local s_Min, s_Max = GetMinMax(...)` was always nil,nil
+-- and the next line died with "attempt to index local 'max' (a nil value)" (TaskMan, 2026-09-08).
 function GetMinMax(p_Min, p_Max)
-	local s_Min = p_Min
-	local s_Max = p_Max
-	if(p_Min.x > p_Max.x) then
-		s_Min.x = p_Max.x;
-		s_Max.x = p_Min.x;
-	end
-	if(p_Min.y > p_Max.y) then
-		s_Min.y = p_Max.y;
-		s_Max.y = p_Min.y;
-	end
-	if(p_Min.z > p_Max.z) then
-		s_Min.z = p_Max.z;
-		s_Max.z = p_Min.z;
-	end
+	local s_Min = {x = math.min(p_Min.x, p_Max.x), y = math.min(p_Min.y or 0, p_Max.y or 0), z = math.min(p_Min.z, p_Max.z)}
+	local s_Max = {x = math.max(p_Min.x, p_Max.x), y = math.max(p_Min.y or 0, p_Max.y or 0), z = math.max(p_Min.z, p_Max.z)}
+	return s_Min, s_Max
 end
 
 local function ZigZag(worker, distanceA, distanceB, flip, push)
@@ -203,6 +196,10 @@ function SplitRegion(p_Min, p_Max, p_Workers, p_Depth)
     local s_MinX, s_MaxX = math.min(p_Min.x, p_Max.x), math.max(p_Min.x, p_Max.x)
     local s_MinZ, s_MaxZ = math.min(p_Min.z, p_Max.z), math.max(p_Min.z, p_Max.z)
     local s_MinY        = math.min(p_Min.y, p_Max.y)
+    -- Enter at the TOP of the box. OnDig descends layer-by-layer from above, always standing on
+    -- cleared space, so it never paths horizontally through solid rock. Handing it the BOTTOM
+    -- corner made it bore BELOW the box and report "dug 0 blocks over 0 layers" (2026-09-07).
+    local s_MaxY        = math.max(p_Min.y, p_Max.y)
 
     local s_DX = s_MaxX - s_MinX + 1
     local s_DZ = s_MaxZ - s_MinZ + 1
@@ -223,9 +220,9 @@ function SplitRegion(p_Min, p_Max, p_Workers, p_Depth)
         local s_Slab = s_Base + ((i <= s_Extra) and 1 or 0)   -- spread the remainder, not all on one
         local s_Start
         if s_RowAlongX then
-            s_Start = {x = s_MinX, y = s_MinY, z = s_MinZ + s_Cursor}
+            s_Start = {x = s_MinX, y = s_MaxY, z = s_MinZ + s_Cursor}
         else
-            s_Start = {x = s_MinX + s_Cursor, y = s_MinY, z = s_MinZ}
+            s_Start = {x = s_MinX + s_Cursor, y = s_MaxY, z = s_MinZ}
         end
         s_Out[#s_Out + 1] = {
             pos   = s_Start,

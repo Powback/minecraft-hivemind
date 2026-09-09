@@ -1,8 +1,7 @@
-Bridge 16
-DockingMan 15
-DroneLogic 20
-DroneMan 11
-MainFrame 10
-MapServer 13
-StorageMan 14
-TaskMan 12
+Bridge 10
+DockingMan 8
+DroneMan 5
+MainFrame 4
+MapServer 7
+StorageMan 40
+TaskMan 6

@@ -2,8 +2,8 @@
   "note": "Duplicated logic. This file may only ever SHRINK -- see test/duplication.test.ts.",
   "window": 5,
   "totals": {
-    "blocks": 48,
-    "idioms": 65
+    "blocks": 52,
+    "idioms": 77
   },
   "files": {
     "hq/src/world/recipes.ts": {
@@ -19,8 +19,8 @@
       "idioms": 2
     },
     "lua/StorageMan.lua": {
-      "blocks": 5,
-      "idioms": 4
+      "blocks": 4,
+      "idioms": 5
     },
     "lua/DroneMan.lua": {
       "blocks": 2,
@@ -28,19 +28,19 @@
     },
     "lua/TaskMan.lua": {
       "blocks": 8,
-      "idioms": 19
+      "idioms": 22
     },
     "lua/pgps.lua": {
-      "blocks": 7,
-      "idioms": 4
-    },
-    "hq/src/world/settlement.ts": {
-      "blocks": 2,
-      "idioms": 0
+      "blocks": 9,
+      "idioms": 5
     },
     "lua/PowNetRemote.lua": {
       "blocks": 2,
       "idioms": 3
+    },
+    "lua/DroneLogic.lua": {
+      "blocks": 2,
+      "idioms": 9
     },
     "lua/MapRender.lua": {
       "blocks": 1,
@@ -50,6 +50,14 @@
       "blocks": 7,
       "idioms": 5
     },
+    "hq/src/agent/bootstrap.ts": {
+      "blocks": 1,
+      "idioms": 3
+    },
+    "hq/src/tools/core.ts": {
+      "blocks": 2,
+      "idioms": 8
+    },
     "hq/src/world/factories.ts": {
       "blocks": 0,
       "idioms": 1
@@ -58,21 +66,21 @@
       "blocks": 0,
       "idioms": 5
     },
-    "lua/DroneLogic.lua": {
-      "blocks": 0,
-      "idioms": 9
-    },
     "lua/Sync.lua": {
       "blocks": 0,
-      "idioms": 1
-    },
-    "hq/src/tools/core.ts": {
-      "blocks": 0,
-      "idioms": 8
+      "idioms": 2
     },
     "hq/src/agent/supply.ts": {
       "blocks": 0,
-      "idioms": 2
+      "idioms": 3
+    },
+    "lua/MainFrame.lua": {
+      "blocks": 0,
+      "idioms": 1
+    },
+    "hq/src/agent/screens.ts": {
+      "blocks": 0,
+      "idioms": 1
     },
     "hq/src/world/blueprints.ts": {
       "blocks": 0,

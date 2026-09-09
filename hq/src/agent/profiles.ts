@@ -88,10 +88,27 @@ export const PROFILES: Record<string, AgentProfile> = {
       'order.mine',
       'order.prospect',
       'order.build',
+      // Explicit-geometry builds: the bootstrap tower ring, roof and floor, built from the miner's own
+      // shaft spoils with no storage in the world.
+      'order.blocks',
+      'order.dig',
+      'bootstrap.status',
+      'bootstrap.start',
+      'bootstrap.stop',
+      'bootstrap.repairdebug',
+      'bootstrap.reinspect',
+      'world.cell',
+      'bay.activate',
+      'storage.deposits',
+      'storage.provide',
       // The tower. It queues a floor as a chain of drone-sized build tasks at priority 1, which is
       // a large and visible commitment of the fleet -- but it is also the only consumer the
       // settlement has for the cobblestone that otherwise fills every chest it owns.
       'order.tower',
+      // Outfit a floor's bays from the generated design (storage racks, furnace banks). The
+      // fresh-world redesign builds the sorted one-item-per-chest storage through this; danger is
+      // 'mutate', already within the commander's ceiling.
+      'order.bay',
       'factory.route',
       'factory.create',
       'factory.attach',

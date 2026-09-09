@@ -30,6 +30,7 @@ import { settlement, withinReach } from '../world/settlement.js';
 import { queueLumberSweep } from '../world/lumber.js';
 import { TOWER_TOP } from '../world/tower.js';
 import { readStockDetail, readStockWhere } from '../world/stock.js';
+import { boot } from './bootstrap.js';
 
 export interface SupplyRule {
   /** The BLOCK to go and mine, e.g. "coal_ore". */
@@ -631,8 +632,11 @@ async function dispatchCraft(rule: SupplyRule, have: number, ctx: SupplyCtx): Pr
   // The TARGET, not the deficit. expand() already subtracts what storage holds, so passing
   // (target - have) subtracts the same stock twice: asking for "8 more chests" while holding 8
   // planned to zero steps and the loop reported "nothing craftable" with a full chest.
-  const want = rule.limit ?? rule.min;
-  const r: any = await callTool('plan.execute', { item: stockKey(rule), quantity: want });
+  // THE SHORTFALL, ON TOP OF WHAT IS THERE. plan.execute's quantity is a stock TARGET: asked for
+  // "8 furnaces" with 8 on the shelf it answered "satisfied" and queued nothing, so the 36-furnace
+  // smeltery never got past its first run (2026-09-08). Ask for have + (min - have, capped by limit).
+  const want = Math.max(1, Math.min(rule.limit ?? Infinity, rule.min - have));
+  const r: any = await callTool('plan.execute', { item: stockKey(rule), quantity: Math.min(512, have + want) });
   const steps = r?.data?.queued ?? r?.queued ?? [];
   if (!steps.length) {
     note(`${rule.match}: ${have}/${rule.min}, nothing craftable — ${JSON.stringify(r?.data?.unsourced ?? [])}`);
@@ -768,6 +772,10 @@ async function queueSurvey(ctx: SupplyCtx, o: {
   name: string; priority: number; kind: string; box: { min: any; max: any };
   action: string; say: string;
 }): Promise<void> {
+  // WHILE THE BOOTSTRAP LOOP RUNS, THE SCOUT IS ITS EYES. These "find-<item>" explores took the scout
+  // tile after tile into the hillsides ("survey: walled in after 25 scans") while the finished courses
+  // waited to be inspected (2026-09-08).
+  if (boot.active) { note(`${o.name}: exploration held -- the bootstrap loop owns the scout`); return; }
   await bridge.call('TaskMan', 'Add', {
     name: o.name,
     priority: o.priority,
@@ -1031,8 +1039,10 @@ try {
       //
       // Two places decided how to obtain a material and they disagreed. Now there is one: the rule
       // table decides, and anything it does not mark for gathering is left to the rule that owns it.
+      // A rule at min 0 is "not wanted" -- coal_ore was set to 0 to stop drones chasing stale
+      // records 70 blocks out, and the top-up kept sending them anyway (2026-09-08).
       const gatherable = new Set(
-        supply.rules.filter((r) => (r.action ?? 'gather') === 'gather').map((r) => r.match));
+        supply.rules.filter((r) => (r.action ?? 'gather') === 'gather' && (r.min ?? 0) > 0).map((r) => r.match));
       const MATERIALS = ['oak_log', 'coal_ore', 'iron_ore', 'copper_ore',
                          'zinc_ore', 'lapis_ore', 'sand', 'gravel']
         .filter((m) => gatherable.has(m));
@@ -1394,6 +1404,14 @@ function offlineish(d: any): boolean {
 async function maintenancePhases(
   live: any[], queued: Set<string>,
 ): Promise<{ acted: boolean; reason: string } | null> {
+  // WHILE THE BOOTSTRAP LOOP RUNS, IT OWNS THE TOWER, THE STORAGE LAYOUT AND THE REPAIRS (cobble
+  // tower, bays in the basement, scouts inspecting). This loop keeps the economy: factories, crafts,
+  // caches, and the resource rules below (2026-09-08).
+  if (boot.active) {
+    return (await bringFactoriesOnline())
+      ?? (await runFactories(queued))
+      ?? (await collectFieldCaches(live, queued));
+  }
   return (await expandStorageIfFull(live, queued))
     ?? (await bringFactoriesOnline())
     ?? (await runFactories(queued))

@@ -29,6 +29,7 @@ local m_YieldAt = nil
 -- The single accepted-but-not-yet-started job. One slot, not a list: a drone does one thing at a
 -- time, and `executing` is claimed at accept time so a second cannot land. See RunJob / jobLoop.
 local m_JobQueue = nil
+JobBodyRunning = false   -- global on purpose: read by ClearStuckExecuting, set by jobLoop (200-local limit)
 -- True while Deposit() is running. A deposit is real work but is not a TASK, so without this the
 -- status sweep clears its "hauling" on every heartbeat and the drone reports idle mid-journey.
 local m_Depositing = false
@@ -235,15 +236,23 @@ local m_DockingSince = nil
 
 print("I AM ALIVE!")
 
+-- THE RADIO, NOT THE WIRE. A drone standing under a bay's slab has the bay's wired modem block
+-- attached on top; peripheral.find("modem") returned THAT first, so mesh fixes, relays and hosting
+-- went onto the chest network and the drone was deaf to the fleet -- every drone that parked at
+-- 53-55,59,22-23 froze at boot waiting for a fix that could never arrive (2026-09-08).
+function WirelessModem()
+    return peripheral.find("modem", function(_, m) return m and m.isWireless and m.isWireless() end)
+        or peripheral.find("modem")
+end
+
 -- InJob is true only inside RunJobNow; GoTo and Survey set `executing` directly and, if they throw
 -- or return on an early path, leave it set for ever -- the drone then reports "busy" with no job,
 -- refuses every dispatch, and TaskMan cannot reclaim what it holds. Globals: the file is at Lua's
 -- 200-local limit.
 InJob = false
-ExecPosKey, ExecStillSince = nil, nil
 function TaskStart()
     executing = true
-    ExecPosKey, ExecStillSince = nil, nil
+    ExecStill.key = nil
 end
 -- EXECUTING WITH NO JOB AND NO MOVEMENT IS A FLAG LEFT BEHIND. Three drones sat docked for 44
 -- minutes reporting busy with a job's detail line from hours before, each holding a tower patch
@@ -369,26 +378,112 @@ function JitterWatch()
     return true
 end
 
+-- How long the drone has stood in one cell, tracked in p_State {key, since}: 0 when it just moved.
+-- One helper because three watchdogs (stuck flag, wedged worker, stalled job) each wrote it out.
+function StillFor(p_State)
+    local cx, cy, cz = pgps.getCachedPosition()
+    local s_Key = tostring(cx) .. ":" .. tostring(cy) .. ":" .. tostring(cz)
+    if s_Key ~= p_State.key then p_State.key, p_State.since = s_Key, os.clock() return 0 end
+    return os.clock() - (p_State.since or os.clock())
+end
+ExecStill, WedgedStill, StallStill = {}, {}, {}
+
 function ClearStuckExecuting()
     -- m_Refuelling is the same shape: RefuelAtStorage sets it and clears it at "refuel sequence
     -- finished"; a sequence that never finishes (deposit into a full shelf that never succeeds) leaves
     -- the drone "refuelling" for ever, refusing work (D40, 29 minutes, 2026-09-04 22:50).
     if not (executing or m_Refuelling) or InJob then return false end
     local EXEC_STILL_S = 300
-    local cx, cy, cz = pgps.getCachedPosition()
-    local s_Key = tostring(cx) .. ":" .. tostring(cy) .. ":" .. tostring(cz)
-    if s_Key ~= ExecPosKey then
-        ExecPosKey, ExecStillSince = s_Key, os.clock()
-        return false
-    end
-    if (os.clock() - (ExecStillSince or os.clock())) <= EXEC_STILL_S then return false end
+    local s_Still = StillFor(ExecStill)
+    if s_Still <= EXEC_STILL_S then return false end
     trace(("%s flag left behind by a %s that has not moved for %ds and runs no job -- clearing")
-        :format(m_Refuelling and "refuelling" or "executing", tostring(m_Status), math.floor(os.clock() - ExecStillSince)))
+        :format(m_Refuelling and "refuelling" or "executing", tostring(m_Status), math.floor(s_Still)))
+    -- A ZOMBIE JOB. An abort clears InJob but the body may carry on (D14's aborted Plant ran a fetch
+    -- sweep for two hours, 2026-09-08): the worker never returns to the queue, every new Craft is
+    -- accepted and never runs, and the crafter looks idle for good. Only a reboot frees the worker.
+    if JobBodyRunning then
+        trace("a job body is still running long after its abort -- rebooting to free the worker")
+        os.sleep(1)
+        os.reboot()
+    end
     TaskEnd()
     m_Refuelling = false
     m_Status = "idle"
     m_Detail = nil
     return true
+end
+-- A WEDGED WORKER RESTARTS THE DRONE. D6 sat at 64,61,44 for three hours with InJob true and
+-- executing false: TaskMan aborted its resumed trunk build ten seconds into the boot, the worker
+-- never unwound, and every dispatch after that went unanswered ("reclaiming task 2585 from nil --
+-- never started") while the heartbeat kept saying busy (2026-09-08). Nothing in the drone can free
+-- a coroutine that will not return; a reboot can, and the job resumes from disk. Five game-minutes
+-- without movement in that state is the threshold, the same as ClearStuckExecuting.
+function RebootIfWedged()
+    if not (InJob and not executing) then WedgedStill.key = nil return false end
+    local s_Still = StillFor(WedgedStill)
+    if s_Still <= 300 then return false end
+    trace(("worker wedged: in a job with executing false and no movement for %ds -- rebooting"):format(math.floor(s_Still)))
+    os.reboot()   -- the resume state on disk is the job's own, written when it started
+    return true
+end
+-- A JOB THAT DOES NOT MOVE SAYS WHERE IT IS. Nine of fourteen drones reported "build" and stood
+-- still for minutes with nothing in the log after "JOB Build start" (2026-09-08); no probe answered.
+-- The worker sets JobPhase at each step; the heartbeat logs it once a minute of stillness, and after
+-- two minutes (1200 game-s) reboots the drone -- the job resumes from disk, as after any restart.
+JobPhase = nil
+StallSaid = 0
+function StallWatch()
+    if not (InJob and executing) then StallStill.key = nil StallSaid = 0 return false end
+    local s_Still = StillFor(StallStill)
+    if s_Still == 0 then StallSaid = 0 return false end
+    if s_Still >= 1200 then
+        trace(("job stalled %ds at %s -- rebooting to resume it"):format(math.floor(s_Still), tostring(JobPhase)))
+        os.reboot()
+        return true
+    end
+    if s_Still >= 600 * (StallSaid + 1) then
+        StallSaid = StallSaid + 1
+        trace(("job still for %ds at phase: %s -- travelBusy=%s owner=%s driving=%s"):format(
+            math.floor(s_Still), tostring(JobPhase), tostring(TravelIsBusy()), tostring(TravelOwner ~= nil),
+            tostring(pgps.isDriving and pgps.isDriving())))
+        local s_Tb = pgps.driverTraceback and pgps.driverTraceback()
+        if s_Tb then trace("driver stack: " .. s_Tb:sub(1, 600)) end
+    end
+    return false
+end
+-- A MOVE THAT NEVER RETURNS. The driver stack of a stalled drone read pgps:1952 'forward' -> [C]:
+-- the native turtle.forward() itself, suspended for ten minutes (2026-09-08). No Lua can unblock a
+-- native call that is waiting on a turtle_response that will not come; the coroutine holding the
+-- drive lock is dead weight and every other mover waits behind it. A move takes under a second;
+-- driving with no position change for 200 game-seconds is that hang, and the drone reboots.
+DriveStill = {}
+function RebootIfMoveHung()
+    if not (pgps.isDriving and pgps.isDriving()) then DriveStill.key = nil return false end
+    local s_Still = StillFor(DriveStill)
+    if s_Still < 200 then return false end
+    local s_Tb = tostring(pgps.driverTraceback and pgps.driverTraceback())
+    -- TWO SHAPES. "[C]: in ?" right under pcall is the native turtle call that never returns: reboot.
+    -- "in field 'yield' bios.lua" is a Lua wait -- a path reply, a sleep -- which MapServer's 7-game-s
+    -- SaveWorld stalls legitimately; rebooting on that made drones cycle every few minutes (2026-09-08).
+    local s_Native = s_Tb:find("%[C%]: in %?") ~= nil
+    if not s_Native and s_Still < 900 then
+        if math.floor(s_Still) % 200 < 15 then trace(("move waiting %ds (driving, no movement, Lua wait) -- %s"):format(math.floor(s_Still), s_Tb:sub(1, 200))) end
+        return false
+    end
+    trace(("move hung %ds (driving, no movement) -- rebooting; driver stack: %s"):format(math.floor(s_Still), s_Tb:sub(1, 400)))
+    os.reboot()
+    return true
+end
+-- OFF THE WIRE. A turtle touching a bay's wired modem block is attached to that network: it gets a
+-- peripheral event for every change on it, gps.locate hangs, and moves stop returning (2026-09-08).
+-- Whenever the heartbeat finds a wired modem attached and nothing is driving, the drone drops one
+-- block; the planner already prices the cells under a wire so routes avoid them.
+function GetOffTheWire()
+    if not (pgps.wiredModemAttached and pgps.wiredModemAttached()) then return false end
+    if pgps.isDriving and pgps.isDriving() then return false end
+    if turtle.detectDown() then return false end
+    trace("a wired modem is attached -- stepping down off the wire")
+    return pgps.down() and true or false
 end
 function TaskEnd()
     executing = false
@@ -584,6 +679,8 @@ function ReportedFuelFloor()
 end
 
 function SendHeartBeat()
+    -- A report TaskMan could not be reached for goes out the moment a beat can (see reportTask).
+    if PendingReports ~= nil and #PendingReports > 0 then pcall(FlushPendingReports) end
     -- Read the position, do not re-derive it. This used to call setLocationFromGPS, which steps
     -- the turtle forward and back to work out its heading -- acceptable once during Init, and the
     -- reason a "heartbeat" could never actually beat: on a timer it would shuffle every docked
@@ -635,6 +732,10 @@ function SendHeartBeat()
         m_DockingSince = nil
     end
     ClearStuckExecuting()
+    RebootIfWedged()
+    StallWatch()
+    RebootIfMoveHung()
+    GetOffTheWire()
     JitterWatch()
 
     -- AN IDLE DRONE IS NOT STILL DOING THE LAST THING.
@@ -1629,12 +1730,95 @@ end
 -- costs one pathfind. Then the sides, which are free of any assumption about what is overhead. Then
 -- the pickaxe, because a miner that cannot find a route to its own shaft head should make one --
 -- but only after the two routes that do not rearrange the world have been tried.
-function ReachSite(p_X, p_Y, p_Z)
+-- THE ONE ANSWER TO "MAY THIS BLOCK BE DUG". Containers, furnaces, every ComputerCraft block (a
+-- station's computer, its monitor, its modem, another drone) and the protected-material list. Every
+-- dig the drone makes on its own initiative -- a column descent, a wall cell it is about to fill, a
+-- standing cell -- goes through this; pgps has the matching rule for the mover. A monitor got past
+-- the old substring test ("computer") in the first version of this file's dig helpers.
+function NeverDig(p_Name)
+    if p_Name == nil then return false end
+    if p_Name:sub(1, 14) == "computercraft:" then return true end
+    return p_Name:find("chest", 1, true) ~= nil or p_Name:find("barrel", 1, true) ~= nil
+        or p_Name:find("furnace", 1, true) ~= nil or p_Name:find("computer", 1, true) ~= nil
+        or p_Name:find("turtle", 1, true) ~= nil or IsProtected(p_Name)
+end
+
+-- Sink straight down from where we stand to p_ToY, digging what is in the way. Stops at anything
+-- worth more than a hole (a chest, a computer, another drone, a protected material) and at anything
+-- it cannot get through in a few tries (bedrock, gravel still falling, a mob). Returns true, or
+-- false and why. Global: DroneLogic's main chunk is at the 200-local limit.
+function DescendDigging(p_ToY, p_AlsoRefuse)
+    local _, s_Cy = pgps.getCachedPosition()
+    local s_Stuck = 0
+    while s_Cy ~= nil and s_Cy > p_ToY do
+        if not executing then return false, "aborted" end
+        if turtle.detectDown() then
+            local s_Has, s_Det = turtle.inspectDown()
+            local s_Name = s_Has and type(s_Det) == "table" and s_Det.name or nil
+            if NeverDig(s_Name) then return false, "will not dig through " .. s_Name end
+            if p_AlsoRefuse and s_Name and p_AlsoRefuse(s_Name) then return false, "will not dig through " .. s_Name end
+            turtle.digDown()
+        end
+        if pgps.down() then
+            s_Stuck = 0
+        else
+            s_Stuck = s_Stuck + 1
+            if s_Stuck > 8 then return false, ("cannot get below y%d"):format(s_Cy) end
+            os.sleep(0.2)
+        end
+        _, s_Cy = pgps.getCachedPosition()
+    end
+    return true
+end
+
+-- Is this position inside the dig box: its footprint, and its height with a little slack for the
+-- cell above the top and the layer below the bottom? The old start check looked at Y alone, so a
+-- drone that had wandered seven blocks off the box but happened to be at the right height passed
+-- it and hollowed a 3x3x4 room where it stood (2026-09-08). Returns true, or false and why.
+function DigStartInBox(d, p_X, p_Y, p_Z)
+    local s_X0, s_TopY, s_Z0 = tonumber(d.pos and d.pos.x), tonumber(d.pos and d.pos.y), tonumber(d.pos and d.pos.z)
+    local s_Span  = math.max(tonumber(d.w) or 8, tonumber(d.l) or 8)
+    local s_Depth = tonumber(d.depth) or 4
+    if p_X == nil or p_Y == nil or s_X0 == nil or s_TopY == nil or s_Z0 == nil then return false, "no position" end
+    if p_Y > s_TopY + 3 or p_Y < s_TopY - s_Depth - 3 then
+        return false, ("y=%d is not within the box (top y%d, depth %d)"):format(p_Y, s_TopY, s_Depth)
+    end
+    if p_X < s_X0 or p_X > s_X0 + s_Span - 1 or p_Z < s_Z0 or p_Z > s_Z0 + s_Span - 1 then
+        return false, ("%d,%d is outside the box footprint %d..%d x %d..%d"):format(
+            p_X, p_Z, s_X0, s_X0 + s_Span - 1, s_Z0, s_Z0 + s_Span - 1)
+    end
+    return true
+end
+
+function ReachSite(p_X, p_Y, p_Z, p_DigIn)
     local s_Above = p_Y and (p_Y + 1) or nil
+    -- lua-hygiene: allow (the open-route attempt; every branch below it IS the fallback -- column descent, side approach, digging route)
     local s_At = pgps.moveTo(p_X, s_Above, p_Z)
     if s_At == false and p_Y ~= nil and executing then
-        trace("site unreachable from above -- trying the sides")
-        s_At = ApproachFromSide({x = p_X, y = p_Y, z = p_Z})
+        if p_DigIn and CanDig() then
+            -- A DIG BOX IS REACHED DOWN ITS OWN COLUMN, NOT ALONG A PLANNED TUNNEL. The planner's
+            -- digging route prices unmapped rock like air, so from the surface to a box 24 blocks
+            -- down it "found" a cheaper way: sideways out of the scanned area and down through cells
+            -- nobody had looked at. D1 followed it, tunnelled diagonally to the tower's corner, ran
+            -- the 3x3 serpentine there, and did it again 16 blocks further on (2026-09-08) -- the
+            -- "digging random shit" the whole benchmark exists to rule out. Fly over the column in
+            -- open air, then sink straight down it: one hole, where the box is.
+            local _, s_Cy = pgps.getCachedPosition()
+            -- lua-hygiene: allow (a fly-over in open air; a failure here falls through to the planner's digging route below, which IS the fallback)
+            if pgps.moveTo(p_X, math.max(s_Cy or s_Above, s_Above), p_Z) then
+                trace(("dig site is below open ground -- sinking straight down its column to y%d"):format(s_Above))
+                local s_Ok, s_Why = DescendDigging(s_Above)
+                s_At = s_Ok == true
+                if not s_At then trace("column descent stopped: " .. tostring(s_Why)) end
+            end
+            if not s_At and executing then
+                trace("buried dig site -- digging straight in (no side approach)")
+                s_At = pgps.digTo(p_X, s_Above, p_Z)
+            end
+        else
+            trace("site unreachable from above -- trying the sides")
+            s_At = ApproachFromSide({x = p_X, y = p_Y, z = p_Z})
+        end
     end
     if s_At == false and executing and CanDig() then
         trace("site unreachable by path -- digging in")
@@ -1824,6 +2008,21 @@ end
 local function resumeJob()
     local s_Job = loadResume()
     if s_Job == nil then return end
+    -- IS THE TASK STILL WANTED? A redeploy reboots the drone mid-job and this resumed whatever was on
+    -- disk -- including a build TaskMan had already given up on, so a scout laid a dead batch nobody
+    -- was counting while the live one waited (2026-09-08). Ask first; a task TaskMan no longer holds
+    -- live is dropped here.
+    local s_TaskId = type(s_Job.data) == "table" and s_Job.data.taskId or nil
+    if s_TaskId ~= nil then
+        os.sleep(5)
+        local s_Alive = PowNet.sendAndWaitForResponse("TaskMan",
+            PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "TaskAlive", {id = s_TaskId}), PowNet.SERVER_PROTOCOL, 8)
+        if type(s_Alive) == "table" and s_Alive.alive == false then
+            Say(("not resuming %s: TaskMan no longer holds task %s"):format(tostring(s_Job.verb), tostring(s_TaskId)))
+            if fs.exists(RESUME_FILE) then fs.delete(RESUME_FILE) end
+            return
+        end
+    end
     Say("resuming " .. tostring(s_Job.verb))
     os.sleep(5)                 -- let the servers finish coming up before talking to them
     -- DISPATCH THROUGH THE HANDLER TABLE, NOT AN IF-CHAIN.
@@ -2054,20 +2253,39 @@ reachableTarget = function(x, y, z)
         tostring(x), tostring(y), tostring(z))
 end
 
+-- THE ONE MESSAGE THE WHOLE QUEUE DEPENDS ON, AND IT IS ACKNOWLEDGED OR IT IS KEPT.
+--
+-- If TaskDone never arrives, TaskMan never learns the task ended: it stays assigned, gets reclaimed
+-- as "held by an idle drone" and re-dispatched. It was fire-and-forget, and a shaft dig ENDS at the
+-- bottom of the shaft, 60 blocks below the radio -- so every deep dig's report was lost, and D1
+-- swept the same empty shaft three times (2026-09-08). Observations already survive this (they are
+-- kept and uploaded later); the report now does the same: unacknowledged reports wait in
+-- PendingReports and go out with the next heartbeat that gets through.
+PendingReports = {}
+function SendTaskReport(p_Report)   -- global: the main chunk is at the 200-local limit
+    local s_Res = PowNet.sendAndWaitForResponse("TaskMan",
+        PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "TaskDone", p_Report), PowNet.SERVER_PROTOCOL, 6)
+    return s_Res ~= nil
+end
+function FlushPendingReports()
+    if #PendingReports == 0 then return 0 end
+    local s_Sent = 0
+    while #PendingReports > 0 and SendTaskReport(PendingReports[1]) do
+        trace(("report task %s delivered late (%d more waiting)"):format(tostring(PendingReports[1].id), #PendingReports - 1))
+        table.remove(PendingReports, 1)
+        s_Sent = s_Sent + 1
+    end
+    return s_Sent
+end
 reportTask = function(p_Data, p_Ok, p_Reason, p_Result)
     if p_Data == nil or p_Data.taskId == nil then return end
-    -- THE ONE MESSAGE THE WHOLE QUEUE DEPENDS ON.
-    --
-    -- If this never arrives, TaskMan never learns the task ended: it stays assigned to this drone
-    -- for ever, and pickDrone -- which only chooses idle drones -- skips the drone for ever too. One
-    -- lost packet takes a task AND a drone out of the settlement permanently, and swallowed it did
-    -- so with the drone cheerfully logging the job as finished on its own side.
-    Tried(("report task %s to TaskMan"):format(tostring(p_Data.taskId)), function()
-        PowNet.SendToServer("TaskMan", PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "TaskDone",
-            {id = p_Data.taskId, ok = p_Ok and true or false,
-             reason = (not p_Ok) and tostring(p_Reason) or nil,
-             result = p_Ok and p_Result or nil}))
-    end)
+    local s_Report = {id = p_Data.taskId, ok = p_Ok and true or false,
+                      reason = (not p_Ok) and tostring(p_Reason) or nil,
+                      result = p_Ok and p_Result or nil}
+    if not SendTaskReport(s_Report) then
+        PendingReports[#PendingReports + 1] = s_Report
+        trace(("report task %s: TaskMan out of reach -- kept, will retry when back in range"):format(tostring(p_Data.taskId)))
+    end
 end
 
 -- THE FIVE THINGS THAT MUST HAPPEN WHEN A SURVEY ENDS WELL.
@@ -2424,6 +2642,34 @@ local function digHard(p_Dig, p_Detect, p_Inspect, p_Which)
     while p_Detect() do
         if p_Inspect then
             local s_Ok, s_Blk = p_Inspect()
+            -- WHAT THE SETTLEMENT BUILT IS NEVER SPOIL. An excavation row that ran through a placed
+            -- wall took the wall with it (2026-09-08). Placed materials are refused like protected
+            -- blocks; the sweep treats the cell as blocked and moves on.
+            if s_Ok and s_Blk and DigSparesPlaced and PLACED_MATERIALS[s_Blk.name] then
+                trace(("not digging %s -- the settlement placed it"):format(tostring(s_Blk.name)))
+                return false
+            end
+            -- NAME WHO BREAKS THE STRUCTURE. A drone "walked around and broke walls and floors"
+            -- (2026-09-08) and no log line said which routine dug them. Banning the dig only strands
+            -- drones inside their own walls (the user); the fix is at the caller, so the caller is named.
+            if s_Ok and s_Blk and PLACED_MATERIALS[s_Blk.name] then
+                local s_Who = {}
+                for lvl = 3, 6 do
+                    local inf = debug.getinfo(lvl, "Sl")
+                    if inf == nil then break end
+                    s_Who[#s_Who + 1] = tostring(inf.short_src):gsub("^.*/", "") .. ":" .. tostring(inf.currentline)
+                end
+                local px, py, pz = pgps.getCachedPosition()
+                trace(("DUG PLACED %s (%s) at %s,%s,%s by %s"):format(tostring(s_Blk.name), p_Which,
+                    tostring(px), tostring(py), tostring(pz), table.concat(s_Who, " < ")))
+                -- AND PUT IT BACK WHEN THE JOB IS OVER. Breaking through the base is allowed when the
+                -- planner saw no other way; leaving the hole is not ("they should repair walls and
+                -- floors and roofs after they break it" -- the user, 2026-09-08). Un-builds opt out.
+                if RepairBrokenPlaced and pgps.cellAt then
+                    local bx, by, bz = pgps.cellAt(p_Which)
+                    if bx then BrokenPlaced[#BrokenPlaced + 1] = {dx = bx, dy = by, dz = bz, item = s_Blk.name} end
+                end
+            end
             if s_Ok and s_Blk and IsProtected(s_Blk.name) then
                 -- RECORD IT, DO NOT JUST ANNOUNCE IT.
                 --
@@ -2884,6 +3130,32 @@ local function riseToCeiling(p_Ceiling)
     return true
 end
 
+-- TRAVEL DOES NOT DIG. A trip to a build square, a dock or a deposit point that finds no open route
+-- used to fall back to a digging plan, and the digging plan went through whatever stood in the way
+-- -- including the wall the same drone had laid ten minutes earlier ("it keeps destroying the shit
+-- it already built trying and failing to move around", 2026-09-08). Digging is a JOB's business:
+-- a dig job sets this for its duration (RunJob, opts.digIn) so its approach can bore in when it
+-- must; everything else flies, or fails and asks for clearance. Global: 200-local limit.
+TravelDigAllowed = false
+-- True while an excavation job runs: digHard then refuses PLACED_MATERIALS (see digHard).
+DigSparesPlaced = false
+
+-- A block the world made, not the settlement: what a builder's mover may clear on its way to a
+-- square. Minecraft's own materials minus the ones the fleet places, plus every protected block.
+-- Trees on the wall line stopped every batch with "walled in: 6 squares had no route" while the
+-- miner carrying a pickaxe circled the canopy (2026-09-08).
+PLACED_MATERIALS = {
+    ["minecraft:cobblestone"] = true, ["minecraft:cobblestone_wall"] = true, ["minecraft:cobblestone_stairs"] = true,
+    ["minecraft:stone_bricks"] = true, ["minecraft:glass"] = true, ["minecraft:torch"] = true,
+    ["minecraft:oak_planks"] = true, ["minecraft:crafting_table"] = true,
+}
+function NaturalBlock(p_Name)
+    if type(p_Name) ~= "string" then return false end
+    if p_Name:sub(1, 10) ~= "minecraft:" then return false end
+    if PLACED_MATERIALS[p_Name] or NeverDig(p_Name) then return false end
+    return true
+end
+
 function TravelToBody(p_X, p_Y, p_Z, p_Ceiling)
     -- A dry drone does not turn to face a step it cannot take (D37: 48 turns, 0 moves per window).
     if turtle.getFuelLevel() == 0 then return false, "out of fuel" end
@@ -2905,13 +3177,27 @@ function TravelToBody(p_X, p_Y, p_Z, p_Ceiling)
         local s_D = Blocks(cx, cy, cz, p_X, p_Y, p_Z)
         if s_D <= STRAIGHT_HOP and stepStraightTo(p_X, p_Y, p_Z) then return true end
     end
+    -- OPEN ROUTE FIRST, FOR EVERYONE. DIGGING IS THE LAST RESORT.
+    --
+    -- moveTo and digTo are the same A* with digging forbidden or allowed. A digger asking for a
+    -- DIGGING plan first (which an earlier change did) is exactly what shredded the tower -- the
+    -- shortest line to anything behind a wall or under a floor is THROUGH it, so travelling around
+    -- the base cut floors, walls and the drone's own escape, walling it in. So try the open plan
+    -- first: it refuses a solid goal (returns false) instead of blind-flying at it, and a digger
+    -- then falls to a DIGGING plan as a genuine last resort -- priced at DIG_STEP_COST per cut cell,
+    -- it still walks around everything the map knows and cuts only where there is no open route.
+    -- digHard refuses chests, computers and modems mid-cut and records them FORBIDDEN, so a route is
+    -- never planned back through the infrastructure. A scout/crafter (no pickaxe) has no dig rung.
     if pgps.moveTo(p_X, p_Y, p_Z) ~= false then return true end
     if hardStop("travel") then return false end
-
-    if riseToCeiling(p_Ceiling) and pgps.moveTo(p_X, p_Y, p_Z) ~= false then return true end
-
-    if CanDig() and pgps.digTo(p_X, p_Y, p_Z) ~= false then return true end
-    if hardStop("travel") then return false end
+    -- NO CEILING CLIMB. "Rise to the ceiling and ask again" sent every drone up to y70 on every
+    -- failed leg -- "flying into the air for no reason" (the user, 2026-09-08). The planner routes
+    -- over an obstacle itself when that is the way; a blind climb only burns fuel and hides why the
+    -- first plan failed.
+    if CanDig() and TravelDigAllowed then
+        if pgps.digTo(p_X, p_Y, p_Z) ~= false then return true end
+        if hardStop("travel") then return false end
+    end
 
     -- NO FLIGHT RUNG. THE PATHFINDER IS THE TRAVEL MECHANISM.
     --
@@ -2969,8 +3255,23 @@ function TravelIsBusy()
     end
     return true
 end
+-- WAIT FOR THE LOCK, DO NOT REFUSE. A sweep of 112 squares was refused square after square within a
+-- tenth of a second -- "another routine is already moving the drone" x112 -- while the idle errand
+-- sat in a path wait, and the whole smeltery build failed twice with nothing placed (2026-09-08). The
+-- drone cannot move for anyone else meanwhile, so waiting costs nothing; a JOB outranks an errand and
+-- breaks its trip after five seconds.
+TRAVEL_LOCK_WAIT_S = 60   -- globals: the file is at Lua's 200-local limit
+function WaitForTravelLock()
+    local s_Waited = 0
+    while TravelIsBusy() and s_Waited < TRAVEL_LOCK_WAIT_S do
+        if s_Waited == 5 and InJob then pgps.BreakExec() os.sleep(1) pgps.StartExec() end
+        os.sleep(1)
+        s_Waited = s_Waited + 1
+    end
+    return not TravelIsBusy()
+end
 function TravelTo(p_X, p_Y, p_Z, p_Ceiling)
-    if TravelIsBusy() then
+    if not WaitForTravelLock() then
         trace(("travel: another routine is already moving the drone -- not also heading to %s,%s,%s")
             :format(tostring(p_X), tostring(p_Y), tostring(p_Z)))
         return false, "travel busy"
@@ -3204,7 +3505,10 @@ end
 -- is the only honest test that anything was handed over at all. Craft and Build each wrote it out.
 function HandoverOrThrow(p_Hand, p_What)
     if type(p_Hand) ~= "table" or p_Hand.pos == nil then
-        error("storage would not hand over " .. p_What, 0)
+        -- WITH THE REASON. Every bay build died on "storage would not hand over materials" and the
+        -- string StorageMan sent back -- the actual cause -- was thrown away here (2026-09-08).
+        local s_Why = type(p_Hand) == "string" and p_Hand or (type(p_Hand) == "table" and (p_Hand.message or p_Hand.error)) or (p_Hand == nil and "no reply") or tostring(p_Hand)
+        error("storage would not hand over " .. p_What .. " -- " .. tostring(s_Why), 0)
     end
 end
 
@@ -3224,12 +3528,56 @@ end
 --   chest: still out of reach after asking     <- and the answer was thrown away
 --
 -- A GLOBAL, like the other helpers here: this file is at Lua's 200-local ceiling.
+-- Where the chest we stand on is, for storage to gather into. nil when we do not know where we are.
+function ChestBelowPos()
+    local x, y, z = pgps.getCachedPosition()
+    if x == nil then return nil end
+    return {x = x, y = y - 1, z = z}
+end
+
+-- REARRANGE THE CHEST OURSELVES. A chest wrapped by side accepts its own side name as a transfer
+-- target on the wrapping computer, so `chest.pullItems("bottom", from, 64, to)` moves a stack
+-- between two of its own slots (tweaked.cc inventory API; CC-Tweaked discussion #1552). That is
+-- the whole "bring it forward" problem, solved locally in one call: put the wanted stack into the
+-- lowest empty slot below the front, or swap it with the front stack via any empty slot, or -- with
+-- the chest full -- take the front stack aboard first. Every earlier version asked StorageMan to
+-- shuffle one stack per network round trip and a 256-block fetch was forty of them (2026-09-08).
+-- Returns true when the wanted stack is now the first occupied slot.
+function SurfaceLocally(p_Chest, p_Slot, p_List)
+    if p_Chest == nil or p_Chest.pullItems == nil then return false end
+    local s_First
+    for slot, it in pairs(p_List) do
+        if it and it.name and (s_First == nil or slot < s_First) then s_First = slot end
+    end
+    if s_First == nil or p_Slot == s_First then return true end
+    local s_Size = 27
+    if p_Chest.size then local ok, sz = pcall(p_Chest.size) if ok then s_Size = tonumber(sz) or 27 end end
+    local s_Empty
+    for i = 1, s_Size do if p_List[i] == nil then s_Empty = i break end end
+    local function move(from, to)
+        local ok, n = pcall(p_Chest.pullItems, "bottom", from, 64, to)
+        if not ok then trace("chest: self-move refused -- " .. tostring(n)) return false end
+        return (tonumber(n) or 0) > 0
+    end
+    if s_Empty and s_Empty < s_First then return move(p_Slot, s_Empty) end
+    if s_Empty then
+        if not move(s_First, s_Empty) then return false end
+        return move(p_Slot, s_First)
+    end
+    -- full chest: the front stack comes aboard, the wanted one takes its place
+    if FreeSlots() < 2 then return false end
+    turtle.select(1)
+    -- lua-hygiene: allow (called only from TakeFromChest; the front stack comes aboard so the wanted one can take its slot)
+    if not turtle.suckDown(64) then return false end
+    return move(p_Slot, s_First)
+end
+
 function SurfaceDeepSlot(p_Chest, p_WantName, p_Want, p_Slot)
     trace(("chest: slot %d is out of a turtle's reach -- asking storage to bring it forward")
         :format(p_Slot))
     local s_Moved = PowNet.sendAndWaitForResponse("StorageMan",
         PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "BringToFront",
-            {match = tostring(p_WantName or "")}), PowNet.SERVER_PROTOCOL, 8)
+            {match = tostring(p_WantName or ""), pos = ChestBelowPos()}), PowNet.SERVER_PROTOCOL, 20)
     if type(s_Moved) ~= "table" or not s_Moved.slot then
         trace("chest: storage could not bring it forward -- " .. tostring(s_Moved))
         return nil, nil
@@ -3237,7 +3585,12 @@ function SurfaceDeepSlot(p_Chest, p_WantName, p_Want, p_Slot)
     trace(("chest: storage moved it to slot %d"):format(s_Moved.slot))
 
     local s_Elsewhere = nil
-    if type(s_Moved.pos) == "table" and s_Moved.pos.x ~= nil then s_Elsewhere = s_Moved.pos end
+    local s_Here = ChestBelowPos()
+    if type(s_Moved.pos) == "table" and s_Moved.pos.x ~= nil
+       and not (s_Here and math.abs(s_Moved.pos.x - s_Here.x) + math.abs(s_Moved.pos.z - s_Here.z) <= 1
+                and s_Moved.pos.y == s_Here.y) then
+        s_Elsewhere = s_Moved.pos
+    end
 
     local s_Ok, s_List = pcall(p_Chest.list)
     if not s_Ok or type(s_List) ~= "table" then return nil, s_Elsewhere end
@@ -3262,6 +3615,29 @@ end
 -- matching stack goes straight back below, while we still stand over the chest it came from:
 -- a 4-log plank craft withdrew 200 logs, could not clear its grid, and flew them to the
 -- shaft-bottom cache 50 blocks down (2026-09-05 15:50).
+-- Does this stack stay aboard under its kind's KEEP_ABOARD allowance? p_Tally counts what is kept so
+-- far per kind and is advanced when the answer is yes. A global: the file is at the 200-local limit.
+function KeepWithinAllowance(p_Name, p_Count, p_Tally)
+    if (p_Tally[p_Name] or 0) >= (KEEP_ABOARD[p_Name] or 0) then return false end
+    p_Tally[p_Name] = (p_Tally[p_Name] or 0) + p_Count
+    return true
+end
+
+-- Put the cargo into the container below, except what the caller wants and each kind's KEEP_ABOARD
+-- allowance. Returns the per-kind tally of what stayed aboard.
+function UnloadSpoils(p_Want)
+    local s_KeptOf = {}
+    for i = 1, 16 do
+        local det = turtle.getItemDetail(i)
+        if det and turtle.getItemCount(i) > 0 and not p_Want(det.name)
+           and not KeepWithinAllowance(det.name, turtle.getItemCount(i), s_KeptOf) then
+            turtle.select(i) PutDown()
+        end
+    end
+    turtle.select(1)
+    return s_KeptOf
+end
+
 function TakeFromChest(p_Want, p_Cap)
     local s_Before = {}
     for i = 1, 16 do
@@ -3295,10 +3671,11 @@ function TakeFromChest(p_Want, p_Cap)
     -- that no longer existed -- "target is in slot 16" computed before adding nine stacks of
     -- cobblestone to the same chest. The pull then counted to the wrong place and came back
     -- without the logs, every time.
-    for i = 1, 16 do
-        if turtle.getItemCount(i) > 0 then turtle.select(i) PutDown() end
-    end
-    turtle.select(1)
+    -- ...BUT NOT THE ORDER ITSELF. This put down EVERY slot, so a staging pass that took 20 chests
+    -- for a bay and came back for the modems returned the chests to the pickup on the way in: every
+    -- bay sweep went out "short of chest x16" with 325 chests on the shelf (2026-09-08). What the
+    -- caller wants stays aboard, and so does each kind up to its KEEP_ABOARD allowance.
+    UnloadSpoils(p_Want)
 
     local s_Chest = peripheral.wrap("bottom")
     local s_List = nil
@@ -3308,6 +3685,16 @@ function TakeFromChest(p_Want, p_Cap)
     end
 
     if s_List then
+        -- WHAT IS IN HERE, on arrival: the shape of a failed fetch is only readable with the chest's
+        -- contents beside the drone's position (2026-09-08).
+        do
+            local s_Sum, s_N, cx, cy, cz = {}, 0, pgps.getCachedPosition()
+            for slot = 1, 128 do
+                local it = s_List[slot]
+                if it and it.name then s_N = s_N + 1 if #s_Sum < 6 then s_Sum[#s_Sum + 1] = tostring(it.name):gsub("^[a-z]*:", "") .. "x" .. tostring(it.count) end end
+            end
+            trace(("chest at %s,%s,%s: %d stack(s): %s%s"):format(tostring(cx), tostring(cy), tostring(cz), s_N, table.concat(s_Sum, " "), s_N > 6 and " ..." or ""))
+        end
         -- Is any of it even here? If not, take nothing and say so -- no flight wasted sorting.
         local s_Ahead, s_TargetSlot, s_WantName = 0, nil, nil
         for slot = 1, 128 do
@@ -3318,7 +3705,15 @@ function TakeFromChest(p_Want, p_Cap)
             end
         end
         if s_TargetSlot == nil then
-            trace("chest: nothing matching is in there")
+            -- SAY WHERE AND WHAT. "nothing matching" at a chest storage swore held the item is either a
+            -- wrong position binding or a stale index, and the two look identical without this line.
+            local s_Seen, s_N = {}, 0
+            for slot = 1, 128 do
+                local it = s_List[slot]
+                if it and it.name and s_N < 4 then s_Seen[#s_Seen + 1] = tostring(it.name):gsub("^minecraft:", "") .. " x" .. tostring(it.count) s_N = s_N + 1 end
+            end
+            local cx, cy, cz = pgps.getCachedPosition()
+            trace(("chest: nothing matching is in there (at %s,%s,%s; holds %s)"):format(tostring(cx), tostring(cy), tostring(cz), #s_Seen > 0 and table.concat(s_Seen, ", ") or "nothing"))
             return {}, {}
         end
         trace(("chest: target is in slot %d, %d stack(s) ahead of it"):format(s_TargetSlot, s_Ahead))
@@ -3330,11 +3725,25 @@ function TakeFromChest(p_Want, p_Cap)
         -- the crafter could not have got them out if it had tried all night; it pulled 16 stacks of
         -- cobblestone, ran out of room, put them back, and reported the logs missing. StorageMan is
         -- on the wired network and can simply move the stack forward.
-        if s_TargetSlot > 16 then
-            local s_Re
-            s_Re, s_ElsewhereAt = SurfaceDeepSlot(s_Chest, s_WantName, p_Want, s_TargetSlot)
-            if s_Re then s_List, s_Ahead, s_TargetSlot = s_Re.list, s_Re.ahead, s_Re.slot end
-            if s_TargetSlot == nil or s_TargetSlot > 16 then
+        -- ANYTHING AHEAD OF IT IS OUT OF REACH. A turtle sucks the first occupied slot, so "slot 12
+        -- with 11 stacks ahead" is as unreachable as slot 21 -- but only slot > 16 asked storage to
+        -- bring the stack forward; the rest fell through to "still short" with the cobble right
+        -- there (2026-09-08). Ask whenever a stack sits in front of the wanted one.
+        if s_Ahead > 0 then
+            -- MAKE THE ROOM STORAGE CANNOT. With every slot of every chest full (3,213 dirt), storage
+            -- had nowhere to shuffle the front stack and answered "could not clear slot 1" while the
+            -- cobble sat in slot 10 (2026-09-08). The turtle takes the front stack into itself first;
+            -- storage then moves the wanted stack into the freed slot; what was pulled goes back after.
+            if SurfaceLocally(s_Chest, s_TargetSlot, s_List) then
+                trace("chest: moved it to the front ourselves")
+                s_Ahead = 0
+            else
+                if FreeSlots() > 2 then turtle.suckDown(64) end
+                local s_Re
+                s_Re, s_ElsewhereAt = SurfaceDeepSlot(s_Chest, s_WantName, p_Want, s_TargetSlot)
+                if s_Re then s_List, s_Ahead, s_TargetSlot = s_Re.list, s_Re.ahead, s_Re.slot end
+            end
+            if s_TargetSlot == nil or s_Ahead > 0 then
                 -- Not reachable HERE. Say which of the two that is: "it moved to another chest" is
                 -- a working answer the caller can act on, and reporting it as a dead end is what
                 -- left the fleet dry beside the charcoal it had just successfully relocated.
@@ -3358,9 +3767,47 @@ function TakeFromChest(p_Want, p_Cap)
         --
         -- The turtle was emptied above, before the layout was read, so every slot is free and the
         -- indices below are the ones actually in the chest right now.
-        for _ = 1, math.min(16, s_Ahead + 1) do
-            if FreeSlots() < 1 then break end
+        -- TAKE UNTIL THE ORDER IS FILLED, NOT ONE STACK. This took min(16, ahead+1) stacks -- with the
+        -- wanted stack in front, exactly one -- so a 236-block batch left with 64 cobble and walked the
+        -- rest of its squares empty (D3, 2026-09-08). Pull, re-list, surface the next stack if something
+        -- sits in front of it, pull again, until the cap is met or the chest has no more.
+        local s_Have = 0
+        for _ = 1, 32 do
+            -- SAY SO. A full turtle broke out of here silently and the log read "target is in slot 1,
+            -- 0 stack(s) ahead" followed by nothing -- the shelf was full, the pre-pickup deposit had
+            -- unloaded nothing, and the chests were never taken (D1, 2026-09-08).
+            if FreeSlots() < 1 then trace("chest: no free slot aboard -- cannot take it") break end
             if not turtle.suckDown(64) then break end
+            s_Have = 0
+            for i = 1, 16 do
+                local d = turtle.getItemDetail(i)
+                if d and p_Want(d.name) then s_Have = s_Have + turtle.getItemCount(i) end
+            end
+            local s_CapNow = p_Cap and p_Cap(s_WantName, s_Have) or nil
+            if s_CapNow ~= nil and s_CapNow <= 0 then break end
+            local ok2, l2 = pcall(s_Chest.list)
+            if not ok2 or type(l2) ~= "table" then break end
+            local s_Next, s_Ahead2 = nil, 0
+            for slot = 1, 128 do
+                local it = l2[slot]
+                if it and it.name then
+                    if p_Want(it.name) then s_Next = slot break end
+                    s_Ahead2 = s_Ahead2 + 1
+                end
+            end
+            if s_Next == nil then trace("chest: no more of it in here") break end
+            if s_Ahead2 > 0 then
+                -- Same trick as the first take: pull the blocking stack into the turtle so storage
+                -- has a free slot to bring the next wanted stack forward into.
+                if not SurfaceLocally(s_Chest, s_Next, l2) then
+                    if FreeSlots() > 2 then turtle.suckDown(64) end
+                    local s_Re2 = SurfaceDeepSlot(s_Chest, s_WantName, p_Want, s_Next)
+                    if not s_Re2 or s_Re2.slot == nil or (s_Re2.ahead or 0) > 0 then
+                        trace("chest: could not surface the next stack -- taking what is aboard")
+                        break
+                    end
+                end
+            end
         end
     else
         for _ = 1, 16 do
@@ -3369,6 +3816,7 @@ function TakeFromChest(p_Want, p_Cap)
         end
     end
 
+    local s_KeptOf = {}
     eachCarriedSlot(function(i, n)
         local d = turtle.getItemDetail(i)
         local nm = d and d.name
@@ -3376,8 +3824,8 @@ function TakeFromChest(p_Want, p_Cap)
             local s_Keep, s_Back = KeepUpTo(n, p_Cap and p_Cap(nm, s_Kept[nm] or 0))
             if s_Back > 0 then PutDown(s_Back) end
             s_Kept[nm] = (s_Kept[nm] or 0) + s_Keep
-        else
-            PutDown()
+        elseif not KeepWithinAllowance(nm, n, s_KeptOf) then
+            PutDown()   -- spoils pulled while reaching the wanted stack, less the KEEP_ABOARD allowance
         end
     end)
 
@@ -3453,6 +3901,12 @@ local function storageHasAnyOf(p_Want, p_Min)
         for _, e in ipairs(s_Res.detail) do
             if (tonumber(e.count) or 0) >= s_Floor and SameItem(s_Name, e.name) then return true end
         end
+        -- OBSERVED deposit chests count too. The wired census (`detail`) misses items that live only
+        -- in position-registered chests whose network binding went stale; without this the fetch
+        -- gives up on them before flying out to look, though FetchSkip would happily search them.
+        for _, e in ipairs(s_Res.observed or {}) do
+            if (tonumber(e.count) or 0) >= s_Floor and SameItem(s_Name, e.name) then return true end
+        end
     end
     return false
 end
@@ -3517,19 +3971,36 @@ end
 -- networked chests; only those are searched. A chest whose contents are on record and hold none of
 -- what we want is skipped too. A global: this file is at Lua's 200-local limit.
 function FetchSkip(p_Point, p_Match)
-    if p_Point.peripheral == nil then return true end
+    -- Known contents settle it either way: search only if the chest holds something we want.
     local seen = p_Point.items
-    if type(seen) ~= "table" then return false end
-    for nm, n in pairs(seen) do
-        if (tonumber(n) or 0) > 0 and p_Match(nm) then return false end
+    if type(seen) == "table" then
+        for nm, n in pairs(seen) do
+            if (tonumber(n) or 0) > 0 and p_Match(nm) then return false end
+        end
+        return true
     end
-    return true
+    -- Unknown contents. A networked chest is always worth a look. A POSITION-ONLY chest is too WHEN
+    -- IT IS NEAR BASE -- those are the bay deposit chests a drone reaches in a couple of hops. The old
+    -- blanket `peripheral == nil` skip assumed materials only ever live in networked chests, but in
+    -- this world the network-name->position bindings went STALE (a chest bound as "chest_4" no longer
+    -- IS chest_4), so half the bay's chests read as position-only and the fleet was told to ignore
+    -- materials it could see and physically suck. Stock is OBSERVED here, not accounted -- a drone
+    -- flies to the position and takes what is there -- so a reachable chest is worth the look
+    -- regardless of whether its network name still resolves. Only FAR position-only points -- a field
+    -- cache at the bottom of a shaft -- are skipped, which is the stranding this guard was added for
+    -- (a cache at -480,8,87, 79 blocks out, nearly took a drone down with it).
+    if p_Point.peripheral ~= nil then return false end
+    local p = p_Point.pos
+    if type(p) ~= "table" or p.x == nil then return true end
+    local hx, hy, hz = HomeXYZ()
+    return (math.abs(p.x - hx) + math.abs(p.y - hy) + math.abs(p.z - hz)) > 20
 end
 -- How many of the chests StorageMan named to visit before giving up on the index and sweeping. The
 -- list is most-held first, so the whole order is usually in the first one or two; the cap bounds the
 -- pathological case of an item smeared one-per-chest across the bay. A global: 200-local main chunk.
 FETCH_KNOWN_MAX = 6
 function FetchItems(p_Want, p_Min)
+    JobPhase = "fetch: sweeping deposit points"
     local s_Match = function(nm)
         for w in pairs(p_Want) do if SameItem(w, nm) then return true end end
         return false
@@ -3736,9 +4207,29 @@ end
 -- each of them.
 -- lua-hygiene: allow (returns the tally; both callers -- UnloadInto and Deposit's below-us shortcut
 -- -- report it and call ReportChest)
+-- WHAT STAYS ABOARD WHEN THE REST IS UNLOADED. The bootstrap's builder is its own storage: a miner
+-- that dumped its cobblestone with the dirt after every shaft chunk had nothing to lay the next
+-- wall course with, went digging again, and the cobble piled up in the spoils chest where the loop
+-- never counted it (2026-09-08). Three stacks ride along; everything above that is deposited.
+KEEP_ABOARD = { ["minecraft:cobblestone"] = 256 }
+KeepRestore = {}   -- what a build raised KEEP_ABOARD from, put back when the job ends  -- four stacks ride along: a builder that unloads its leftover after every batch fetches it straight back (2026-09-08)
+-- NOT DEPOSITED AT ALL while storage is this small: dirt filled 51 of 81 chest slots and the cobble
+-- the builders needed could not be unloaded behind it (2026-09-08). Dirt stays aboard until a sink
+-- for it exists (a backfill order); it costs a miner slots, not the settlement its walls.
+DEPOSIT_NEVER = {}   -- dirt deposits again: the user chose more chests over a dirt sink (10 chests on the wire, 2026-09-08)
+
+-- lua-hygiene: allow (every caller -- UnloadInto, emptyInventory -- calls ReportChest right after; this is the shared unload step, not a chest write of its own)
 local function unloadHere()
     if not ContainerBelow() then return nil end
-    return putDownSlots(nil)
+    local s_Kept = {}
+    return putDownSlots(function(i)
+        local det = turtle.getItemDetail(i)
+        if det and DEPOSIT_NEVER[det.name] then return false end
+        local s_Cap = det and KEEP_ABOARD[det.name]
+        if s_Cap == nil or (s_Kept[det.name] or 0) >= s_Cap then return true end
+        s_Kept[det.name] = (s_Kept[det.name] or 0) + det.count
+        return false
+    end)
 end
 
 -- MOVE THE LOAD OUT OF THE DRONE, REPORT IT, AND SAY HOW MUCH WENT.
@@ -4160,6 +4651,28 @@ end
 -- The tower is unreachable because of DISTANCE, and distance is the one thing the drone can fix by
 -- itself. Walking back toward base restores the link that answers the question -- so a failed
 -- lookup schedules a step home instead of a retry in place. It converges; retrying does not.
+-- When StorageMan last answered "no deposit point" (os.clock), or nil. Read by depositIfFull.
+NoStorageSaidAt = nil
+
+-- Items aboard that a deposit would unload: everything except the KEEP_ABOARD allowance.
+function DepositableCount()
+    local s_Kept, s_N = {}, 0
+    for i = 1, 16 do
+        local det = turtle.getItemDetail(i)
+        if det then
+            local s_Cap = KEEP_ABOARD[det.name]
+            if DEPOSIT_NEVER[det.name] then
+                -- stays aboard: not counted as cargo to unload
+            elseif s_Cap and (s_Kept[det.name] or 0) < s_Cap then
+                s_Kept[det.name] = (s_Kept[det.name] or 0) + det.count
+            else
+                s_N = s_N + det.count
+            end
+        end
+    end
+    return s_N
+end
+
 function DepositTarget()
     -- SAY WHERE WE ARE. StorageMan cannot send a drone to the nearest chest without knowing which
     -- chest is nearest to it -- and until it did, it answered with the EMPTIEST in the settlement,
@@ -4172,6 +4685,17 @@ function DepositTarget()
     if type(s_Res) == "table" and s_Res.pos ~= nil then
         m_HomePos = s_Res.pos
         return s_Res.pos
+    end
+    if s_Res ~= nil then
+        -- StorageMan ANSWERED and has nowhere for us. That is "the settlement has no storage", not a
+        -- radio gap, and no amount of flying changes it. The fall-through below is for a drone that
+        -- got NO answer -- out of range -- and closes the gap toward home one leg at a time; run on
+        -- this answer instead it bounced D1 on the spot for 63 moves after every shaft chunk
+        -- (2026-09-08), until the jitter watch aborted it. The bootstrap has no chests by design:
+        -- the cargo is the material for the next build and belongs exactly where it is, aboard.
+        trace("deposit: storage has no deposit point -- keeping the cargo aboard")
+        NoStorageSaidAt = os.clock()
+        return nil
     end
 
     -- A BEARING IS ONLY AS GOOD AS THE POSITION IT STARTS FROM. NO FIX, NO WALK.
@@ -4417,14 +4941,15 @@ end
 -- deposit point, which is what makes this possible before redstone exists.
 -- Things a cache is never worth destroying to make room for itself. Its own predicate so the
 -- placement stays readable and the list can grow without touching it.
-local function tooValuableToDig(p_Name)
-    if p_Name == nil then return false end
-    return p_Name:find("chest", 1, true) ~= nil or p_Name:find("barrel", 1, true) ~= nil
-        or p_Name:find("furnace", 1, true) ~= nil or p_Name:find("computer", 1, true) ~= nil
-        or p_Name:find("turtle", 1, true) ~= nil or IsProtected(p_Name)
-end
+local function tooValuableToDig(p_Name) return NeverDig(p_Name) end
 
-local CACHE_WORTH_IT = 32          -- blocks of haul that justify spending a chest
+-- Raised from 32: the base/basement sits ~18-40 blocks from the storage row, so at 32 a miner
+-- excavating a corner asked for a cache chest, could not find one (StorageMan cannot see rcon-seeded
+-- chests), and ran around the map hunting one instead of digging (operator: "d1 is running around
+-- like crazy looking for a chest"). Within ~60 blocks a single miner just hauls its load home -- a
+-- 16-slot pack is ~1000 blocks, far more than one basement trip -- so no chest is needed. Genuine
+-- far mining (>64) still earns a cache.
+local CACHE_WORTH_IT = 64          -- blocks of haul that justify spending a chest
 
 function PlaceCacheHere()
     local s_Slot = nil
@@ -4603,6 +5128,9 @@ local function resumeAtFace(p_X, p_Y, p_Z)
     return true
 end
 
+-- Set by RunJob's finish around its end-of-job Deposit(): the drone stays at the chest.
+DepositNoReturn = false
+
 function DepositNow()
     -- THE CHEST YOU ARE STANDING ON IS A DEPOSIT POINT.
     --
@@ -4659,6 +5187,7 @@ function DepositNow()
         if not RoomAfterUnload(UnloadInto()) then return false, "storage full" end
         -- silent: allow (a convenience errand -- the drone works fine without a spare chest, it just caches less efficiently)
         pcall(TakeCacheChest)          -- leave with a chest for the next work site
+        if DepositNoReturn then return true end
         return resumeAtFace(hx, hy, hz)
     end
     -- A failed arrival because ANOTHER routine is flying the drone is not a blocked route: climbing
@@ -4687,6 +5216,7 @@ function DepositNow()
     end
     trace("deposit: arrived, unloading")
     if not RoomAfterUnload(UnloadInto()) then return false, "storage full" end
+    if DepositNoReturn then return true end
     return resumeAtFace(hx, hy, hz)
 end
 
@@ -4836,7 +5366,50 @@ local function depositIfFull()
     --
     -- Four slots is enough to work with and still worth the trip.
     if FreeSlots() > 4 then return true end
+    -- Only cargo a deposit would UNLOAD justifies the trip. Dirt stays aboard by rule (DEPOSIT_NEVER),
+    -- so a hold full of dirt sent the miner to the chest after every cell to unload nothing
+    -- (2026-09-08). With nothing unloadable and a slot still free, dig on; with none free, the job
+    -- ends and says why -- the dirt needs a destination, and that is a decision, not a trip.
+    if DepositableCount() == 0 then
+        if FreeSlots() > 0 then return true end
+        trace("hold full of cargo that never deposits (dirt) -- ending the job; dirt needs a sink")
+        return false
+    end
+    -- No storage in the world (StorageMan said so within the last ten game-minutes): a deposit trip
+    -- cannot succeed, so do not make one per cell -- D1 asked seventeen times a minute on the ring
+    -- trench and dug nothing between the asks (2026-09-08). Keep digging while a slot is free; the
+    -- job ends cleanly when the last one fills and the builder frees slots by placing.
+    if NoStorageSaidAt ~= nil and os.clock() - NoStorageSaidAt < 600 then
+        if FreeSlots() > 0 then return true end
+        trace("inventory full and there is no storage -- ending the job with what is aboard")
+        return false
+    end
     return Deposit()
+end
+
+-- Deposit when full WITHOUT losing our place. Deposit() flies to a storage chest and does NOT come
+-- back -- so any loop that keeps its position in COUNTERS (the dig serpentine's row/col) rather than
+-- by re-reading it will, after the first pack-fill, go on "cutting forward" from the storage chest
+-- while the counters march over a box the drone no longer stands in. That is the ~57% dig-coverage
+-- plateau, measured as scattered single cells: the room was hollowed only up to the first deposit
+-- (2026-09-07). Remember the cell + heading, run the ordinary deposit, and if it moved us, dig back
+-- to the exact cell before the caller cuts the next block. A GLOBAL, like the other resumable-work
+-- helpers here: DroneLogic's main chunk is at Lua's 200-local limit.
+--
+-- OnMine's shaft/branch loops have the same latent shape but re-derive `cy` from the world each
+-- iteration and rarely fill on a short shaft, so they mask it; left on raw depositIfFull() on
+-- purpose -- adopting this there changes a working path and wants a supervised test of its own.
+function DepositKeepingPlace()
+    local s_X, s_Y, s_Z, s_D = pgps.getCachedPosition()
+    local s_Ok = depositIfFull()
+    if s_Ok then
+        local s_Nx, s_Ny, s_Nz = pgps.getCachedPosition()
+        if s_Nx ~= s_X or s_Ny ~= s_Y or s_Nz ~= s_Z then
+            if not pgps.digTo(s_X, s_Y, s_Z) then return false end
+            if s_D ~= nil then pgps.turnTo(s_D) end
+        end
+    end
+    return s_Ok
 end
 
 -- Dig a box. Serpentine within each layer, then drop a level -- so the drone is always adjacent
@@ -4964,6 +5537,10 @@ local function RunJobNow(p_Name, p_Data, p_Opts, p_Body)
     -- WHAT DID IT COST. Every job line below carries the fuel it spent, net of any refuel inside
     -- it. The fleet burned 3-4x what its routes should cost and nothing said which job did it.
     local s_FuelAtStart = turtle.getFuelLevel()
+    if pgps.resetPlanBudget then pgps.resetPlanBudget() end   -- start counting the a* fuel budget for this job
+    if pgps.jobMotionReset then pgps.jobMotionReset() end     -- and the moves/turns for the EFFICIENCY line
+    BrokenPlaced = {}
+    RepairBrokenPlaced = true
     local function spent()
         local f = turtle.getFuelLevel()
         if type(f) ~= "number" or type(s_FuelAtStart) ~= "number" then return "?" end
@@ -4986,13 +5563,29 @@ local function RunJobNow(p_Name, p_Data, p_Opts, p_Body)
     TaskStart()
 
     InJob = true
+    JobPhase = "body"
     local function finish(p_Ok, p_Res)
+        for name, was in pairs(KeepRestore) do
+            if was == false then KEEP_ABOARD[name] = nil else KEEP_ABOARD[name] = was end
+        end
+        KeepRestore = {}
+        TravelDigAllowed = false        -- a dig job's licence to bore ends with the job
+        DigSparesPlaced = false
+        if pgps.setDigFilter then pgps.setDigFilter(nil) end
         InJob = false
         -- The description dies with the job. Left set, the panel shows a drone sitting idle
         -- "crafting chest x16" for ever, which reads as a stuck job rather than a finished one.
         m_Detail = nil
         SetHauling(nil)
-        if o.deposit ~= false and FreeSlots() < 16 then Deposit() end
+        if o.deposit ~= false and FreeSlots() < 16 and DepositableCount() > 0 then
+            -- The job is over: unload what needs unloading (kept build material does not) and stay at the chest. DepositNow otherwise flies back to the
+            -- cell the drone was working in ("resume at the face"), which after a shaft chunk is the
+            -- bottom of the shaft -- D1 went from the chest back down to y50 to be idle there and
+            -- called itself buried (2026-09-08).
+            DepositNoReturn = true
+            Deposit()
+            DepositNoReturn = false
+        end
 
         -- GET OFF THE CHEST. THE ACCESS SQUARE IS SHARED INFRASTRUCTURE.
         --
@@ -5049,8 +5642,15 @@ local function RunJobNow(p_Name, p_Data, p_Opts, p_Body)
     pcall(EnsureCacheChest, d)
 
     -- Go to the ordered site, or refuse. Digging "somewhere" is worse than digging nowhere.
+    -- A builder with a pickaxe may clear the world's own blocks from its path -- and nothing else.
+    if o.travelDig == "natural" and CanDig() then
+        TravelDigAllowed = true
+        if pgps.setDigFilter then pgps.setDigFilter(NaturalBlock) end
+    end
     if o.travel ~= false and d.pos and d.pos.x and d.pos.z then
-        local s_Arrived = ReachSite(tonumber(d.pos.x), tonumber(d.pos.y), tonumber(d.pos.z))
+        TravelDigAllowed = o.digIn == true
+        DigSparesPlaced = o.digIn == true      -- an excavation never removes placed material; a build may replace a wrong block
+        local s_Arrived = ReachSite(tonumber(d.pos.x), tonumber(d.pos.y), tonumber(d.pos.z), o.digIn)
         if s_Arrived == false then
             Distress("cannot reach site",
                 tostring(d.pos.x) .. "," .. tostring(d.pos.y) .. "," .. tostring(d.pos.z))
@@ -5076,6 +5676,7 @@ local function RunJobNow(p_Name, p_Data, p_Opts, p_Body)
         -- A job that throws must report, not vanish: the drone is left somewhere unexpected and
         -- somebody has to know why.
         trace(("JOB %s THREW %s"):format(p_Name, tostring(s_Ret[2])))
+        if executing then RestoreBroken(p_Name) end
         -- The TASK failed. The drone is fine and is about to ask for more work.
         Distress(p_Name .. " failed", tostring(s_Ret[2]), false)
         return finish(false, tostring(s_Ret[2]))
@@ -5115,7 +5716,21 @@ local function RunJobNow(p_Name, p_Data, p_Opts, p_Body)
         trace(("JOB %s INTERRUPTED -- returning it to the queue (%s fuel spent)"):format(p_Name, spent()))
         return finish(false, "interrupted before it finished")
     end
-    trace(("JOB %s done -- %s fuel spent"):format(p_Name, spent()))
+    RestoreBroken(p_Name)
+    trace(("JOB %s done -- %s fuel spent (a* budget %s)"):format(p_Name, spent(),
+        (pgps.planBudget and tostring(pgps.planBudget())) or "?"))
+    -- EFFICIENCY, AS A NUMBER. Squares handled against moves made: a sweep is optimal at one move
+    -- per square plus the trip to the site, so moves/square near 1 is the target and anything over
+    -- 2 is a route problem to read out of the sweep lines (the user, 2026-09-08: "log task
+    -- efficiency ... push all towards 100% compared to optimal").
+    if pgps.jobMotion and type(s_Res) == "table" then
+        local s_Steps, s_Turns = pgps.jobMotion()
+        local s_Sq = (tonumber(s_Res.placed) or 0) + (tonumber(s_Res.skipped) or 0) + (tonumber(s_Res.dug) or 0) + (tonumber(s_Res.wrong) or 0)
+        if s_Sq > 0 then
+            trace(("EFFICIENCY %s: %d squares, %d moves, %d turns, %s fuel -- %.2f moves/square, %.2f fuel/square")
+                :format(p_Name, s_Sq, s_Steps, s_Turns, spent(), s_Steps / s_Sq, (tonumber(spent()) or 0) / s_Sq))
+        end
+    end
     return finish(true, s_Res)
 end
 
@@ -5128,7 +5743,10 @@ function Serpentine(p_W, p_L, p_OnCell, p_Advance)
         if not executing then return row - 1 end
         for col = 1, p_W - 1 do
             if not executing then return row - 1 end
-            if p_OnCell(row, col) == false then break end
+            -- A cell callback saying false means STOP THE SWEEP (inventory full, blocked, aborted),
+            -- not "skip to the next row": walking the remaining rows while unable to work in any of
+            -- them was pure travel (2026-09-08).
+            if p_OnCell(row, col) == false then return row - 1 end
         end
         if row < p_L then
             local s_Turn = (row % 2 == 1) and pgps.turnRight or pgps.turnLeft
@@ -5140,43 +5758,245 @@ function Serpentine(p_W, p_L, p_OnCell, p_Advance)
     return p_L
 end
 
-function OnDig(p_ID, p_Message)
-    return RunJob("Dig", p_Message.data, {status = "mining"}, function(d)
-        local s_W     = tonumber(d.w)     or 8
-        local s_L     = tonumber(d.l)     or 8
-        local s_Depth = tonumber(d.depth) or 4
-
-        -- Refuse to quarry air. A drone that has just flown somewhere is airborne, and the first
-        -- real run dug a clean 3x3x2 of nothing at y=84: seventeen fuel spent, every dig hitting
-        -- nothing, empty inventory, and a job that reported success.
-        if not turtle.detectDown() then
-            Distress("nothing to dig", "no ground within " .. (tonumber(d.drop) or 24) .. " blocks")
-            error("no ground beneath")
+-- One box of a dig: stand over its top corner, then hollow it layer by layer top-down. Returns the
+-- blocks dug and layers finished. Global: the 200-local limit; shared by every box of a multi-box dig.
+-- ONE LAYER OF A DIG BOX, IN WORLD COORDINATES. Rows run along +z from the box's min corner, each
+-- row is walked along x, and every turn is a turnTo on an absolute heading. The old sweep was
+-- relative -- "w-1 steps forward, turn right, one step, turn right" -- so a box's orientation was
+-- whatever way the drone happened to face on arrival, and each layer began where the last one had
+-- ENDED, facing the way it ended: the second layer walked straight out of the box and every layer
+-- shifted it two cells further, until a 3x3x4 shaft came out as a diagonal staircase eight blocks
+-- long (D1, 2026-09-08; the "digging random shit" of the day before was the same thing). The layer
+-- is entered at whichever corner the drone stands on; it sweeps toward the other end.
+-- Returns true, or false and why. Global: 200-local limit; exported through the test seam.
+-- Is every cell of this layer already KNOWN to be air (0 in the drone's own map)? Then there is
+-- nothing to sweep: the drone descends through it. Re-issued or resumed digs used to walk every
+-- cell of every empty layer like a 3D printer scanning air (the user, 2026-09-08).
+function LayerKnownAir(p_X0, p_Z0, p_W, p_L, p_Y)
+    local s_World = pgps.cachedWorld or {}
+    for dz = 0, p_L - 1 do
+        for dx = 0, p_W - 1 do
+            if s_World[(p_X0 + dx) .. ":" .. p_Y .. ":" .. (p_Z0 + dz)] ~= 0 then return false end
         end
+    end
+    return true
+end
 
-        local s_Dug, s_Layers = 0, 0
-        for layer = 1, s_Depth do
-            if not executing then break end
-            Serpentine(s_W, s_L, function()
-                if not depositIfFull() then return false end
-                DigForward()
-                -- Something unbreakable (bedrock, a claim, a machine). Abandon the row, not the
-                -- job: the rest of the box is still worth having.
-                if not pgps.forward() then return false end
-                s_Dug = s_Dug + 1
-            end, function()
-                DigForward()
-                return pgps.forward()
-            end)
-            s_Layers = s_Layers + 1
-            if layer < s_Depth then
-                if not DigDown() then break end
-                if not pgps.down() then break end
+-- The cells of this layer the FLEET knows to be air: this drone's own map plus MapServer's, which
+-- holds what every other drone dug and saw. Keys "x:z". Unknown stays unknown and gets swept.
+function SharedAirForLayer(p_X0, p_Z0, p_W, p_L, p_Y)
+    local s_Air, s_Own = {}, pgps.cachedWorld or {}
+    local s_Pos = {}
+    for dz = 0, p_L - 1 do for dx = 0, p_W - 1 do
+        local x, z = p_X0 + dx, p_Z0 + dz
+        if s_Own[x .. ":" .. p_Y .. ":" .. z] == 0 then s_Air[x .. ":" .. z] = true end
+        s_Pos[#s_Pos + 1] = {x = x, y = p_Y, z = z}
+    end end
+    if #s_Pos <= 400 then
+        local s_Res = PowNet.sendAndWaitForResponse("MapServer",
+            PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "KnownAir", {positions = s_Pos}), PowNet.SERVER_PROTOCOL, 10)
+        if type(s_Res) == "table" and type(s_Res.air) == "table" then
+            for _, i in ipairs(s_Res.air) do local p = s_Pos[i] if p then s_Air[p.x .. ":" .. p.z] = true end end
+        end
+    end
+    return s_Air
+end
+
+function DigLayer(p_X0, p_Z0, p_W, p_L, p_OnCell)
+    local cx, cy, cz = pgps.getCachedPosition()
+    if cx == nil then return false, "no position" end
+    if LayerKnownAir(p_X0, p_Z0, p_W, p_L, cy) then return true, "known air" end
+    local s_Air = SharedAirForLayer(p_X0, p_Z0, p_W, p_L, cy)
+    local function rowAllAir(r)
+        for dx = 0, p_W - 1 do if not s_Air[(p_X0 + dx) .. ":" .. (p_Z0 + r)] then return false end end
+        return true
+    end
+    do
+        local s_All = true
+        for r = 0, p_L - 1 do if not rowAllAir(r) then s_All = false break end end
+        if s_All then return true, "known air (shared map)" end
+    end
+    local s_Up = cz <= p_Z0                       -- rows ascending in z, or descending from the far edge
+    local r0, r1, dr = 0, p_L - 1, 1
+    if not s_Up then r0, r1, dr = p_L - 1, 0, -1 end
+    for r = r0, r1, dr do
+        cx = pgps.getCachedPosition()
+        local s_East = cx <= p_X0                  -- at the west end: walk east; else walk west
+        local H = HEADINGS_()
+        -- A row the fleet already knows as air is not walked: only rows with something left in them.
+        if not rowAllAir(r) then
+            if p_W > 1 and pgps.turnTo(s_East and H.east or H.west) == false then return false, "cannot turn" end
+            for _ = 1, p_W - 1 do
+                if p_OnCell() == false then return false, "stopped in a row" end
             end
         end
+        if r ~= r1 then
+            if pgps.turnTo(dr > 0 and H.south or H.north) == false then return false, "cannot turn" end
+            if p_OnCell() == false then return false, "stopped between rows" end
+        end
+    end
+    return true
+end
 
-        return {message = "dug " .. s_Dug .. " blocks over " .. s_Layers .. " layers",
-                dug = s_Dug, layers = s_Layers}
+-- One box of a dig: stand over its min corner, then hollow it layer by layer top-down. Returns the
+-- blocks dug and layers finished, or throws if the box was left unfinished. Global: 200-local limit.
+-- The container in front, emptied into the turtle and dug up as an item -- only when it is EMPTY, so
+-- nothing ever hits the ground ("IT SHOULD NEVER DROP ITEMS"). False when the block ahead is no
+-- container, or it could not be emptied (the turtle is full: the next deposit trip makes room).
+function ClearCacheAhead()
+    local s_Has, s_Det = turtle.inspect()
+    local s_Name = s_Has and type(s_Det) == "table" and tostring(s_Det.name) or ""
+    if not (s_Name:find("chest", 1, true) or s_Name:find("barrel", 1, true)) then return false end
+    local s_Took = 0
+    for _ = 1, 64 do
+        if FreeSlots() < 2 then break end
+        if not turtle.suck() then break end
+        s_Took = s_Took + 1
+    end
+    local s_Inv = peripheral.wrap("front")
+    local s_Ok, s_List = pcall(function() return s_Inv and s_Inv.list and s_Inv.list() or nil end)
+    if not s_Ok or type(s_List) ~= "table" or next(s_List) ~= nil then
+        trace(("dig: a %s stands in the row and could not be emptied -- leaving it"):format(s_Name))
+        return false
+    end
+    if not turtle.dig() then return false end
+    trace(("dig: a %s stood in the row -- %d stack(s) taken aboard and the chest with them"):format(s_Name, s_Took))
+    return true
+end
+
+function DigBox(d)
+    local s_W     = tonumber(d.w)     or 8
+    local s_L     = tonumber(d.l)     or 8
+    local s_Depth = tonumber(d.depth) or 4
+    local s_X0, s_Z0 = tonumber(d.pos.x), tonumber(d.pos.z)
+
+    do
+        local s_MyX, s_MyY, s_MyZ = pgps.getCachedPosition()
+        local s_InBox, s_Why = DigStartInBox(d, s_MyX, s_MyY, s_MyZ)
+        if not s_InBox then
+            Distress("nothing to dig", "not at the box: " .. tostring(s_Why))
+            error("not at the box: " .. tostring(s_Why), 0)
+        end
+    end
+    if not turtle.detectDown() then
+        trace("start cell already air (re-dig / shaft column) -- descending to the rock below")
+    end
+    JobPhase = "dig: descending"
+
+    local s_Dug, s_Layers, s_Stopped = 0, 0, nil
+    for _ = 1, s_Depth do
+        if not executing then s_Stopped = "aborted" break end
+        -- ANOTHER DRONE UNDERNEATH IS A WAIT, NOT A FAILURE. Two miners on adjacent basement rows met
+        -- at the descent column; the refusal to mine a turtle was right, ending the chunk on it was
+        -- not (D3, 2026-09-08). Give it up to a minute to move on.
+        for _ = 1, 30 do
+            local s_Has, s_Det = turtle.inspectDown()
+            if not (s_Has and type(s_Det) == "table" and tostring(s_Det.name):find("turtle", 1, true)) then break end
+            if not executing then break end
+            os.sleep(2)
+        end
+        if not DigDown() then s_Stopped = "could not dig down" break end
+        if not pgps.down() then s_Stopped = "could not descend" break end
+        s_Dug = s_Dug + 1
+        JobPhase = ("dig: layer %d"):format(s_Layers + 1)
+        local s_Ok, s_Why = DigLayer(s_X0, s_Z0, s_W, s_L, function()
+            if not DepositKeepingPlace() then s_Stopped = "inventory full" return false end
+            JobPhase = ("dig: row, %d dug"):format(s_Dug)
+            DigForward()
+            if not pgps.forward() then
+                -- A SPOILS CHEST IN THE ROW IS CARGO, NOT A WALL. digHard refuses containers, so a cache a
+                -- miner had dropped in the excavation stopped every row through it: "refusing to mine
+                -- minecraft:chest" then "blocked in the row after 26 block(s)", three attempts, and the row
+                -- was written off as dug with the chest still there (2026-09-08). Empty it aboard, take the
+                -- chest, carry on.
+                if not (ClearCacheAhead() and pgps.forward()) then s_Stopped = "blocked in the row" return false end
+            end
+            s_Dug = s_Dug + 1
+        end)
+        if s_Stopped then break end
+        if not s_Ok then s_Stopped = s_Why or "layer unfinished" break end
+        s_Layers = s_Layers + 1
+    end
+    -- A BOX LEFT HALF DUG IS A FAILURE, NOT A RESULT. This returned the count and RunJob reported the
+    -- job DONE, TaskMan marked it 100%, and the loop above it moved to the next chunk -- over a 1x1
+    -- hole four deep where a 3x3 box should have been, dug until the inventory filled (2026-09-08).
+    -- Throwing keeps the task in the queue for another attempt once the drone has unloaded.
+    if s_Stopped then
+        error(("%s after %d block(s), %d of %d layer(s) -- the box is not finished"):format(s_Stopped, s_Dug, s_Layers, s_Depth), 0)
+    end
+    return s_Dug, s_Layers
+end
+
+-- A dig is one box, or a LIST of boxes (d.boxes) worked in order -- how a round footprint is
+-- excavated: one box per row of the disc, so nothing outside the circle is touched. RunJob reaches
+-- the first box; every further box is reached the same way (fly over it, sink down its column).
+-- lua-hygiene: allow (a dig needs no resume memo: the layers it has cleared are air in its own cache
+-- and in MapServer's, and LayerKnownAir/SharedAirForLayer skip them on the re-issued task)
+function OnDig(p_ID, p_Message)
+    return RunJob("Dig", p_Message.data, {status = "mining", settle = false, digIn = true}, function(d)
+        local s_Boxes = type(d.boxes) == "table" and #d.boxes > 0 and d.boxes or {d}
+        -- AN UN-BUILD: the boxes hold slab the design never had (the service cavity between the two
+        -- wall rings must be hollow -- the user, 2026-09-08). Only such a job may remove placed material.
+        if d.unbuild == true then DigSparesPlaced = false RepairBrokenPlaced = false end
+        local s_Dug, s_Layers, s_Done = 0, 0, 0
+        -- NEAREST BOX NEXT, not list order: a clearing job is scattered single cells, and walking them
+        -- in the order they were listed crossed the whole room between neighbours ("move to the
+        -- closest block, not like a 3D printer", the user, 2026-09-08). Rows of a solid layer keep
+        -- their natural order too, since the nearest row end is where the last one finished.
+        local s_Left = {}
+        for _, box in ipairs(s_Boxes) do s_Left[#s_Left + 1] = box end
+        local i = 0
+        while #s_Left > 0 do
+            local cx, cy, cz = pgps.getCachedPosition()
+            local s_Pick, s_Best = 1, math.huge
+            for k, box in ipairs(s_Left) do
+                local bx, by, bz = tonumber(box.pos.x) or 0, tonumber(box.pos.y) or 0, tonumber(box.pos.z) or 0
+                local w, l = (tonumber(box.w) or 1) - 1, (tonumber(box.l) or 1) - 1
+                -- distance to the nearer end of the box
+                local dx = math.min(math.abs((cx or bx) - bx), math.abs((cx or bx) - (bx + w)))
+                local dz = math.min(math.abs((cz or bz) - bz), math.abs((cz or bz) - (bz + l)))
+                local dist = dx + dz + math.abs((cy or by) - by)
+                if dist < s_Best then s_Best, s_Pick = dist, k end
+            end
+            local box = table.remove(s_Left, s_Pick)
+            i = i + 1
+            if not executing then break end
+            -- A box whose every layer this drone already knows as air is done without a flight: a
+            -- resumed chunk re-swept the rows it had cleared before the reboot (2026-09-08).
+            local s_AllAir = true
+            for dy = 0, (tonumber(box.depth) or 1) - 1 do
+                if not LayerKnownAir(tonumber(box.pos.x), tonumber(box.pos.z), tonumber(box.w) or 1,
+                                     tonumber(box.l) or 1, tonumber(box.pos.y) - dy) then s_AllAir = false break end
+            end
+            if s_AllAir then s_Done = s_Done + 1 goto nextBox end
+            if i > 1 or s_Best > 1 then
+                -- THE NEAREST CORNER, NOT THE MIN CORNER. Every row is its own box, so after a row dug
+                -- eastward the miner flew back west to begin the next one from the same end -- a full
+                -- empty pass per row (2026-09-08). DigLayer sweeps from whichever corner it is entered
+                -- at, so the next box begins where the last one ended.
+                local s_X0, s_Z0 = tonumber(box.pos.x), tonumber(box.pos.z)
+                local s_X1, s_Z1 = s_X0 + (tonumber(box.w) or 1) - 1, s_Z0 + (tonumber(box.l) or 1) - 1
+                local cx, _, cz = pgps.getCachedPosition()
+                local s_Sx = (cx ~= nil and math.abs(cx - s_X1) < math.abs(cx - s_X0)) and s_X1 or s_X0
+                local s_Sz = (cz ~= nil and math.abs(cz - s_Z1) < math.abs(cz - s_Z0)) and s_Z1 or s_Z0
+                local s_At = ReachSite(s_Sx, tonumber(box.pos.y), s_Sz, true)
+                if not s_At then
+                    trace(("dig: could not reach box %d of %d at %s,%s,%s -- stopping here")
+                        :format(i, #s_Boxes, tostring(box.pos.x), tostring(box.pos.y), tostring(box.pos.z)))
+                    break
+                end
+            end
+            do
+                local a, b = DigBox(box)
+                s_Dug, s_Layers, s_Done = s_Dug + a, s_Layers + b, s_Done + 1
+            end
+            ::nextBox::
+        end
+        if s_Done < #s_Boxes then
+            error(("dug %d of %d boxes (%d blocks) -- the rest are unreached"):format(s_Done, #s_Boxes, s_Dug), 0)
+        end
+        return {message = ("dug %d blocks over %d layers in %d box(es)"):format(s_Dug, s_Layers, s_Done),
+                dug = s_Dug, layers = s_Layers, boxes = s_Done}
     end)
 end
 
@@ -5390,7 +6210,7 @@ function OnGather(p_ID, p_Message)
                 -- single step ever looking wrong. D6 followed gravel to -412 and ended up parked at
                 -- -402: 78 blocks out, beyond the 64-block modem range, unable to hear an order
                 -- again. D1 and D2 were lost the same way and never came back.
-                if not pgps.isWithinReach(x, z) then return end
+                if not pgps.isWithinReach(x, z, y) then return end
                 s_Queue[#s_Queue + 1] = {x = x, y = y, z = z}
             end
         end
@@ -5802,7 +6622,13 @@ local CRAFT_SLOTS = {1, 2, 3, 5, 6, 7, 9, 10, 11}
 -- anywhere for inputs.
 function StowCargoForCraft()
     if CarriedCount() == 0 then return end
+    -- EVERYTHING GOES, ALLOWANCE INCLUDED. The 256-cobble KEEP_ABOARD rode along into the craft, Deposit
+    -- left it aboard by design, and every craft threw "holding 256 item(s) with nowhere to put them --
+    -- the shelf is full" over an EMPTY chest (D14, 2026-09-08). A crafter has no use for the allowance.
+    local s_Keep = {}
+    for k, v in pairs(KEEP_ABOARD) do s_Keep[k] = v KEEP_ABOARD[k] = 0 end
     Deposit()
+    for k, v in pairs(s_Keep) do KEEP_ABOARD[k] = v end
     local s_Left = CarriedCount()
     if s_Left > 0 then
         error(("holding %d item(s) with nowhere to put them -- the shelf is full"):format(s_Left), 0)
@@ -5856,69 +6682,23 @@ end
 --- along with the logs. Two things go wrong if that is left alone: the base is quietly emptied into
 --- a turtle, and -- worse -- the junk sits in slots 1-11, which ARE the crafting grid, so the craft
 --- either produces the wrong item or silently nothing.
+-- Take the wanted items from the chest below, each kind by name, using TakeFromChest -- which brings a
+-- deep stack forward through storage and keeps only what was asked for. The previous version sucked
+-- the first twelve stacks blind and hoped the material was among them; over spoils chests full of
+-- dirt it seldom was, and every scout build ended "nothing aboard to place" (2026-09-08).
 local function stageFromChest(p_Wanted)
-    local s_Where = {}
-
-    -- PULL IN BULK FIRST, sort afterwards.
-    --
-    -- turtle.suckDown always takes the chest's FIRST occupied slot. Sucking one stack, deciding it
-    -- is not wanted and dropping it straight back puts it right back in that first slot -- so the
-    -- drone cycles the same stack of glass for ever and never reaches the logs four slots further
-    -- in. Staging came back empty every time while the chest plainly held 64 logs.
-    --
-    -- Filling all twelve non-staging slots before returning anything means the leading stacks stay
-    -- OUT of the chest while we look past them, which is the only way to see what is behind them.
-    local s_Pulled = 0
-    for i = 1, 12 do
-        turtle.select(i)
-        if turtle.getItemCount(i) == 0 then
-            if not turtle.suckDown() then break end
-            s_Pulled = s_Pulled + 1
-        end
-    end
-    if s_Pulled == 0 then return nil, "the pickup chest gave up nothing" end
-
-    -- Keep what the recipe asked for...
-    for i = 1, 12 do
-        local d = turtle.getItemDetail(i)
-        -- Family match, not name match: the recipe table says oak because something had to be
-        -- written down, but a spruce log makes spruce planks and a spruce plank makes the same
-        -- chest. Discarding them here is how a fleet surrounded by trees reports no wood.
-        local s_Key = nil
-        if d and d.name then
-            if p_Wanted[d.name] then s_Key = d.name
-            else
-                for w in pairs(p_Wanted) do
-                    if SameItem(w, d.name) then s_Key = w break end
-                end
+    local s_Where, s_Got = {}, 0
+    for want, count in pairs(p_Wanted) do
+        local s_Kept = TakeFromChest(function(n) return SameItem(want, n) end,
+                                     function(_, already) return math.max(0, (tonumber(count) or 0) - already) end)
+        for nm, n in pairs(s_Kept or {}) do
+            if n > 0 then
+                s_Got = s_Got + n
+                for i = 1, 16 do local d = turtle.getItemDetail(i) if d and d.name == nm then s_Where[want] = i break end end
             end
         end
-        if s_Key then
-            d = {name = s_Key, actual = d.name}
-            local s_Slot = s_Where[d.name]
-            if s_Slot == nil then
-                for _, cand in ipairs(STAGE_SLOTS) do
-                    local cd = turtle.getItemDetail(cand)
-                    if cd == nil or cd.name == d.name then s_Slot = cand break end
-                end
-                if s_Slot == nil then
-                    -- 12, not 16: whatever is already staged in 13-16 stays there.
-                    putDownSlots(nil, 12)
-                    return nil, "more ingredient kinds than staging slots"
-                end
-                s_Where[d.name] = s_Slot
-            end
-            turtle.select(i)
-            turtle.transferTo(s_Slot)
-        end
     end
-
-    -- ...and hand everything else straight back. The fleet's whole store passes through this
-    -- turtle; none of it may stay there, and anything left in slots 1-11 is IN the crafting grid
-    -- and would change what turtle.craft believes it is making.
-    putDownSlots(nil, 12)
-    ReportChest()          -- everything just handed back changed this chest (see emptyInventory)
-
+    if s_Got == 0 then return nil, "the pickup chest gave up nothing" end
     return s_Where
 end
 
@@ -6082,7 +6862,7 @@ function OnCraft(p_ID, p_Message)
         Doing(("craft %s: asking storage for ingredients"):format(tostring(s_Item):gsub("^minecraft:", "")))
         local s_Hand = PowNet.sendAndWaitForResponse("StorageMan",
             PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Provide", {items = s_Req}),
-            PowNet.SERVER_PROTOCOL)
+            PowNet.SERVER_PROTOCOL, 60)   -- StorageMan's rescan outruns the default window (2026-09-08)
 
         if type(s_Hand) ~= "table" or s_Hand.pos == nil then
             -- ONE PRIMITIVE, AND A WRONG ANSWER IS NO LONGER FATAL. FetchItems asks StorageMan
@@ -6510,6 +7290,26 @@ function OnMine(p_ID, p_Message)
         local s_Spacing = tonumber(d.spacing)  or 16
         local s_WallEvery = tonumber(d.wallEvery) or 6
 
+        -- BUDGET THE DETERMINISTIC DIG-WORK + THE HAULS THE GEOMETRY FORCES, so this job's fuel
+        -- estimate is the whole task and not just the a* travel to the head. Sinking the shaft is
+        -- (headY - depth) moves down and the same to climb back out; each of the s_Lines branches is
+        -- driven s_Length out and back. Then the drone HAULS: it deposits after every branch that
+        -- turned up spoils (`FreeSlots() < 16` at each line end) and once more before parking, so a
+        -- fresh dig makes s_Lines + 1 round-trips home -- verified against a fresh mine (289 skeleton
+        -- + 3x56 haul = 401 vs 399 spent). Digs themselves are free (only MOVES cost fuel), so spoil
+        -- VOLUME does not enter here; what varies is ore veins pulling extra branch-following and bay
+        -- congestion forcing deposit retries, and those stay in the actual spend, not the budget.
+        local s_Cx, s_Cy, s_Cz = pgps.getCachedPosition()
+        local s_HeadY = (d.pos and tonumber(d.pos.y)) or s_Cy or 64
+        if pgps.addPlanBudget then
+            local s_Hx, _, s_Hz = HomeXYZ()
+            local s_Hdx = (d.pos and tonumber(d.pos.x)) or s_Cx or 0
+            local s_Hdz = (d.pos and tonumber(d.pos.z)) or s_Cz or 0
+            local s_Haul = (math.abs(s_Hdx - s_Hx) + math.abs(s_Hdz - s_Hz)) * 2
+            pgps.addPlanBudget((s_HeadY - s_Depth) * 2 + 2 * s_Lines * s_Length
+                + (s_Lines + 1) * s_Haul)
+        end
+
         local s_Got, s_Steps = 0, 0
 
         -- Two lines. A shaft interrupted by a fleet stand-down does not re-cut the lines it already
@@ -6868,6 +7668,7 @@ function sureWhereWeAre(p_X, p_Y, p_Z)
 end
 
 local function stageBuildMaterials(s_Hand, s_Need)
+    JobPhase = "pickup: depositing spoils"
     -- ONE CONTESTED SQUARE MUST NOT BE THE ONLY WAY TO GET BRICKS.
     --
     -- StorageMan hands every builder the same chest, and the access square above it is a single
@@ -6885,10 +7686,22 @@ local function stageBuildMaterials(s_Hand, s_Need)
     -- to find a material anywhere -- it reads the container directly below first and sweeps the
     -- bay after -- so falling back to it turns a hard dependency on one square into a
     -- preference for it. Slower when the bay is busy; never deadlocked.
+    -- SPOILS GO TO STORAGE, NOT INTO THE PICKUP. This emptied the drone's cargo into the pickup chest
+    -- on arrival, so an order staged in an empty chest was buried behind twenty stacks of the
+    -- drone's own dirt and the next kind read "21 stacks ahead -- no more of it in here" (2026-09-08).
+    -- ...and the cobble allowance goes too when this order has no use for it: four stacks ridden along
+    -- left no slot to suck the staged cable into (60,68,28: "no more of it in here" with 21 cable in
+    -- front, 2026-09-08). KEEP_ABOARD is restored once the deposit is done.
+    local s_Keep = {}
+    for k, v in pairs(KEEP_ABOARD) do s_Keep[k] = v if not s_Need[k] then KEEP_ABOARD[k] = 0 end end
+    if DepositableCount() > 0 then
+        -- silent: allow (a failed deposit leaves the cargo aboard; the pickup below is still read by name)
+        pcall(Deposit)
+    end
+    for k, v in pairs(s_Keep) do KEEP_ABOARD[k] = v end
+    JobPhase = "pickup: travelling to the pickup chest"
     local s_Got = pcall(arrivePickupOrWait, s_Hand.pos)
-    if s_Got then
-        emptyInventory()
-    else
+    if not s_Got then
         trace("pickup: that chest is unreachable -- collecting the materials the ordinary way")
     end
     -- FILL THE WHOLE PATCH, NOT WHATEVER THE PICKUP CHEST HAPPENED TO HOLD. The pickup chest holds
@@ -6898,21 +7711,129 @@ local function stageBuildMaterials(s_Hand, s_Need)
     -- below; FetchItems then ALWAYS tops up to the full need from the rest of the bay (it counts what
     -- is already aboard, so it fetches only the shortfall). Only finding none anywhere leaves it short.
     stageFromChest(s_Need)
+    CollectAtPoints(s_Hand.points, s_Need)
     FetchItems(s_Need, s_Need)
+end
+
+-- WHAT THE HANDOVER COULD NOT PUSH, COLLECT WHERE IT LIES. Storage names the chest holding the most
+-- of each item it could not move into the pickup (no room: 26 free slots on the shelf, 2026-09-08);
+-- each is one hop across the bay, against a FetchItems sweep of every deposit point -- which once sent
+-- a bay builder to a spoils cache 40 blocks down the mine for 23 chests. A global: the file is at
+-- Lua's 200-local limit.
+function CollectAtPoints(p_Points, p_Need)
+    JobPhase = "pickup: collecting at named chests"
+    for _, pt in ipairs(p_Points or {}) do
+        local s_Short = (tonumber(p_Need[pt.name]) or 0) - (CountNeededAboard(p_Need)[pt.name] or 0)
+        if s_Short > 0 and type(pt.pos) == "table" then
+            trace(("pickup: %d %s more at %d,%d,%d"):format(s_Short, pt.name, pt.pos.x, pt.pos.y, pt.pos.z))
+            if pcall(arrivePickupOrWait, pt.pos) then stageFromChest({[pt.name] = s_Short}) end
+        end
+    end
+end
+
+-- Where a sweep stands to work a square: its side cell for a wall square, its own column for a flat one.
+function StandOf(b) return b.sx or b.dx, b.sz or b.dz end
+
+-- THROUGH THE COVER AND BACK, from the cell two above the square (see the caller). Returns "placed"
+-- or "skipped" when this routine settled the square itself, nil when fixCell did (its counters apply).
+-- A global: DroneLogic is at Lua's 200-local limit.
+-- THE CELL ABOVE THE SQUARE IS OPEN; THE ROUTE TO IT WAS NOT. Five to nine chest cells per bay came
+-- back "covered by something" with plain air over them, pass after pass (2026-09-08): another drone
+-- had stood there, or the planner had a stale cell. From two above it is one step down.
+function FixFromOpenStand(bx, by, bz, b, fixCell, p_Why)
+    if pgps.down() then
+        fixCell(turtle.inspectDown, DigDown, turtle.placeDown, b, bx, by, bz)
+        pgps.up()
+        return nil
+    end
+    noteSkip(p_Why, "stand above unreachable")
+    return "skipped"
+end
+
+-- Take a one-layer cover off: a cable with the raw dig (digHard refuses every computercraft block), a
+-- placed material with the tracked dig. Anything else stays and the square is reported covered.
+function LiftCover(p_IsCable, p_Name)
+    if p_IsCable then return turtle.digDown() end
+    if PLACED_MATERIALS[p_Name] then return DigDown() end
+    return false
+end
+
+function FixThroughCover(bx, by, bz, b, fixCell, p_Why)
+    local s_HasC, s_Cover = turtle.inspectDown()
+    local s_CName = s_HasC and type(s_Cover) == "table" and s_Cover.name or nil
+    if not s_HasC then return FixFromOpenStand(bx, by, bz, b, fixCell, p_Why) end
+    -- A networking cable is a wire, not a computer: it may be lifted and re-laid to reach the
+    -- square beneath it (a run through a slab is laid bottom-up and its own cable is then in
+    -- the way of the slab cell, 2026-09-08). digHard refuses every computercraft block, so the
+    -- cable is taken with the raw dig and comes back the same way.
+    local s_Cable = s_CName == "computercraft:cable"
+    if LiftCover(s_Cable, s_CName) and pgps.down() then
+        fixCell(turtle.inspectDown, DigDown, turtle.placeDown, b, bx, by, bz)
+        if pgps.up() and selectItem(s_CName) then
+            if turtle.placeDown() then pgps.noteObservation(bx .. ":" .. (by + 1) .. ":" .. bz, 1, {true, {name = s_CName}}) end
+        else
+            trace(("sweep: could not restore the %s cover over %d,%d,%d"):format(tostring(s_CName), bx, by, bz))
+        end
+    elseif s_CName == "minecraft:chest" and b.item == "computercraft:wired_modem_full" then
+        -- A CHEST STANDS ON ITS MODEM. In the bay design a chest is only ever placed onto a modem,
+        -- so a modem cell under a chest is right; skipping it as "covered by chest x9" left the bay
+        -- 9 cells "open" on the map and re-ordered for ever (2026-09-08). Count it, and tell the map.
+        pgps.noteObservation(bx .. ":" .. by .. ":" .. bz, 1, {true, {name = b.item}}, true)
+        return "placed"
+    else
+        -- Name what "something" is: a cover the tally could not name was two to nine cells a bay, pass
+        -- after pass, and nothing in the log said what stood there (2026-09-08).
+        if s_CName == nil then trace(("sweep: cover over %d,%d,%d reads as %s"):format(bx, by, bz, textutils.serialize(s_Cover):gsub("%s+", " "))) end
+        noteSkip(p_Why, "covered by " .. tostring(s_CName or "something"))
+        return "skipped"
+    end
+end
+
+-- THE SWEEP'S MOVE BUDGET STARTS AT THE FIRST SQUARE AND IS GENEROUS. At 8 per square plus 200 from
+-- the job's start, a re-ordered 7-square bay sweep had 256 moves, the approach from the pickup chests
+-- spent them, and the same far cluster of every bay was cut pass after pass ("runaway sweep x1",
+-- 2026-09-08). The trip in is not the sweep's fault; 12 per square plus 600 still catches a planner
+-- bouncing a drone (1,161 moves for one square, the case the guard was written for).
+function NewSweepBudget(p_Squares)
+    local b = {squares = p_Squares, m0 = nil}
+    function b.over(self)
+        if not pgps.jobMotion then return false end
+        if self.m0 == nil then self.m0 = pgps.jobMotion() return false end
+        return (pgps.jobMotion() - self.m0) > 12 * self.squares + 600
+    end
+    function b.spent(self) return pgps.jobMotion() - (self.m0 or 0) end
+    return b
+end
+-- Tally the squares a cut sweep leaves, one line each so the count survives into the result.
+function SkipRest(p_Why, p_Count, p_Reason)
+    for _ = 1, p_Count do noteSkip(p_Why, p_Reason) end
+    return math.max(0, p_Count)
 end
 
 -- THE MAP ALREADY HAS SOMETHING THERE. Flying to a square another drone filled, to read "occupied
 -- by something else", was a trip per square of a 2,200-block floor. A square the shared map has as
 -- solid is marked done before the loop starts. A global: this file is at Lua's 200-local limit,
 -- and OnBuild is already the most branching function in it.
+-- Does what the map names at a solid cell satisfy the design block? See MarkMapSolidDone.
+function SolidCellIsDone(p_Detail, p_Item)
+    local s_Name = type(p_Detail) == "table" and type(p_Detail[2]) == "table" and p_Detail[2].name or nil
+    if s_Name ~= nil then return s_Name == p_Item end
+    return tostring(p_Item):find("computercraft:", 1, true) == nil
+end
 function MarkMapSolidDone(p_Memo, p_Blocks, p_Origin)
     if type(p_Origin) ~= "table" or type(p_Blocks) ~= "table" then return 0 end
     local s_World = pgps.cachedWorld or {}
+    local s_Detail = pgps.cachedWorldDetail or {}
     local n = 0
     for _, b in ipairs(p_Blocks or {}) do
         local k = (p_Origin.x + (tonumber(b.dx) or 0)) .. ":" .. (p_Origin.y + (tonumber(b.dy) or 0))
             .. ":" .. (p_Origin.z + (tonumber(b.dz) or 0))
-        if s_World[k] == 1 and not p_Memo.done(k) then p_Memo.mark(k) n = n + 1 end
+        -- SOLID IS NOT DONE. A cable cell through a cobble floor slab is solid on the map and still
+        -- has to be laid: "solid = done" is what kept every level's riser unbuilt and level -2's
+        -- chests off the network (2026-09-08). A cell counts as done only when the map names the
+        -- design block there, or names nothing and the design block is plain building material --
+        -- infrastructure (cable, modems) is always visited so the sweep can replace what is there.
+        if s_World[k] == 1 and SolidCellIsDone(s_Detail[k], b.item) and not p_Memo.done(k) then p_Memo.mark(k) n = n + 1 end
     end
     if n > 0 then trace(("build: %d square(s) already solid on the map -- not visiting them"):format(n)) end
     return n
@@ -6929,8 +7850,37 @@ end
 -- DO NOT PATH INTO A CELL THE MAP CALLS SOLID. Worth trying a cell the map does not know (it may be
 -- air); never one it already records as a wall. Same rule stepStraightTo and localHop now follow.
 function ApproachOpen(p_X, p_Y, p_Z)
-    return (pgps.cachedWorld or {})[p_X .. ":" .. p_Y .. ":" .. p_Z] ~= 1
+    if (pgps.cachedWorld or {})[p_X .. ":" .. p_Y .. ":" .. p_Z] == 1 then return false end
+    -- NEVER STAND UNDER AN ACTIVE WIRED MODEM. The turtle attaches to the network and its next native
+    -- move hangs for good (five drones in one evening at 54-60,59,15-18 under level -1's modem layer,
+    -- 2026-09-08). Only a reboot-and-nudge frees it, so the stand is refused up front.
+    local d = (pgps.cachedWorldDetail or {})[p_X .. ":" .. (p_Y + 1) .. ":" .. p_Z]
+    local n = type(d) == "table" and type(d[2]) == "table" and d[2].name or nil
+    return n ~= "computercraft:wired_modem_full"
 end
+-- The standing cell above a target is solid. If that cell is itself part of this build (the next
+-- course of the same wall), reach the cell above IT, dig it out and drop in: the builder now stands
+-- where it will place next, over the block it replaces now. Anything not in the build is left alone
+-- and the covered-cell path takes over. Returns true when standing at by+1.
+function StandOnStructure(bx, by, bz, p_Cells)
+    if not p_Cells[bx .. ":" .. (by + 1) .. ":" .. bz] then return false end
+    -- How far up does the structure run in this column? A wall through a hillside is buried for its
+    -- whole height, so the cell above the target is dirt, and the one above that -- reach the open
+    -- air above the topmost structure cell and sink down through the column instead, digging only
+    -- what the build will fill anyway (the courses above, the roof). Stopping at the first solid
+    -- cell left every hillside wall cell "no route" and the miner circling it (2026-09-08).
+    local s_Top = by + 1
+    while p_Cells[bx .. ":" .. (s_Top + 1) .. ":" .. bz] do s_Top = s_Top + 1 end
+    if not TravelTo(bx, s_Top + 1, bz, s_Top + 4) then return false end
+    -- NEVER THROUGH WHAT IS ALREADY BUILT. A repair of a hole in a low course used to sink through the
+    -- finished courses above it -- breaking the wall to mend the wall (D3, 2026-09-08). Placed material
+    -- in the column stops the descent; the covered-cell path then lays the hole from the side.
+    local s_Ok, s_Why = DescendDigging(by + 1, function(n) return PLACED_MATERIALS[n] == true end)
+    if not s_Ok then trace("build: could not sink through the column: " .. tostring(s_Why)) return false end
+    local _, s_Y = pgps.getCachedPosition()
+    return s_Y == by + 1
+end
+
 function LayCovered(bx, by, bz, p_Block)
     if p_Block.heading ~= nil then return "no route" end
     -- A covered floor square's neighbours are usually other floor blocks, and the cell below it is
@@ -6943,23 +7893,32 @@ function LayCovered(bx, by, bz, p_Block)
         if ApproachOpen(ax, by, az) and TravelTo(ax, by, az, by + 3) then
             local h = headingToward(ax, az, bx, bz)
             if h ~= nil and pgps.turnTo(h) ~= false then
-                return LayAhead(turtle.inspect, turtle.place, p_Block.item)
+                return LayAhead(turtle.inspect, turtle.place, p_Block.item, DigForward)
             end
         end
     end
     if ApproachOpen(bx, by - 1, bz) and TravelTo(bx, by - 1, bz, by + 1) then
-        return LayAhead(turtle.inspectUp, turtle.placeUp, p_Block.item)
+        return LayAhead(turtle.inspectUp, turtle.placeUp, p_Block.item, DigUp)
     end
     return "no route"
 end
-function LayAhead(p_Inspect, p_Place, p_Item)
+-- Lay the block in the cell ahead (or above). Whatever else is in that cell is dug first, because
+-- the cell IS the structure: a wall course through a hillside or a tree is dirt and wood until the
+-- builder makes it cobble, and a pre-dig pass over the whole ring was the wrong answer to that
+-- ("it can dig as it's placing the wall if there's existing shit there", 2026-09-08). Protected
+-- blocks -- stations, chests, drones -- stay, and the cell is reported occupied.
+--
+-- SHORT IS A SKIP, NOT A CRASH. This used to error("ran out of X partway"), which aborted the WHOLE
+-- patch the moment one covered square wanted a material the load was short on. The main placement
+-- branch treats "short" as a skip; the covered path must match.
+function LayAhead(p_Inspect, p_Place, p_Item, p_Dig)
     local s_Has, s_What = p_Inspect()
-    if s_Has then return alreadyThatBlock(s_What, p_Item) and "already" or "occupied" end
-    -- SHORT IS A SKIP, NOT A CRASH. This used to error("ran out of X partway"), which aborted the
-    -- WHOLE patch the moment one covered square wanted a material the load was short on -- so a build
-    -- that had placed twenty squares threw them all away as a failure and re-walked them next pass.
-    -- The main placement branch already treats "short" as a skip (OnBuild ~7188); the covered path
-    -- must match, so a build always completes to what it actually carries and re-issues the rest.
+    if s_Has and alreadyThatBlock(s_What, p_Item) then return "already" end
+    if s_Has then
+        local s_Name = type(s_What) == "table" and s_What.name or "?"
+        if NeverDig(s_Name) or p_Dig == nil or not p_Dig() then return "occupied" end
+        trace(("build: cleared %s to lay %s"):format(s_Name, tostring(p_Item)))
+    end
     if not selectItem(p_Item) then return "short" end
     return p_Place() and "placed" or "occupied"
 end
@@ -7018,8 +7977,339 @@ function OrderBuildBlocks(p_Blocks, p_Origin)
     end
     return s_Out
 end
+-- WHAT IS ABOARD COUNTS FIRST. A build order used to open with an unconditional StorageMan
+-- "Provide" for the whole bill of materials and throw if storage would not hand over -- so a miner
+-- standing at the site with 200 cobblestone in its own slots, mined from the shaft it was told to
+-- build with, could not place one block until a chest existed somewhere. The bootstrap has no chests
+-- on purpose (2026-09-08: one miner, one scout, a shaft, and the tower built from its spoils). So:
+-- count the inventory, ask storage only for the shortfall, and if there is no storage to ask,
+-- build with what is aboard. Only an EMPTY drone facing a build with no storage is an error.
+--
+-- PLACE WHAT WE HAVE. A PARTLY BUILT WALL IS PROGRESS; A REFUSAL IS NOT. Storage filling only part
+-- of the order is the same case: "partial progress beats waiting for the full order" is the rule
+-- this file already states for FetchItems and Craft. A tower floor is 2,310 bricks made a few
+-- hundred at a time, and every patch that asked for more than existed used to throw
+-- "JOB Build THREW short of minecraft:stone_bricks x160" with nothing placed. Blocks whose material
+-- did not arrive are skipped by the placement loop rather than placed wrong, and the patch is
+-- re-issued, so the structure converges instead of stalling.
+--
+-- Globals: DroneLogic's main chunk is at Lua's 200-local limit; exported through the test seam.
+function CountNeededAboard(p_Need)
+    local s_Aboard = {}
+    for i = 1, 16 do
+        local det = turtle.getItemDetail(i)
+        if det and p_Need[det.name] then s_Aboard[det.name] = (s_Aboard[det.name] or 0) + det.count end
+    end
+    return s_Aboard
+end
+
+-- Raise KEEP_ABOARD to unlimited for every material of the order; KeepRestore remembers what to put back.
+function KeepOrderAboard(p_Need)
+    for name in pairs(p_Need) do
+        if KEEP_ABOARD[name] == nil then KeepRestore[name] = false else KeepRestore[name] = KEEP_ABOARD[name] end
+        KEEP_ABOARD[name] = math.huge
+    end
+end
+
+function SecureBuildMaterials(p_Need)
+    JobPhase = "materials: asking storage"
+    local s_Aboard = CountNeededAboard(p_Need)
+    local s_Req, s_HaveAny = {}, false
+    for name, count in pairs(p_Need) do
+        local s_Short = count - (s_Aboard[name] or 0)
+        if s_Short > 0 then s_Req[#s_Req + 1] = {name = name, count = s_Short} end
+        if (s_Aboard[name] or 0) > 0 then s_HaveAny = true end
+    end
+    if #s_Req == 0 then
+        trace("build: everything needed is already aboard -- no storage trip")
+        return true
+    end
+    local s_Hand = PowNet.sendAndWaitForResponse("StorageMan",
+        PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Provide", {items = s_Req}),
+        -- 60 game-seconds (6 s real): at 8 (0.8 s real) StorageMan's rescan of 28 chests outran the
+        -- window and every bay build threw "storage would not hand over materials" (2026-09-08).
+        PowNet.SERVER_PROTOCOL, 60)
+    if type(s_Hand) ~= "table" or s_Hand.pos == nil then
+        if not s_HaveAny then HandoverOrThrow(s_Hand, "materials") end
+        trace("build: no storage to draw from -- building from what is aboard")
+        return true
+    end
+    if s_Hand.complete == false then
+        local s_Miss = ""
+        for _, m in ipairs(s_Hand.short or {}) do s_Miss = s_Miss .. m.name .. " x" .. m.count .. " " end
+        trace(("build: short of %s -- placing what arrived and leaving the rest for the next pass")
+              :format(s_Miss))
+    end
+    -- ArriveOrAskToMove inside, not a bare ArriveAt: the bay access square is one block and "a drone
+    -- is standing there" is the ORDINARY reason a pickup fails, not an exceptional one.
+    JobPhase = "materials: staging"
+    stageBuildMaterials(s_Hand, p_Need)
+    return true
+end
+
+-- Placed blocks this job broke on its way, re-laid by RestoreBroken at the job's end (see digHard).
+BrokenPlaced = {}
+RepairBrokenPlaced = true
+function RestoreBroken(p_Name)
+    if #BrokenPlaced == 0 then return end
+    local s_List = BrokenPlaced
+    BrokenPlaced = {}
+    if not RepairBrokenPlaced then return end
+    local s_Why = {}
+    local s_Ok, s_Placed, s_Skipped = pcall(SweepBuild, s_List, {x = 0, y = 0, z = 0}, {}, s_Why)
+    if s_Ok then
+        trace(("%s: restored %d of %d placed block(s) it broke on the way"):format(p_Name, s_Placed or 0, #s_List))
+    else
+        trace(("%s: could not restore %d broken block(s) -- %s"):format(p_Name, #s_List, tostring(s_Placed)))
+    end
+end
+
+-- A CABLE IN THE STANDING CELL. A wired run through a slab is laid bottom-up, so by the time the
+-- slab-layer cell is due the cable above it already stands where the drone would hover (2026-09-08).
+-- From a side neighbour of that standing cell: lift the cable (raw dig -- digHard refuses every
+-- computercraft block), step in, fix the square below, step back, lay the cable again.
+-- BOXED IN FROM ABOVE: the top cell of a riser has cable below it, cable above it (the next level's
+-- ring) and ring cable on three sides of the standing cell, so nothing "over the square" can work and
+-- LiftStandCable finds no side stand either. The square's own level is open air, though -- lay it
+-- from a neighbour at the same height (2026-09-08: 53,59,31 was skipped as "no way over the square"
+-- on three passes while level -2's forty chests waited on that one cable).
+function LaidFromBeside(bx, by, bz, b)
+    local v = LayCovered(bx, by, bz, b)
+    return v == "placed" or v == "already"
+end
+function LiftStandCable(bx, by, bz, b, fixCell)
+    local H = HEADINGS_()
+    local sx, sy, sz = bx, by + 1, bz
+    for _, d in ipairs({{1, 0, H.west}, {-1, 0, H.east}, {0, 1, H.north}, {0, -1, H.south}}) do
+        local nx, nz = sx + d[1], sz + d[2]
+        local cx, cy, cz = pgps.getCachedPosition()
+        local s_Near = cx and math.abs(cx - nx) + math.abs(cy - sy) + math.abs(cz - nz) <= 6
+        if (s_Near and pgps.moveTo(nx, sy, nz) ~= false) or (not s_Near and TravelTo(nx, sy, nz, sy + 3)) then
+            if pgps.turnTo(d[3]) ~= false then
+                local s_Has, s_What = turtle.inspect()
+                if s_Has and type(s_What) == "table" and s_What.name == "computercraft:cable" then
+                    if turtle.dig() and pgps.forward() then
+                        fixCell(turtle.inspectDown, DigDown, turtle.placeDown, b, bx, by, bz)
+                        if pgps.back() and selectItem("computercraft:cable") then
+                            if not turtle.place() then trace(("sweep: could not re-lay the cable at %d,%d,%d"):format(sx, sy, sz)) end
+                        end
+                        return true
+                    end
+                end
+            end
+        end
+    end
+    -- No side stand at the level above either: lay it from beside, at its own height.
+    return LaidFromBeside(bx, by, bz, b)
+end
+
+-- THE SWEEP BUILD. For a flat structure -- a slab, a roof -- the efficient move is the one a hand-
+-- written roof patcher made on 2026-09-08: fly the plane one block above it, row by row, and fix the
+-- design cell below each step (dig a wrong block, lay the material), one move per cell, no planner,
+-- no per-square approach. The manual version placed 180 and cleared 45 leaves in a minute where the
+-- per-square builder managed a few dozen. Blocks are visited in serpentine order by row; a gap between
+-- consecutive cells is crossed with plain steps (natural blocks in the way are dug), a long gap by
+-- TravelTo. Returns placed, skipped, why.
+function SweepBuild(p_Blocks, p_Origin, p_Need, p_Why, p_InspectOnly)
+    local s_Placed, s_Skipped = 0, 0
+    local s_Travels = 0          -- planner legs between non-adjacent squares: each one is waste to read
+    local H = HEADINGS_()
+    -- serpentine order: rows by z, alternating x direction
+    local s_Rows = {}
+    for _, b in ipairs(p_Blocks) do
+        local row = tonumber(b.dz) or 0
+        s_Rows[row] = s_Rows[row] or {}
+        s_Rows[row][#s_Rows[row] + 1] = b
+    end
+    local s_Zs = {}
+    for row in pairs(s_Rows) do s_Zs[#s_Zs + 1] = row end
+    table.sort(s_Zs)
+    local s_Order, s_Flip = {}, false
+    for _, row in ipairs(s_Zs) do
+        table.sort(s_Rows[row], function(a, b) return (a.dx < b.dx) ~= s_Flip end)
+        for _, b in ipairs(s_Rows[row]) do s_Order[#s_Order + 1] = b end
+        s_Flip = not s_Flip
+    end
+    local function stepTo(tx, ty, tz)
+        local cx, cy, cz = pgps.getCachedPosition()
+        if cx == nil then return false end
+        if cx == tx and cy == ty and cz == tz then return true end
+        local s_Man = math.abs(tx - cx) + math.abs(tz - cz) + math.abs(ty - cy)
+        if s_Man > 3 then s_Travels = s_Travels + 1 return TravelTo(tx, ty, tz, ty + 3) end
+        -- NEVER THROUGH THE STRUCTURE. A step that meets placed material gives the square up; the
+        -- planner (TravelTo) is asked for a route round instead. Digging down to a wall's standing
+        -- cell went through the floor slab (2026-09-08).
+        local function clearOrStop(inspect, digf)
+            local has, what = inspect()
+            if not has then return true end
+            if not NaturalBlock(what and what.name) then return false end
+            return digf()
+        end
+        while cy ~= ty do
+            if cy < ty then
+                if not (clearOrStop(turtle.inspectUp, DigUp) and pgps.up()) then return false end
+            else
+                if not (clearOrStop(turtle.inspectDown, DigDown) and pgps.down()) then return false end
+            end
+            local _
+            _, cy = pgps.getCachedPosition()
+        end
+        for _ = 1, 6 do
+            local _
+            cx, _, cz = pgps.getCachedPosition()
+            if cx == tx and cz == tz then return true end
+            local h = (cx < tx and H.east) or (cx > tx and H.west) or (cz < tz and H.south) or H.north
+            if pgps.turnTo(h) == false then return false end
+            if not clearOrStop(turtle.inspect, DigForward) then return false end
+            if not pgps.forward() then
+                -- another drone in the way: give it a moment, then try once more
+                local s_Has, s_Blk = turtle.inspect()
+                if s_Has and tostring(s_Blk.name):find("turtle", 1, true) then os.sleep(2) end
+                if not pgps.forward() then return false end
+            end
+        end
+        return false
+    end
+    -- A wall course cannot be reached from above once the roof is on: such blocks carry a standing
+    -- cell (sx, sz at the same height, the open side of the wall) and are inspected, cleared and
+    -- laid FORWARD from there. Walls are visited round the ring, not row by row, so consecutive
+    -- squares are neighbours and each costs one step.
+    if s_Order[1] and s_Order[1].sx ~= nil then
+        -- A NEAREST-NEIGHBOUR WALK OVER THE STANDING CELLS. Sorting a discrete ring by angle leaves
+        -- diagonal gaps (two steps) and jumps at the notch and between rings; measured 4.5-8.4 moves
+        -- per square on wall inspections against 1 possible (2026-09-08). Greedy: from where we are,
+        -- always the closest unvisited standing cell (manhattan). O(n^2) on ~250 cells.
+        local x0, _, z0 = pgps.getCachedPosition()
+        local cx, cz = (x0 or p_Origin.x) - p_Origin.x, (z0 or p_Origin.z) - p_Origin.z
+        local s_Left, s_Walk = {}, {}
+        for i, b in ipairs(s_Order) do s_Left[i] = b end
+        while #s_Left > 0 do
+            local bi, bd = 1, math.huge
+            for i, b in ipairs(s_Left) do
+                -- A MIXED BATCH: a flat square (no stand) walks from its own column. `b.sx - cx` on a
+                -- slab square in a wall course threw "arithmetic on field 'sx' (a nil value)" and
+                -- killed the whole repair (D8, 2026-09-08).
+                local sx, sz = StandOf(b)
+                local d = math.abs(sx - cx) + math.abs(sz - cz)
+                if d < bd then bi, bd = i, d end
+            end
+            local b = table.remove(s_Left, bi)
+            s_Walk[#s_Walk + 1] = b
+            cx, cz = StandOf(b)
+        end
+        s_Order = s_Walk
+    end
+    local function fixCell(inspect, dig, place, b, bx, by, bz)
+        local s_Has, s_What = inspect()
+        if p_InspectOnly then
+            -- THE SCOUT'S PASS: look, record, move on. What it sees goes to the shared map, and a
+            -- miner is sent for exactly the squares that are wrong ("why would D3 know wall
+            -- damage it can't see -- D2 can scan", the user, 2026-09-08).
+            local s_Nm = s_Has and type(s_What) == "table" and s_What.name or nil
+            pgps.noteObservation(bx .. ":" .. by .. ":" .. bz, s_Has and 1 or 0, {s_Has, s_Has and {name = s_Nm} or nil}, true)
+            if s_Has and alreadyThatBlock(s_What, b.item) then s_Placed = s_Placed + 1 else s_Skipped = s_Skipped + 1 end
+        elseif s_Has and alreadyThatBlock(s_What, b.item) then
+            s_Placed = s_Placed + 1              -- correct already; counted as done
+        else
+            local s_Name = s_Has and type(s_What) == "table" and s_What.name or nil
+            if s_Has and NeverDig(s_Name) then
+                s_Skipped = s_Skipped + 1
+                noteSkip(p_Why, "occupied by protected " .. tostring(s_Name))
+            elseif s_Has and not dig() then
+                s_Skipped = s_Skipped + 1
+                noteSkip(p_Why, "could not clear " .. tostring(s_Name))
+            elseif not selectItem(b.item) then
+                -- SHORT OF ONE MATERIAL IS NOT THE END OF THE BATCH. A bay of chests, modems and cable
+                -- threw "ran out of cable after 0 placed" and laid none of its chests either, three
+                -- tries running (2026-09-08). The squares of the missing material are skipped and
+                -- reported; the rest is laid; the re-order fills the gaps when the item is in stock.
+                s_Skipped = s_Skipped + 1
+                noteSkip(p_Why, "short of " .. tostring(b.item):gsub("^minecraft:", ""))
+            elseif place() then
+                s_Placed = s_Placed + 1
+                pgps.noteObservation(bx .. ":" .. by .. ":" .. bz, 1, {true, {name = b.item}})
+            else
+                s_Skipped = s_Skipped + 1
+                noteSkip(p_Why, "placeDown refused")
+            end
+        end
+    end
+    local s_Visited, s_T0, s_F0 = 0, os.clock(), turtle.getFuelLevel()
+    local s_Budget = NewSweepBudget(#s_Order)
+    for _, b in ipairs(s_Order) do
+        if not executing then break end
+        -- RUNAWAY GUARD. A sweep is one move per square plus the trip; when the moves made since it
+        -- started pass 8 per square plus 200, the planner is bouncing it around (1,161 moves for one
+        -- square, 2026-09-08) and the rest is left for the next pass.
+        if s_Budget:over() then
+            trace(("sweep: %d moves for %d squares -- runaway; leaving the rest for the next pass"):format(s_Budget:spent(), #s_Order))
+            s_Skipped = s_Skipped + SkipRest(p_Why, #s_Order - s_Visited, "runaway sweep")
+            break
+        end
+        s_Visited = s_Visited + 1
+        JobPhase = ("sweep %d/%d"):format(s_Visited, #s_Order)
+        -- SAY HOW IT GOES. A 1,208-square sweep ran twenty minutes and 7,000 fuel with not one line
+        -- in the log (D3, 2026-09-08); a sweep is cheap only when it steps, and the step count is
+        -- the tell -- so every 40 squares: where, how many right/placed/skipped, fuel and moves.
+        if s_Visited % 40 == 1 then
+            trace(("sweep: %d/%d squares, %d right or placed, %d skipped, %d fuel, %ds, %d planner legs%s")
+                :format(s_Visited, #s_Order, s_Placed, s_Skipped, s_F0 - (turtle.getFuelLevel() or 0),
+                        math.floor(os.clock() - s_T0), s_Travels, p_InspectOnly and " (inspecting)" or ""))
+        end
+        local bx, by, bz = p_Origin.x + (tonumber(b.dx) or 0), p_Origin.y + (tonumber(b.dy) or 0), p_Origin.z + (tonumber(b.dz) or 0)
+        local s_Side = b.sx ~= nil
+        local inspect, dig, place = turtle.inspectDown, DigDown, turtle.placeDown
+        local s_Reached
+        if s_Side then
+            -- the room side first, the other side (outdoors, for the outer ring) when that fails
+            local s_Sides = {{b.sx, b.sz}}
+            if b.sx2 ~= nil then s_Sides[2] = {b.sx2, b.sz2} end
+            for _, sd in ipairs(s_Sides) do
+                local sx, sz = p_Origin.x + (tonumber(sd[1]) or 0), p_Origin.z + (tonumber(sd[2]) or 0)
+                s_Reached = stepTo(sx, by, sz)
+                if s_Reached then
+                    local h = (bx > sx and H.east) or (bx < sx and H.west) or (bz > sz and H.south) or H.north
+                    s_Reached = pgps.turnTo(h) ~= false
+                end
+                if s_Reached then break end
+            end
+            inspect, dig, place = turtle.inspect, DigForward, turtle.place
+        else
+            s_Reached = stepTo(bx, by + 1, bz)
+        end
+        if s_Reached then
+            -- WHERE WE STAND IS AIR. The map kept the cavity and the room "solid" from the day the
+            -- courses were pre-marked, so the planner refused every route to the standing cells and
+            -- the holes behind them were never seen (2026-09-08). Each reached standing cell is
+            -- written back as air, and the map heals as the scouts patrol.
+            local px, py, pz = pgps.getCachedPosition()
+            if px then pgps.noteObservation(px .. ":" .. py .. ":" .. pz, 0, {false}, true) end
+        end
+        if not s_Reached and not s_Side and stepTo(bx, by - 1, bz) then
+            -- FROM BELOW. A slab square with hardware or a wall over it is open from the room under
+            -- it ("they can reach the dirt floor from underneath" -- the user, 2026-09-08).
+            fixCell(turtle.inspectUp, DigUp, turtle.placeUp, b, bx, by, bz)
+        elseif not s_Reached and not s_Side and not p_InspectOnly and stepTo(bx, by + 2, bz) then
+            -- THROUGH THE COVER AND BACK. The square below a placed slab block is dirt (the slab was laid
+            -- over it before the interior was cleared): take the cover off, fix the square, put the
+            -- cover back ("they can destroy cobble as long as they rebuild it" -- the user, 2026-09-08).
+            -- One layer only; anything deeper is a wall and stays.
+            local s_Out = FixThroughCover(bx, by, bz, b, fixCell, p_Why)
+            if s_Out == "placed" then s_Placed = s_Placed + 1 elseif s_Out == "skipped" then s_Skipped = s_Skipped + 1 end
+        elseif not s_Reached and not s_Side and not p_InspectOnly and LiftStandCable(bx, by, bz, b, fixCell) then
+            -- handled: the standing cell held a cable, lifted and re-laid around the placement
+        elseif not s_Reached then
+            s_Skipped = s_Skipped + 1
+            noteSkip(p_Why, s_Side and "no way to the wall's open side" or "no way over the square")
+        else
+            fixCell(inspect, dig, place, b, bx, by, bz)
+        end
+    end
+    return s_Placed, s_Skipped
+end
+
 function OnBuild(p_ID, p_Message)
-    return RunJob("Build", p_Message.data, {status = "building", travel = false}, function(d)
+    return RunJob("Build", p_Message.data, {status = "building", travel = false, travelDig = "natural"}, function(d)
         local s_Origin = d.origin
         local s_Blocks = d.blocks
         if type(s_Origin) ~= "table" or s_Origin.x == nil then error("no origin", 0) end
@@ -7030,6 +8320,24 @@ function OnBuild(p_ID, p_Message)
         -- re-walking every block it already placed.
         local s_BuildDone = Resumable(d)
         s_BuildDone.announce("build")
+        -- Every cell this build will fill: the courses above a wall cell are cells the builder may
+        -- clear to stand in, since it is about to fill them with cobble anyway (StandOnStructure).
+        local s_Cells = {}
+        for _, b in ipairs(s_Blocks) do
+            s_Cells[(s_Origin.x + (tonumber(b.dx) or 0)) .. ":" .. (s_Origin.y + (tonumber(b.dy) or 0))
+                    .. ":" .. (s_Origin.z + (tonumber(b.dz) or 0))] = true
+        end
+        -- An inspection records the truth; it must run BEFORE the build pre-marks its cells solid.
+        if d.inspect == true then
+            local s_Why0 = {}
+            local s_Right, s_Wrong = SweepBuild(s_Blocks, s_Origin, {}, s_Why0, true)
+            -- silent: allow (the observations stay queued and go with the next upload if this one fails)
+            pcall(UploadWorld)
+            local s_Unreach = 0
+            for why, n in pairs(s_Why0) do if tostring(why):find("no way", 1, true) then s_Unreach = s_Unreach + n end end
+            trace(("inspection: %d right, %d wrong, %d unreachable of %d"):format(s_Right, s_Wrong - s_Unreach, s_Unreach, #s_Blocks))
+            return {message = ("inspected %d squares: %d wrong, %d unreachable"):format(#s_Blocks, s_Wrong - s_Unreach, s_Unreach), placed = 0, wrong = s_Wrong - s_Unreach, unreachable = s_Unreach}
+        end
         MarkMapSolidDone(s_BuildDone, s_Blocks, s_Origin)
 
         -- 1. Collect the materials. Same handover chest crafting uses.
@@ -7037,45 +8345,36 @@ function OnBuild(p_ID, p_Message)
         for _, b in ipairs(s_Blocks) do
             if b.item then s_Need[b.item] = (s_Need[b.item] or 0) + 1 end
         end
-        local s_Req = {}
-        for name, count in pairs(s_Need) do s_Req[#s_Req + 1] = {name = name, count = count} end
-
-        local s_Hand = PowNet.sendAndWaitForResponse("StorageMan",
-            PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Provide", {items = s_Req}),
-            PowNet.SERVER_PROTOCOL, 8)
-        HandoverOrThrow(s_Hand, "materials")
-        -- PLACE WHAT WE HAVE. A PARTLY BUILT WALL IS PROGRESS; A REFUSAL IS NOT.
-        --
-        -- This threw the moment storage could not fill the whole order, which is the same mistake
-        -- FetchItems and Craft were both corrected for: "partial progress beats waiting for the
-        -- full order" is the rule this file already states, and build was the one job still
-        -- ignoring it.
-        --
-        -- It matters most exactly when the settlement is building its own material. A tower floor
-        -- is 2,310 stone bricks made a few hundred at a time, so for hours EVERY patch asked for
-        -- more than existed and every one threw:
-        --
-        --   JOB Build THREW short of minecraft:stone_bricks x160
-        --   JOB Build THREW short of minecraft:stone_bricks x96
-        --
-        -- Nothing was ever placed, the floor stayed at zero blocks, and the log read as a broken
-        -- builder when the builder was fine and the order was simply bigger than the larder.
-        --
-        -- Blocks whose material did not arrive are skipped below rather than placed wrong, and the
-        -- patch is re-issued by order.tower, so the floor converges instead of stalling.
-        if s_Hand.complete == false then
-            local s_Miss = ""
-            for _, m in ipairs(s_Hand.short or {}) do s_Miss = s_Miss .. m.name .. " x" .. m.count .. " " end
-            trace(("build: short of %s -- placing what arrived and leaving the rest for the next pass")
-                  :format(s_Miss))
+        -- A sweep carries material for EVERY square it is sent: HQ already filtered out the squares the
+        -- map knows built, so what remains needs a block each. Capping at a quarter made every storey
+        -- wall batch throw "ran out of cobblestone after 64 placed" (2026-09-08).
+        -- THE ORDER RIDES ALONG. A sweep digs slab cobble as it lays, the inventory fills, and the
+        -- mid-job deposit unloaded everything not on the keep list -- the bay's chests and cable went
+        -- back to storage after four were placed, five bays running (2026-09-08). Every material of
+        -- this build is kept aboard until the job ends; KEEP_ABOARD is restored in RunJob's finish.
+        -- BEFORE STAGING, not after: staging takes the order one kind at a time, and each stop unloads
+        -- what it does not count as kept -- so the 21 cable taken at the first chest went into the
+        -- second chest while the modems came out of it (D7, 2026-09-08).
+        KeepOrderAboard(s_Need)
+        SecureBuildMaterials(s_Need)
+        if d.sweep == true then
+            local s_Why2 = {}
+            local s_P, s_S = SweepBuild(s_Blocks, s_Origin, s_Need, s_Why2)
+            FailIfNothingPlaced(s_P, #s_Blocks, s_Why2)
+            local s_Tally = {}
+            for why, n in pairs(s_Why2) do s_Tally[#s_Tally + 1] = tostring(why) .. " x" .. tostring(n) end
+            trace(("sweep build: %d placed, %d skipped of %d%s"):format(s_P, s_S, #s_Blocks,
+                #s_Tally > 0 and (" -- " .. table.concat(s_Tally, "; ")) or ""))
+            return {message = ("built %d of %d blocks (sweep)"):format(s_P, #s_Blocks), placed = s_P, skipped = s_S}
         end
-
-        -- ArriveOrAskToMove, not a bare ArriveAt -- see the note on the crafting pickup above.
-        -- The bay is the most congested airspace in the settlement and the access square is one
-        -- block, so "a drone is standing there" is the ORDINARY reason a pickup fails, not an
-        -- exceptional one. build-chest-row failed on exactly this while the settlement sat at zero
-        -- free slots waiting for the chests it was trying to collect.
-        stageBuildMaterials(s_Hand, s_Need)
+        -- NOTHING ABOARD, NOTHING TO WALK FOR. A batch whose fetch came back empty still visited all
+        -- 81 squares to skip each one "short of cobblestone" -- three minutes of flying to place
+        -- nothing (D2, 2026-09-08). Fail here; TaskMan re-queues it for when storage has some.
+        do
+            local s_Aboard, s_Any = CountNeededAboard(s_Need), false
+            for name in pairs(s_Need) do if (s_Aboard[name] or 0) > 0 then s_Any = true end end
+            if not s_Any then error("nothing aboard to place -- storage handed over none of the materials", 0) end
+        end
 
 
         -- Materials live in the staging slots; spread them into the main inventory so placeDown
@@ -7106,6 +8405,7 @@ function OnBuild(p_ID, p_Message)
         -- the drone can actually guarantee in the blueprint, and leaves the per-block convention with
         -- the blueprint, which is where it can be written down and checked.
         local s_Placed, s_Skipped = 0, 0
+        local s_Already = 0   -- squares the map already shows right: a re-sweep of a finished bay is DONE, not "placed none"
         local s_NoRouteRun = 0
         -- WHY a block was skipped, counted by reason. Two thirds of every patch was being skipped
         -- and the log said only how MANY -- so every theory about the cause (occupied ground, bad
@@ -7140,9 +8440,18 @@ function OnBuild(p_ID, p_Message)
             -- re-ordered patch and threw "placed none of 32" (2026-09-05 15:30, twice in 4 min).
             if DoneAndSolid(s_BuildDone, s_BK) then
                 -- already placed before the last stand-down, and the map agrees
-            elseif not TravelTo(bx, by + 1, bz, (by or 64) + 4) then
-                s_NoRouteRun, s_Placed, s_Skipped = CountCovered(LayCovered(bx, by, bz, b), s_BuildDone, s_BK,
-                                                                 s_Why, s_NoRouteRun, s_Placed, s_Skipped)
+                s_Already = s_Already + 1
+            elseif not (TravelTo(bx, by + 1, bz, (by or 64) + 4) or StandOnStructure(bx, by, bz, s_Cells)) then
+                -- No pickaxe: whatever is in the way stays in the way, so the side-by-side approaches
+                -- are just circling. Skip at once; the miner fills these (the user: "D2 should just
+                -- ignore the shit it can't reach so whoever can mine can fix it", 2026-09-08).
+                if not CanDig() then
+                    s_Skipped = s_Skipped + 1
+                    noteSkip(s_Why, "unreachable without a pickaxe")
+                else
+                    s_NoRouteRun, s_Placed, s_Skipped = CountCovered(LayCovered(bx, by, bz, b), s_BuildDone, s_BK,
+                                                                     s_Why, s_NoRouteRun, s_Placed, s_Skipped)
+                end
             else
                 s_NoRouteRun = 0
                 -- MARK ONLY WHAT WAS ACTUALLY PLACED. This used to mark here, on arrival, which
@@ -7201,6 +8510,15 @@ function OnBuild(p_ID, p_Message)
                     -- The squares stay unbuilt on the map and the repair pass re-orders them.
                     s_Skipped = s_Skipped + 1
                     noteSkip(s_Why, "short of " .. tostring(b.item))
+                    -- ...but OUT OF MATERIAL MEANS STOP, NOT TOUR: with nothing of it left aboard, the
+                    -- square is recorded as the air it is (a repair pass can then see the hole) and the
+                    -- job ends with its count; TaskMan re-queues it and the next pass fetches afresh. D3
+                    -- walked 73 empty squares after its last cobble (2026-09-08).
+                    pgps.noteObservation(s_BK, 0, {false})
+                    if CountNeededAboard(s_Need)[b.item] == nil then
+                        error(("ran out of %s after %d placed -- %d square(s) left for the next pass")
+                            :format(tostring(b.item):gsub("^minecraft:", ""), s_Placed, #s_Blocks - s_Idx + 1), 0)
+                    end
                 elseif (b.heading == nil or pgps.turnTo(HEADINGS_()[b.heading]) ~= false)
                         and turtle.placeDown() then
                     s_BuildDone.mark(s_BK)
@@ -7237,7 +8555,10 @@ function OnBuild(p_ID, p_Message)
         -- Throw instead. The patch goes back on the queue and the coordinates already placed are
         -- memoised, so the retry finishes the remainder rather than starting over.
         reportSkips(s_Why)
-        FailIfNothingPlaced(s_Placed, #s_Blocks, s_Why)
+        -- Squares already right count as placed here: HQ re-orders a bay whose cells the map lost
+        -- track of, the sweep finds every block in place, and "placed none of 61" sent it round
+        -- again (D5, 2026-09-08 18:15).
+        FailIfNothingPlaced(s_Placed + s_Already, #s_Blocks, s_Why)
         return {message = ("built %d of %d blocks (%d skipped)")
                     :format(s_Placed, #s_Blocks, s_Skipped),
                 placed = s_Placed, skipped = s_Skipped, total = #s_Blocks}
@@ -8056,7 +9377,9 @@ function UploadWorld(p_Force)
         {cachedWorld = s_World, cachedWorldDetail = s_Detail})
     -- One attempt: observations are re-queued on failure (below), so a retry here only duplicates
     -- traffic against a MapServer that is already the busiest module in the fleet.
-    local s_Ok = PowNet.sendAndWaitForResponse("MapServer", s_Message, PowNet.SERVER_PROTOCOL, 20, 1)
+    -- 60 game-seconds (6 s real): at 20 the scout's 256-cell inspection uploads timed out 67 times in
+    -- a row and every hole it had found stayed out of the map (2026-09-08).
+    local s_Ok = PowNet.sendAndWaitForResponse("MapServer", s_Message, PowNet.SERVER_PROTOCOL, 60, 1)
     if(not s_Ok) then
         -- Put them back rather than lose them: an unreachable MapServer should cost a retry, not
         -- a hole in the map that nothing will ever revisit.
@@ -8280,7 +9603,7 @@ m_Hosting = false
 -- answer pings, which is the actual mechanism by which a stranded drone gets its position back.
 function OnRelay(p_ID, p_Message)
     local d = p_Message.data or {}
-    local s_Modem = peripheral.find("modem")
+    local s_Modem = WirelessModem()
     if s_Modem == nil then return false, "no modem" end
 
     if d.on == false then
@@ -8521,7 +9844,7 @@ end
 -- That exactness is the whole reason this works: trilaterated positions are noisy to tens of
 -- blocks, but the individual ranges are not noisy at all.
 local function pingPeers(p_Nonce, p_WaitS)
-    local s_Modem = peripheral.find("modem")
+    local s_Modem = WirelessModem()
     if not s_Modem then return {} end
     -- silent: allow (one ping in a mesh that re-pings every cycle -- a lost packet is the normal case for this transport)
     pcall(s_Modem.open, PEER_CHANNEL)
@@ -8667,7 +9990,7 @@ end
 -- Open the mesh channel. Three peer coroutines did this by hand, and a copy that forgets the
 -- open() listens for ever on a channel nothing is delivered on -- silently.
 local function peerModem()
-    local s_Modem = peripheral.find("modem")
+    local s_Modem = WirelessModem()
     if not s_Modem then return nil end
     -- The note above is about listening on a channel nothing is delivered on, SILENTLY. A failed
     -- open is the other half of that: no listener at all, and the mesh simply never answers.
@@ -8814,7 +10137,7 @@ function meshForward(p_Envelope, p_FromId)
     local cx, cy, cz = pgps.getCachedPosition()
     local s_Mine = cx and (Blocks(cx, cy, cz, hx, hy, hz)) or math.huge
 
-    local s_Modem = peripheral.find("modem")
+    local s_Modem = WirelessModem()
     if not s_Modem then return false end
 
     for _, e in ipairs(peersByHomeward()) do
@@ -8849,7 +10172,7 @@ local function meshRelayListen()
 end
 
 local function meshRepeat()
-    local s_Modem = peripheral.find("modem")
+    local s_Modem = WirelessModem()
     if not s_Modem then return end
 
     -- OPEN THE CHANNEL, OR NONE OF THIS RUNS.
@@ -9513,7 +10836,11 @@ local function idleDockLoop()
                 -- was waiting on -- while storage reported none and the next task blocked for want
                 -- of them. Whatever put the drone in this state, carrying it into a park is always
                 -- wrong, and here is the one place every idle drone passes through.
-                local s_Cargo = CarriedCount()
+                -- Only what a deposit would actually unload counts: the build material kept aboard
+                -- (KEEP_ABOARD) is not cargo to get rid of. Counting it sent D2 to the chest with 64
+                -- cobblestone every idle pass, unloaded nothing by design, and read that as "storage
+                -- has no room" (2026-09-08).
+                local s_Cargo = DepositableCount()
                 if WantsDepositNow(s_Cargo) then
                     trace(("idle while holding %d item(s) -- depositing before parking"):format(s_Cargo))
                     -- Stock inside a drone is invisible to planning, so a failed deposit hides the
@@ -9541,7 +10868,18 @@ local function idleDockLoop()
                     local s_Ok = pcall(dockNow)
                     if not s_Ok or not m_Docked then
                         m_DockBlockedUntil = os.clock() + 300
-                        trace("no berth available -- holding position for 5 minutes before trying again")
+                        -- FAR FROM HOME, "NO BERTH" MEANS "NOBODY HEARD US". D2 held position 60 blocks
+                        -- out of radio range for an hour, asking for a berth every five minutes into
+                        -- silence (2026-09-08). An idle drone that cannot get a berth first comes home.
+                        local hx, hy, hz = HomeXYZ()
+                        local cx, cy, cz = pgps.getCachedPosition()
+                        if hx and cx and Blocks(cx, cy, cz, hx, hy, hz) > 24 then
+                            trace("no berth answer and far from home -- flying back to the base first")
+                            -- silent: allow (a failed leg home is retried on the next idle beat)
+                            pcall(TravelTo, hx, (hy or cy) + 4, hz, (hy or cy) + 8)
+                        else
+                            trace("no berth available -- holding position for 5 minutes before trying again")
+                        end
                     end
                 end
                 s_IdleSince = nil
@@ -9804,7 +11142,7 @@ local RELAY_DISABLED = true
 local function gpsRelay()
     if RELAY_DISABLED then
         -- Close the channel if a previous version left it open, then stand down.
-        local s_M = peripheral.find("modem")
+        local s_M = WirelessModem()
         if s_M then pcall(s_M.close, gps.CHANNEL_GPS) end
         m_Hosting, m_HostPos = false, nil
         while true do os.sleep(300) end
@@ -9813,7 +11151,7 @@ local function gpsRelay()
         os.sleep(10)
 
         local s_Eligible = (m_Status == "idle") and not executing
-        local s_Modem = peripheral.find("modem")
+        local s_Modem = WirelessModem()
 
         if s_Eligible and s_Modem then
             -- Anchor on a fix of our OWN, every cycle. Dead reckoning is good enough to navigate
@@ -10176,7 +11514,9 @@ local function jobLoop()
             -- RunJobNow owns the whole lifecycle including clearing `executing` via TaskEnd, so a
             -- job that throws cannot leave the drone claimed for ever -- pcall here as well, since
             -- this loop dying would take the drone down with it.
+            JobBodyRunning = true   -- global: ClearStuckExecuting reads it (the file is at Lua's local limit)
             local ok, err = pcall(RunJobNow, j.name, j.data, j.opts, j.body)
+            JobBodyRunning = false
             if not ok then
                 trace(("JOB %s crashed the worker: %s"):format(tostring(j.name), tostring(err)))
                 executing = false
@@ -10214,6 +11554,24 @@ if HiveMindTest then
         isExecuting = function() return executing end,
         setStatus = function(v) m_Status = v end,
         collectFuel = CollectFuel,
+        depositKeepingPlace = DepositKeepingPlace,
+        secureBuildMaterials = SecureBuildMaterials,
+        takeFromChest = TakeFromChest,
+        depositTarget = DepositTarget,
+        descendDigging = DescendDigging,
+        digStartInBox = DigStartInBox,
+        digLayer = DigLayer,
+        layerKnownAir = LayerKnownAir,
+        sharedAirForLayer = SharedAirForLayer,
+        naturalBlock = NaturalBlock,
+        travelToBody = TravelToBody,
+        layAhead = LayAhead,
+        sweepBuild = SweepBuild,
+        unloadHere = unloadHere,
+        reportTask = function(...) return reportTask(...) end,
+        flushPendingReports = FlushPendingReports,
+        standOnStructure = StandOnStructure,
+        countNeededAboard = CountNeededAboard,
     }
 end
 parallel.waitForAny(table.unpack(s_Fns))

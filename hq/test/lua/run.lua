@@ -284,6 +284,7 @@ end)
 
 test("StorageMan.ServiceSort consolidates each item into one home chest -- one item per chest", function()
     local env, S = storageWithChests()
+    env.SORT_ENABLED = true              -- the sorter is off by default during the bootstrap; this tests the sorter itself
     -- chest_0 holds the bulk of the bricks; chest_1 has a few bricks IN FRONT of its coal -- exactly
     -- the buried-item shape that made a fetch return one stack.
     env.__world.peripherals["minecraft:chest_0"].api.__inv.items = {
@@ -301,6 +302,20 @@ test("StorageMan.ServiceSort consolidates each item into one home chest -- one i
     eq(k1["minecraft:coal"], 64, "coal alone in its own chest")
 end)
 
+test("StorageMan.ServiceSort leaves the pickup/handover chest alone so Provide's push survives", function()
+    local env, S = storageWithChests()
+    -- Bricks smeared: bulk in chest_0, a handover load pushed into chest_1. Without the guard the
+    -- sort drags chest_1's bricks into chest_0's home before the drone collects -> "short".
+    env.__world.peripherals["minecraft:chest_0"].api.__inv.items = { [1] = { name = "minecraft:stone_bricks", count = 64 } }
+    env.__world.peripherals["minecraft:chest_1"].api.__inv.items = { [1] = { name = "minecraft:stone_bricks", count = 20 } }
+    env.DATA.pickup = { pos = { x = -475, y = 64, z = 78 }, peripheral = "minecraft:chest_1" }
+    env.Rescan()
+    S.ServiceSort()
+    local kinds = function(l) local k = {} for _, it in pairs(l) do k[it.name] = (k[it.name] or 0) + it.count end return k end
+    local k1 = kinds(env.__world.peripherals["minecraft:chest_1"].api.list())
+    eq(k1["minecraft:stone_bricks"], 20, "the pickup keeps its handover load -- sort must not empty it")
+end)
+
 test("StorageMan.assignHomes gives each item its own chest -- the bigger item keeps a contested one", function()
     local env, S = storageWithChests()
     -- Both items have their majority in chest_0; only the larger may keep it.
@@ -313,6 +328,33 @@ test("StorageMan.assignHomes gives each item its own chest -- the bigger item ke
     truthy(home["minecraft:coal"] ~= "minecraft:chest_0", "the smaller item does not share it")
 end)
 
+test("StorageMan.OnChestContents binds a one-item chest by type even when the count has drifted", function()
+    local env = loadModule("StorageMan.lua")
+    local w = env.__world
+    w.addInventory("minecraft:chest_0", "minecraft:chest", { [1] = { name = "minecraft:stone_bricks", count = 164 } }, 27)
+    w.addInventory("minecraft:chest_1", "minecraft:chest", { [1] = { name = "minecraft:coal", count = 40 } }, 27)
+    env.DATA.deposits, env.DATA.chestName = {}, {}
+    env.Rescan()
+    -- The drone read the same chest a few ticks earlier, before the sort topped it up: 100 vs 164.
+    -- Exact-count matching bound nothing here and left every build throwing "would not hand over".
+    env.OnChestContents(5, { data = { at = { x = -478, y = 64, z = 78 }, items = { ["minecraft:stone_bricks"] = 100 } } })
+    eq(env.DATA.chestName["-478:64:78"], "minecraft:chest_0", "bound to the only brick chest despite the drift")
+    local bound
+    for _, d in ipairs(env.DATA.deposits) do if d.peripheral == "minecraft:chest_0" then bound = d end end
+    truthy(bound and bound.pos.x == -478, "a deposit point carrying the network name was registered")
+end)
+
+test("StorageMan.OnChestContents will NOT bind by type while the item is smeared across two chests", function()
+    local env = loadModule("StorageMan.lua")
+    local w = env.__world
+    w.addInventory("minecraft:chest_0", "minecraft:chest", { [1] = { name = "minecraft:stone_bricks", count = 64 } }, 27)
+    w.addInventory("minecraft:chest_1", "minecraft:chest", { [1] = { name = "minecraft:stone_bricks", count = 30 } }, 27)
+    env.DATA.deposits, env.DATA.chestName = {}, {}
+    env.Rescan()
+    env.OnChestContents(5, { data = { at = { x = -478, y = 64, z = 78 }, items = { ["minecraft:stone_bricks"] = 100 } } })
+    truthy(env.DATA.chestName["-478:64:78"] == nil, "ambiguous type set -> no binding until the sort makes them one")
+end)
+
 test("StorageMan: fuel before furniture -- wood smelts while fuel is short", function()
     local env, S = storageWithChests()
     env.Rescan()
@@ -321,7 +363,7 @@ test("StorageMan: fuel before furniture -- wood smelts while fuel is short", fun
     falsy(S.reservedForCrafting("minecraft:oak_log", env.m_Index["minecraft:oak_log"]), "not reserved")
     -- With plenty of fuel the sixteen-log crafting reserve is back.
     env.__world.peripherals["minecraft:chest_0"].api.__inv.items[1].count = 64
-    env.Rescan()
+    env.Rescan(true)   -- contents changed under a fresh scan: a caller that just moved stacks forces it
     eq(S.smeltAllowance("minecraft:oak_log", env.m_Index["minecraft:oak_log"]), 0, "5 - 16 reserve -> nothing to smelt")
 end)
 
@@ -463,6 +505,64 @@ test("DroneLogic.FellTrunkAt reports a trunk that is gone and observes the air",
     eq(why, "gone", "reason")
     eq(#observed, 3, "the foot and the two cells above it were recorded as air")
     eq(observed[1], "5:64:5=0", "first observation")
+end)
+
+-- The dig-coverage plateau (2026-09-07): OnDig serpentines a layer trusting row/col COUNTERS, but a
+-- mid-dig deposit flies the drone to storage and does not bring it back, so every cell after the
+-- first pack-fill was cut from wherever storage left it -- the room hollowed only ~57%, as scattered
+-- single cells. DepositKeepingPlace is the fix: deposit, then return to the exact cell + heading.
+-- getFuelLevel -> "unlimited" makes depositIfFull skip its own position reads, so the two
+-- getCachedPosition calls the helper makes are deterministically calls 1 (before) and 2 (after).
+test("DroneLogic.DepositKeepingPlace digs back to the exact cell + heading after a deposit flies the drone off", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 5000 })
+    env.__world.turtle.getFuelLevel = function() return "unlimited" end
+    local n, origin, moved = 0, { -488, 62, 56, 1 }, { -476, 64, 78, 3 }
+    env.pgps.getCachedPosition = function()
+        n = n + 1
+        local q = (n == 1) and origin or moved            -- as if Deposit() flew us to a chest
+        return q[1], q[2], q[3], q[4]
+    end
+    local digTos, turns = {}, {}
+    env.pgps.digTo = function(x, y, z) digTos[#digTos + 1] = { x, y, z } return true end
+    env.pgps.turnTo = function(d) turns[#turns + 1] = d return true end
+    truthy(env.DepositKeepingPlace(), "deposit reported success")
+    eq(#digTos, 1, "dug back to the abandoned cell exactly once")
+    eq(digTos[1][1], -488, "returned to origin x")
+    eq(digTos[1][2], 62, "returned to origin y")
+    eq(digTos[1][3], 56, "returned to origin z")
+    eq(turns[1], 1, "restored the original heading")
+end)
+
+test("DroneLogic.DepositKeepingPlace does not travel when the pack never filled (no phantom dig-back)", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 5000 })
+    env.__world.turtle.getFuelLevel = function() return "unlimited" end
+    local digTos = 0
+    env.pgps.digTo = function() digTos = digTos + 1 return true end
+    truthy(env.DepositKeepingPlace(), "reported success")
+    eq(digTos, 0, "no dig-back when the drone never left its cell")
+end)
+
+-- The basement never got dug (2026-09-07): its box is fully BURIED (surface y63, box top y62), so the
+-- cell ReachSite lands on (pos.y+1 = ground) is solid and every face around it is rock. ApproachFromSide
+-- then flailed for an open face that cannot exist and JitterWatch aborted the job at the dock. A dig job
+-- must dig straight in; the planner's cost still prefers open air for the descent.
+test("DroneLogic.ReachSite digs straight into a buried dig site instead of flailing at its faces", function()
+    local env, D = loadModule("DroneLogic.lua", { fuel = 5000, pos = { x = -490, y = 75, z = 66 } })
+    D.setExecuting(true)
+    env.peripheral.getType = function() return nil end       -- a miner (both slots free) -> CanDig()
+    local moves = 0
+    env.pgps.moveTo = function() moves = moves + 1 return false end   -- the cell above the box is solid ground
+    local digTo = nil
+    env.pgps.digTo = function(x, y, z) digTo = { x, y, z } return true end
+    local at = env.ReachSite(-488, 62, 56, true)             -- digIn = true (a dig job)
+    truthy(at, "reached the buried site")
+    -- Two moveTo calls: the cell above the box, then the fly-over of its column (both solid here).
+    -- Neither is a face-by-face flail.
+    eq(moves, 2, "tried the open route and the column fly-over, then did NOT flail across the faces")
+    truthy(digTo, "dug straight in")
+    eq(digTo[1], -488, "dug to the box corner x")
+    eq(digTo[2], 63, "dug to the cell on top of the box (pos.y+1)")
+    eq(digTo[3], 56, "dug to the box corner z")
 end)
 
 test("DroneLogic.PlantSaplingAt plants on soil from one above, and not on stone", function()
@@ -702,10 +802,11 @@ test("DroneLogic: an executing flag with no job and no movement is cleared by th
     truthy(not D.isExecuting(), "still there 400 s later with no job: cleared")
 end)
 
-test("DroneLogic.FetchSkip: fetches search networked chests, never caches", function()
+test("DroneLogic.FetchSkip: searches reachable chests (networked or near bay), skips far caches", function()
     local env = loadModule("DroneLogic.lua")
     local wantsCoal = function(nm) return nm == "minecraft:coal" end
-    truthy(env.FetchSkip({ pos = { x = -480, y = 8, z = 87 } }, wantsCoal), "a cache (no peripheral) is skipped even with unknown contents")
+    truthy(env.FetchSkip({ pos = { x = -480, y = 8, z = 87 } }, wantsCoal), "a FAR position-only cache (~79 blocks out) is skipped -- no stranding")
+    falsy(env.FetchSkip({ pos = { x = -478, y = 64, z = 74 } }, wantsCoal), "a NEAR position-only bay chest (unknown contents) IS searched -- its network binding may have gone stale")
     truthy(env.FetchSkip({ pos = {}, peripheral = "minecraft:chest_0", items = { ["minecraft:stone"] = 64 } }, wantsCoal), "a chest known to hold none is skipped")
     falsy(env.FetchSkip({ pos = {}, peripheral = "minecraft:chest_1" }, wantsCoal), "a networked chest of unknown contents is searched")
     falsy(env.FetchSkip({ pos = {}, peripheral = "minecraft:chest_2", items = { ["minecraft:coal"] = 3 } }, wantsCoal), "a chest known to hold it is searched")
@@ -813,6 +914,7 @@ end)
 
 test("DroneLogic: TravelTo digs only after the open-route plans have failed", function()
     local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.TravelDigAllowed = true        -- inside a dig job; outside one travel never digs (see the gate test)
     local s_Calls = {}
     env.pgps.moveTo = function() s_Calls[#s_Calls + 1] = "moveTo" return false end
     env.pgps.digTo = function() s_Calls[#s_Calls + 1] = "digTo" return true end
@@ -1180,21 +1282,35 @@ test("DroneLogic: a covered square short of material skips cleanly -- it does no
 end)
 
 
-test("StorageMan: the pickup point is the chest that already holds the most of the first item", function()
+test("StorageMan: the pickup point is an empty chest, else a holder with room, never a furnace", function()
     local env = loadModule("StorageMan.lua")
     env.DATA.deposits = {
         { peripheral = "minecraft:chest_0", pos = { x = -476, y = 64, z = 78 } },
         { peripheral = "minecraft:chest_1", pos = { x = -480, y = 64, z = 78 } },
         { peripheral = "minecraft:furnace_2", pos = { x = -479, y = 65, z = 77 } },
     }
+    env.m_Chests = { "minecraft:chest_0", "minecraft:chest_1", "minecraft:furnace_2" }
+    env.m_Free = { ["minecraft:chest_0"] = 10, ["minecraft:chest_1"] = 10, ["minecraft:furnace_2"] = 2 }
     env.m_Index = { ["minecraft:stone_bricks"] = { total = 90, at = {
         { where = "minecraft:chest_0", slot = 1, count = 20 },
         { where = "minecraft:chest_1", slot = 3, count = 60 },
         { where = "minecraft:furnace_2", slot = 1, count = 10 } } } }
-    -- two askers spread across the chests that hold it, never the furnace
+    -- both holders have room: askers spread across them, never the furnace
     local seen = {}
     for asker = 1, 6 do local p = env.pickupFor("minecraft:stone_bricks", asker); truthy(p ~= nil, "a pickup"); truthy(p.peripheral ~= "minecraft:furnace_2", "never the furnace"); seen[p.peripheral] = true end
     truthy(seen["minecraft:chest_0"] and seen["minecraft:chest_1"], "spread across both chests, not one")
+    -- an EMPTY chest beats every holder: the whole order is pushed into it and sucked out front to back
+    env.DATA.deposits[#env.DATA.deposits + 1] = { peripheral = "minecraft:chest_9", pos = { x = -470, y = 64, z = 78 } }
+    env.m_Chests[#env.m_Chests + 1] = "minecraft:chest_9"
+    env.m_Free["minecraft:chest_9"] = 27
+    eq(env.pickupFor("minecraft:stone_bricks", 1).peripheral, "minecraft:chest_9", "the empty chest is the pickup")
+    -- full holders lose to any stranger with room (the cable sat in a full chest, 2026-09-08)
+    env.m_Free["minecraft:chest_9"] = 0
+    env.m_Free["minecraft:chest_0"], env.m_Free["minecraft:chest_1"] = 0, 0
+    env.DATA.deposits[#env.DATA.deposits + 1] = { peripheral = "minecraft:chest_5", pos = { x = -471, y = 64, z = 78 } }
+    env.m_Chests[#env.m_Chests + 1] = "minecraft:chest_5"
+    env.m_Free["minecraft:chest_5"] = 5
+    eq(env.pickupFor("minecraft:stone_bricks", 2).peripheral, "minecraft:chest_5", "a stranger with room beats full holders (asker 1 still holds its reservation on chest_9)")
     eq(env.pickupFor("minecraft:glass", 1), nil, "nothing holds glass")
 end)
 
@@ -1398,6 +1514,386 @@ test("DroneLogic: the straight hop bails to the planner instead of stepping into
     truthy(planned, "it used the planner instead of walking into the known wall")
     eq(s_Fwd, 0, "it never stepped forward into the solid cell")
 end)
+
+
+test("DroneLogic.DepositTarget: storage answers 'no deposit point' -> stay put, keep the cargo", function()
+    local env, D = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.__world.pos = { x = 58, y = 67, z = 23 }
+    env.__world.replies.StorageMan = { DepositPoint = { message = "no deposit point with free space" } }
+    local moved = 0
+    env.pgps.moveTo = function() moved = moved + 1 return true end
+    env.pgps.digTo = function() moved = moved + 1 return true end
+    eq(D.depositTarget(), nil, "no target")
+    eq(moved, 0, "an answered 'nowhere' must not fly anywhere")
+end)
+
+test("pgps.flyTo holds the height it climbed for until a sideways step succeeds -- no up/down bounce", function()
+    local env = loadModule("pgps.lua")
+    -- A wall column at x=1 from the ground up to y=68; start at 0,66,0 and fly to 3,64,0.
+    -- The old loop: down to 65, blocked, up to 66, down to 65, blocked ... for the whole budget.
+    local function solid(x, y, z) return x == 1 and y <= 68 end
+    local w = env.__world
+    w.pos = { x = 0, y = 66, z = 0 }
+    env.setLocation(0, 66, 0, env.East)
+    local moves = 0
+    local function step(dx, dy, dz)
+        local x, y, z = env.getCachedPosition()
+        if solid(x + dx, y + dy, z + dz) then return false end
+        moves = moves + 1
+        w.pos = { x = x + dx, y = y + dy, z = z + dz }
+        return true
+    end
+    env.turtle.up = function() return step(0, 1, 0) end
+    env.turtle.down = function() return step(0, -1, 0) end
+    env.turtle.forward = function()
+        local _, _, _, d = env.getCachedPosition()
+        if d == env.East then return step(1, 0, 0) elseif d == env.West then return step(-1, 0, 0)
+        elseif d == env.South then return step(0, 0, 1) else return step(0, 0, -1) end
+    end
+    local ok, why = env.flyTo(3, 64, 0, 60)
+    truthy(ok, "arrives: " .. tostring(why))
+    local x, y, z = env.getCachedPosition()
+    eq(x .. "," .. y .. "," .. z, "3,64,0", "at the target")
+    -- 15: one wasted down+up before the hold engages, then climb 3, over 2, down 5, forward 1. The
+    -- old loop spent the whole 60-step budget bouncing between y65 and y66 and never arrived.
+    truthy(moves <= 16, "no bounce: took " .. moves .. " moves")
+end)
+
+test("DroneLogic.ReachSite reaches a buried dig box down its own column, never along a planned tunnel", function()
+    local env, D = loadModule("DroneLogic.lua", { fuel = 1000 })
+    local w = env.__world
+    w.pos = { x = 64, y = 68, z = 31 }         -- at the dock; box top y43 under 24 blocks of rock
+    D.setExecuting(true)
+    env.peripheral.getType = function() return nil end       -- a miner (both slots free) -> CanDig()
+    local planned = 0
+    env.pgps.moveTo = function(x, y, z)
+        if y == 44 then return false end       -- the cell above the box is inside rock: no path
+        w.pos = { x = x, y = y, z = z } return true
+    end
+    env.pgps.digTo = function() planned = planned + 1 return true end
+    env.pgps.down = function() w.pos.y = w.pos.y - 1 return true end
+    local dug = 0
+    env.turtle.detectDown = function() return true end
+    env.turtle.inspectDown = function() return true, { name = "minecraft:stone" } end
+    env.turtle.digDown = function() dug = dug + 1 return true end
+    truthy(env.ReachSite(63, 43, 31, true), "arrives")
+    eq(w.pos.x .. "," .. w.pos.y .. "," .. w.pos.z, "63,44,31", "directly above the box top")
+    eq(dug, 24, "one block dug per block of descent -- a column, not a tunnel")
+    eq(planned, 0, "the planner was never asked for a digging route")
+end)
+
+test("DroneLogic.DescendDigging stops above a chest instead of digging through it", function()
+    local env, D = loadModule("DroneLogic.lua", { fuel = 1000 })
+    local w = env.__world
+    w.pos = { x = 0, y = 70, z = 0 }
+    D.setExecuting(true)
+    env.pgps.down = function() w.pos.y = w.pos.y - 1 return true end
+    env.turtle.detectDown = function() return true end
+    env.turtle.inspectDown = function() return true, { name = w.pos.y == 68 and "minecraft:chest" or "minecraft:dirt" } end
+    local ok, why = D.descendDigging(60)
+    falsy(ok, "refused")
+    contains(tostring(why), "chest", "names the block")
+    eq(w.pos.y, 68, "stopped on top of it")
+end)
+
+test("DroneLogic.DigStartInBox refuses a start seven blocks off the box even at the right height", function()
+    local env, D = loadModule("DroneLogic.lua", { fuel = 1000 })
+    local d = { pos = { x = 63, y = 43, z = 31 }, w = 3, l = 3, depth = 4 }
+    truthy(D.digStartInBox(d, 64, 44, 32), "inside the footprint, one above the top: fine")
+    truthy(D.digStartInBox(d, 63, 40, 33), "inside, at the bottom layer: fine (a re-dig)")
+    local ok, why = D.digStartInBox(d, 71, 40, 39)
+    falsy(ok, "seven blocks off the footprint is not the box")
+    contains(tostring(why), "outside the box footprint", "says which check failed")
+    ok, why = D.digStartInBox(d, 64, 60, 32)
+    falsy(ok, "far above the box is not the box")
+    contains(tostring(why), "not within the box", "says which check failed")
+end)
+
+test("DroneLogic.TravelToBody never digs outside a dig job -- a blocked trip fails instead of tunnelling", function()
+    local env, D = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.__world.pos = { x = 0, y = 68, z = 0 }
+    env.peripheral.getType = function() return nil end       -- a miner: CanDig()
+    env.pgps.moveTo = function() return false end
+    local dug = 0
+    env.pgps.digTo = function() dug = dug + 1 return true end
+    falsy(D.travelToBody(30, 68, 0), "no open route and no licence to dig: the trip fails")
+    eq(dug, 0, "did not tunnel")
+    env.TravelDigAllowed = true                               -- what RunJob sets for a dig job
+    truthy(D.travelToBody(30, 68, 0), "a dig job may bore in")
+    eq(dug, 1, "one digging plan")
+end)
+
+test("DroneLogic.LayAhead digs dirt out of a wall cell and lays the cobble; leaves a protected block", function()
+    local env, D = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.turtle.inv[1] = { name = "minecraft:cobblestone", count = 10 }
+    local dug, placed = 0, 0
+    local ahead = { name = "minecraft:dirt" }
+    local inspect = function() return ahead ~= nil, ahead end
+    local dig = function() dug = dug + 1 ahead = nil return true end
+    local place = function() placed = placed + 1 return true end
+    eq(D.layAhead(inspect, place, "minecraft:cobblestone", dig), "placed", "dirt gives way to the wall")
+    eq(dug, 1, "one dig") eq(placed, 1, "one place")
+    ahead = { name = "computercraft:monitor_advanced" }
+    eq(D.layAhead(inspect, place, "minecraft:cobblestone", dig), "occupied", "a station is not dug")
+    eq(dug, 1, "no further dig")
+end)
+
+test("DroneLogic.StandOnStructure sinks through a buried wall column, digging only the build's own cells", function()
+    local env, D = loadModule("DroneLogic.lua", { fuel = 1000 })
+    local w = env.__world
+    w.pos = { x = 0, y = 70, z = 0 }
+    D.setExecuting(true)
+    local flewTo
+    env.TravelTo = function(x, y, z) flewTo = { x, y, z } w.pos = { x = x, y = y, z = z } return true end
+    env.pgps.down = function() w.pos.y = w.pos.y - 1 return true end
+    local dug = {}
+    env.turtle.detectDown = function() return true end                        -- hillside: solid all the way
+    env.turtle.inspectDown = function() return true, { name = "minecraft:dirt" } end
+    env.turtle.digDown = function() dug[#dug + 1] = w.pos.y - 1 return true end
+    falsy(D.standOnStructure(5, 66, 5, {}), "a cell outside the build is not touched")
+    eq(#dug, 0, "nothing dug")
+    -- wall cells dy 1..5 and the roof at dy 6 above the target at y66: the column runs to y72
+    local cells = {}
+    for y = 67, 72 do cells["5:" .. y .. ":5"] = true end
+    truthy(D.standOnStructure(5, 66, 5, cells), "reaches the standing cell")
+    eq(flewTo[2], 73, "flew to the open air above the column (y72 is the roof)")
+    eq(#dug, 6, "dug the six structure cells y72..y67 on the way down")
+    eq(w.pos.y, 67, "standing at by+1")
+end)
+
+-- A stub world for the dig sweep: turnTo sets the heading, a cell callback moves one step along it
+-- and records the cell. The sweep must visit exactly the box, whichever corner it starts from.
+local function sweepWorld(env, x0, z0, w, l)
+    local pos = { x = x0, z = z0 }
+    local H = env.pgps.HEADINGS
+    local dir = H.east
+    local seen = {}
+    env.pgps.getCachedPosition = function() return pos.x, 60, pos.z, dir end
+    env.pgps.turnTo = function(d) dir = d return true end
+    local step = function()
+        if dir == H.east then pos.x = pos.x + 1 elseif dir == H.west then pos.x = pos.x - 1
+        elseif dir == H.south then pos.z = pos.z + 1 else pos.z = pos.z - 1 end
+        seen[pos.x .. ":" .. pos.z] = true
+        return true
+    end
+    return pos, seen, step
+end
+for _, shape in ipairs({ {3, 3}, {3, 2}, {5, 1}, {2, 4} }) do
+    local w, l = shape[1], shape[2]
+    test(("DroneLogic.DigLayer sweeps exactly a %dx%d box on two consecutive layers, from either corner"):format(w, l), function()
+        local env, D = loadModule("DroneLogic.lua", { fuel = 1000 })
+        local pos, seen, step = sweepWorld(env, 10, 20, w, l)
+        seen["10:20"] = true
+        truthy(D.digLayer(10, 20, w, l, step), "layer 1 sweeps")
+        eq(#(function() local n = {} for k in pairs(seen) do n[#n + 1] = k end return n end)(), w * l, "layer 1 covers every cell once")
+        -- layer 2 starts where layer 1 ended, on whatever corner that is
+        local seen2 = {}
+        env.pgps.turnTo = env.pgps.turnTo
+        local step2 = function() local ok = step() seen2[pos.x .. ":" .. pos.z] = true return ok end
+        seen2[pos.x .. ":" .. pos.z] = true
+        truthy(D.digLayer(10, 20, w, l, step2), "layer 2 sweeps")
+        local n = 0 for k in pairs(seen2) do n = n + 1
+            local x, z = k:match("^(-?%d+):(-?%d+)$"); x, z = tonumber(x), tonumber(z)
+            truthy(x >= 10 and x <= 10 + w - 1 and z >= 20 and z <= 20 + l - 1, "layer 2 stays inside the box: " .. k)
+        end
+        eq(n, w * l, "layer 2 covers every cell once")
+    end)
+end
+
+test("DroneLogic.unloadHere keeps up to four stacks of cobblestone aboard and deposits the rest", function()
+    local env, D = loadModule("DroneLogic.lua", { fuel = 1000 })
+    local w = env.__world
+    w.addInventory("minecraft:chest_9", "minecraft:chest", {}, 27)
+    env.turtle.inspectDown = function() return true, { name = "minecraft:chest" } end
+    env.turtle.dropDown = function() env.turtle.inv[env.turtle.selected] = nil return true end   -- the stub's drop moves nothing
+    env.turtle.inv[1] = { name = "minecraft:cobblestone", count = 64 }
+    env.turtle.inv[2] = { name = "minecraft:cobblestone", count = 64 }
+    env.turtle.inv[3] = { name = "minecraft:cobblestone", count = 64 }
+    env.turtle.inv[4] = { name = "minecraft:cobblestone", count = 50 }
+    env.turtle.inv[5] = { name = "minecraft:gravel", count = 40 }   -- dirt itself never leaves the drone (DEPOSIT_NEVER)
+    local put = D.unloadHere()
+    truthy(put, "unloaded into the chest below")
+    eq(put["minecraft:gravel"], 40, "the spoils go")
+    eq(put["minecraft:cobblestone"] or 0, 0, "cobble under four stacks all stays aboard")
+    local aboard = 0
+    for i = 1, 16 do local it = env.turtle.inv[i] if it and it.name == "minecraft:cobblestone" then aboard = aboard + it.count end end
+    eq(aboard, 242, "the build material stays aboard for the next batch")
+end)
+
+test("DroneLogic.reportTask keeps an unacknowledged TaskDone and delivers it once TaskMan answers", function()
+    local env, D = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.__world.replies.TaskMan = {}                       -- out of range: no reply
+    D.reportTask({ taskId = 146 }, true, nil, { dug = 288 })
+    eq(#env.PendingReports, 1, "kept for later")
+    eq(env.PendingReports[1].id, 146, "the right task")
+    local got
+    env.__world.replies.TaskMan = { TaskDone = function(d) got = d return { id = d.id } end }
+    eq(D.flushPendingReports(), 1, "delivered on the next chance")
+    eq(#env.PendingReports, 0, "queue drained")
+    eq(got.id, 146, "TaskMan received the report") eq(got.ok, true, "with its verdict")
+end)
+
+test("DroneLogic.DigLayer descends through a layer its own map already knows as air without sweeping it", function()
+    local env, D = loadModule("DroneLogic.lua", { fuel = 1000 })
+    local w = env.__world
+    w.pos = { x = 10, y = 60, z = 20 }
+    env.pgps.cachedWorld = {}
+    for dx = 0, 2 do for dz = 0, 2 do env.pgps.cachedWorld[(10 + dx) .. ":60:" .. (20 + dz)] = 0 end end
+    local steps = 0
+    local ok = D.digLayer(10, 20, 3, 3, function() steps = steps + 1 return true end)
+    truthy(ok, "layer counts as done")
+    eq(steps, 0, "not one cell walked")
+    env.pgps.cachedWorld["11:60:21"] = 1                           -- one block left in the middle
+    falsy(D.layerKnownAir(10, 20, 3, 3, 60), "a single solid cell means the layer is swept")
+end)
+
+test("DroneLogic.NaturalBlock: leaves, logs and dirt yes; cobblestone, computers, chests no", function()
+    local env, D = loadModule("DroneLogic.lua", { fuel = 1000 })
+    truthy(D.naturalBlock("minecraft:oak_leaves"), "leaves") truthy(D.naturalBlock("minecraft:oak_log"), "logs")
+    truthy(D.naturalBlock("minecraft:dirt"), "dirt") truthy(D.naturalBlock("minecraft:stone"), "stone")
+    falsy(D.naturalBlock("minecraft:cobblestone"), "placed cobble") falsy(D.naturalBlock("minecraft:chest"), "a chest")
+    falsy(D.naturalBlock("computercraft:monitor_advanced"), "a station") falsy(D.naturalBlock("create:veridium"), "another mod's block")
+end)
+
+test("DroneLogic.DigLayer skips a row the SHARED map knows as air and walks the rest", function()
+    local env, D = loadModule("DroneLogic.lua", { fuel = 1000 })
+    local w = env.__world
+    local pos, seen, step = sweepWorld(env, 10, 20, 3, 3)
+    -- MapServer knows the middle row (z=21) is air; the drone's own map knows nothing.
+    env.__world.replies.MapServer = { KnownAir = function(d)
+        local air = {} for i, p in ipairs(d.positions) do if p.z == 21 then air[#air + 1] = i end end return { air = air }
+    end }
+    local steps = 0
+    local counted = function() steps = steps + 1 return step() end
+    truthy(D.digLayer(10, 20, 3, 3, counted), "sweeps")
+    -- rows 0 and 2 walked (2 steps each) plus two row changes: 6, not 8
+    eq(steps, 6, "the known-air row is crossed, not walked")
+end)
+
+-- ================================================================================================
+-- Build materials come from the drone first; storage is only asked for the shortfall
+-- ================================================================================================
+test("DroneLogic.SecureBuildMaterials: everything aboard -> no storage call", function()
+    local env, D = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.turtle.inv[1] = { name = "minecraft:cobblestone", count = 40 }
+    local asked = false
+    env.__world.replies.StorageMan = { Provide = function() asked = true return nil end }
+    truthy(D.secureBuildMaterials({ ["minecraft:cobblestone"] = 30 }), "returns true")
+    falsy(asked, "storage was not asked when the drone already carries the bill of materials")
+end)
+
+test("DroneLogic.SecureBuildMaterials: partly aboard, no storage -> build with what is aboard", function()
+    local env, D = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.turtle.inv[1] = { name = "minecraft:cobblestone", count = 10 }
+    local askedFor
+    env.__world.replies.StorageMan = { Provide = function(d) askedFor = d.items[1].count return nil end }
+    truthy(D.secureBuildMaterials({ ["minecraft:cobblestone"] = 30 }), "returns true")
+    eq(askedFor, 20, "storage was asked for the shortfall only")
+end)
+
+test("DroneLogic.SecureBuildMaterials: storage names where the unpushed item lies -> the drone goes there", function()
+    local env, D = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.__world.replies.StorageMan = { Provide = function()
+        return { pos = { x = 1, y = 2, z = 3 }, peripheral = "minecraft:chest_1", complete = false,
+                 provided = {}, short = { { name = "minecraft:chest", count = 20 } },
+                 points = { { name = "minecraft:chest", count = 20, pos = { x = 5, y = 2, z = 3 }, peripheral = "minecraft:chest_2" } } }
+    end }
+    truthy(D.secureBuildMaterials({ ["minecraft:chest"] = 20 }), "returns true")
+    local went = false
+    for _, body in pairs(env.__world.files) do if type(body) == "string" and body:find("pickup: 20 minecraft:chest more at 5,2,3", 1, true) then went = true end end
+    truthy(went, "the drone set out for the chest storage named instead of sweeping every deposit point")
+end)
+
+test("StorageMan.Rescan: a scan younger than RESCAN_MIN_S is reused; a forced one is not", function()
+    local env = loadModule("StorageMan.lua")
+    local built = 0
+    env.BuildIndex = function() built = built + 1 return {}, {}, {}, {} end
+    env.Rescan(true) env.Rescan() env.Rescan() env.Rescan()
+    eq(built, 1, "one build serves the burst")
+    env.Rescan(true)
+    eq(built, 2, "a write path forces a fresh scan")
+    env.__world.addInventory("minecraft:chest_77", "minecraft:chest", {})
+    env.Rescan()
+    eq(built, 3, "a new peripheral on the wire forces one too")
+end)
+
+test("StorageMan.holderPointFor: the registered chest holding the most, never the handover chest", function()
+    local env = loadModule("StorageMan.lua")
+    env.DATA.deposits = {
+        { peripheral = "minecraft:chest_0", pos = { x = 1, y = 61, z = 1 } },
+        { peripheral = "minecraft:chest_1", pos = { x = 3, y = 61, z = 1 } },
+    }
+    env.m_Index = { ["minecraft:chest"] = { total = 77, at = {
+        { where = "minecraft:chest_0", slot = 1, count = 54 },
+        { where = "minecraft:chest_1", slot = 3, count = 20 },
+        { where = "minecraft:chest_7", slot = 1, count = 3 } } } }   -- chest_7 has no registered position
+    eq(env.holderPointFor("minecraft:chest", nil).peripheral, "minecraft:chest_0", "the biggest holder")
+    eq(env.holderPointFor("minecraft:chest", "minecraft:chest_0").peripheral, "minecraft:chest_1", "not the handover chest itself")
+    eq(env.holderPointFor("minecraft:chest", "minecraft:chest_0").pos.x, 3, "with its position")
+    eq(env.holderPointFor("minecraft:cable", nil), nil, "nothing held -> nil")
+end)
+
+test("DroneLogic.TakeFromChest: unloads spoils on arrival but keeps what it came for and the KEEP allowance", function()
+    local env, D = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.turtle.inv[1] = { name = "minecraft:chest", count = 20 }      -- taken for this order on the last stop
+    env.turtle.inv[2] = { name = "minecraft:dirt", count = 64 }       -- spoils
+    env.turtle.inv[3] = { name = "minecraft:cobblestone", count = 64 }   -- within the KEEP_ABOARD allowance
+    env.turtle.inspectDown = function() return true, { name = "minecraft:chest" } end
+    local dropped = {}
+    env.turtle.dropDown = function() local it = env.turtle.inv[env.turtle.selected] dropped[#dropped + 1] = it.name env.turtle.inv[env.turtle.selected] = nil return true end
+    env.__world.addInventory("bottom", "minecraft:chest", { [1] = { name = "computercraft:wired_modem_full", count = 20 } })
+    local want = function(n) return n == "minecraft:chest" or n == "computercraft:wired_modem_full" end
+    D.takeFromChest(want, function() return 20 end)
+    eq(tostring(env.KEEP_ABOARD and env.KEEP_ABOARD["minecraft:cobblestone"]), "256", "allowance visible")
+    eq(table.concat(dropped, ","), "minecraft:dirt", "only the spoils went down")
+    eq(dropped[1], "minecraft:dirt", "the spoils")
+    truthy(env.turtle.inv[1] and env.turtle.inv[1].name == "minecraft:chest", "the chests stayed aboard")
+    truthy(env.turtle.inv[3] and env.turtle.inv[3].name == "minecraft:cobblestone", "the cobble allowance stayed aboard")
+end)
+
+test("DroneLogic.TakeFromChest: the order's other kinds stay aboard once KeepOrderAboard ran", function()
+    local env, D = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.turtle.inv[1] = { name = "computercraft:cable", count = 21 }   -- taken at the previous stop
+    env.turtle.inspectDown = function() return true, { name = "minecraft:chest" } end
+    local dropped = {}
+    env.turtle.dropDown = function() local it = env.turtle.inv[env.turtle.selected] dropped[#dropped + 1] = it.name env.turtle.inv[env.turtle.selected] = nil return true end
+    env.__world.addInventory("bottom", "minecraft:chest", { [1] = { name = "computercraft:wired_modem_full", count = 20 } })
+    env.KeepOrderAboard({ ["computercraft:cable"] = 21, ["computercraft:wired_modem_full"] = 20 })
+    D.takeFromChest(function(n) return n == "computercraft:wired_modem_full" end, function() return 20 end)
+    eq(#dropped, 0, "the cable was not put back into the modem chest")
+end)
+
+test("DroneLogic.MarkMapSolidDone: a solid cell counts as done only when the map names the design block", function()
+    local env = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.pgps.cachedWorld = { ["0:0:0"] = 1, ["0:1:0"] = 1, ["0:2:0"] = 1, ["0:3:0"] = 1 }
+    env.pgps.cachedWorldDetail = {
+        ["0:0:0"] = { true, { name = "minecraft:cobblestone" } },   -- a floor slab where cable must go
+        ["0:1:0"] = { true, { name = "computercraft:cable" } },      -- cable already laid
+    }
+    local marked = {}
+    local memo = { done = function(k) return marked[k] == true end, mark = function(k) marked[k] = true end }
+    local blocks = {
+        { dx = 0, dy = 0, dz = 0, item = "computercraft:cable" },        -- wrong block, solid: visit
+        { dx = 0, dy = 1, dz = 0, item = "computercraft:cable" },        -- right block: done
+        { dx = 0, dy = 2, dz = 0, item = "computercraft:cable" },        -- solid, unnamed infra: visit
+        { dx = 0, dy = 3, dz = 0, item = "minecraft:cobblestone" },      -- solid, unnamed plain: done
+    }
+    local n = env.MarkMapSolidDone(memo, blocks, { x = 0, y = 0, z = 0 })
+    eq(n, 2, "two cells pre-marked")
+    truthy(marked["0:1:0"], "laid cable is done")
+    truthy(marked["0:3:0"], "unnamed solid cobble is done")
+    truthy(not marked["0:0:0"], "cable over a cobble slab is visited")
+    truthy(not marked["0:2:0"], "unnamed solid infra cell is visited")
+end)
+
+test("DroneLogic.SecureBuildMaterials: nothing aboard, no storage -> the one real error", function()
+    local env, D = loadModule("DroneLogic.lua", { fuel = 1000 })
+    env.__world.replies.StorageMan = { Provide = function() return nil end }
+    local ok, err = pcall(D.secureBuildMaterials, { ["minecraft:cobblestone"] = 30 })
+    falsy(ok, "throws")
+    contains(tostring(err), "storage would not hand over", "the storage error, not a nil index")
+end)
+
 
 io.stderr:write(("%d test(s), %d failed\n"):format(#results, failed))
 os.exit(failed == 0 and 0 or 1)

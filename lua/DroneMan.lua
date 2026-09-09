@@ -151,6 +151,11 @@ function OnHeartbeat(p_ID, p_Message)
     for k,v in pairs(p_Message.data) do
         DATA["drones"][s_ID][k] = v
     end
+    -- ABSENT MEANS NONE, FOR THE JOB DESCRIPTION. The merge above only writes fields the beat
+    -- carries, and a nil never travels -- so a drone whose job had ended went on being described by
+    -- it: "dig 63,65,31" on an idle, docked D1 for twenty minutes (2026-09-08). The description
+    -- follows the beat exactly: present while a job runs, gone the beat after it ends.
+    DATA["drones"][s_ID].detail = p_Message.data.detail
 
     -- ROLE IS DERIVED FROM HARDWARE, AND IT HAS TO SURVIVE A RESTART.
     --
@@ -606,8 +611,13 @@ function OnGoTo(p_ID, p_Message)
         --
         -- Waiting bought nothing anyway: OnAbort is idempotent and always clears, and the GoTo that
         -- follows is what the drone acts on.
-        PowNet.Send(v, PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Abort", {}), PowNet.SERVER_PROTOCOL)
-        os.sleep(0.2)   -- let the abort land before the new order arrives
+        -- A PROBE IS A QUESTION, NOT AN ORDER. Every fleet.probe rode this path and aborted whatever the
+        -- drone was doing -- builds "placed none", digs re-issued -- for as long as probes have existed
+        -- (found 2026-09-08 when a probe loop kept three drones idle).
+        if p_Message.data.verb ~= "Probe" then
+            PowNet.Send(v, PowNet.newMessage(PowNet.MESSAGE_TYPE.CALL, "Abort", {}), PowNet.SERVER_PROTOCOL)
+            os.sleep(0.2)   -- let the abort land before the new order arrives
+        end
 
         -- The verb is a parameter now, not a constant.
         --

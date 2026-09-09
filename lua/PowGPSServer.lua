@@ -373,11 +373,20 @@ end
 local m_Seen = {}       -- chunk key -> epoch ms
 
 
+-- chunk key -> set of cell keys. Every cell write passes through MarkChunkDirty, so this index is
+-- complete by construction, and a save reads its dirty chunks straight off it. Before it existed
+-- each save walked the entire map (300k cells) to find the cells of two dozen chunks: 5-10 game-s
+-- with the message loop blocked, a round of "pathfinder did not answer" per upload (2026-09-08).
+local m_ChunkKeys = {}
+
 function MarkChunkDirty(p_Key)
     local c = chunkOfKey(p_Key)
     if c then
         m_Dirty[c] = true
         m_Seen[c] = os.epoch("utc")
+        local ks = m_ChunkKeys[c]
+        if ks == nil then ks = {} m_ChunkKeys[c] = ks end
+        ks[p_Key] = true
     end
 end
 
@@ -586,16 +595,13 @@ function save()
     -- Group the dirty cells by chunk in one pass. Walking the whole map once per dirty chunk would
     -- reintroduce exactly the cost this change exists to remove.
     local s_Buckets = {}
-    local s_Seen2 = 0
-    for k in pairs(cachedWorld) do
-        s_Seen2 = s_Seen2 + 1
-        if s_Seen2 % 5000 == 0 then breathe("walk") end
-        local c = chunkOfKey(k)
-        if c and m_Dirty[c] then
-            local b = s_Buckets[c]
-            if b == nil then b = {} s_Buckets[c] = b end
-            b[#b + 1] = k
+    for c in pairs(m_Dirty) do
+        local keys, ks = {}, m_ChunkKeys[c] or {}
+        for k in pairs(ks) do
+            -- aged-out cells leave cachedWorld without a word; drop them from the index here
+            if cachedWorld[k] ~= nil then keys[#keys + 1] = k else ks[k] = nil end
         end
+        s_Buckets[c] = keys
     end
 
     -- A SAVE MUST NOT BE ABLE TO HOG THE COMPUTER THREAD, HOWEVER MUCH IS DIRTY.
@@ -618,7 +624,11 @@ function save()
     -- So bound the pass. Whatever is left stays in m_Dirty and is written by the next one; the map
     -- is a cache of observations that are re-uploaded constantly, so a chunk reaching disk a minute
     -- later costs nothing, and taking the fleet's scheduler down costs everything.
-    local CHUNKS_PER_SAVE = 24
+    -- SIX, not twenty-four. A pass of 24 chunks held the handler 11-12 game-seconds every upload
+    -- (MapServer.log "slow handler SaveWorld", 2026-09-08 17:08) -- longer than a drone waits for
+    -- GetPath, so every save cost the fleet a round of "pathfinder did not answer" and drones froze
+    -- mid-leg. Smaller passes, taken on every upload while a backlog stands, drain at the same rate.
+    local CHUNKS_PER_SAVE = 6
 
     local s_Failed, s_Wrote = nil, 0
     for c, keys in pairs(s_Buckets) do
@@ -1333,6 +1343,35 @@ local DIG_STEP_COST = 12
 -- walked lately (2) is free, rock that must be cut pays the tunnel price. Unknown cells cost
 -- `discover`, set per request.
 local STEP_COST = {[0] = 1, [1] = 1 + DIG_STEP_COST, [2] = 0, [3] = 1}
+-- UNDER A WIRE IS A BAD PLACE TO FLY. A turtle directly below a wired_modem_full (or cable) is attached
+-- to that wired network and gets a peripheral event for every change on it; bay activations replace
+-- dozens of modems at a time, the bursts overflow the turtle's event queue, and timers and move
+-- responses are lost -- drones crossing a basement at its ceiling (one below the slab's modem layer)
+-- froze there all afternoon (2026-09-08). Priced, not forbidden: a route may still pass under when
+-- there is no other way.
+local WIRE_CEILING_COST = 4
+local function underWire(x, y, z)
+    local d = cachedWorldDetail[x .. ":" .. (y + 1) .. ":" .. z]
+    local n = d and d.data and d.data[2] and d.data[2].name
+    return n == "computercraft:wired_modem_full" or n == "computercraft:cable"
+end
+-- The price of stepping into a cell: unknown cells cost `discover`, known cells their STEP_COST, and
+-- anything directly under a wire the WIRE_CEILING_COST on top.
+-- Directly under a wired MODEM block the turtle is attached to the wired network, and a native move
+-- from there deadlocks (five turtles hung in turtle.forward/down at 55-60,59,15-18 under the level -1
+-- modem layer, 2026-09-08). Cable overhead only costs; a modem overhead is a wall.
+local UNDER_MODEM_COST = 1000000
+local function underModem(x, y, z)
+    local d = cachedWorldDetail[x .. ":" .. (y + 1) .. ":" .. z]
+    local n = d and d.data and d.data[2] and d.data[2].name
+    return n == "computercraft:wired_modem_full"
+end
+local function stepCost(p_Cell, p_Discover, x, y, z)
+    local s_Step = (p_Cell == nil) and p_Discover or STEP_COST[p_Cell]
+    if underModem(x, y, z) then return s_Step + UNDER_MODEM_COST end
+    if underWire(x, y, z) then s_Step = s_Step + WIRE_CEILING_COST end
+    return s_Step
+end
 
 -- How far outside the start/goal box the search may wander. Without this an unreachable goal makes
 -- the frontier expand in every direction until the node limit, which is slow AND useless -- if the
@@ -1345,7 +1384,7 @@ local ASTAR_MARGIN = 24
 -- 03:10). Through rock the straight line is nearly always the answer, so the digging search is
 -- small and greedy; a normal search that needs more than 6,000 nodes in a 24-block margin box is a
 -- route that does not exist.
-local ASTAR_MAX_NODES = 6000
+local ASTAR_MAX_NODES = 12000   -- 6,000 gave up on half the open-air routes inside the finished base (2026-09-08)
 -- 20000, not 2500: with a dug cell priced at 13 steps a 45-block dig-out costs ~600, and the search
 -- rightly tries every open cell within that trade first. The old budget gave up before it reached
 -- the rock ("GoTo FAILED: stuck at -505,62,45 -- 51 blocks from target"), stranding rescues.
@@ -1497,8 +1536,7 @@ function a_star(x1, y1, z1, x2, y2, z2, discover, priority, asker, dig)
                        and s_Passable
                        and (s_Busy[idx_neighbor] == nil or idx_neighbor == idx_goal)
                        and not closedset[idx_neighbor] then
-                        local s_Step = (s_Cell == nil) and discover or STEP_COST[s_Cell]
-                        local tentative = g_score[idx_current] + s_Step
+                        local tentative = g_score[idx_current] + stepCost(s_Cell, discover, x4, y4, z4)
                         if g_score[idx_neighbor] == nil or tentative < g_score[idx_neighbor] then
                             cameFrom[idx_neighbor] = {dir, idx_current}
                             g_score[idx_neighbor] = tentative

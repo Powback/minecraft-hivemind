@@ -139,6 +139,11 @@ function Lookup(p_Name)
     if s_Entry ~= nil and (os.clock() - s_Entry.at) < HOST_TTL then return s_Entry.id end
     local s_ID = rednet.lookup(SERVER_PROTOCOL, p_Name)
     if s_ID ~= nil then m_Hosts[p_Name] = {id = s_ID, at = os.clock()} end
+    -- A BUSY MODULE CANNOT ANSWER DNS. rednet.lookup waits two game-seconds; StorageMan's index scan
+    -- over 128 chests holds it for twelve, so the Bridge's fresh lookups came back nil for minutes
+    -- ("call StorageMan.stock FAILED (lookup=nil)") while the module answered every call it heard
+    -- (2026-09-08). The last id we knew is a far better guess than nobody.
+    if s_ID == nil and s_Entry ~= nil then return s_Entry.id end
     return s_ID
 end
 
@@ -316,6 +321,27 @@ end
 --
 -- Searches, tolerates having no monitor, and falls back to the terminal so a module without a
 -- screen still runs instead of crashing.
+-- Paint a title and lines on the attached monitor (text scale 0.5 on a 3x4 advanced monitor gives
+-- 42x40 characters). Returns the number of lines shown; 0 when there is no monitor.
+function ShowScreen(p_Lines, p_Title)
+    local ok, m = pcall(peripheral.find, "monitor")
+    if not ok or m == nil then return 0 end
+    pcall(m.setTextScale, 0.5)
+    local w, h = m.getSize()
+    m.setBackgroundColour(colors.black) m.clear()
+    local row = 1
+    if p_Title then
+        m.setCursorPos(1, 1) m.setTextColour(colors.yellow) m.write(tostring(p_Title):sub(1, w)) row = 2
+    end
+    m.setTextColour(colors.white)
+    local n = 0
+    for _, l in ipairs(p_Lines or {}) do
+        if row > h then break end
+        m.setCursorPos(1, row) m.write(tostring(l):sub(1, w)) row, n = row + 1, n + 1
+    end
+    return n
+end
+
 local m_TermShim
 function Monitor(p_PreferredSide)
     if p_PreferredSide then
@@ -570,10 +596,32 @@ function main()
                 RunShutdownHook("update")
                 return
             end
+            -- A BUILT-IN "Screen" ENDPOINT, ON EVERY MODULE. HQ composes each station's status lines and
+            -- pushes them here; the module paints them on the monitor beside it. Central because the
+            -- alternative was the same twenty lines in seven modules, and because a module with no
+            -- monitor should simply answer "shown 0" rather than not exist for the call.
+            if serverMessage.dataKey == "Screen" and (m_ServerEvents["Screen"] == nil) then
+                local s_Lines = type(serverMessage.data) == "table" and serverMessage.data.lines or nil
+                local s_Ok, s_N = pcall(ShowScreen, s_Lines, serverMessage.data and serverMessage.data.title)
+                -- Reply exactly as the dispatch below does: same envelope, tagged, straight to the sender.
+                -- The first version called SendToServer with a computer ID where it wants a NAME and took
+                -- every module down on HQ's first push (2026-09-08).
+                serverMessage.status = true
+                serverMessage.data = {shown = s_Ok and s_N or 0, error = (not s_Ok) and tostring(s_N) or nil}
+                serverMessage.reply = true
+                rednet.send(serverID, serverMessage, SERVER_PROTOCOL)
+                return
+            end
             if(m_ServerEvents[serverMessage.dataKey] ~= nil) then
                 print("Received: " .. serverMessage.dataKey)
 
                 local s_Result, s_Response
+                -- A BREADCRUMB FOR THE WATCHDOG. CC terminated StorageMan twice for running ten seconds
+                -- without a yield (2026-09-08) and the only trace was a Java stack in the server log.
+                -- The handler about to run is written to /handler.txt (overwritten each time), so a killed
+                -- module names its killer; anything over 3 game-seconds is logged as slow.
+                local s_T0 = os.clock()
+                pcall(function() local h = fs.open("/handler.txt", "w") if h then h.write(tostring(serverMessage.dataKey) .. " from " .. tostring(serverID) .. " at " .. tostring(s_T0)) h.close() end end)
                 if(type(m_ServerEvents[serverMessage.dataKey]) == "function") then
                    s_Result, s_Response = m_ServerEvents[serverMessage.dataKey](serverID, serverMessage)
                 elseif(type(m_ServerEvents[serverMessage.dataKey]) == "table") then
@@ -598,6 +646,7 @@ function main()
                     print("Unknown message handle: " .. tostring(serverMessage.dataKey))
                     s_Result, s_Response = false, "no such endpoint: " .. tostring(serverMessage.dataKey)
                 end
+                if os.clock() - s_T0 > 3 and _G.Log then _G.Log(("slow handler %s: %.1f game-s"):format(tostring(serverMessage.dataKey), os.clock() - s_T0)) end
                 if(s_Result ~= nil) then
                     serverMessage.status = s_Result
                     serverMessage.data = s_Response
@@ -737,6 +786,13 @@ function sendAndWaitForResponse(p_Recipient, message, protocol, p_Timeout)
     -- MapServer fell from ~100 a minute to 1-3 while the drones logged "did not answer" 146 times in
     -- five minutes (2026-09-04 03:14). Messages that are not ours are held and put back on the
     -- event queue when this wait ends, in order, for the receive loop that was meant to have them.
+    -- HOLD A FEW, NOT ALL. Every message that is not the awaited reply is held and requeued when the
+    -- wait ends. A sixty-game-second wait on a fourteen-drone network holds hundreds of GPS pings and
+    -- heartbeats, and ComputerCraft's event queue is 256 deep: the requeue overflowed it and the
+    -- overflow silently dropped the timer events every other wait on the computer depended on --
+    -- workers stood still for ten minutes with nothing in the log (2026-09-08). Broadcast chatter is
+    -- stale within seconds anyway; the newest HELD_MAX are kept, the rest are let go.
+    local HELD_MAX = 32
     local s_Held = {}
     local function release()
         for _, h in ipairs(s_Held) do os.queueEvent("rednet_message", h[1], h[2], h[3]) end
@@ -775,6 +831,7 @@ function sendAndWaitForResponse(p_Recipient, message, protocol, p_Timeout)
             end
         else
             s_Held[#s_Held + 1] = {senderID, reply, s_Proto}
+            if #s_Held > HELD_MAX then table.remove(s_Held, 1) end
         end
     end
 end

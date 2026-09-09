@@ -221,7 +221,12 @@ function M.makeEnv(p_Opts)
         formatTime = function() return "" end, tabulate = noop, pagedTabulate = noop, pagedPrint = noop,
     }
     env.textutils.unserialize = env.textutils.unserialise
-    env.parallel = { waitForAny = noop, waitForAll = noop }
+    -- waitForAll runs every function to completion (in order -- the stub has no scheduler); waitForAny
+    -- runs the first. A no-op here hid a StorageMan scan that lists chests in parallel batches.
+    env.parallel = {
+        waitForAll = function(...) for i = 1, select("#", ...) do local f = select(i, ...) if type(f) == "function" then f() end end end,
+        waitForAny = function(f) if type(f) == "function" then f() end end,
+    }
     env.term = setmetatable({}, { __index = function() return noop end })
     env.term.getSize = function() return 51, 19 end
     env.term.isColour = no
@@ -267,6 +272,8 @@ function M.makeEnv(p_Opts)
         local byKey = world.replies[recipient]
         local r = byKey and byKey[message.dataKey]
         if type(r) == "function" then return r(message.data) end
+        -- A drone (numeric id) with no scripted reply accepts the job, as the real one answers at once.
+        if r == nil and type(recipient) == "number" and message.type == "call" then return { accepted = message.dataKey } end
         return r
     end
     env.PowNet = PowNet

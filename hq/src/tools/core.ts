@@ -22,11 +22,11 @@ import { city, saveCity, factories } from '../world/city.js';
 import { chain, unmetInputs, buildOrder, inputsOf, transportPlan, type Factory } from '../world/factories.js';
 import { BLUEPRINTS, blueprint, materials, placementOrder, footprint } from '../world/blueprints.js';
 import { PALETTES, towerFloor, floorCost, specForLevel, LEVELS, TOWER_TOP, bayIsFlightPath } from '../world/tower.js';
-import { outfitBay } from '../world/bay.js';
+import { outfitBay, factoryBayInterior, storageBayInterior } from '../world/bay.js';
 import { supply, runSupplyTick, saveSupply, stockKey, type SupplyRule } from '../agent/supply.js';
 import { luaList, field, numField } from '../lua-table.js';
 import { readStockMap } from '../world/stock.js';
-import { settlement, withinReach } from '../world/settlement.js';
+import { settlement, withinReach, withinRadio } from '../world/settlement.js';
 import { economySummary, economyFault } from '../agent/economy.js';
 
 /**
@@ -808,6 +808,25 @@ registry.register({
 });
 
 registry.register({
+  name: 'storage.deposits',
+  summary: 'List every registered deposit point (position, peripheral name, free slots).',
+  description: 'StorageMan.DepositPoints as-is; the registry drones fly to when unloading.',
+  params: z.object({}).strict(),
+  returns: 'The deposit list.',
+  danger: 'read',
+  handler: async () => bridge.call('StorageMan', 'DepositPoints', {}, { timeoutMs: 8000 }),
+});
+registry.register({
+  name: 'storage.provide',
+  summary: 'Ask StorageMan to stage items at a pickup chest (what a build does before fetching) and return its raw answer.',
+  description: 'Diagnostic: StorageMan.Provide with the given items; surfaces the refusal text a drone would only see as "would not hand over".',
+  params: z.object({ items: z.array(z.object({ name: z.string(), count: z.number().int().min(1) })).min(1) }).strict(),
+  returns: 'The Provide reply, or the refusal string.',
+  danger: 'mutate',
+  // verify-at-effect: returns StorageMan's own report of what it moved and what was short
+  handler: async (a) => bridge.call('StorageMan', 'Provide', { items: a.items }, { timeoutMs: 20000 }),
+});
+registry.register({
   name: 'storage.forgetDeposit',
   summary: 'Drop a registered deposit point whose chest is gone or never existed.',
   description:
@@ -971,6 +990,9 @@ registry.register({
       // from it is how D3 ended up at -496,53,126 -- out of modem range, out of GPS, not ticking,
       // and only found by force-loading a 160-block box to look for it.
       .filter((h) => withinReach(h))
+      // ...AND IN EARSHOT. The circle is horizontal; a coal seam at y=31 on its edge is 100 blocks
+      // from the repeater. D5 followed one there and stopped hearing MapServer (2026-09-08).
+      .filter((h) => withinRadio(h))
       .sort((p, q) =>
         (Math.abs(p.x - base.x) + Math.abs(p.y - base.y) + Math.abs(p.z - base.z)) -
         (Math.abs(q.x - base.x) + Math.abs(q.y - base.y) + Math.abs(q.z - base.z)))
@@ -1366,6 +1388,11 @@ function describeTask(t: any) {
     assignedTo: typeof t.assignedTo === 'number' ? t.assignedTo : null,
     assigned: t.assigned ?? null,
     progress: t.progress ?? null,
+    // A task at 100% with a failure is one TaskMan GAVE UP on, not one that finished. Without this
+    // field the two were indistinguishable to HQ, and the bootstrap loop advanced past 178 wall
+    // blocks nobody had placed (2026-09-08).
+    failure: t.failure ?? null,
+    attempts: t.attempts ?? 0,
     // THE FIELD THAT DECIDES THE ORDER WAS THE ONE FIELD NOBODY COULD SEE.
     //
     // priority governs which task a freed drone is offered next, and it appeared in no tool output
@@ -2462,11 +2489,33 @@ registry.register({
     // left returns zero tasks, which is what makes the level advance.
     const floorOrigin = { x: settlement.base.x, y: settlement.base.y + a.level * spec.floorHeight, z: settlement.base.z };
     const built = await squaresAlreadySolid(planned, floorOrigin, ctx);
-    const blocks = planned.filter((_, i) => !built.has(i));
-    if (!blocks.length) {
+    const unbuilt = planned.filter((_, i) => !built.has(i));
+    if (!unbuilt.length) {
       ctx.log(`tower level ${a.level}: all ${planned.length} squares already hold a block on the map`);
       return { dispatched: false, tasks: [], alreadyBuilt: planned.length,
                message: `level ${a.level}: every square already holds a block on the map -- nothing to queue` };
+    }
+    // COURSE BY COURSE — ONE HEIGHT-LAYER AT A TIME, LOWEST FIRST. Like a 2D printer: lay a whole
+    // layer before starting the one above it.
+    //
+    // A floor used to queue every course at once (dy 0..floorHeight), so a drone would grab a patch
+    // six blocks up while the floor below it was still open -- and then thrash trying to REACH it and
+    // to cross back over the half-built walls to a chest. Measured 2026-09-06: moveTo rising to y=72
+    // to clear a wall, failing to find a descent on the far side, and oscillating in place -- 80+
+    // moves over 2 cells, 0 turns (pure up/down), aborting the job. The walls are the maze, and they
+    // only become one when they go up before the floor is done.
+    //
+    // squaresAlreadySolid already dropped the built cells, so the lowest remaining dy IS the current
+    // course. Queue only that; when the drones finish it, the map marks it solid, and the next order
+    // (the supply loop re-invokes this every tick) picks up the course above. Walls then rise one
+    // block at a time across the whole ring, so a drone never has more than a one-block step to cross
+    // and always has an open path to a chest. Floor-to-floor gating (towerLevel) is unchanged; this
+    // is the same discipline WITHIN a floor.
+    const lowestDy = Math.min(...unbuilt.map((b) => b.dy ?? 0));
+    const blocks = unbuilt.filter((b) => (b.dy ?? 0) === lowestDy);
+    if (built.size || blocks.length < unbuilt.length) {
+      ctx.log(`tower level ${a.level}: course dy=${lowestDy} -- ${blocks.length} square(s) ` +
+              `(${unbuilt.length - blocks.length} left for higher courses, ${built.size} already built)`);
     }
     if (built.size) ctx.log(`tower level ${a.level}: ${built.size} of ${planned.length} squares already built -- not re-ordering them`);
     const cost = floorCost(blocks);
@@ -2671,6 +2720,8 @@ registry.register({
     level: z.number().int().min(-3).max(7),
     sector: z.number().int().min(0).optional()
       .describe('One bay; omit to outfit every buildable bay on the level.'),
+    role: z.enum(['storage', 'factory']).optional()
+      .describe('Override what the level would get: a furnace bank (factory) or sorted chests (storage). The smeltery goes in the basement beside storage until the smelt floor exists (2026-09-08).'),
   }).strict(),
   returns: 'Per-bay role and build task id, plus chest/machine/modem world positions.',
   danger: 'mutate',
@@ -2698,13 +2749,18 @@ registry.register({
     for (const sector of sectors) {
       // The notch is a vertical flight channel, not a room -- never furnish it.
       if (bayIsFlightPath(spec, sector)) { bays.push({ sector, role: 'notch', task: null }); continue; }
-      const plan = outfitBay(spec, a.level, sector);
+      const plan = a.role === 'factory' ? { role: 'factory' as const, interior: factoryBayInterior(spec, sector) }
+        : a.role === 'storage' ? { role: 'storage' as const, interior: storageBayInterior(spec, sector) }
+        : outfitBay(spec, a.level, sector);
       if (plan.interior.blocks.length === 0) { bays.push({ sector, role: plan.role, task: null }); continue; }
       const res: any = await bridge.call('TaskMan', 'Add', {
         name: `bay-L${a.level}-s${sector}`,
-        // After the shell (2) and fuel (1): a bay interior needs its floor slab already standing.
-        priority: 3,
-        work: { build: { origin, blocks: bottomUp(plan.interior.blocks) } },
+        // Level with the growth loop's builds (1): at 3 the first basement bay sat unassigned behind
+        // nine miners' worth of storey work (2026-09-08). Storage and the smeltery are the economy.
+        priority: 1,
+        // A sweep: every cell independently (chest from above, its modem from the room below, cable in the
+        // slab from above). The square-by-square builder left every cable cell of two bays unlaid (2026-09-08).
+        work: { build: { origin, blocks: bottomUp(plan.interior.blocks), sweep: true } },
       }, { timeoutMs: 12000 });
       if (typeof res === 'string') { refused = res; break; }
       bays.push({
@@ -2901,6 +2957,108 @@ registry.register({
       needs: need, crafted, buildTask: build?.id,
       note: crafted.length ? 'build waits for the crafting to finish' : 'materials already in stock',
     };
+  },
+});
+
+// ── order.blocks ───────────────────────────────────────────────────────────
+// A build of EXPLICIT blocks at an explicit origin, for structures the blueprint catalogue does not
+// describe -- the bootstrap tower's square wall ring, its roof, its floor. The drone builds from
+// what it carries first (SecureBuildMaterials), so this is how a miner turns the shaft's cobble into
+// walls with no storage in the world. Blocks are relative to origin, like a blueprint.
+const MAX_BLOCKS_PER_ORDER = 4096;
+registry.register({
+  name: 'order.blocks',
+  summary: 'Queue a build of explicit blocks (dx,dy,dz,item) at an origin.',
+  description:
+    'Hands TaskMan one build task of the given blocks, relative to origin. No plot, no siting, no ' +
+    'crafting: the caller has already decided the geometry. The drone counts what it carries before ' +
+    'asking storage, so it works with no chests in the world. Blocks already solid are skipped.',
+  params: z.object({
+    name: z.string().describe('Task name, e.g. "tower-ring-L0-1".'),
+    origin: z.object({ x: z.number().int(), y: z.number().int(), z: z.number().int() }),
+    blocks: z.array(z.object({
+      dx: z.number().int(), dy: z.number().int(), dz: z.number().int(),
+      item: z.string(),
+      face: z.string().optional(),
+      sx: z.number().int().optional().describe('Sweep builds: the standing cell (same height) from which this block is laid sideways, for wall courses under a roof.'),
+      sz: z.number().int().optional(),
+      sx2: z.number().int().optional().describe('Second standing cell (the other side), tried when the first is unreachable.'),
+      sz2: z.number().int().optional(),
+    })).min(1).max(MAX_BLOCKS_PER_ORDER),
+    priority: z.number().int().min(1).max(9).default(2),
+    sweep: z.boolean().default(false).describe('Flat structure: the drone flies the plane above it row by row and fixes each cell below (one move per cell) instead of approaching every square.'),
+    inspect: z.boolean().default(false).describe('Look only: sweep the course, record what each cell holds in the shared map, place nothing. Scout work.'),
+  }).strict(),
+  returns: 'The TaskMan task id and the block count.',
+  danger: 'destructive',
+  bounds: `At most ${MAX_BLOCKS_PER_ORDER} blocks per order; every block is an explicit coordinate.`,
+  teach: [{
+    situation: 'The miner carries 120 cobblestone from the shaft; the first wall course is due.',
+    args: { name: 'tower-ring-c1', priority: 2, origin: { x: 64, y: 66, z: 32 }, sweep: false, inspect: false,
+            blocks: [{ dx: -7, dy: 1, dz: -7, item: 'minecraft:cobblestone' }] },
+    result: { task: 12, blocks: 1 },
+    takeaway: 'Geometry decided by the caller, materials from the drone, one task.',
+  }],
+  handler: async (a, ctx) => {
+    const t: any = await bridge.call('TaskMan', 'Add', {
+      name: a.name, priority: a.priority,
+      work: { build: { origin: a.origin, blocks: a.blocks, sweep: (a.sweep || a.inspect) || undefined, inspect: a.inspect || undefined } },
+    }, { timeoutMs: 12000 });
+    refuseIfString(t, 'build');
+    ctx.log('order.blocks', { name: a.name, blocks: a.blocks.length, origin: a.origin });
+    return { task: t?.id, blocks: a.blocks.length, origin: a.origin };
+  },
+});
+
+// ── order.dig ──────────────────────────────────────────────────────────────
+// A dig of explicit BOXES, worked in order by one miner as a single task. The plain dig order is one
+// rectangle; a round footprint is not, and digging its bounding box flattens the ground outside the
+// circle. Rows of the disc, each a box, dig exactly the circle. Capped like any dig.
+registry.register({
+  name: 'order.dig',
+  summary: 'Queue one miner to excavate a list of boxes in order (a round footprint as rows).',
+  description:
+    'Each box is min/max inclusive. TaskMan hands the whole list to one miner as one Dig task; the ' +
+    'drone reaches each box by flying over it and sinking down its own column, and never digs ' +
+    'through chests, computers, drones or protected materials. Total volume is capped.',
+  params: z.object({
+    name: z.string().describe('Task name, e.g. "boot:basement-L1-rows-0-9".'),
+    boxes: z.array(z.object({
+      min: z.object({ x: z.number().int(), y: z.number().int(), z: z.number().int() }),
+      max: z.object({ x: z.number().int(), y: z.number().int(), z: z.number().int() }),
+    })).min(1).max(256),
+    priority: z.number().int().min(1).max(9).default(2),
+    unbuild: z.boolean().default(false).describe('The boxes hold PLACED material that must go (a slab laid where the design has a cavity); ordinary digs never remove what the settlement built.'),
+  }).strict(),
+  returns: 'The TaskMan task id, the box count and the total volume.',
+  danger: 'destructive',
+  bounds: `Total volume at most ${MAX_DIG_VOLUME} blocks; every box is an explicit region.`,
+  teach: [{
+    situation: 'The basement is a disc; its rows are boxes one block deep in z.',
+    args: { name: 'boot:basement-0', priority: 1, unbuild: false, boxes: [{ min: { x: 50, y: 60, z: 20 }, max: { x: 78, y: 60, z: 20 } }] },
+    result: { task: 31, boxes: 1, volume: 29 },
+    takeaway: 'Rows dig a circle; a bounding box digs the corners too.',
+  }],
+  handler: async (a, ctx) => {
+    let volume = 0;
+    const bb = { min: { x: Infinity, y: Infinity, z: Infinity }, max: { x: -Infinity, y: -Infinity, z: -Infinity } };
+    const boxes = a.boxes.map((b) => {
+      const lo = { x: Math.min(b.min.x, b.max.x), y: Math.min(b.min.y, b.max.y), z: Math.min(b.min.z, b.max.z) };
+      const hi = { x: Math.max(b.min.x, b.max.x), y: Math.max(b.min.y, b.max.y), z: Math.max(b.min.z, b.max.z) };
+      volume += (hi.x - lo.x + 1) * (hi.y - lo.y + 1) * (hi.z - lo.z + 1);
+      for (const k of ['x', 'y', 'z'] as const) { bb.min[k] = Math.min(bb.min[k], lo[k]); bb.max[k] = Math.max(bb.max[k], hi[k]); }
+      // The drone's box shape: top corner, width along x, length along z, depth in layers.
+      return { pos: { x: lo.x, y: hi.y, z: lo.z }, w: hi.x - lo.x + 1, l: hi.z - lo.z + 1, depth: hi.y - lo.y + 1 };
+    });
+    if (volume > MAX_DIG_VOLUME) throw new ToolError(
+      `The boxes total ${volume} blocks, over the ${MAX_DIG_VOLUME} limit.`, 'Split the dig into smaller orders.');
+    const t: any = await bridge.call('TaskMan', 'Add', {
+      name: a.name, priority: a.priority,
+      work: { dig: { start: bb.min, stop: bb.max, boxes, unbuild: a.unbuild || undefined } },
+    }, { timeoutMs: 12000 });
+    refuseIfString(t, 'dig');
+    ctx.log('order.dig', { name: a.name, boxes: boxes.length, volume });
+    return { task: t?.id, boxes: boxes.length, volume };
   },
 });
 

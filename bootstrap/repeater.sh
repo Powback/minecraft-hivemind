@@ -35,7 +35,12 @@ WORLD=data/world
 #
 # y=85 is the height at which BOTH a ground drone and one cruising at y=110 stay inside 64 blocks
 # across a reach of 56. Measured, not picked.
-X=-480; Y=85; Z=64
+# Seed-7 base (2026-09-08): on top of the GPS mast at 64,110-114,32. The modules sit at x 57-71,
+# so a drone at the 72-block reach was 79 blocks from MapServer and deaf; at y=116 the repeater's
+# own range is ~93 and CC:T uses the larger of the two ranges. Placed by hand as computer #34.
+X=${X:-64}; Y=${Y:-116}; Z=${Z:-32}
+# The basement repeater (#35) was placed the same way with X=77 Y=26 Z=32 (modem east of it):
+# MapServer's own modem reaches ~y10 straight down, and the diggers below went deaf.
 
 rc() { docker compose exec -T mc rcon-cli "$1" </dev/null 2>&1 | tr -d '\r' | sed 's/\x1b\[[0-9;]*m//g'; }
 state() { rc "computercraft dump" | grep -E "^#$1 " | awk -F'|' '{gsub(/ /,"",$2);print $2}'; }

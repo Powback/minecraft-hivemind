@@ -8,8 +8,12 @@
 import { describe, it, expect } from 'vitest';
 import { settlement, bounds } from '../src/world/settlement.js';
 
-/** Mast repeater, from bootstrap/repeater.sh. */
-const MAST = { x: -480, y: 85, z: 64 };
+/**
+ * The radio the drones must stay in range of. The modules sit on the ground-floor wall ring of the
+ * tower, two blocks above its base, so the tower centre stands in for all of them -- derived from the
+ * settlement, never a literal, or this test pins the fleet to whichever world it was written in.
+ */
+const MAST = { x: settlement.base.x, y: settlement.base.y + 2, z: settlement.base.z };
 const MODEM_RANGE = 64;
 
 const distToMast = (x: number, y: number, z: number) =>

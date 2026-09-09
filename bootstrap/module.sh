@@ -39,7 +39,8 @@ cycle() {
 
 echo "== $LABEL at $X $Y $Z"
 rc "forceload add $((X-8)) $((Z-8)) $((X+8)) $((Z+8))" >/dev/null
-rc "setblock $X $Y $Z computercraft:computer_normal" >/dev/null
+# FACING (north/south/east/west) is which way the screen looks: wall stations face into the room.
+rc "setblock $X $Y $Z computercraft:computer_normal[facing=${FACING:-north}]" >/dev/null
 rc "setblock $X $((Y+1)) $Z computercraft:wireless_modem_normal[facing=down]" >/dev/null
 rc "data merge block $X $Y $Z {On:1b}" >/dev/null
 sleep 5

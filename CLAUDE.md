@@ -884,3 +884,60 @@ fetch keeping whole stacks (a 4-log craft withdrew 200 logs: `TakeFromChest(p_Wa
 `KeepUpTo`). The user authorised wood: 256 oak logs and 8 chests were put on the shelf in place of
 stone so the chest row could exist at all. HIVE_REACH is 72 because the nearest standing oak is 63
 blocks out.
+
+## A terminated computer costs a worker thread (2026-09-08)
+
+`computercraft-server.toml` runs the Lua of every computer on a small pool (`computer_threads`, was 4).
+When CC's watchdog logs `Terminating computer #N due to timeout`, a computer whose Lua is inside a
+Java call does not die: it shows `On | Y` in `computercraft dump`, `computercraft shutdown` reports
+success and changes nothing, it writes no log and no boot-stage -- and it KEEPS ITS WORKER THREAD.
+StorageMan was terminated three times in one afternoon (a full index rescan per request at 170
+chests), so ~35 computers at `tick rate 200` shared one or two threads. From inside a drone that
+looks like a native `turtle.forward()` that never returns (driver stack `pgps:1952 'forward' -> [C]`),
+StorageMan handlers of 12 game-seconds, `rednet.lookup` misses, and finally 14/14 drones motionless.
+The block can be replaced (`setblock ... air`, then `bootstrap/module.sh <Label> x y z`; module DATA
+lives on MainFrame and comes back), but only a server restart frees the thread. `computer_threads` is
+8 now. Keep every handler under ten seconds of Lua between yields; `/handler.txt` names the last
+handler a module started, and `slow handler` lines mark anything over three game-seconds.
+
+## Radio is a 3D horizon, and every floor needs a riser (2026-09-08)
+
+- Modules sit at x 57-71, y 68 with a 64-block modem range. A drone at the 72-block reach was 79
+  blocks from MapServer and deaf: "pathfinder did not answer" while MapServer's own stats were fine.
+  A rednet repeater (computer #34, `bootstrap/repeater.sh`) stands on the GPS mast at 64,116,32;
+  `settlement.radio` lists the stations and `withinRadio()` / `pgps.isWithinReach(x, z, y)` refuse
+  gather targets out of earshot. The stations travel with the bounds push as the scalar string
+  `"x,y,z,range;..."` -- MapServer's param validator rejects nested tables (`centre` failed that way).
+- Radio reaches ~60 blocks DOWN as well: diggers at y0-5 were out of MapServer's earshot (y68) and
+  reported "buried walled in". A second repeater (#35) sits outside the level -7 wall at 77,26,32
+  and is the third `settlement.radio` station. Every ~60 blocks of depth needs one.
+- Each level's cable trunk is its own wired network until `riserBlocks()` joins it to the level
+  nearer -1. A bay that activates with zero registered chests is an island, never "active".
+- MapServer saves must not walk the map: `m_ChunkKeys` (PowGPSServer) indexes cells per chunk as
+  they are written; `CHUNKS_PER_SAVE` is 6. A save that held the handler 11 game-seconds cost the
+  fleet a round of failed path requests per upload.
+- `chunkIsOpen` requires KNOWN air (KnownAir), never "not known solid": unsurveyed depths were
+  skipped as open and marked dug. The plan grows when the rock runs out (all dig chunks issued and
+  the queue under QUEUED_DIGS), and QUEUED_DIGS keeps all but two miners digging.
+- TaskMan's Tick must never block on rednet: an acknowledged dispatch built on `sendAndWaitForResponse`
+  inside Tick stopped every dispatch (2026-09-08 19:24). If an ack is wanted, the drone must send an
+  async "Accepted" event. Dispatch stays fire-and-forget; lost dispatches are reclaimed after 90 s.
+- An aborted job body can outlive its abort (D14's Plant ran a fetch sweep for two hours): the worker
+  never returns to the queue, so every new job is accepted and never run. `ClearStuckExecuting` now
+  reboots when `JobBodyRunning` is still set with no job in flight.
+- `bootstrap/module.sh` REUSES an existing computer at the position. To replace a watchdog-terminated
+  module (stays On, unkillable), `setblock` the computer and its modem to air first; the new one gets a
+  fresh id (StorageMan is #36 since 19:38) -- then update `bootstrap/module-ids.txt`.
+- A turtle stuck in a native `turtle.forward` at boot (log ends at "pgps: coverage") wakes when its
+  block is moved: `clone x y z x y z x y-2 z replace move`. Four at once at 56-60,59,15-18 (2026-09-08).
+- The hangs above correlate with the turtle being ATTACHED to a wired modem (the cell directly under a
+  `wired_modem_full`). PowGPSServer's `stepCost` now adds `UNDER_MODEM_COST` (1e6) to such cells, so
+  routes never stand under the modem layer; cable overhead stays a +4 cost.
+- Underground GPS needs non-coplanar hosts: the basement ring (#23-26, y61/63) alone never fixed a
+  drone below it, and D1 dead-reckoned for two hours to 25 blocks off. Deep hosts #37-39 sit at y26
+  (79,26,40 / 49,26,24 / 64,26,50); all eleven hosts are listed in `settlement.gpsHosts`.
+- StorageMan wedges silently on a 250+ chest wired network (handler stuck in a deposit → rescan; no
+  CC termination, log just stops). `computercraft shutdown` cannot restart it: `setblock` the computer
+  and its modem to air, rename `computer/<id>` aside, run `module.sh StorageMan 57 68 27`, update
+  `module-ids.txt`. #33 and #36 died this way on 2026-09-08; #40 is current. Splitting the network or
+  capping chests per StorageMan is the real fix.

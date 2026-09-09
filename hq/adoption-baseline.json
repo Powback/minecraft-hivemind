@@ -1,19 +1,21 @@
 {
   "note": "Helpers that exist but were never adopted everywhere. May only ever SHRINK -- see test/adoption.test.ts.",
   "run": 4,
-  "total": 49,
+  "total": 62,
   "files": {
     "lua/DroneMan.lua": 6,
     "lua/TaskMan.lua": 6,
+    "lua/PowGPSServer.lua": 13,
+    "lua/DroneLogic.lua": 11,
     "lua/DockingMan.lua": 3,
-    "lua/PowGPSServer.lua": 11,
-    "lua/StorageMan.lua": 5,
-    "lua/pgps.lua": 7,
+    "lua/pgps.lua": 8,
     "hq/src/world/place.ts": 1,
     "hq/src/world/state.ts": 2,
     "hq/src/tools/core.ts": 2,
-    "lua/DroneLogic.lua": 4,
+    "lua/StorageMan.lua": 2,
     "lua/MapServer.lua": 1,
-    "lua/MainFrame.lua": 1
+    "lua/MainFrame.lua": 1,
+    "hq/src/agent/bootstrap.ts": 5,
+    "hq/src/agent/supply.ts": 1
   }
 }

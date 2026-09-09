@@ -32,6 +32,8 @@ import { createHash } from 'node:crypto';
 import { join, relative, extname } from 'node:path';
 import { registry } from './tools/registry.js';
 import { startSupplyLoop } from './agent/supply.js';
+import { startBootstrapLoop } from './agent/bootstrap.js';   // side-effect: registers bootstrap.* tools
+import { startScreens, monitorsFeed } from './agent/screens.js';
 import { startEconomySampler } from './agent/economy.js';
 import { startSentinel, sentinel, runSentinelTick } from './agent/sentinel.js';
 import { pushSettlement } from './world/settlement.js';
@@ -146,6 +148,8 @@ const server = createServer(async (req, res) => {
     // that is an empty fleet -- which has no unhealthy drones, so this answered `problems: ["none"]`
     // before anything had been looked at. Measured: "none" while all seven drones sat at zero fuel.
     if (url.pathname === '/brief') { await refreshFleet(); return send(200, buildBrief()); }
+    // The station monitors' text, for the world viewer (which cannot read a terminal any other way).
+    if (url.pathname === '/monitors') return send(200, monitorsFeed());
 
     /**
      * Everything a runner needs to start an agent: system prompt, tool schemas,
@@ -347,6 +351,9 @@ server.listen(PORT, '0.0.0.0', () => {
   });
 
   startSupplyLoop();
+  startBootstrapLoop();
+  // startScreens(): HQ pushing text to the station monitors is OFF -- the user wants the screens
+  // native (each module paints its own; the viewer reads the world save), not driven from HQ.
   startEconomySampler();
   // The part that reads the system's own output. Nothing did, which is why every outage so far has
   // needed a person to spot a contradiction in a log.

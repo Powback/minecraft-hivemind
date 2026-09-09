@@ -497,7 +497,7 @@ export function towerFloor(
  * glance; a recess running the full height tells you which way the tower faces from a distance, and
  * lines the terraces up underneath it.
  */
-export const NOTCH_BEARING = 0;              // due north
+export const NOTCH_BEARING = Math.PI;        // due south: the entrance faces the shaft side the drones and the user approach from (2026-09-08)
 export const NOTCH_HALF_ARC = Math.PI / 14;  // about 13 degrees each side: two blocks wide at r=14
 
 /** Is this cell inside the flight notch -- open air rather than wall, bay or concourse? */
